@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+app/.next/
+app/out/
+
+# Build outputs
+sdk/dist/
+indexer/dist/
+scripts/dist/
+contracts/target/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+indexer/.env
+app/.env.local
+
+# Deployed / seeded state
+scripts/deployed.json
+scripts/seeded.json
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust
+contracts/target/

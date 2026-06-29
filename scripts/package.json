@@ -1,0 +1,17 @@
+{
+  "name": "@circleup/scripts",
+  "version": "0.1.0",
+  "scripts": {
+    "deploy:testnet": "ts-node src/deploy.ts",
+    "seed:demo": "ts-node src/seed-demo.ts"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^12.3.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}

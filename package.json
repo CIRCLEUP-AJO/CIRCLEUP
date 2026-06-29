@@ -1,0 +1,35 @@
+{
+  "name": "circleup",
+  "version": "0.1.0",
+  "description": "On-chain rotating savings circles (ROSCA) on Stellar Soroban",
+  "private": true,
+  "workspaces": [
+    "sdk",
+    "indexer",
+    "app",
+    "scripts"
+  ],
+  "scripts": {
+    "install:all": "npm install",
+    "build:sdk": "npm run build --workspace=sdk",
+    "build:app": "npm run build --workspace=app",
+    "dev:app": "npm run dev --workspace=app",
+    "dev:indexer": "npm run dev --workspace=indexer",
+    "dev": "npm run dev:indexer & npm run dev:app",
+    "deploy:testnet": "npm run deploy:testnet --workspace=scripts",
+    "seed:demo": "npm run seed:demo --workspace=scripts",
+    "migrate": "npm run migrate:dev --workspace=indexer",
+    "lint": "npm run lint --workspace=app"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/circleup"
+  },
+  "license": "MIT"
+}
