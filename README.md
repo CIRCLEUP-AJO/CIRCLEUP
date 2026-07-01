@@ -1,11 +1,11 @@
 # 🔄 CircleUp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![CI](https://github.com/CIRCLEUP-AJO/CIRCLEUP/actions/workflows/ci.yml/badge.svg)](https://github.com/CIRCLEUP-AJO/CIRCLEUP/actions/workflows/ci.yml)
 [![Built on Stellar](https://img.shields.io/badge/Built%20on-Stellar%20Soroban-7B2FBE?logo=stellar&logoColor=white)](https://stellar.org)
 [![Next.js](https://img.shields.io/badge/Frontend-Next.js%2014-black?logo=next.js&logoColor=white)](https://nextjs.org)
 [![Rust](https://img.shields.io/badge/Contracts-Rust%20%2B%20Soroban-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](./CODE_OF_CONDUCT.md)
-
 > **The savings club a billion people already use — made trustless.**
 
 CircleUp brings Rotating Savings & Credit Associations (ROSCAs) — known as **Ajo** in Nigeria, **Esusu** across West Africa, **Tanda** in Latin America, and **Chama** in Kenya — onto **Stellar Soroban**. The notebook-and-trust model is replaced by a tamper-proof smart contract: every member contributes each round, and the pot auto-pays the scheduled recipient. The organizer can never run off with the money.

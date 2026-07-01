@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── TypeScript type-check + build ──────────────────────────────────────────
+  typescript:
+    name: TypeScript (SDK + Indexer + App)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build SDK
+        run: npm run build --workspace=sdk
+
+      - name: Type-check Indexer
+        run: npx tsc --noEmit
+        working-directory: indexer
+
+      - name: Type-check Scripts
+        run: npx tsc --noEmit
+        working-directory: scripts
+
+      - name: Build App (Next.js)
+        run: npm run build --workspace=app
+
+  # ── Rust contracts ─────────────────────────────────────────────────────────
+  contracts:
+    name: Soroban Contracts (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Run contract tests
+        run: cargo test
+        working-directory: contracts
+
+      - name: Build contracts (release WASM)
+        run: cargo build --release --target wasm32-unknown-unknown
+        working-directory: contracts
+
+  # ── Lint ───────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint (Next.js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run ESLint
+        run: npm run lint --workspace=app
