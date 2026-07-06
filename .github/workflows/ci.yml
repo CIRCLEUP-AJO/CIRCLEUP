@@ -59,11 +59,11 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run contract tests
-        run: cargo test
+        run: cargo test --workspace
         working-directory: contracts
 
       - name: Build contracts (release WASM)
-        run: cargo build --release --target wasm32-unknown-unknown
+        run: cargo build --release --target wasm32-unknown-unknown --workspace
         working-directory: contracts
 
   # ── Lint ───────────────────────────────────────────────────────────────────

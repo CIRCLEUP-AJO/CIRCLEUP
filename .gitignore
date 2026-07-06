@@ -43,3 +43,4 @@ Thumbs.db
 
 # Rust
 contracts/target/
+# Note: Cargo.lock IS committed (pinned deps for CI reproducibility)
