@@ -18,10 +18,7 @@
 
 import * as dotenv from "dotenv";
 import * as path from "path";
-// Load from scripts/.env if present, otherwise fall back to root .env
-dotenv.config({ path: path.join(__dirname, "../.env") });
-dotenv.config({ path: path.join(__dirname, "../../.env") });
-
+import * as fs from "fs";
 import {
   Keypair,
   SorobanRpc,
@@ -32,10 +29,11 @@ import {
   nativeToScVal,
   scValToNative,
   xdr,
-  Networks,
 } from "@stellar/stellar-sdk";
-import * as fs from "fs";
-import * as path from "path";
+
+// Load from scripts/.env if present, otherwise fall back to root .env
+dotenv.config({ path: path.join(__dirname, "../.env") });
+dotenv.config({ path: path.join(__dirname, "../../.env") });
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
