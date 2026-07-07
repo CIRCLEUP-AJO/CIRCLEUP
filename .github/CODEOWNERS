@@ -1,0 +1,23 @@
+# CODEOWNERS — automatically requests reviews from the right people
+# Format: file-pattern  @github-username
+
+# Default owner for everything
+*                           @CIRCLEUP-AJO
+
+# Smart contracts — require contract expert review
+contracts/                  @CIRCLEUP-AJO
+
+# SDK
+sdk/                        @CIRCLEUP-AJO
+
+# Frontend
+app/                        @CIRCLEUP-AJO
+
+# Indexer
+indexer/                    @CIRCLEUP-AJO
+
+# CI / workflows
+.github/                    @CIRCLEUP-AJO
+
+# Security policy — always needs maintainer sign-off
+SECURITY.md                 @CIRCLEUP-AJO
