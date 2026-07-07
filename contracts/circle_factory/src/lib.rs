@@ -93,7 +93,7 @@ impl CircleFactory {
         salt_bytes.append(&creator.clone().to_xdr(&env));
         let count_bytes = count.to_xdr(&env);
         salt_bytes.append(&count_bytes);
-        let salt: BytesN<32> = env.crypto().sha256(&salt_bytes);
+        let salt: BytesN<32> = env.crypto().sha256(&salt_bytes).into();
 
         // Deploy
         let circle_address = env
