@@ -4,58 +4,77 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | ✅ Yes    |
+| 0.1.x   | ✅ Active |
+
+---
 
 ## Reporting a Vulnerability
 
-**Please do not report security vulnerabilities through public GitHub issues.**
+**Please do not open a public GitHub issue for security vulnerabilities.**
 
-If you discover a vulnerability in CircleUp — especially one affecting the smart contracts, collateral handling, or payout logic — please report it privately.
+If you discover a vulnerability — especially one affecting contract funds, collateral logic, or payout order — please report it privately.
 
-**How to report:**
+### How to Report
 
-1. Open a **private** GitHub Security Advisory at:
-   `https://github.com/Hovibby/CIRCLUP/security/advisories/new`
+**Option 1 — GitHub Security Advisory (preferred)**
+Open a private advisory at:
+`https://github.com/CIRCLEUP-AJO/CIRCLEUP/security/advisories/new`
 
-2. Or email the maintainers directly with the subject line `[SECURITY] CircleUp Vulnerability`.
+**Option 2 — Email**
+Send a report with the subject `[SECURITY] CircleUp Vulnerability` to the maintainers.
 
-**Include in your report:**
-- A clear description of the vulnerability
+### What to Include
+
+- Clear description of the vulnerability
 - Steps to reproduce or a proof-of-concept
-- The potential impact (e.g. funds at risk, collateral bypass, payout manipulation)
-- Any suggested fix if you have one
+- Affected component (`circle`, `circle_factory`, `reputation`, `indexer`, `app`)
+- Potential impact (e.g. funds at risk, collateral bypass, payout manipulation, unauthorized default)
+- Suggested fix if you have one
+
+---
 
 ## Response Timeline
 
-| Action | Timeframe |
-|--------|-----------|
+| Action | Target |
+|--------|--------|
 | Acknowledgement | Within 48 hours |
-| Initial assessment | Within 5 business days |
-| Fix or mitigation | Depends on severity |
-| Public disclosure | After fix is deployed |
+| Severity assessment | Within 5 business days |
+| Fix or mitigation shipped | Depends on severity (critical: ASAP) |
+| Public disclosure | After fix is deployed and users are notified |
 
-## Smart Contract Security
+---
 
-CircleUp's core risk surface is the `circle` contract. Key areas:
+## Smart Contract Risk Surface
 
-- **Payout logic** — only triggers when all members have contributed; recipient is set at initialization and cannot be changed
-- **Collateral** — locked at join, only released via `close` after completion or cancellation
-- **Default penalty** — capped at 20% per missed round; cannot exceed collateral balance
-- **Access control** — `join` and `contribute` require the caller's own auth; `payout` and `mark_default` are permissionless but have strict on-chain guards
+The core attack surface is in `contracts/circle`:
+
+| Area | Protection |
+|------|-----------|
+| **Payout** | Only triggers when `contributions_received == member_count`; recipient set at init, immutable |
+| **Collateral** | Locked at `join`; only released via `close` after `Completed` or `Cancelled` status |
+| **Default penalty** | Capped at 20% per missed round (2000 BPS); cannot exceed current collateral balance |
+| **Contribution auth** | `member.require_auth()` — only the member themselves can contribute for their slot |
+| **Idempotency** | Temporary storage key prevents double-contribution in the same round |
+| **Round advancement** | Only happens inside `payout` after full contribution; no manual override |
+
+---
 
 ## Scope
 
-In scope:
+**In scope:**
 - `contracts/` — all three Soroban contracts
 - `sdk/` — TypeScript SDK
 - `indexer/` — event indexer and REST API
-- `app/` — Next.js frontend
+- `app/` — Next.js frontend (XSS, wallet spoofing, etc.)
 
-Out of scope:
-- Third-party dependencies (report to their maintainers)
+**Out of scope:**
+- Third-party dependencies — report to their maintainers
 - Issues requiring physical access to a user's device
-- Social engineering attacks
+- Social engineering attacks on users
+- Stellar network-level issues — report to the [Stellar Security Team](https://www.stellar.org/bug-bounty-program)
+
+---
 
 ## Disclosure Policy
 
-We follow **coordinated disclosure**. We ask that you give us reasonable time to patch before making any public disclosure. We will credit researchers who report valid vulnerabilities in our release notes unless they prefer to remain anonymous.
+We follow **coordinated disclosure**. We ask that you give us reasonable time to patch before any public disclosure. Researchers who report valid vulnerabilities will be credited in the release notes unless they prefer to remain anonymous.
