@@ -1,7 +1,6 @@
 # 🔄 CircleUp
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
-[![CI](https://github.com/CIRCLEUP-AJO/CIRCLEUP/actions/workflows/ci.yml/badge.svg)](https://github.com/CIRCLEUP-AJO/CIRCLEUP/actions/workflows/ci.yml)
 [![Built on Stellar](https://img.shields.io/badge/Built%20on-Stellar%20Soroban-7B2FBE?logo=stellar&logoColor=white)](https://stellar.org)
 [![Next.js](https://img.shields.io/badge/Frontend-Next.js%2014-black?logo=next.js&logoColor=white)](https://nextjs.org)
 [![Rust](https://img.shields.io/badge/Contracts-Rust%20%2B%20Soroban-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
