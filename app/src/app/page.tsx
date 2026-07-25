@@ -1,27 +1,41 @@
 import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
-import { CircleCard, Circle } from "@/components/CircleCard";
+import { CircleCard } from "@/components/CircleCard";
+import type { Circle } from "@/components/CircleCard";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface Circle {
-  address: string;
-  creator: string;
-  round_amount: string;
-  member_count: number;
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  created_ledger: number;
-}
-
 type FetchResult =
   | { ok: true; circles: Circle[] }
-  | { ok: false; error: "network" | "parse" | "server" };
+  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" };
+
+// ─── URL validation ───────────────────────────────────────────────────────────
+
+/**
+ * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
+ * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
+ * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
+ * identical to a real network failure and gives no actionable guidance.
+ */
+function isValidUrl(url: string): boolean {
+  if (!url || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 async function getCircles(): Promise<FetchResult> {
+  // Catch misconfiguration before attempting the network request so that
+  // developers get a targeted error message rather than a cryptic network failure.
+  if (!isValidUrl(INDEXER_URL)) {
+    return { ok: false, error: "misconfigured" };
+  }
+
   let res: Response;
   try {
     res = await fetch(`${INDEXER_URL}/circles`, {
@@ -56,8 +70,15 @@ async function getCircles(): Promise<FetchResult> {
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
-function IndexerErrorBanner({ error }: { error: "network" | "parse" | "server" }) {
+function IndexerErrorBanner({
+  error,
+}: {
+  error: "network" | "parse" | "server" | "misconfigured";
+}) {
   const messages: Record<string, string> = {
+    misconfigured:
+      "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
+      "Copy app/.env.example to app/.env.local and set a valid indexer URL, then restart the server.",
     network:
       "The indexer is unreachable right now. Circles may not be up to date. Check that the indexer service is running.",
     server:
@@ -136,6 +157,50 @@ export default async function HomePage() {
             <p className="text-slate-500 text-sm">{step.desc}</p>
           </div>
         ))}
+      </div>
+
+      {/* Protocol guarantees */}
+      <div className="mb-12">
+        <h2 className="text-xl font-bold text-slate-800 mb-4">
+          🔐 Protocol Guarantees
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {[
+            {
+              emoji: "🚫",
+              title: "No rug-pulls",
+              desc: "The organizer cannot withdraw funds early. All money is locked in the Soroban smart contract until the scheduled payout.",
+            },
+            {
+              emoji: "🔄",
+              title: "Deterministic rotation",
+              desc: "Payout order is set on-chain at join time. The contract enforces it — no one can skip the queue or pay themselves twice.",
+            },
+            {
+              emoji: "⚠️",
+              title: "Collateral-backed defaults",
+              desc: "Every member locks 1× the round amount as collateral. A missed contribution triggers an automatic penalty deducted from that collateral.",
+            },
+            {
+              emoji: "🌐",
+              title: "On-chain reputation",
+              desc: "Contribution and default history is recorded on-chain. Your reputation score is public, portable, and unforgeable.",
+            },
+          ].map((g) => (
+            <div
+              key={g.title}
+              className="bg-white rounded-xl border border-slate-200 p-5 flex gap-4 items-start"
+            >
+              <span className="text-2xl mt-0.5" aria-hidden="true">
+                {g.emoji}
+              </span>
+              <div>
+                <h3 className="font-semibold text-slate-800 mb-1">{g.title}</h3>
+                <p className="text-slate-500 text-sm">{g.desc}</p>
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Circles list */}
