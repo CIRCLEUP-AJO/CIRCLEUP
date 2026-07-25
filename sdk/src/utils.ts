@@ -17,7 +17,11 @@ export const STROOP = BigInt(STROOPS_PER_USDC);
  *   usdcToStroops("0.01")   → 100_000n
  */
 export function usdcToStroops(usdc: number | string): bigint {
-  const [whole, frac = ""] = String(usdc).split(".");
+  const str = String(usdc).trim();
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new TypeError(`Invalid USDC amount: "${str}"`);
+  }
+  const [whole, frac = ""] = str.split(".");
   const fracPadded = frac.padEnd(USDC_DECIMALS, "0").slice(0, USDC_DECIMALS);
   return BigInt(whole) * STROOP + BigInt(fracPadded);
 }
