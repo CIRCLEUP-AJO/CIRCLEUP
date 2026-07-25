@@ -3,7 +3,6 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   CIRCLE_FACTORY_ADDRESS,
-  NETWORK_PASSPHRASE,
   usdcToStroops,
   shortAddress,
 } from "@/lib/config";
@@ -11,6 +10,9 @@ import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
+
+/** Stellar Expert base URL for testnet transactions. */
+const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
 
 export default function CreatePage() {
   const router = useRouter();
@@ -20,6 +22,7 @@ export default function CreatePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [txHash, setTxHash] = useState("");
+  const [copied, setCopied] = useState(false);
 
   function updateMember(i: number, val: string) {
     setMembers((prev) => {
@@ -38,10 +41,22 @@ export default function CreatePage() {
     setMembers((prev) => prev.filter((_, idx) => idx !== i));
   }
 
+  async function copyTxHash() {
+    if (!txHash) return;
+    try {
+      await navigator.clipboard.writeText(txHash);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard API unavailable — silently skip
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
     setTxHash("");
+    setCopied(false);
 
     const walletAddress = await getWalletAddress();
     if (!walletAddress) {
@@ -95,8 +110,10 @@ export default function CreatePage() {
         return;
       }
 
+      // Show the transaction hash before redirecting so the user can save it
       setTxHash(result.txHash);
-      setTimeout(() => router.push("/"), 3000);
+      // Give the user 5 seconds to see and copy the hash before redirecting
+      setTimeout(() => router.push("/"), 5000);
     } catch (err: any) {
       setError(err.message || "Unknown error");
     } finally {
@@ -202,30 +219,56 @@ export default function CreatePage() {
         </div>
 
         {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700" role="alert">
             {error}
           </div>
         )}
 
         {txHash && (
-          <div className="bg-brand-50 border border-brand-200 rounded-lg p-3 text-sm text-brand-700">
-            ✅ Circle created! Tx:{" "}
+          <div
+            className="bg-brand-50 border border-brand-200 rounded-lg p-4 text-sm text-brand-700 space-y-3"
+            role="status"
+            aria-live="polite"
+          >
+            <p className="font-semibold text-brand-800 flex items-center gap-1.5">
+              ✅ Circle created successfully!
+            </p>
+
+            <div>
+              <p className="text-xs text-brand-600 mb-1 font-medium">Transaction hash</p>
+              <div className="flex items-center gap-2 bg-white border border-brand-200 rounded-lg px-3 py-2">
+                <span className="font-mono text-xs text-slate-700 flex-1 break-all select-all">
+                  {txHash}
+                </span>
+                <button
+                  type="button"
+                  onClick={copyTxHash}
+                  className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0"
+                  aria-label="Copy transaction hash"
+                >
+                  {copied ? "✓ Copied" : "Copy"}
+                </button>
+              </div>
+            </div>
+
             <a
-              href={`https://stellar.expert/explorer/testnet/tx/${txHash}`}
+              href={`${EXPLORER_BASE}/${txHash}`}
               target="_blank"
               rel="noopener noreferrer"
-              className="font-mono underline"
+              className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
             >
-              {shortAddress(txHash)}
+              View on Stellar Expert ↗
             </a>
-            <br />
-            Redirecting to circles list…
+
+            <p className="text-xs text-slate-500">
+              Redirecting to circles list in a few seconds…
+            </p>
           </div>
         )}
 
         <button
           type="submit"
-          disabled={loading}
+          disabled={loading || !!txHash}
           className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 text-lg"
         >
           {loading ? "Creating circle…" : "Create Circle"}
