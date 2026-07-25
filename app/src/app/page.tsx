@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
-import { CircleCard } from "@/components/CircleCard";
+import { CircleCard, Circle } from "@/components/CircleCard";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 

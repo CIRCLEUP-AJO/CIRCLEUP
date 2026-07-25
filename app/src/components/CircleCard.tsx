@@ -3,7 +3,7 @@ import Link from "next/link";
 import { shortAddress, formatUsdc, formatPot } from "@/lib/config";
 import clsx from "clsx";
 
-interface Circle {
+export interface Circle {
   address: string;
   creator: string;
   /** Per-member round contribution, in stroops */
