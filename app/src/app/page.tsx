@@ -1,8 +1,8 @@
 import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
-import { CircleCard } from "@/components/CircleCard";
+import { CircleCard, Circle } from "@/components/CircleCard";
 
-async function getCircles() {
+async function getCircles(): Promise<Circle[]> {
   try {
     const res = await fetch(`${INDEXER_URL}/circles`, {
       next: { revalidate: 10 },
@@ -92,7 +92,7 @@ export default async function HomePage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {circles.map((circle: any) => (
+          {circles.map((circle: Circle) => (
             <CircleCard key={circle.address} circle={circle} />
           ))}
         </div>

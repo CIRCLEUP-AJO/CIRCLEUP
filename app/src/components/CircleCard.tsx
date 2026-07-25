@@ -3,7 +3,7 @@ import Link from "next/link";
 import { shortAddress, stroopsToUsdc } from "@/lib/config";
 import clsx from "clsx";
 
-interface Circle {
+export interface Circle {
   address: string;
   creator: string;
   round_amount: string;
