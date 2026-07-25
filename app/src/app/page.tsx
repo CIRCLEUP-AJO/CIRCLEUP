@@ -2,21 +2,29 @@ import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
 import { CircleCard } from "@/components/CircleCard";
 
-async function getCircles() {
+async function getCircles(): Promise<{ circles: any[]; error: string | null }> {
   try {
     const res = await fetch(`${INDEXER_URL}/circles`, {
       next: { revalidate: 10 },
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      return {
+        circles: [],
+        error: `Failed to load circles (HTTP ${res.status}). Please try again later.`,
+      };
+    }
     const data = await res.json();
-    return data.circles || [];
+    return { circles: data.circles || [], error: null };
   } catch {
-    return [];
+    return {
+      circles: [],
+      error: "Could not reach the indexer. Check your connection and try again.",
+    };
   }
 }
 
 export default async function HomePage() {
-  const circles = await getCircles();
+  const { circles, error } = await getCircles();
 
   return (
     <div>
@@ -80,7 +88,13 @@ export default async function HomePage() {
         </Link>
       </div>
 
-      {circles.length === 0 ? (
+      {error ? (
+        <div className="text-center py-16 text-slate-500">
+          <div className="text-4xl mb-3">⚠️</div>
+          <p className="font-medium text-red-600">Something went wrong</p>
+          <p className="text-sm mt-1">{error}</p>
+        </div>
+      ) : circles.length === 0 ? (
         <div className="text-center py-16 text-slate-500">
           <div className="text-4xl mb-3">🌱</div>
           <p className="font-medium">No circles yet.</p>
