@@ -346,7 +346,19 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       )
     : false;
 
-  async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
+  /** Returns true when the error looks like a timeout or network failure. */
+  function isRetryableError(err: string): boolean {
+    const lower = err.toLowerCase();
+    return (
+      lower.includes("timeout") ||
+      lower.includes("timed out") ||
+      lower.includes("network") ||
+      lower.includes("fetch") ||
+      lower.includes("connection")
+    );
+  }
+
+  async function doAction(action: string, args: xdr.ScVal[] = []) {
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
@@ -355,7 +367,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     if (loading !== null) return;
 
     setError("");
-    setSuccess("");
+    setSuccess(null);
+    setRetryAction(null);
     setLoading(action);
     try {
       const result = await invokeContract(
@@ -365,7 +378,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         walletAddress,
       );
       if (!result.success) {
-        setError(result.error || "Transaction failed.");
+        const errMsg = result.error || "Transaction failed";
+        setError(errMsg);
+        // Offer a retry button for transient failures
+        if (isRetryableError(errMsg)) {
+          setRetryAction(() => () => doAction(action, args));
+        }
       } else {
         setSuccess(`${action} successful! Tx: ${shortAddress(result.txHash)}`);
         // Refresh data after a successful action
@@ -417,12 +435,28 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             {error}
           </div>
         )}
+
         {success && (
           <div
+            className="bg-brand-50 border border-brand-200 rounded-lg p-3 text-sm text-brand-700 mb-3 space-y-2"
             role="status"
-            className="bg-brand-50 border border-brand-200 rounded-lg p-3 text-sm text-brand-700 mb-3"
+            aria-live="polite"
           >
-            ✅ {success}
+            <p>✅ {success.message}</p>
+            {success.txHash && (
+              <p className="text-xs">
+                Tx:{" "}
+                <a
+                  href={`https://stellar.expert/explorer/testnet/tx/${success.txHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-mono underline hover:text-brand-900"
+                  title={success.txHash}
+                >
+                  {shortAddress(success.txHash)}
+                </a>
+              </p>
+            )}
           </div>
         )}
 
@@ -510,6 +544,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               i === currentRound && data.circle.status === "Active";
             const roundForMember = data.rounds.find((r) => r.roundIndex === i);
 
+            // Contribution status for the current active round
+            const contribStatus = getMemberContributionStatus(
+              member,
+              currentRound,
+              data.circle.status,
+            );
+
             return (
               <div
                 key={member.member_address}
@@ -547,8 +588,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                     )}
                   </div>
                 </div>
-                <div className="text-right text-sm">
+
+                {/* Right-hand status column */}
+                <div className="text-right text-sm shrink-0">
                   {isPaid ? (
+                    // Past round recipient
                     <span className="text-slate-500">
                       ✅ received ${formatUsdc(roundForMember?.amount ?? "0")}
                     </span>
@@ -557,13 +601,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                       ← next payout
                     </span>
                   ) : (
-                    <span className="text-slate-400">waiting</span>
+                    // Future slot — show per-member contribution status for active circles
+                    <ContributionStatusBadge status={contribStatus} />
                   )}
                 </div>
               </div>
             );
           })}
         </div>
+
+        {data.circle.status === "Active" && (
+          <p className="text-xs text-slate-400 mt-3">
+            Round {currentRound} · contributions shown for the current round only
+          </p>
+        )}
       </div>
 
       {/* Round history */}
@@ -585,6 +636,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-xs text-brand-600 hover:underline font-mono"
+                    title={round.txHash}
                   >
                     {shortAddress(round.txHash)}
                   </a>
@@ -648,4 +700,36 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       </div>
     </div>
   );
+}
+
+// ─── Contribution status badge ────────────────────────────────────────────────
+
+interface ContributionStatusBadgeProps {
+  status: "contributed" | "pending" | "defaulted" | "not_applicable";
+}
+
+function ContributionStatusBadge({ status }: ContributionStatusBadgeProps) {
+  switch (status) {
+    case "contributed":
+      return (
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700 bg-green-50 border border-green-200 rounded-full px-2 py-0.5">
+          ✓ contributed
+        </span>
+      );
+    case "pending":
+      return (
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">
+          ⏳ pending
+        </span>
+      );
+    case "defaulted":
+      return (
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-full px-2 py-0.5">
+          ✗ defaulted
+        </span>
+      );
+    case "not_applicable":
+    default:
+      return <span className="text-slate-400 text-xs">waiting</span>;
+  }
 }
