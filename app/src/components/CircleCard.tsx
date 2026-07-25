@@ -1,11 +1,12 @@
 "use client";
 import Link from "next/link";
-import { shortAddress, stroopsToUsdc } from "@/lib/config";
+import { shortAddress, formatUsdc, formatPot } from "@/lib/config";
 import clsx from "clsx";
 
 interface Circle {
   address: string;
   creator: string;
+  /** Per-member round contribution, in stroops */
   round_amount: string;
   member_count: number;
   status: string;
@@ -36,8 +37,9 @@ export function CircleCard({ circle }: { circle: Circle }) {
             <p className="font-mono text-xs text-slate-500">
               {shortAddress(circle.address)}
             </p>
+            {/* formatUsdc → always 2 dp, e.g. "$10.00 / round" */}
             <p className="text-lg font-semibold text-slate-800 mt-0.5">
-              ${stroopsToUsdc(circle.round_amount)} / round
+              ${formatUsdc(circle.round_amount)} / round
             </p>
           </div>
           <span
@@ -63,8 +65,9 @@ export function CircleCard({ circle }: { circle: Circle }) {
             <p className="text-slate-500">rounds</p>
           </div>
           <div className="bg-slate-50 rounded-lg py-2">
+            {/* formatPot → pot = round_amount × member_count, 2 dp */}
             <p className="font-semibold text-slate-800">
-              ${(parseFloat(stroopsToUsdc(circle.round_amount)) * circle.member_count).toFixed(0)}
+              ${formatPot(circle.round_amount, circle.member_count)}
             </p>
             <p className="text-slate-500">pot</p>
           </div>
@@ -72,7 +75,14 @@ export function CircleCard({ circle }: { circle: Circle }) {
 
         {/* Progress bar */}
         {circle.total_rounds > 0 && (
-          <div className="w-full bg-slate-100 rounded-full h-1.5">
+          <div
+            className="w-full bg-slate-100 rounded-full h-1.5"
+            role="progressbar"
+            aria-valuenow={progressPct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-label={`Round progress: ${circle.current_round} of ${circle.total_rounds}`}
+          >
             <div
               className="bg-brand-500 h-1.5 rounded-full transition-all"
               style={{ width: `${progressPct}%` }}
