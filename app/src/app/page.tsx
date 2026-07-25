@@ -1,19 +1,9 @@
+import { Suspense } from "react";
 import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
-import { CircleCard, Circle } from "@/components/CircleCard";
+import { CircleCard, type Circle } from "@/components/CircleCard";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
-interface Circle {
-  address: string;
-  creator: string;
-  round_amount: string;
-  member_count: number;
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  created_ledger: number;
-}
 
 type FetchResult =
   | { ok: true; circles: Circle[] }
@@ -28,7 +18,6 @@ async function getCircles(): Promise<FetchResult> {
       next: { revalidate: 10 },
     });
   } catch {
-    // Network error – indexer unreachable
     return { ok: false, error: "network" };
   }
 
@@ -51,7 +40,18 @@ async function getCircles(): Promise<FetchResult> {
     return { ok: false, error: "parse" };
   }
 
-  return { ok: true, circles: (data as { circles: Circle[] }).circles };
+  // Deduplicate by address — the indexer should never return duplicates, but
+  // guard here so a transient bug never causes a React key collision or a
+  // misleading count in the heading.
+  const raw = (data as { circles: Circle[] }).circles;
+  const seen = new Set<string>();
+  const circles = raw.filter((c) => {
+    if (seen.has(c.address)) return false;
+    seen.add(c.address);
+    return true;
+  });
+
+  return { ok: true, circles };
 }
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
@@ -82,10 +82,88 @@ function IndexerErrorBanner({ error }: { error: "network" | "parse" | "server" }
   );
 }
 
+// ─── Loading skeleton ─────────────────────────────────────────────────────────
+//
+// Shown via Suspense while the async circles fetch is in flight. Renders the
+// same grid layout as the real list so there is no layout shift on hydration.
+
+function CircleListSkeleton() {
+  return (
+    <div
+      className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
+      aria-busy="true"
+      aria-label="Loading circles…"
+    >
+      {Array.from({ length: 6 }).map((_, i) => (
+        <div
+          key={i}
+          className="bg-white rounded-xl border border-slate-200 p-5 animate-pulse"
+          aria-hidden="true"
+        >
+          {/* Address line */}
+          <div className="h-3 bg-slate-200 rounded w-1/2 mb-2" />
+          {/* Amount line */}
+          <div className="h-5 bg-slate-200 rounded w-2/3 mb-4" />
+          {/* Stats row */}
+          <div className="grid grid-cols-3 gap-2 mb-3">
+            {Array.from({ length: 3 }).map((__, j) => (
+              <div key={j} className="bg-slate-100 rounded-lg h-10" />
+            ))}
+          </div>
+          {/* Progress bar */}
+          <div className="h-1.5 bg-slate-100 rounded-full" />
+          {/* Creator line */}
+          <div className="h-3 bg-slate-100 rounded w-1/3 mt-2" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─── Circles list (async server component) ────────────────────────────────────
+//
+// Extracted into its own async component so it can be wrapped in Suspense.
+// The hero section renders immediately while this component fetches data.
+
+async function CirclesList() {
+  const result = await getCircles();
+
+  if (!result.ok) {
+    return <IndexerErrorBanner error={result.error} />;
+  }
+
+  if (result.circles.length === 0) {
+    return (
+      <div className="text-center py-16 text-slate-500">
+        <div className="text-4xl mb-3">🌱</div>
+        <p className="font-medium">No circles yet.</p>
+        <p className="text-sm mt-1">
+          <Link href="/create" className="text-brand-600 underline">
+            Create the first one
+          </Link>
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      {result.circles.map((circle) => (
+        <CircleCard key={circle.address} circle={circle} />
+      ))}
+    </div>
+  );
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default async function HomePage() {
-  const result = await getCircles();
+  // Pre-fetch so we can show the count in the heading without waiting for the
+  // Suspense boundary to resolve. If this fails the heading falls back to
+  // "Active Circles" without a count — the list section handles errors itself.
+  const countResult = await getCircles().catch(() => null);
+  const circleCount =
+    countResult?.ok ? countResult.circles.length : null;
 
   return (
     <div>
@@ -140,7 +218,14 @@ export default async function HomePage() {
 
       {/* Circles list */}
       <div className="flex items-center justify-between mb-5">
-        <h2 className="text-xl font-bold text-slate-800">Active Circles</h2>
+        <h2 className="text-xl font-bold text-slate-800">
+          Active Circles
+          {circleCount !== null && (
+            <span className="ml-2 text-sm font-normal text-slate-400">
+              ({circleCount})
+            </span>
+          )}
+        </h2>
         <Link
           href="/create"
           className="text-brand-600 text-sm font-medium hover:underline"
@@ -149,25 +234,10 @@ export default async function HomePage() {
         </Link>
       </div>
 
-      {!result.ok ? (
-        <IndexerErrorBanner error={result.error} />
-      ) : result.circles.length === 0 ? (
-        <div className="text-center py-16 text-slate-500">
-          <div className="text-4xl mb-3">🌱</div>
-          <p className="font-medium">No circles yet.</p>
-          <p className="text-sm mt-1">
-            <Link href="/create" className="text-brand-600 underline">
-              Create the first one
-            </Link>
-          </p>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {result.circles.map((circle) => (
-            <CircleCard key={circle.address} circle={circle} />
-          ))}
-        </div>
-      )}
+      {/* Suspense boundary: hero + heading render immediately; list streams in */}
+      <Suspense fallback={<CircleListSkeleton />}>
+        <CirclesList />
+      </Suspense>
     </div>
   );
 }
