@@ -9,15 +9,37 @@ import {
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type FetchError = "network" | "not_found" | "server" | "parse";
+type FetchError = "network" | "not_found" | "server" | "parse" | "misconfigured";
 
 type FetchResult =
   | { ok: true; data: CircleDetailData }
   | { ok: false; error: FetchError };
 
+// ─── URL validation ───────────────────────────────────────────────────────────
+
+/**
+ * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
+ * Catches empty strings, relative paths, and placeholder values that would
+ * otherwise surface as opaque TypeErrors from fetch().
+ */
+function isValidUrl(url: string): boolean {
+  if (!url || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 async function getCircleDetail(address: string): Promise<FetchResult> {
+  // Guard against misconfigured INDEXER_URL before touching the network.
+  if (!isValidUrl(INDEXER_URL)) {
+    return { ok: false, error: "misconfigured" };
+  }
+
   let circleRes: Response;
   let roundsRes: Response;
 
@@ -64,13 +86,18 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
     return { ok: false, error: "parse" };
   }
 
+  // Members are optional — if the indexer omits the field (e.g. during
+  // re-indexing or for very new circles) we fall back to an empty array
+  // and render the rotation view as empty rather than crashing.
+  const members: CircleMember[] = Array.isArray(circleData.members)
+    ? (circleData.members as CircleMember[])
+    : [];
+
   return {
     ok: true,
     data: {
       circle: circleData.circle as CircleDetailData["circle"],
-      members: Array.isArray(circleData.members)
-        ? (circleData.members as CircleMember[])
-        : [],
+      members,
       rounds: Array.isArray(roundsData.rounds)
         ? (roundsData.rounds as CircleRound[])
         : [],
@@ -101,6 +128,9 @@ function CircleErrorState({ error }: { error: FetchError }) {
   }
 
   const messages: Record<string, string> = {
+    misconfigured:
+      "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
+      "Copy app/.env.example to app/.env.local and set a valid indexer URL, then restart the server.",
     network:
       "The indexer is unreachable. Check that the indexer service is running and try again.",
     server:
@@ -180,6 +210,21 @@ export default async function CircleDetailPage({
         circleAddress={params.address}
         circleData={data}
       />
+
+      {/* Stable fallback notice when member data is temporarily unavailable */}
+      {data.members.length === 0 && (
+        <div
+          role="status"
+          className="mt-4 bg-slate-50 border border-slate-200 rounded-xl px-5 py-4 flex items-start gap-3 text-sm text-slate-600"
+        >
+          <span className="text-lg mt-0.5" aria-hidden="true">ℹ️</span>
+          <p>
+            Member data is not available yet. The indexer may still be
+            processing this circle — refresh in a moment to see the full
+            rotation order.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

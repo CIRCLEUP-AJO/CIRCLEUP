@@ -14,6 +14,10 @@ const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
 /** Stellar Expert base URL for testnet transactions. */
 const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
 
+/** Minimum and maximum number of members allowed by the contract. */
+const MIN_MEMBERS = 2;
+const MAX_MEMBERS = 20;
+
 export default function CreatePage() {
   const router = useRouter();
   const [members, setMembers] = useState<string[]>(["", "", "", ""]);
@@ -33,11 +37,12 @@ export default function CreatePage() {
   }
 
   function addMember() {
+    if (members.length >= MAX_MEMBERS) return;
     setMembers((prev) => [...prev, ""]);
   }
 
   function removeMember(i: number) {
-    if (members.length <= 2) return;
+    if (members.length <= MIN_MEMBERS) return;
     setMembers((prev) => prev.filter((_, idx) => idx !== i));
   }
 
@@ -65,8 +70,12 @@ export default function CreatePage() {
     }
 
     const validMembers = members.filter((m) => m.trim().length > 0);
-    if (validMembers.length < 2) {
-      setError("Need at least 2 members.");
+    if (validMembers.length < MIN_MEMBERS) {
+      setError(`A circle needs at least ${MIN_MEMBERS} members.`);
+      return;
+    }
+    if (validMembers.length > MAX_MEMBERS) {
+      setError(`A circle cannot have more than ${MAX_MEMBERS} members.`);
       return;
     }
 
@@ -170,9 +179,20 @@ export default function CreatePage() {
 
         {/* Members */}
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-2">
-            Members (Stellar addresses) — payout order top → bottom
-          </label>
+          <div className="flex items-center justify-between mb-2">
+            <label className="block text-sm font-medium text-slate-700">
+              Members (Stellar addresses) — payout order top → bottom
+            </label>
+            <span
+              className={`text-xs font-medium ${
+                members.length >= MAX_MEMBERS
+                  ? "text-amber-600"
+                  : "text-slate-400"
+              }`}
+            >
+              {members.length} / {MAX_MEMBERS}
+            </span>
+          </div>
           <div className="space-y-2">
             {members.map((m, i) => (
               <div key={i} className="flex items-center gap-2">
@@ -184,12 +204,12 @@ export default function CreatePage() {
                   onChange={(e) => updateMember(i, e.target.value)}
                   className="flex-1 border border-slate-300 rounded-lg px-3 py-2 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
                 />
-                {members.length > 2 && (
+                {members.length > MIN_MEMBERS && (
                   <button
                     type="button"
                     onClick={() => removeMember(i)}
                     className="text-slate-400 hover:text-red-500 text-lg leading-none"
-                    aria-label="Remove member"
+                    aria-label={`Remove member ${i + 1}`}
                   >
                     ×
                   </button>
@@ -197,13 +217,24 @@ export default function CreatePage() {
               </div>
             ))}
           </div>
-          <button
-            type="button"
-            onClick={addMember}
-            className="mt-2 text-sm text-brand-600 hover:underline"
-          >
-            + Add member
-          </button>
+          <div className="mt-2 flex items-center gap-3">
+            <button
+              type="button"
+              onClick={addMember}
+              disabled={members.length >= MAX_MEMBERS}
+              className="text-sm text-brand-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline"
+            >
+              + Add member
+            </button>
+            {members.length >= MAX_MEMBERS && (
+              <span className="text-xs text-amber-600">
+                Maximum of {MAX_MEMBERS} members reached.
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-slate-400 mt-1">
+            Minimum {MIN_MEMBERS} members · maximum {MAX_MEMBERS} members.
+          </p>
         </div>
 
         {/* Summary */}
