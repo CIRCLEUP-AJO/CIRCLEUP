@@ -99,8 +99,14 @@ export const INDEXER_URL: string =
 /** 1 USDC = 10_000_000 stroops (7 decimal places) */
 export const STROOP = BigInt(10_000_000);
 
-export function usdcToStroops(usdc: number): bigint {
-  return BigInt(Math.round(usdc * 10_000_000));
+export function usdcToStroops(usdc: number | string): bigint {
+  const str = String(usdc).trim();
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new TypeError(`Invalid USDC amount: "${str}"`);
+  }
+  const [whole, frac = ""] = str.split(".");
+  const fracPadded = frac.padEnd(7, "0").slice(0, 7);
+  return BigInt(whole) * STROOP + BigInt(fracPadded);
 }
 
 /**
