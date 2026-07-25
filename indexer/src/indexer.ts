@@ -39,7 +39,10 @@ function getContractIdStr(event: SdkEvent): string | null {
   if (!c) return null;
   if (typeof c === "string") return c;
   // Contract object — call toString() which returns the strkey
-  return (c as any).toString?.() ?? null;
+  if (typeof (c as { toString?: () => string }).toString === "function") {
+    return (c as { toString: () => string }).toString();
+  }
+  return null;
 }
 
 function getTopicStr(event: SdkEvent, idx: number): string {
@@ -48,7 +51,7 @@ function getTopicStr(event: SdkEvent, idx: number): string {
   return scValToNative(val as xdr.ScVal) as string;
 }
 
-function getValueNative(event: SdkEvent): any {
+function getValueNative(event: SdkEvent): unknown {
   // In EventResponse, value is already an xdr.ScVal object
   return scValToNative(event.value as xdr.ScVal);
 }
@@ -72,15 +75,30 @@ async function setLastLedger(ledger: number) {
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
 async function handleFactoryCircleCreated(event: SdkEvent) {
-  const [circleAddr, creator] = getValueNative(event) as [string, string, number];
+  // The factory emits: (circle_address, creator, round_deadline_ledgers)
+  // Index 2 (round_deadline_ledgers) may be absent on older contract versions.
+  const value = getValueNative(event) as [string, string, number?];
+  const [circleAddr, creator, roundDeadlineLedgers] = value;
 
   await query(
-    `INSERT INTO circles (address, creator, round_amount, member_count, total_rounds, status, current_round, created_ledger)
-     VALUES ($1, $2, 0, 0, 0, 'Pending', 0, $3)
+    `INSERT INTO circles
+       (address, creator, round_amount, member_count, total_rounds, status,
+        current_round, created_ledger, round_deadline_ledgers)
+     VALUES ($1, $2, 0, 0, 0, 'Pending', 0, $3, $4)
      ON CONFLICT (address) DO NOTHING`,
-    [circleAddr, creator, event.ledger],
+    [
+      circleAddr,
+      creator,
+      event.ledger,
+      roundDeadlineLedgers != null ? Number(roundDeadlineLedgers) : null,
+    ],
   );
-  console.log(`[indexer] New circle created: ${circleAddr} by ${creator}`);
+  console.log(
+    `[indexer] New circle created: ${circleAddr} by ${creator}` +
+      (roundDeadlineLedgers != null
+        ? ` (deadline: ${roundDeadlineLedgers} ledgers/round)`
+        : ""),
+  );
 }
 
 async function handleCircleJoined(circleAddr: string, event: SdkEvent) {

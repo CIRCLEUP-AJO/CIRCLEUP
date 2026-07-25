@@ -1,22 +1,91 @@
 import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
-import { CircleCard } from "@/components/CircleCard";
+import { CircleCard, Circle } from "@/components/CircleCard";
 
-async function getCircles() {
-  try {
-    const res = await fetch(`${INDEXER_URL}/circles`, {
-      next: { revalidate: 10 },
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data.circles || [];
-  } catch {
-    return [];
-  }
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface Circle {
+  address: string;
+  creator: string;
+  round_amount: string;
+  member_count: number;
+  status: string;
+  current_round: number;
+  total_rounds: number;
+  created_ledger: number;
 }
 
+type FetchResult =
+  | { ok: true; circles: Circle[] }
+  | { ok: false; error: "network" | "parse" | "server" };
+
+// ─── Data fetching ────────────────────────────────────────────────────────────
+
+async function getCircles(): Promise<FetchResult> {
+  let res: Response;
+  try {
+    res = await fetch(`${INDEXER_URL}/circles`, {
+      next: { revalidate: 10 },
+    });
+  } catch {
+    // Network error – indexer unreachable
+    return { ok: false, error: "network" };
+  }
+
+  if (!res.ok) {
+    return { ok: false, error: "server" };
+  }
+
+  let data: unknown;
+  try {
+    data = await res.json();
+  } catch {
+    return { ok: false, error: "parse" };
+  }
+
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    !Array.isArray((data as Record<string, unknown>).circles)
+  ) {
+    return { ok: false, error: "parse" };
+  }
+
+  return { ok: true, circles: (data as { circles: Circle[] }).circles };
+}
+
+// ─── Error banner ─────────────────────────────────────────────────────────────
+
+function IndexerErrorBanner({ error }: { error: "network" | "parse" | "server" }) {
+  const messages: Record<string, string> = {
+    network:
+      "The indexer is unreachable right now. Circles may not be up to date. Check that the indexer service is running.",
+    server:
+      "The indexer returned an unexpected error. Circles cannot be loaded at the moment.",
+    parse:
+      "The indexer response was malformed. This is likely a temporary issue — try refreshing.",
+  };
+
+  return (
+    <div
+      role="alert"
+      className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-4 mb-6 flex items-start gap-3"
+    >
+      <span className="text-xl mt-0.5" aria-hidden="true">⚠️</span>
+      <div>
+        <p className="font-semibold text-amber-800 text-sm">
+          Circles list unavailable
+        </p>
+        <p className="text-amber-700 text-sm mt-0.5">{messages[error]}</p>
+      </div>
+    </div>
+  );
+}
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
+
 export default async function HomePage() {
-  const circles = await getCircles();
+  const result = await getCircles();
 
   return (
     <div>
@@ -80,7 +149,9 @@ export default async function HomePage() {
         </Link>
       </div>
 
-      {circles.length === 0 ? (
+      {!result.ok ? (
+        <IndexerErrorBanner error={result.error} />
+      ) : result.circles.length === 0 ? (
         <div className="text-center py-16 text-slate-500">
           <div className="text-4xl mb-3">🌱</div>
           <p className="font-medium">No circles yet.</p>
@@ -92,7 +163,7 @@ export default async function HomePage() {
         </div>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {circles.map((circle: any) => (
+          {result.circles.map((circle) => (
             <CircleCard key={circle.address} circle={circle} />
           ))}
         </div>
