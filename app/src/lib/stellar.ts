@@ -12,6 +12,7 @@ import {
   Address,
   scValToNative,
   xdr,
+  type Account,
 } from "@stellar/stellar-sdk";
 import {
   isConnected,
@@ -315,11 +316,13 @@ export async function readContract<T>(
 ): Promise<T> {
   const rpc = getRpc();
   const contract = new Contract(contractId);
+  // A minimal stub that satisfies the TransactionBuilder's Account interface.
+  // We only need a static sequence for read-only simulation — it is never submitted.
   const fakeAccount = {
     id: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
     sequence: "0",
     incrementSequenceNumber() {},
-  } as any;
+  } as unknown as Account;
 
   const tx = new TransactionBuilder(fakeAccount, {
     fee: BASE_FEE,
@@ -351,10 +354,10 @@ export async function getCircleStatus(circleAddress: string): Promise<string> {
   return readContract<string>(circleAddress, "get_status", []);
 }
 
-export async function getCurrentRound(circleAddress: string) {
-  return readContract<any>(circleAddress, "get_current_round", []);
+export async function getCurrentRound(circleAddress: string): Promise<unknown> {
+  return readContract<unknown>(circleAddress, "get_current_round", []);
 }
 
-export async function getCircleConfig(circleAddress: string) {
-  return readContract<any>(circleAddress, "get_config", []);
+export async function getCircleConfig(circleAddress: string): Promise<unknown> {
+  return readContract<unknown>(circleAddress, "get_config", []);
 }
