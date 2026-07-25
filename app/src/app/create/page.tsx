@@ -28,6 +28,21 @@ export default function CreatePage() {
   const [txHash, setTxHash] = useState("");
   const [copied, setCopied] = useState(false);
 
+  // ── Derived summary values ───────────────────────────────────────────────────
+  //
+  // Both the round-amount hint and the summary card derive from the same
+  // filledCount so they are always consistent. Previously the hint used
+  // members.length (counting blank rows) while the summary card used
+  // members.filter(m=>m.trim()).length (correct) — now both use filledCount.
+
+  const filledCount = getFilledMembers(members).length;
+  const roundAmountNum = parseFloat(roundUSDC || "0");
+  const potPerRound = Number.isFinite(roundAmountNum)
+    ? roundAmountNum * filledCount
+    : 0;
+
+  // ── Member mutation helpers ──────────────────────────────────────────────────
+
   function updateMember(i: number, val: string) {
     setMembers((prev) => {
       const next = [...prev];
@@ -57,6 +72,8 @@ export default function CreatePage() {
     }
   }
 
+  // ── Submit ───────────────────────────────────────────────────────────────────
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
@@ -76,6 +93,17 @@ export default function CreatePage() {
     }
     if (validMembers.length > MAX_MEMBERS) {
       setError(`A circle cannot have more than ${MAX_MEMBERS} members.`);
+      return;
+    }
+
+    // Duplicate-address check — the contract will reject duplicates on-chain,
+    // but surfacing it here gives the user a clear, actionable message instead
+    // of a cryptic contract error.
+    const duplicate = findDuplicateAddress(validMembers);
+    if (duplicate) {
+      setError(
+        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
+      );
       return;
     }
 
@@ -123,12 +151,15 @@ export default function CreatePage() {
       setTxHash(result.txHash);
       // Give the user 5 seconds to see and copy the hash before redirecting
       setTimeout(() => router.push("/"), 5000);
-    } catch (err: any) {
-      setError(err.message || "Unknown error");
+    } catch (err: unknown) {
+      // err typed as unknown — extract message safely instead of casting to any
+      setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
     }
   }
+
+  // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
     <div className="max-w-xl mx-auto">
@@ -157,8 +188,10 @@ export default function CreatePage() {
             />
             <span className="text-slate-500 text-sm">USDC</span>
           </div>
+          {/* Hint uses filledCount so blank rows are not counted */}
           <p className="text-xs text-slate-400 mt-1">
-            The full pot per round = ${roundUSDC || 0} × {members.filter((m) => m).length || members.length} members
+            The full pot per round = ${roundUSDC || 0} ×{" "}
+            {filledCount > 0 ? filledCount : "…"} members
           </p>
         </div>
 
@@ -237,20 +270,25 @@ export default function CreatePage() {
           </p>
         </div>
 
-        {/* Summary */}
+        {/* Summary card ─────────────────────────────────────────────────────── */}
+        {/* All values derived from filledCount / potPerRound so blank rows     */}
+        {/* are never included in any count or calculation shown here.           */}
         <div className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-slate-700">
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
           <ul className="space-y-0.5 text-slate-600">
-            <li>👥 {members.filter((m) => m.trim()).length} members</li>
+            <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
             <li>💰 ${roundUSDC} USDC / member / round</li>
-            <li>🎯 Pot per round: ${(parseFloat(roundUSDC || "0") * members.filter((m) => m.trim()).length).toFixed(0)}</li>
+            <li>🎯 Pot per round: ${potPerRound.toFixed(0)}</li>
             <li>📅 Round duration: {roundDays} days</li>
             <li>🔒 Collateral required: ${roundUSDC} per member (1× round amount)</li>
           </ul>
         </div>
 
         {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700" role="alert">
+          <div
+            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700"
+            role="alert"
+          >
             {error}
           </div>
         )}
