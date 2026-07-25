@@ -17,6 +17,7 @@ mod circle_tests {
         env: Env,
         circle: CircleContractClient<'a>,
         token: TokenClient<'a>,
+        #[allow(dead_code)]
         members: soroban_sdk::Vec<Address>,
         alice: Address,
         bob: Address,
@@ -29,8 +30,8 @@ mod circle_tests {
         env.mock_all_auths();
 
         // Deploy USDC mock token
-        let token_admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let _token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(_token_admin.clone());
         let token = TokenClient::new(&env, &token_id.address());
         let token_asset_client = StellarAssetClient::new(&env, &token_id.address());
 
