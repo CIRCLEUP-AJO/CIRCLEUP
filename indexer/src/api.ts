@@ -63,7 +63,41 @@ export function createApp() {
         [address],
       );
 
-      res.json({ circle, members });
+      // Attach the latest indexed ledger so the client can derive wall-clock
+      // estimates for the deadline countdown without a separate request.
+      const [indexerState] = await query<{ last_ledger: string }>(
+        `SELECT last_ledger FROM indexer_state WHERE id = 1`,
+      );
+      const latestLedger = indexerState ? Number(indexerState.last_ledger) : null;
+
+      // Compute deadline_ledger for the current active round when we have
+      // enough data.  Formula:
+      //   deadline = created_ledger
+      //            + (current_round + 1) * round_deadline_ledgers
+      //
+      // This is an approximation based on the creation ledger; the contract
+      // sets the exact deadline per-round, but the indexer does not yet store
+      // the per-round deadline_ledger from contract state.
+      let deadlineLedger: number | null = null;
+      if (
+        circle.round_deadline_ledgers != null &&
+        circle.created_ledger != null &&
+        circle.status === "Active"
+      ) {
+        deadlineLedger =
+          Number(circle.created_ledger) +
+          (Number(circle.current_round) + 1) *
+            Number(circle.round_deadline_ledgers);
+      }
+
+      res.json({
+        circle: {
+          ...circle,
+          deadline_ledger: deadlineLedger,
+        },
+        members,
+        latestLedger,
+      });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Internal server error" });
