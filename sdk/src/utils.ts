@@ -8,16 +8,22 @@ export const STROOP = BigInt(STROOPS_PER_USDC);
 
 /** Convert a human-readable USDC amount to stroops */
 export function usdcToStroops(usdc: number | string): bigint {
-  const [whole, frac = ""] = String(usdc).split(".");
+  const str = String(usdc).trim();
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new TypeError(`Invalid USDC amount: "${str}"`);
+  }
+  const [whole, frac = ""] = str.split(".");
   const fracPadded = frac.padEnd(USDC_DECIMALS, "0").slice(0, USDC_DECIMALS);
   return BigInt(whole) * STROOP + BigInt(fracPadded);
 }
 
 /** Convert stroops to human-readable USDC string */
-export function stroopsToUsdc(stroops: bigint): string {
-  const whole = stroops / STROOP;
-  const frac = (stroops % STROOP).toString().padStart(USDC_DECIMALS, "0");
-  return `${whole}.${frac}`;
+export function stroopsToUsdc(stroops: bigint | string | number): string {
+  const n = BigInt(stroops.toString());
+  if (n < 0n) throw new RangeError("stroops must be non-negative");
+  const whole = n / STROOP;
+  const frac = (n % STROOP).toString().padStart(USDC_DECIMALS, "0");
+  return `${whole}.${frac}`.replace(/\.?0+$/, "") || "0";
 }
 
 /** Approximate ledgers for a given number of days (Stellar: ~5 s/ledger) */

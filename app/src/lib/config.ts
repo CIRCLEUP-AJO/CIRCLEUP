@@ -20,12 +20,19 @@ export const INDEXER_URL =
 /** 1 USDC = 10_000_000 stroops */
 export const STROOP = BigInt(10_000_000);
 
-export function usdcToStroops(usdc: number): bigint {
-  return BigInt(Math.round(usdc * 10_000_000));
+export function usdcToStroops(usdc: number | string): bigint {
+  const str = String(usdc).trim();
+  if (!/^\d+(\.\d+)?$/.test(str)) {
+    throw new TypeError(`Invalid USDC amount: "${str}"`);
+  }
+  const [whole, frac = ""] = str.split(".");
+  const fracPadded = frac.padEnd(7, "0").slice(0, 7);
+  return BigInt(whole) * STROOP + BigInt(fracPadded);
 }
 
 export function stroopsToUsdc(stroops: bigint | string | number): string {
   const n = BigInt(stroops.toString());
+  if (n < 0n) throw new RangeError("stroops must be non-negative");
   const whole = n / STROOP;
   const frac = (n % STROOP).toString().padStart(7, "0");
   return `${whole}.${frac}`.replace(/\.?0+$/, "") || "0";
