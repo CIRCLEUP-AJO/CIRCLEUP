@@ -3,6 +3,41 @@
 //! The factory holds the WASM hash of the circle contract, deploys fresh instances
 //! via `env.deployer().with_current_contract(salt)`, initialises them in one
 //! transaction, and records them in a list for the indexer to discover.
+//!
+//! # Events
+//!
+//! All factory events use a two-symbol topic prefix so the indexer can filter
+//! with `topic0 == "factory"`.
+//!
+//! ## `factory` / `circle_created`
+//!
+//! Emitted at the end of a successful [`CircleFactory::create_circle`] call,
+//! after the new circle has been deployed, initialised, and registered.
+//!
+//! | Part | Shape | Meaning |
+//! |------|-------|---------|
+//! | **Topics** | `(Symbol("factory"), Symbol("circle_created"))` | Stable filter keys for the indexer |
+//! | **Data** | `(Address, Address, u32)` | See fields below |
+//!
+//! Data tuple fields, in order:
+//!
+//! 1. `circle_address: Address` — contract ID of the newly deployed circle
+//! 2. `creator: Address` — wallet that authorised `create_circle`
+//! 3. `circle_index: u32` — zero-based factory counter **before** this create
+//!    (the same value mixed into the deploy salt). After the event is published
+//!    the stored `CircleCount` is `circle_index + 1`.
+//!
+//! Example (conceptual):
+//!
+//! ```text
+//! topics: ["factory", "circle_created"]
+//! data:   ["CCircle...", "GCreator...", 3u32]
+//! ```
+//!
+//! Indexers should treat an absent or differently-typed third element as a
+//! compatibility concern with older factory builds, not as
+//! `round_deadline_ledgers` (that value lives on the circle config, not in
+//! this event).
 
 #![no_std]
 
@@ -22,6 +57,43 @@ pub enum DataKey {
     UsdcToken,
     Circles,          // Vec<Address> — deployed circle addresses
     CircleCount,      // u32
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Rejects member lists that contain the same address more than once.
+///
+/// Duplicate members would break payout ordering and let one wallet occupy
+/// multiple rotation slots, so we fail before paying for a deploy.
+fn assert_unique_members(members: &Vec<Address>) {
+    let len = members.len();
+    let mut i: u32 = 0;
+    while i < len {
+        let mut j = i + 1;
+        while j < len {
+            if members.get(i).unwrap() == members.get(j).unwrap() {
+                panic!("duplicate members");
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+}
+
+/// Build a deploy salt that is unique per successful `create_circle` call.
+///
+/// Primary uniqueness comes from the monotonic factory `CircleCount` mixed with
+/// the creator address. Ledger sequence and timestamp are appended as extra
+/// entropy so a count reset (e.g. after an unusual storage wipe + redeploy of
+/// the same factory WASM id) cannot recreate a previously used salt under
+/// `with_current_contract`.
+fn derive_circle_salt(env: &Env, creator: &Address, count: u32) -> BytesN<32> {
+    let mut salt_bytes = Bytes::new(env);
+    salt_bytes.append(&creator.clone().to_xdr(env));
+    salt_bytes.append(&count.to_xdr(env));
+    salt_bytes.append(&env.ledger().sequence().to_xdr(env));
+    salt_bytes.append(&env.ledger().timestamp().to_xdr(env));
+    env.crypto().sha256(&salt_bytes).into()
 }
 
 // ─── Contract ────────────────────────────────────────────────────────────────
@@ -56,7 +128,19 @@ impl CircleFactory {
     // ── Create Circle ─────────────────────────────────────────────────────────
 
     /// Deploy a new circle contract and initialise it in one tx.
+    ///
     /// Returns the address of the newly deployed circle.
+    ///
+    /// # Panics
+    ///
+    /// - `"duplicate members"` if `members` contains the same address twice
+    /// - `"need at least 2 members"` / `"round_amount must be positive"` from
+    ///   the circle `initialize` call when inputs are invalid
+    ///
+    /// # Events
+    ///
+    /// Publishes `factory` / `circle_created` — see the crate-level docs for
+    /// the exact topic and data tuple shape.
     pub fn create_circle(
         env: Env,
         creator: Address,
@@ -65,6 +149,8 @@ impl CircleFactory {
         round_deadline_ledgers: u32,
     ) -> Address {
         creator.require_auth();
+
+        assert_unique_members(&members);
 
         let wasm_hash: BytesN<32> = env
             .storage()
@@ -82,18 +168,15 @@ impl CircleFactory {
             .get(&DataKey::UsdcToken)
             .unwrap();
 
-        // Derive a unique salt from the creator + count
+        // Monotonic counter mixed into the salt — incremented only after a
+        // successful deploy + init so failed creates do not burn an index.
         let count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::CircleCount)
             .unwrap_or(0);
 
-        let mut salt_bytes = Bytes::new(&env);
-        salt_bytes.append(&creator.clone().to_xdr(&env));
-        let count_bytes = count.to_xdr(&env);
-        salt_bytes.append(&count_bytes);
-        let salt: BytesN<32> = env.crypto().sha256(&salt_bytes).into();
+        let salt = derive_circle_salt(&env, &creator, count);
 
         // Deploy
         let circle_address = env
@@ -127,6 +210,7 @@ impl CircleFactory {
         env.storage().instance().set(&DataKey::Circles, &circles);
         env.storage().instance().set(&DataKey::CircleCount, &(count + 1));
 
+        // Event data: (circle_address, creator, circle_index) — see crate docs.
         env.events().publish(
             (Symbol::new(&env, "factory"), Symbol::new(&env, "circle_created")),
             (circle_address.clone(), creator, count),
@@ -157,19 +241,27 @@ impl CircleFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
+
+    fn setup_factory(env: &Env) -> (CircleFactoryClient, Address) {
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(env, &id);
+        let admin = Address::generate(env);
+        let rep = Address::generate(env);
+        let usdc = Address::generate(env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        (client, admin)
+    }
 
     #[test]
     fn test_factory_initializes() {
         let env = Env::default();
-        env.mock_all_auths();
-        let id = env.register_contract(None, CircleFactory);
-        let client = CircleFactoryClient::new(&env, &id);
-        let admin = Address::generate(&env);
-        let rep = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
-        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        let (client, _) = setup_factory(&env);
         assert_eq!(client.get_circle_count(), 0);
     }
 
@@ -186,5 +278,68 @@ mod tests {
         let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
         client.initialize(&admin, &wasm_hash, &rep, &usdc);
         client.initialize(&admin, &wasm_hash, &rep, &usdc);
+    }
+
+    #[test]
+    fn test_assert_unique_members_accepts_distinct() {
+        let env = Env::default();
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+        assert_unique_members(&members);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate members")]
+    fn test_assert_unique_members_rejects_duplicates() {
+        let env = Env::default();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(a.clone());
+        members.push_back(b);
+        members.push_back(a);
+        assert_unique_members(&members);
+    }
+
+    #[test]
+    fn test_derive_circle_salt_is_stable_for_same_inputs() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let salt_a = derive_circle_salt(&env, &creator, 0);
+        let salt_b = derive_circle_salt(&env, &creator, 0);
+        assert_eq!(salt_a, salt_b);
+    }
+
+    #[test]
+    fn test_derive_circle_salt_differs_by_count() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let salt_0 = derive_circle_salt(&env, &creator, 0);
+        let salt_1 = derive_circle_salt(&env, &creator, 1);
+        assert_ne!(salt_0, salt_1);
+    }
+
+    #[test]
+    fn test_derive_circle_salt_differs_by_creator() {
+        let env = Env::default();
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let salt_a = derive_circle_salt(&env, &a, 0);
+        let salt_b = derive_circle_salt(&env, &b, 0);
+        assert_ne!(salt_a, salt_b);
+    }
+
+    #[test]
+    fn test_derive_circle_salt_differs_by_ledger_sequence() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let salt_before = derive_circle_salt(&env, &creator, 0);
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 1;
+        });
+        let salt_after = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(salt_before, salt_after);
     }
 }
