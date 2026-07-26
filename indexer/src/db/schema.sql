@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS reputation (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS ingested_events (
+    event_key       TEXT PRIMARY KEY,
+    contract_id     TEXT,
+    ledger          BIGINT NOT NULL,
+    tx_hash         TEXT,
+    event_type      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS indexer_state (
     id              INTEGER PRIMARY KEY DEFAULT 1,
     last_ledger     BIGINT NOT NULL DEFAULT 0,
