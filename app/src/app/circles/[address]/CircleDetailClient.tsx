@@ -367,8 +367,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   }, []);
 
   useEffect(() => {
-    // Safe: this effect only runs in the browser
-    setInviteUrl(window.location.href);
+    // Safe: window is only accessed inside useEffect, which never runs on the
+    // server. During SSR the input renders with an empty string and the
+    // placeholder text is shown instead.
+    if (typeof window !== "undefined") {
+      setInviteUrl(window.location.href);
+    }
   }, []);
 
   const isMember = walletAddress
@@ -789,10 +793,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         <input
           readOnly
           value={inviteUrl}
-          className="w-full font-mono text-xs bg-white border border-slate-300 rounded px-3 py-2 text-slate-600"
+          className="w-full font-mono text-xs bg-white border border-slate-300 rounded px-3 py-2 text-slate-600 placeholder:text-slate-400"
           onClick={(e) => (e.target as HTMLInputElement).select()}
-          aria-label="Invite link"
-          placeholder="Loading URL…"
+          aria-label="Invite link for this circle"
+          // Shown during SSR and before the client-side effect fires.
+          // window.location is never accessed outside a useEffect, so this
+          // component is safe to render on the server.
+          placeholder="Loading invite link…"
         />
       </div>
     </div>

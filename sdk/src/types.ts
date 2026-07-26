@@ -320,14 +320,22 @@ export interface ApiRoundsResponse {
 /** Response body for GET /reputation/:member */
 export interface ApiReputationResponse {
   member: string;
+  /**
+   * `true` when a reputation row exists for this member in the database.
+   * `false` means the member has no recorded activity; `score` will be 0.
+   * Lets clients distinguish an explicit zero from a member not yet seen.
+   */
+  found: boolean;
   score: number;
   contributions: Array<{
     circle_address: string;
+    /** Number of rounds the member has contributed in this circle. */
     contributions: number;
     total_rounds: number;
   }>;
   defaults: Array<{
     circle_address: string;
+    /** Number of rounds the member has defaulted in this circle. */
     count: number;
   }>;
   updatedAt: string | null;
