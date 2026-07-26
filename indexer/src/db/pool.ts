@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, QueryResultRow } from "pg";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -14,14 +14,31 @@ pool.on("error", (err) => {
   console.error("[db] Unexpected pool error:", err);
 });
 
-export async function query<T = any>(
+export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
-  params?: any[],
+  params?: unknown[],
 ): Promise<T[]> {
   const client = await pool.connect();
   try {
-    const res = await client.query(text, params);
-    return res.rows as T[];
+    const res = await client.query<T>(text, params);
+    return res.rows;
+  } finally {
+    client.release();
+  }
+}
+
+export async function withTransaction<T>(
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
   } finally {
     client.release();
   }

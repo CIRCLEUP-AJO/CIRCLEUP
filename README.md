@@ -18,6 +18,7 @@ CircleUp brings Rotating Savings & Credit Associations (ROSCAs) — known as **A
 - [Project Structure](#project-structure)
 - [Data Flow](#data-flow)
 - [Quick Start](#quick-start)
+- [SDK](#sdk)
 - [Environment Variables](#environment-variables)
 - [Contracts Reference](#contracts-reference)
 - [API Reference](#api-reference)
@@ -264,6 +265,159 @@ npm run seed:demo
 # Runs Round 1 (all contribute → Alice receives $400)
 # Shows Round 2 default for Dave
 ```
+
+---
+
+## SDK
+
+`@circleup/sdk` is the TypeScript client for interacting with CircleUp contracts and the indexer REST API. It is consumed by the `app` and `scripts` packages and can also be used in any Node.js or browser environment.
+
+### Installation
+
+```bash
+npm install @circleup/sdk
+```
+
+> The SDK is published from the `sdk/` workspace. If you are working inside this monorepo it is already available via npm workspaces — no separate install needed.
+
+### Network configuration
+
+Use `getNetworkConfig` to get a fully typed config object for a given network instead of hard-coding URLs and passphrases:
+
+```ts
+import { getNetworkConfig, isValidNetwork } from "@circleup/sdk";
+
+// Validate an environment variable before use
+const raw = process.env.NETWORK ?? "testnet";
+if (!isValidNetwork(raw)) {
+  throw new Error(`Invalid NETWORK value: "${raw}". Must be "testnet" or "mainnet".`);
+}
+
+const net = getNetworkConfig(raw);
+// net.rpcUrl         — Soroban RPC endpoint
+// net.passphrase     — network passphrase for transaction signing
+// net.friendbotUrl   — Friendbot URL (null on mainnet)
+```
+
+### Creating a `CircleUpConfig`
+
+All SDK clients take a `CircleUpConfig`. The constructor validates every field at construction time and throws a descriptive error for any missing or malformed value.
+
+```ts
+import { getNetworkConfig } from "@circleup/sdk";
+import type { CircleUpConfig } from "@circleup/sdk";
+
+const net = getNetworkConfig("testnet");
+
+const config: CircleUpConfig = {
+  rpcUrl: net.rpcUrl,
+  networkPassphrase: net.passphrase,
+  contracts: {
+    circleFactory: "CCIRCLE_FACTORY_ADDRESS",
+    reputation:    "CREPUTATION_ADDRESS",
+    usdc:          "CUSDC_ADDRESS",
+  },
+};
+```
+
+### `FactoryClient` — deploy and list circles
+
+```ts
+import { FactoryClient } from "@circleup/sdk";
+import { Keypair } from "@stellar/stellar-sdk";
+import { usdcToStroops } from "@circleup/sdk";
+
+const factory = new FactoryClient(config);
+
+// List all deployed circles
+const addresses = await factory.getCircles();
+console.log(`${addresses.length} circles on-chain`);
+
+// Deploy a new circle
+const creator = Keypair.fromSecret("S...");
+const { result } = await factory.createCircle({
+  creator,
+  members: [
+    "GALICE...",
+    "GBOB...",
+    "GCAROL...",
+    "GDAVE...",
+  ],
+  roundAmountStroops: usdcToStroops("100"), // 100 USDC
+  roundDeadlineLedgers: 17_280,             // ~1 day
+});
+
+if (!result.success) {
+  console.error("Circle creation failed:", result.error);
+} else {
+  console.log("Deployed at ledger", result.ledger, "tx:", result.txHash);
+}
+```
+
+### `CircleClient` — join, contribute, payout
+
+```ts
+import { CircleClient } from "@circleup/sdk";
+
+const circle = new CircleClient(config, "CCIRCLE_ADDRESS");
+
+// Read current state
+const { status, currentRound, config: circleConfig } = await circle.getFullState();
+console.log("Status:", status);
+console.log("Round:", currentRound.roundIndex, "→ recipient:", currentRound.recipient);
+
+// Member joins (locks collateral)
+const memberKeypair = Keypair.fromSecret("S...");
+const joinResult = await circle.join(memberKeypair);
+
+// Member contributes for the current round
+const contributeResult = await circle.contribute(memberKeypair);
+
+// Trigger payout once all members have contributed
+const payoutResult = await circle.payout(memberKeypair);
+
+// Mark a defaulted member after the deadline
+const defaultResult = await circle.markDefault(memberKeypair, "GDAVE...");
+```
+
+### `ReputationClient` — read on-chain scores
+
+```ts
+import { ReputationClient } from "@circleup/sdk";
+
+const rep = new ReputationClient(config);
+const score = await rep.getScore("GALICE...");
+console.log("Alice's reputation score:", score);
+```
+
+### Utility helpers
+
+```ts
+import {
+  usdcToStroops,   // "10.50"  → 105_000_000n
+  stroopsToUsdc,   // 105_000_000n → "10.5"
+  formatUsdc,      // 105_000_000n → "10.50"  (always 2 dp, for display)
+  formatPot,       // (roundAmount, memberCount) → "42.00"
+  daysToLedgers,   // 7  → 120_960
+  ledgersToDays,   // 120_960 → 7
+  shortAddress,    // "GCEZ…GZBL"
+} from "@circleup/sdk";
+
+// Safe conversions — both functions are robust to bad input
+usdcToStroops("1.5");          // → 15_000_000n
+stroopsToUsdc(15_000_000n);    // → "1.5"
+stroopsToUsdc("not-a-number"); // → "0"  (never throws in render paths)
+
+formatUsdc(15_000_000n);       // → "1.50"
+formatPot("10000000", 4);      // → "4.00"
+```
+
+### Error handling conventions
+
+- `usdcToStroops` throws `TypeError` for invalid or out-of-range input — validate before calling if the value comes from untrusted input.
+- `stroopsToUsdc`, `formatUsdc`, and `formatPot` return `"0"` / `"0.00"` on bad input so they are safe to call in render paths without a try/catch.
+- All SDK clients throw synchronously from the constructor when `CircleUpConfig` is invalid, so misconfiguration surfaces early rather than as an obscure RPC error at call time.
+- `getNetworkConfig` throws `Error` for unrecognised network names; use `isValidNetwork` to guard before calling it.
 
 ---
 
