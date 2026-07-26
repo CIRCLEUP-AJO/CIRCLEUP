@@ -1,6 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runEventHandler, getIndexerMetrics } from "./indexer";
+import { runEventHandler, getIndexerMetrics, USDC } from "./indexer";
+
+test("USDC is read from the validated USDC_ADDRESS env var, not left dangling", () => {
+  assert.equal(USDC, process.env.USDC_ADDRESS);
+  assert.ok(USDC && USDC.length > 0, "USDC_ADDRESS must be a non-empty string once config validation passes");
+});
 
 test("runEventHandler counts a successful handler and returns true", async () => {
   const before = getIndexerMetrics();
