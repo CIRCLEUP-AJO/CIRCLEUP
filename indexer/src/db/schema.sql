@@ -84,9 +84,30 @@ CREATE TABLE IF NOT EXISTS indexer_state (
 INSERT INTO indexer_state (id, last_ledger) VALUES (1, 0)
 ON CONFLICT (id) DO NOTHING;
 
+-- Tracks which files under src/db/migrations/ have been applied, so
+-- migrate.ts can report schema version/status and skip re-applying files.
+-- Defined here (rather than only in migrate.ts) so the schema's version
+-- history lives next to the rest of the schema definition.
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename        TEXT PRIMARY KEY,
+    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_circle_members_address ON circle_members(member_address);
 CREATE INDEX IF NOT EXISTS idx_contributions_member ON contributions(member_address);
 CREATE INDEX IF NOT EXISTS idx_payouts_recipient ON payouts(recipient);
 CREATE INDEX IF NOT EXISTS idx_defaults_member ON defaults(member_address);
-CREATE INDEX IF NOT EXISTS idx_ingested_events_ledger ON ingested_events(ledger);
+
+-- circles.created_ledger: GET /circles orders the full circle list by this
+-- column (see api.ts). circle_members(circle_address, payout_order) and
+-- contributions/defaults(circle_address, ...) support the circle-detail
+-- endpoints, which filter by circle_address and then sort by round/payout
+-- order — the (address, member_address) unique constraint on circle_members
+-- already covers equality on circle_address alone, but not the ORDER BY, so
+-- payout_order is added as a second column here to avoid a sort step.
+-- See src/db/explain.ts to re-verify these plans (`npm run explain --workspace=indexer`).
+CREATE INDEX IF NOT EXISTS idx_circles_created_ledger ON circles(created_ledger DESC);
+CREATE INDEX IF NOT EXISTS idx_circle_members_circle_address ON circle_members(circle_address, payout_order);
+CREATE INDEX IF NOT EXISTS idx_contributions_circle_round ON contributions(circle_address, round_index, created_at);
+CREATE INDEX IF NOT EXISTS idx_defaults_circle_address ON defaults(circle_address, round_index);

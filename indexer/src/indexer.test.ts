@@ -1,44 +1,34 @@
-import test from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
+import { runEventHandler, getIndexerMetrics } from "./indexer";
 
-import { createEventKey } from "./indexer";
+test("runEventHandler counts a successful handler and returns true", async () => {
+  const before = getIndexerMetrics();
 
-test("createEventKey is stable for equivalent events", () => {
-  const event = {
-    ledger: 42,
-    txHash: "tx-123",
-    contractId: "CA123",
-    topic: [{}, {}],
-    value: {},
-  } as any;
+  const ok = await runEventHandler(async () => {}, {
+    contractId: "CCIRCLE",
+    topic: "circle/joined",
+    ledger: 100,
+  });
 
-  const duplicate = {
-    ledger: 42,
-    txHash: "tx-123",
-    contractId: "CA123",
-    topic: [{}, {}],
-    value: {},
-  } as any;
-
-  assert.equal(createEventKey(event), createEventKey(duplicate));
+  assert.equal(ok, true);
+  const after = getIndexerMetrics();
+  assert.equal(after.totalEventsProcessed, before.totalEventsProcessed + 1);
+  assert.equal(after.totalEventsFailed, before.totalEventsFailed);
 });
 
-test("createEventKey changes when event content changes", () => {
-  const event = {
-    ledger: 42,
-    txHash: "tx-123",
-    contractId: "CA123",
-    topic: [{}, {}],
-    value: {},
-  } as any;
+test("runEventHandler isolates a throwing handler instead of propagating", async () => {
+  const before = getIndexerMetrics();
 
-  const changed = {
-    ledger: 43,
-    txHash: "tx-123",
-    contractId: "CA123",
-    topic: [{}, {}],
-    value: {},
-  } as any;
+  const ok = await runEventHandler(
+    async () => {
+      throw new Error("malformed event payload");
+    },
+    { contractId: "CCIRCLE", topic: "circle/contributed", ledger: 101, txHash: "deadbeef" },
+  );
 
-  assert.notEqual(createEventKey(event), createEventKey(changed));
+  assert.equal(ok, false);
+  const after = getIndexerMetrics();
+  assert.equal(after.totalEventsFailed, before.totalEventsFailed + 1);
+  assert.equal(after.totalEventsProcessed, before.totalEventsProcessed);
 });

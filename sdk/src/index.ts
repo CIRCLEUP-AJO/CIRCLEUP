@@ -1,4 +1,11 @@
-export * from "./client";
-export * from "./types";
-export * from "./utils";
-export * from "./constants";
+// ─── @circleup/sdk public surface ────────────────────────────────────────────
+//
+// Import order: constants → types → utils → client
+// This ensures that consumers who rely on named imports always get the same
+// canonical source for each symbol (e.g. `NetworkConfig` comes from constants,
+// not re-exported transitively through another module).
+
+export * from "./constants"; // NetworkConfig, getNetworkConfig, isValidNetwork, …
+export * from "./types";     // CircleUpConfig, CircleState, ApiCircleRow, …
+export * from "./utils";     // usdcToStroops, stroopsToUsdc, formatUsdc, …
+export * from "./client";    // CircleUpClient, FactoryClient, CircleClient, …

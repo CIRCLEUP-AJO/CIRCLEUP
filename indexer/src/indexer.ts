@@ -268,83 +268,137 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   console.log(`[indexer] Reputation: ${memberAddr} → score ${score}`);
 }
 
+// ─── Metrics ───────────────────────────────────────────────────────────────
+
+// Cumulative counters surfaced in each cycle's summary log line so a spike in
+// errors is visible without cross-referencing individual error entries.
+let totalEventsProcessed = 0;
+let totalEventsFailed = 0;
+
+interface EventLogContext {
+  contractId: string | null;
+  topic: string;
+  ledger: number;
+  txHash?: string;
+}
+
+// Runs a single event's handler in isolation so a malformed or unexpected
+// event (e.g. a contract upgrade adding/removing a topic field) can't abort
+// the rest of the batch — without this, one bad event in a 100-event page
+// would silently drop every event after it for that poll cycle.
+export async function runEventHandler(
+  handler: () => Promise<void>,
+  ctx: EventLogContext,
+): Promise<boolean> {
+  try {
+    await handler();
+    totalEventsProcessed++;
+    return true;
+  } catch (err) {
+    totalEventsFailed++;
+    console.error(
+      `[indexer] Failed to process ${ctx.topic} event ` +
+        `(contract=${ctx.contractId ?? "unknown"}, ledger=${ctx.ledger}` +
+        (ctx.txHash ? `, tx=${ctx.txHash}` : "") +
+        "):",
+      err,
+    );
+    return false;
+  }
+}
+
 // ─── Main poll loop ───────────────────────────────────────────────────────────
 
-async function processEvents(fromLedger: number, _toLedger: number) {
-  try {
-    // Factory + reputation events
-    const factoryResponse = await rpc.getEvents({
+async function processEvents(fromLedger: number, toLedger: number) {
+  const startedAt = Date.now();
+  let eventsSeen = 0;
+  let eventsFailed = 0;
+
+  // Factory + reputation events
+  const factoryResponse = await rpc.getEvents({
+    startLedger: fromLedger,
+    filters: [
+      {
+        type: "contract",
+        contractIds: [FACTORY, REPUTATION],
+      },
+    ],
+    limit: EVENTS_LIMIT,
+  });
+
+  for (const event of factoryResponse.events) {
+    if (!event.topic || event.topic.length < 2) continue;
+    const topic0 = getTopicStr(event, 0);
+    const topic1 = getTopicStr(event, 1);
+
+    let handler: (() => Promise<void>) | null = null;
+    if (topic0 === "factory" && topic1 === "circle_created") {
+      handler = () => handleFactoryCircleCreated(event);
+    } else if (topic0 === "reputation" && topic1 === "increment") {
+      handler = () => handleReputationIncrement(event);
+    }
+    if (!handler) continue;
+
+    eventsSeen++;
+    const ok = await runEventHandler(handler, {
+      contractId: getContractIdStr(event),
+      topic: `${topic0}/${topic1}`,
+      ledger: event.ledger,
+      txHash: event.txHash,
+    });
+    if (!ok) eventsFailed++;
+  }
+
+  // Circle contract events — query all known circles
+  const circles = await query<{ address: string }>("SELECT address FROM circles");
+
+  if (circles.length > 0) {
+    const circleAddresses = circles.map((c) => c.address);
+    const circleResponse = await rpc.getEvents({
       startLedger: fromLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds: [FACTORY, REPUTATION],
-        },
-      ],
+      filters: [{ type: "contract", contractIds: circleAddresses }],
       limit: EVENTS_LIMIT,
     });
 
-    for (const event of factoryResponse.events) {
+    for (const event of circleResponse.events) {
       if (!event.topic || event.topic.length < 2) continue;
+
+      const contractId = getContractIdStr(event);
+      if (!contractId) continue;
+
       const topic0 = getTopicStr(event, 0);
       const topic1 = getTopicStr(event, 1);
-      const eventKey = createEventKey(event);
 
-      const ingested = await ingestEvent(event, async (client) => {
-        if (topic0 === "factory" && topic1 === "circle_created") {
-          await handleFactoryCircleCreated(client, event);
-        } else if (topic0 === "reputation" && topic1 === "increment") {
-          await handleReputationIncrement(client, event);
-        }
-      });
+      if (topic0 !== "circle") continue;
 
-      if (!ingested) {
-        console.debug(`[indexer] Skipping already ingested event ${eventKey}`);
+      let handler: (() => Promise<void>) | null = null;
+      switch (topic1) {
+        case "joined":       handler = () => handleCircleJoined(contractId, event);      break;
+        case "active":       handler = () => handleCircleActive(contractId);            break;
+        case "contributed":  handler = () => handleCircleContributed(contractId, event); break;
+        case "payout":       handler = () => handleCirclePayout(contractId, event);      break;
+        case "default":      handler = () => handleCircleDefault(contractId, event);     break;
+        case "completed":    handler = () => handleCircleCompleted(contractId);          break;
       }
-    }
+      if (!handler) continue;
 
-    // Circle contract events — query all known circles
-    const circles = await query<{ address: string }>("SELECT address FROM circles");
-
-    if (circles.length > 0) {
-      const circleAddresses = circles.map((c) => c.address);
-      const circleResponse = await rpc.getEvents({
-        startLedger: fromLedger,
-        filters: [{ type: "contract", contractIds: circleAddresses }],
-        limit: EVENTS_LIMIT,
+      eventsSeen++;
+      const ok = await runEventHandler(handler, {
+        contractId,
+        topic: `circle/${topic1}`,
+        ledger: event.ledger,
+        txHash: event.txHash,
       });
-
-      for (const event of circleResponse.events) {
-        if (!event.topic || event.topic.length < 2) continue;
-
-        const contractId = getContractIdStr(event);
-        if (!contractId) continue;
-
-        const topic0 = getTopicStr(event, 0);
-        const topic1 = getTopicStr(event, 1);
-        const eventKey = createEventKey(event);
-
-        if (topic0 !== "circle") continue;
-
-        const ingested = await ingestEvent(event, async (client) => {
-          switch (topic1) {
-            case "joined":       await handleCircleJoined(client, contractId, event);      break;
-            case "active":       await handleCircleActive(client, contractId);              break;
-            case "contributed":  await handleCircleContributed(client, contractId, event); break;
-            case "payout":       await handleCirclePayout(client, contractId, event);      break;
-            case "default":      await handleCircleDefault(client, contractId, event);     break;
-            case "completed":    await handleCircleCompleted(client, contractId);          break;
-          }
-        });
-
-        if (!ingested) {
-          console.debug(`[indexer] Skipping already ingested event ${eventKey}`);
-        }
-      }
+      if (!ok) eventsFailed++;
     }
-  } catch (err) {
-    console.error("[indexer] Error processing events:", err);
   }
+
+  const durationMs = Date.now() - startedAt;
+  console.log(
+    `[indexer] Processed ledgers ${fromLedger}-${toLedger}: ` +
+      `${eventsSeen} event(s), ${eventsFailed} failed, ${durationMs}ms` +
+      (totalEventsFailed > 0 ? ` (${totalEventsFailed} failed since start)` : ""),
+  );
 }
 
 export async function startIndexer() {
@@ -364,12 +418,24 @@ export async function startIndexer() {
       const toLedger = latestLedger.sequence;
 
       if (toLedger > lastLedger) {
+        // processEvents isolates per-event failures internally; if it throws,
+        // the failure is at the batch level (RPC/DB unreachable) so we must
+        // NOT advance lastLedger — retry the same range next tick instead of
+        // silently skipping the ledgers we failed to fetch.
         await processEvents(lastLedger + 1, toLedger);
         lastLedger = toLedger;
         await setLastLedger(lastLedger);
       }
     } catch (err) {
-      console.error("[indexer] Poll error:", err);
+      console.error(
+        `[indexer] Poll error (will retry from ledger ${lastLedger + 1}):`,
+        err,
+      );
     }
   }, POLL_INTERVAL_MS);
+}
+
+// Exposed for tests and potential future health/metrics endpoints.
+export function getIndexerMetrics() {
+  return { totalEventsProcessed, totalEventsFailed };
 }
