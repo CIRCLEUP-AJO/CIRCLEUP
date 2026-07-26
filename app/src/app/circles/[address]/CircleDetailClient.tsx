@@ -328,13 +328,6 @@ function WorkflowBanner({
   return null;
 }
 
-// ─── Success state type ───────────────────────────────────────────────────────
-
-interface SuccessState {
-  message: string;
-  txHash: string;
-}
-
 // ─── getMemberContributionStatus ─────────────────────────────────────────────
 //
 // Determines whether a member has contributed, is pending, or has defaulted
@@ -458,8 +451,26 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const handlePayout     = () => doAction("payout",     []);
   const handleClose      = () => doAction("close",      []);
 
+  // Spoken summary of circle status + round progress. Rendered in a polite
+  // live region below so screen-reader users hear "Circle status: Active.
+  // Round 3 of 10." whenever an action (contribute / payout / close) refreshes
+  // the circle data. The round fragment is omitted when total_rounds is
+  // missing or invalid rather than announcing "Round 0 of 0".
+  const totalRounds = data.circle.total_rounds;
+  const progressAnnouncement =
+    `Circle status: ${data.circle.status}.` +
+    (Number.isFinite(totalRounds) && totalRounds > 0
+      ? ` Round ${Math.max(0, currentRound)} of ${totalRounds}.`
+      : "");
+
   return (
     <div className="space-y-8">
+
+      {/* Live announcement of status / round changes. Must be present from
+          the first render — live regions added later are not announced. */}
+      <p className="sr-only" role="status" aria-live="polite">
+        {progressAnnouncement}
+      </p>
 
       {/* Workflow explanation */}
       <WorkflowBanner
@@ -498,7 +509,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             role="status"
             aria-live="polite"
           >
-            <p>✅ {success.message}</p>
+            <p>
+              <span aria-hidden="true">✅ </span>
+              {success.message}
+            </p>
             {success.txHash && (
               <p className="text-xs">
                 Tx:{" "}
@@ -638,7 +652,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                     />
                     {member.defaults > 0 && (
                       <span className="text-xs text-red-600 font-medium">
-                        ⚠️ {member.defaults} default
+                        <span aria-hidden="true">⚠️ </span>
+                        {member.defaults} default
                         {member.defaults > 1 ? "s" : ""}
                       </span>
                     )}
@@ -650,11 +665,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   {isPaid ? (
                     // Past round recipient
                     <span className="text-slate-500">
-                      ✅ received ${formatUsdc(roundForMember?.amount ?? "0")}
+                      <span aria-hidden="true">✅ </span>
+                      received ${formatUsdc(roundForMember?.amount ?? "0")}
                     </span>
                   ) : isNext ? (
                     <span className="text-brand-700 font-semibold">
-                      ← next payout
+                      <span aria-hidden="true">← </span>
+                      next payout
                     </span>
                   ) : (
                     // Future slot — show per-member contribution status for active circles
@@ -758,61 +775,50 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   );
 }
 
-// ─── getMemberContributionStatus ─────────────────────────────────────────────
-//
-// Determines a member's contribution status for the current active round.
-//
-// Logic:
-//   - "not_applicable" → circle is not Active, or the member is the next payout
-//                         recipient (payout_order === current_round)
-//   - "contributed"    → member's total_contributions count is > current_round
-//                         index (they have already paid for this round)
-//   - "defaulted"      → member has at least one default and has NOT contributed
-//   - "pending"        → anything else (active round, no contribution yet)
-
-function getMemberContributionStatus(
-  member: CircleMember,
-  currentRound: number,
-  status: string,
-): "contributed" | "pending" | "defaulted" | "not_applicable" {
-  if (status !== "Active") return "not_applicable";
-  // The next payout recipient is index currentRound — they don't contribute
-  if (member.payout_order === currentRound) return "not_applicable";
-
-  const hasContributed = Number(member.total_contributions) > currentRound;
-  if (hasContributed) return "contributed";
-  if (member.defaults > 0) return "defaulted";
-  return "pending";
-}
-
 // ─── Contribution status badge ────────────────────────────────────────────────
 
 interface ContributionStatusBadgeProps {
   status: "contributed" | "pending" | "defaulted" | "not_applicable";
 }
 
+// The leading glyphs (✓ / ⏳ / ✗) are decorative — screen readers would
+// otherwise announce them literally ("check mark contributed"), so they are
+// hidden and an sr-only "Contribution status:" prefix gives the bare word
+// context when the badge is read on its own.
+
 function ContributionStatusBadge({ status }: ContributionStatusBadgeProps) {
   switch (status) {
     case "contributed":
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700 bg-green-50 border border-green-200 rounded-full px-2 py-0.5">
-          ✓ contributed
+          <span aria-hidden="true">✓</span>
+          <span className="sr-only">Contribution status: </span>
+          contributed
         </span>
       );
     case "pending":
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">
-          ⏳ pending
+          <span aria-hidden="true">⏳</span>
+          <span className="sr-only">Contribution status: </span>
+          pending
         </span>
       );
     case "defaulted":
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-full px-2 py-0.5">
-          ✗ defaulted
+          <span aria-hidden="true">✗</span>
+          <span className="sr-only">Contribution status: </span>
+          defaulted
         </span>
       );
     case "not_applicable":
     default:
-      return <span className="text-slate-400 text-xs">waiting</span>;
+      return (
+        <span className="text-slate-400 text-xs">
+          <span className="sr-only">Contribution status: </span>
+          waiting
+        </span>
+      );
   }
 }
