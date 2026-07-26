@@ -4,8 +4,8 @@ import {
   runEventHandler,
   getIndexerMetrics,
   USDC,
-  isTransientRpcError,
-  withRpcRetry,
+  stopIndexer,
+  isIndexerRunning,
 } from "./indexer";
 
 test("USDC is read from the validated USDC_ADDRESS env var, not left dangling", () => {
@@ -44,71 +44,8 @@ test("runEventHandler isolates a throwing handler instead of propagating", async
   assert.equal(after.totalEventsProcessed, before.totalEventsProcessed);
 });
 
-test("isTransientRpcError detects network and rate-limit failures", () => {
-  assert.equal(isTransientRpcError(Object.assign(new Error("boom"), { code: "ECONNRESET" })), true);
-  assert.equal(isTransientRpcError(Object.assign(new Error("nope"), { status: 429 })), true);
-  assert.equal(isTransientRpcError(new Error("gateway timeout from upstream")), true);
-  assert.equal(isTransientRpcError(new Error("invalid contract id")), false);
-  assert.equal(isTransientRpcError(null), false);
-});
-
-test("withRpcRetry succeeds after transient failures", async () => {
-  let attempts = 0;
-  const sleeps: number[] = [];
-
-  const result = await withRpcRetry(
-    "test-call",
-    async () => {
-      attempts++;
-      if (attempts < 3) {
-        throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
-      }
-      return "ok";
-    },
-    {
-      maxAttempts: 4,
-      baseDelayMs: 10,
-      sleep: async (ms) => {
-        sleeps.push(ms);
-      },
-    },
-  );
-
-  assert.equal(result, "ok");
-  assert.equal(attempts, 3);
-  assert.deepEqual(sleeps, [10, 20]);
-});
-
-test("withRpcRetry fails fast on non-transient errors", async () => {
-  let attempts = 0;
-  await assert.rejects(
-    () =>
-      withRpcRetry(
-        "test-call",
-        async () => {
-          attempts++;
-          throw new Error("invalid startLedger");
-        },
-        { maxAttempts: 4, baseDelayMs: 10, sleep: async () => {} },
-      ),
-    /failed after 1 attempt/,
-  );
-  assert.equal(attempts, 1);
-});
-
-test("withRpcRetry exhausts attempts on persistent transient errors", async () => {
-  let attempts = 0;
-  await assert.rejects(
-    () =>
-      withRpcRetry(
-        "test-call",
-        async () => {
-          attempts++;
-          throw Object.assign(new Error("rate limit"), { status: 429 });
-        },
-        { maxAttempts: 3, baseDelayMs: 5, sleep: async () => {} },
-      ),
-    /failed after 3 attempt/,
-  );
-  assert.equal(attempts, 3);
+test("stopIndexer is a safe no-op when the poller was never started", async () => {
+  assert.equal(isIndexerRunning(), false);
+  await assert.doesNotReject(() => stopIndexer());
+  assert.equal(isIndexerRunning(), false);
 });

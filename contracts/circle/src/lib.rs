@@ -2,10 +2,13 @@
 //!
 //! Lifecycle:
 //!   1. `initialize` — sets members, contribution amount, payout order, schedule
-//!   2. Members call `join` to lock collateral (1× round amount)
-//!   3. Each round: members call `contribute`, then anyone calls `payout`
-//!   4. `mark_default` can be called after the round deadline to penalize a non-contributor
-//!   5. After all rounds complete, `close` releases remaining collateral
+//!   2. Members call `join` to lock collateral (1× round amount) while Pending
+//!   3. When every member has joined, status transitions to Active (deadline clock starts)
+//!   4. Each round: members call `contribute`, then anyone calls `payout`
+//!   5. `mark_default` can be called after the round deadline to penalize a non-contributor
+//!      for the *current* round only
+//!   6. After all rounds complete → Completed; or while still Pending → `cancel` → Cancelled
+//!   7. `close` releases remaining collateral once Completed or Cancelled
 
 #![no_std]
 
@@ -21,10 +24,13 @@ use soroban_sdk::{
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum CircleStatus {
-    Pending,   // waiting for members to join
-    Active,    // rounds in progress
+    Pending,   // waiting for members to join; only state that accepts join/cancel
+    Active,    // all members joined; rounds in progress
     Completed, // all rounds done
-    Cancelled, // closed early / never filled
+    /// Circle never filled: cancelled while still Pending.
+    /// Collateral locked by early joiners is reclaimable via `close`.
+    /// Active circles cannot become Cancelled.
+    Cancelled,
 }
 
 #[contracttype]
@@ -53,14 +59,20 @@ pub enum DataKey {
     Status,
     CurrentRound,
     Collateral(Address),         // per-member collateral balance
-    Contributed(Address, u32),   // whether member contributed in a given round
+    Contributed(Address, u32),   // whether member contributed in a given round (persistent)
     Defaults(Address),           // missed-contribution count per member
+    Defaulted(Address, u32),     // member already flagged for a given round
     RoundsCompleted,
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution
 const PENALTY_BPS: i128 = 2_000;
 const BPS_DENOM: i128 = 10_000;
+
+/// ~8 minutes at 5s/ledger — keeps testnets usable while rejecting zero/near-zero deadlines
+pub const MIN_ROUND_DEADLINE_LEDGERS: u32 = 100;
+/// ~60 days at 5s/ledger — upper bound against accidental multi-year lockups
+pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -89,6 +101,12 @@ impl CircleContract {
         if round_amount <= 0 {
             panic!("round_amount must be positive");
         }
+        if round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS {
+            panic!("round_deadline_ledgers below minimum");
+        }
+        if round_deadline_ledgers > MAX_ROUND_DEADLINE_LEDGERS {
+            panic!("round_deadline_ledgers above maximum");
+        }
 
         let config = CircleConfig {
             members: members.clone(),
@@ -102,7 +120,8 @@ impl CircleContract {
         env.storage().instance().set(&DataKey::Status, &CircleStatus::Pending);
         env.storage().instance().set(&DataKey::RoundsCompleted, &0u32);
 
-        // Set up round 0 with the first member as recipient
+        // Round 0 is prepared at init; the live deadline is refreshed when the
+        // circle becomes Active (all members joined), not at initialize time.
         let first_recipient = members.get(0).unwrap();
         let initial_round = RoundState {
             round_index: 0,
@@ -123,14 +142,17 @@ impl CircleContract {
     // ── Join ──────────────────────────────────────────────────────────────────
 
     /// Member locks collateral (1 × round_amount) to join.
-    /// All members must join before contributions begin.
+    ///
+    /// Join is only accepted while `Pending`. The circle transitions to `Active`
+    /// exactly once — when every configured member has joined — and the round-0
+    /// deadline clock starts at that moment.
     pub fn join(env: Env, member: Address) {
         member.require_auth();
 
         let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
         let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
 
-        if status != CircleStatus::Pending && status != CircleStatus::Active {
+        if status != CircleStatus::Pending {
             panic!("circle not accepting members");
         }
 
@@ -138,14 +160,19 @@ impl CircleContract {
             panic!("not a circle member");
         }
 
-        let existing: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Collateral(member.clone()))
-            .unwrap_or(0);
-        if existing > 0 {
+        // Use `has` (not collateral > 0) so a member whose balance was later
+        // reduced to 0 (penalties / release) cannot join again and transfer
+        // a second collateral deposit. Reserve the slot *before* the token
+        // transfer (checks-effects-interactions) so a reentrant join during
+        // transfer cannot double-pull funds.
+        let collateral_key = DataKey::Collateral(member.clone());
+        if env.storage().persistent().has(&collateral_key) {
             panic!("already joined");
         }
+
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &config.round_amount);
 
         // Transfer collateral from member to this contract
         let token_client = token::Client::new(&env, &config.usdc_token);
@@ -159,25 +186,68 @@ impl CircleContract {
             .persistent()
             .set(&DataKey::Collateral(member.clone()), &config.round_amount);
 
-        // If every member has joined → activate the circle
+        // Explicit Active transition only after every member has joined
         let all_joined = config.members.iter().all(|m| {
             env.storage()
                 .persistent()
-                .get::<DataKey, i128>(&DataKey::Collateral(m))
-                .unwrap_or(0)
-                > 0
+                .has(&DataKey::Collateral(m))
         });
 
         if all_joined {
             env.storage()
                 .instance()
                 .set(&DataKey::Status, &CircleStatus::Active);
+
+            // Start the round-0 deadline from the activation ledger so the join
+            // window does not eat into the first contribution window.
+            let mut round: RoundState = env
+                .storage()
+                .instance()
+                .get(&DataKey::CurrentRound)
+                .unwrap();
+            round.deadline_ledger = env.ledger().sequence() as u64
+                + config.round_deadline_ledgers as u64;
+            env.storage().instance().set(&DataKey::CurrentRound, &round);
+
             env.events()
                 .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "active")), ());
         }
 
         env.events()
             .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "joined")), member);
+    }
+
+    // ── Cancel ────────────────────────────────────────────────────────────────
+
+    /// Cancel a circle that never filled (`Pending` only).
+    ///
+    /// Semantics of `Cancelled`:
+    /// - Means the circle was abandoned before all members joined (never Active).
+    /// - Any member may call `cancel` while status is `Pending`.
+    /// - After Cancelled, `close` returns collateral to members who already joined.
+    /// - Active / Completed circles cannot be cancelled.
+    pub fn cancel(env: Env, caller: Address) {
+        caller.require_auth();
+
+        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
+        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
+
+        if status != CircleStatus::Pending {
+            panic!("can only cancel a pending circle");
+        }
+
+        if !config.members.contains(&caller) {
+            panic!("not a circle member");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Status, &CircleStatus::Cancelled);
+
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "cancelled")),
+            caller,
+        );
     }
 
     // ── Contribute ────────────────────────────────────────────────────────────
@@ -200,16 +270,22 @@ impl CircleContract {
             panic!("round already paid out");
         }
 
-        if env.ledger().sequence() as u64 > round.deadline_ledger {
-            panic!("round deadline passed");
+        // Reject late contributions even when payout has not run yet (e.g. the
+        // pot is incomplete and callers are waiting on mark_default / payout).
+        // Must stay consistent with mark_default, which becomes available once
+        // sequence > deadline_ledger.
+        if (env.ledger().sequence() as u64) > round.deadline_ledger {
+            panic!("round deadline passed; cannot contribute before payout");
         }
 
         if !config.members.contains(&member) {
             panic!("not a member");
         }
 
+        // Persistent so the record survives past the round deadline and
+        // `mark_default` can accurately tell who missed the current round.
         let key = DataKey::Contributed(member.clone(), round.round_index);
-        if env.storage().temporary().has(&key) {
+        if env.storage().persistent().has(&key) {
             panic!("already contributed this round");
         }
 
@@ -221,7 +297,7 @@ impl CircleContract {
             &config.round_amount,
         );
 
-        env.storage().temporary().set(&key, &true);
+        env.storage().persistent().set(&key, &true);
         round.contributions_received += 1;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
@@ -309,8 +385,11 @@ impl CircleContract {
 
     // ── Mark Default ──────────────────────────────────────────────────────────
 
-    /// Flag and penalize a member who missed the round deadline.
-    /// Can be called by anyone after `deadline_ledger` has passed.
+    /// Flag and penalize a member who missed the *current* round deadline.
+    ///
+    /// Can be called by anyone after `deadline_ledger` has passed. Only members
+    /// who (1) have joined, (2) did not contribute in the current round, and
+    /// (3) have not already been flagged for this round may be marked.
     pub fn mark_default(env: Env, member: Address) {
         let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
         let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
@@ -322,6 +401,10 @@ impl CircleContract {
         let round: RoundState =
             env.storage().instance().get(&DataKey::CurrentRound).unwrap();
 
+        if round.paid_out {
+            panic!("round already paid out");
+        }
+
         if (env.ledger().sequence() as u64) <= round.deadline_ledger {
             panic!("round deadline not yet passed");
         }
@@ -330,24 +413,37 @@ impl CircleContract {
             panic!("not a member");
         }
 
-        // Make sure they actually missed
-        let key = DataKey::Contributed(member.clone(), round.round_index);
-        if env.storage().temporary().has(&key) {
-            panic!("member did contribute");
-        }
-
-        // Deduct penalty from collateral
+        // Must have joined (locked collateral) to be flaggable
         let collateral: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::Collateral(member.clone()))
             .unwrap_or(0);
+        if collateral <= 0 {
+            panic!("member has not joined");
+        }
 
+        // Only the current round — refuse if already flagged for this round_index
+        let defaulted_key = DataKey::Defaulted(member.clone(), round.round_index);
+        if env.storage().persistent().has(&defaulted_key) {
+            panic!("already marked default this round");
+        }
+
+        // Make sure they actually missed the current round
+        let contrib_key = DataKey::Contributed(member.clone(), round.round_index);
+        if env.storage().persistent().has(&contrib_key) {
+            panic!("member did contribute");
+        }
+
+        // Deduct penalty from collateral
         let penalty = collateral * PENALTY_BPS / BPS_DENOM;
         let new_collateral = collateral - penalty;
         env.storage()
             .persistent()
             .set(&DataKey::Collateral(member.clone()), &new_collateral);
+
+        // Record that this member was flagged for this round (idempotency)
+        env.storage().persistent().set(&defaulted_key, &true);
 
         // Increment default counter
         let defaults: u32 = env
@@ -368,8 +464,11 @@ impl CircleContract {
     // ── Close ─────────────────────────────────────────────────────────────────
 
     /// Release remaining collateral back to all members.
-    /// Only callable when the circle is Completed or Cancelled.
-    pub fn close(env: Env) {
+    /// Only callable when the circle is Completed or Cancelled, and only by an
+    /// authorized circle member (`closer.require_auth()` + membership check).
+    pub fn close(env: Env, closer: Address) {
+        closer.require_auth();
+
         let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
         let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
 
@@ -377,7 +476,12 @@ impl CircleContract {
             panic!("circle still active");
         }
 
+        if !config.members.contains(&closer) {
+            panic!("not authorized to close: caller is not a circle member");
+        }
+
         let token_client = token::Client::new(&env, &config.usdc_token);
+        let mut total_released: i128 = 0;
 
         for member in config.members.iter() {
             let collateral: i128 = env
@@ -395,11 +499,23 @@ impl CircleContract {
                 env.storage()
                     .persistent()
                     .set(&DataKey::Collateral(member.clone()), &0i128);
+                total_released += collateral;
+
+                // Per-member audit trail for indexers / off-chain reconciler
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "circle"),
+                        Symbol::new(&env, "collateral_released"),
+                    ),
+                    (member.clone(), collateral),
+                );
             }
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "closed")), ());
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
+            (closer, total_released),
+        );
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────
@@ -432,7 +548,7 @@ impl CircleContract {
 
     pub fn has_contributed(env: Env, member: Address, round_index: u32) -> bool {
         env.storage()
-            .temporary()
+            .persistent()
             .has(&DataKey::Contributed(member, round_index))
     }
 }

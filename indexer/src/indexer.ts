@@ -545,7 +545,39 @@ async function processEvents(fromLedger: number, toLedger: number) {
   );
 }
 
+// ─── Poller lifecycle (graceful shutdown) ─────────────────────────────────────
+
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+let pollInFlight: Promise<void> | null = null;
+let shuttingDown = false;
+let indexerStarted = false;
+
+/**
+ * Run one poll cycle: fetch latest ledger and ingest events in (lastLedger, to].
+ * Returns the ledger cursor to persist (unchanged when there is nothing new or
+ * when the batch fails — so the next tick retries the same range).
+ */
+async function runPollCycle(lastLedger: number): Promise<number> {
+  const latestLedger = await rpc.getLatestLedger();
+  const toLedger = latestLedger.sequence;
+
+  if (toLedger > lastLedger) {
+    // processEvents isolates per-event failures internally; if it throws,
+    // the failure is at the batch level (RPC/DB unreachable) so we must
+    // NOT advance lastLedger — retry the same range next tick instead of
+    // silently skipping the ledgers we failed to fetch.
+    await processEvents(lastLedger + 1, toLedger);
+    await setLastLedger(toLedger);
+    return toLedger;
+  }
+  return lastLedger;
+}
+
 export async function startIndexer() {
+  if (indexerStarted) {
+    throw new Error("[indexer] Event poller is already running");
+  }
+
   console.log(
     `[indexer] Starting CircleUp event indexer ` +
       `(poll interval: ${POLL_INTERVAL_MS}ms, events per page: ${EVENTS_LIMIT})...`,
@@ -558,29 +590,77 @@ export async function startIndexer() {
 
   console.log(`[indexer] Starting from ledger ${lastLedger}`);
 
-  setInterval(async () => {
-    try {
-      const latestLedger = await withRpcRetry("getLatestLedger", () =>
-        rpc.getLatestLedger(),
-      );
-      const toLedger = latestLedger.sequence;
+  shuttingDown = false;
+  indexerStarted = true;
 
-      if (toLedger > lastLedger) {
-        // processEvents isolates per-event failures internally; if it throws
-        // after exhausting RPC retries, the failure is at the batch level so
-        // we must NOT advance lastLedger — retry the same range next tick
-        // instead of silently skipping the ledgers we failed to fetch.
-        await processEvents(lastLedger + 1, toLedger);
-        lastLedger = toLedger;
-        await setLastLedger(lastLedger);
-      }
-    } catch (err) {
-      console.error(
-        `[indexer] Poll error (will retry from ledger ${lastLedger + 1}):`,
-        err,
-      );
+  const tick = () => {
+    if (shuttingDown) {
+      return;
     }
-  }, POLL_INTERVAL_MS);
+    if (pollInFlight) {
+      console.warn(
+        "[indexer] Previous poll still in flight — skipping overlapping tick",
+      );
+      return;
+    }
+
+    pollInFlight = (async () => {
+      try {
+        lastLedger = await runPollCycle(lastLedger);
+      } catch (err) {
+        console.error(
+          `[indexer] Poll error (will retry from ledger ${lastLedger + 1}):`,
+          err,
+        );
+      }
+    })().finally(() => {
+      pollInFlight = null;
+    });
+  };
+
+  pollTimer = setInterval(tick, POLL_INTERVAL_MS);
+}
+
+/**
+ * Stop the event poller cleanly: clear the interval, refuse new ticks, and
+ * wait for any in-flight poll cycle to finish so we don't exit mid-write.
+ */
+export async function stopIndexer(): Promise<void> {
+  if (!indexerStarted && !pollTimer && !pollInFlight) {
+    console.log("[indexer] Event poller is not running — nothing to stop");
+    return;
+  }
+
+  if (shuttingDown) {
+    console.log("[indexer] Shutdown already in progress — waiting...");
+    if (pollInFlight) {
+      await pollInFlight.catch(() => undefined);
+    }
+    return;
+  }
+
+  shuttingDown = true;
+  console.log(
+    "[indexer] Graceful shutdown requested — stopping event poller...",
+  );
+
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  if (pollInFlight) {
+    console.log("[indexer] Waiting for in-flight poll cycle to finish...");
+    await pollInFlight.catch(() => undefined);
+  }
+
+  indexerStarted = false;
+  console.log("[indexer] Event poller stopped cleanly");
+}
+
+/** Test/ops helper: whether the poller has been started and not fully stopped. */
+export function isIndexerRunning(): boolean {
+  return indexerStarted && !shuttingDown;
 }
 
 // Exposed for tests and potential future health/metrics endpoints.

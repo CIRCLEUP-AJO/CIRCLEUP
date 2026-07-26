@@ -23,6 +23,7 @@ import type {
   ApiMembersResponse,
   ApiRoundsResponse,
   ApiReputationResponse,
+  ApiMemberContributionsResponse,
   ApiHealthResponse,
 } from "./types";
 import { validateCircleUpConfig, isValidContractAddress } from "./types";
@@ -326,7 +327,9 @@ export class CircleClient extends CircleUpClient {
   }
 
   async close(caller: Keypair): Promise<TxResult> {
-    const result = await this.buildAndSend(caller, this.circleAddress, "close", []);
+    const result = await this.buildAndSend(caller, this.circleAddress, "close", [
+      new Address(caller.publicKey()).toScVal(),
+    ]);
     if (result.success) this.invalidateCache();
     return result;
   }
@@ -396,7 +399,8 @@ export class CircleClient extends CircleUpClient {
    * even if the member did contribute. Use this for the _current_ round only,
    * or use {@link hasContributedCurrentRound} which handles that for you.
    * For historical contribution data across all rounds, query the indexer via
-   * {@link IndexerClient.getMembers} or {@link IndexerClient.getRounds}.
+   * {@link IndexerClient.getMemberContributions}, {@link IndexerClient.getMembers},
+   * or {@link IndexerClient.getRounds}.
    *
    * @param member     Stellar public key of the member to check.
    * @param roundIndex Zero-based round index to query.
@@ -719,6 +723,35 @@ export class IndexerClient {
    */
   async getReputation(member: string): Promise<ApiReputationResponse> {
     return this.get<ApiReputationResponse>(`/reputation/${encodeURIComponent(member)}`);
+  }
+
+  /**
+   * Fetch the raw contribution history for a member.
+   *
+   * Unlike {@link getReputation} (counts only) or {@link getRounds} (nested
+   * under payouts), this returns every indexed contribution row for building
+   * a personal history view.
+   *
+   * Pass `circle` to restrict results to one circle. An unknown circle address
+   * yields a 404; a member with no contributions yields an empty list.
+   *
+   * Equivalent to `GET /members/:member/contributions`.
+   *
+   * @param member Stellar public key of the member.
+   * @param options Optional circle filter and pagination.
+   */
+  async getMemberContributions(
+    member: string,
+    options?: { circle?: string; page?: number; limit?: number },
+  ): Promise<ApiMemberContributionsResponse> {
+    const params = new URLSearchParams();
+    if (options?.circle) params.set("circle", options.circle);
+    if (options?.page != null) params.set("page", String(options.page));
+    if (options?.limit != null) params.set("limit", String(options.limit));
+    const qs = params.toString();
+    return this.get<ApiMemberContributionsResponse>(
+      `/members/${encodeURIComponent(member)}/contributions${qs ? `?${qs}` : ""}`,
+    );
   }
 
   /**

@@ -5,7 +5,8 @@
  * GET /circles/summary                 → circle counts by status
  * GET /circles/:address                → circle detail + members + rounds
  * GET /circles/:address/members        → members with contribution status
- * GET /circles/:address/rounds         → rounds grouped by round (payouts + contributions + defaults)
+ * GET /circles/:address/rounds         → all rounds (payouts + defaults)
+ * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
  * GET /indexer/state                   → indexer audit: last ledger + event counts
  * GET /health                          → health check (db + RPC status)
@@ -706,6 +707,106 @@ export function createApp() {
     } catch (err) {
       console.error(`[api] Failed to load rounds for circle ${address}`, err);
       sendError(res, 500, "Failed to load circle rounds", getErrorMessage(err));
+    }
+  });
+
+  // ── Member contribution history ──────────────────────────────────────────────
+  //
+  // Read-only ledger of every indexed contribution for a member. Unlike
+  // /reputation/:member (which returns per-circle counts) and
+  // /circles/:address/rounds (which nests contributions under payouts), this
+  // endpoint returns the raw contribution rows so clients can build a personal
+  // history view without scanning every circle.
+  //
+  // Optional ?circle=<address> narrows results to one circle. Missing members
+  // yield an empty list (not 404) — same convention as /reputation/:member.
+  // An unknown ?circle= address is a 404 so callers get a clear signal that
+  // the filter itself is invalid rather than a silently empty result.
+
+  app.get("/members/:member/contributions", async (req: Request, res: Response) => {
+    const member = nonBlankParam(req.params.member);
+    if (!member) {
+      res.status(400).json({ error: "Member address is required" });
+      return;
+    }
+
+    const pageResult = parsePage(req.query.page);
+    const limitResult = parseLimit(req.query.limit);
+    const circleResult = parseCircleFilter(req.query.circle);
+
+    const errors = [pageResult, limitResult, circleResult]
+      .filter(isParseError)
+      .map((r) => r.error);
+
+    if (errors.length > 0) {
+      res.status(400).json({ error: errors.join("; ") });
+      return;
+    }
+
+    const page = pageResult as number;
+    const limit = limitResult as number;
+    const circleFilter = circleResult as string | undefined;
+    const offset = (page - 1) * limit;
+
+    try {
+      if (circleFilter) {
+        const [circle] = await query<Pick<CircleRow, "address">>(
+          `SELECT address FROM circles WHERE address = $1`,
+          [circleFilter],
+        );
+        if (!circle) {
+          res.status(404).json({ error: `Circle '${circleFilter}' not found` });
+          return;
+        }
+      }
+
+      const whereSql = circleFilter
+        ? "WHERE c.member_address = $1 AND c.circle_address = $2"
+        : "WHERE c.member_address = $1";
+      const whereParams: (string | number)[] = circleFilter
+        ? [member, circleFilter]
+        : [member];
+
+      const [contributions, [countRow]] = await Promise.all([
+        query<ContributionRow>(
+          `SELECT c.circle_address, c.member_address, c.round_index, c.amount::text as amount,
+                  c.tx_hash, c.ledger, c.created_at
+           FROM contributions c
+           ${whereSql}
+           ORDER BY c.ledger DESC, c.round_index DESC, c.created_at DESC
+           LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
+          [...whereParams, limit, offset],
+        ),
+        query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM contributions c ${whereSql}`,
+          whereParams,
+        ),
+      ]);
+
+      const total = Number(countRow.count);
+
+      res.json({
+        member,
+        circle: circleFilter ?? null,
+        contributions,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+        },
+      });
+    } catch (err) {
+      console.error(
+        `[api] Failed to load contributions for member ${member}`,
+        err,
+      );
+      sendError(
+        res,
+        500,
+        "Failed to load member contributions",
+        getErrorMessage(err),
+      );
     }
   });
 
