@@ -9,14 +9,43 @@
  * GET /health                          → health check
  */
 
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import { query } from "./db/pool";
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  return "Unknown error";
+}
+
+function sendError(res: Response, status: number, message: string, details?: unknown) {
+  res.status(status).json({
+    error: {
+      message,
+      details: details ?? null,
+    },
+  });
+}
 
 export function createApp() {
   const app = express();
   app.use(cors());
   app.use(express.json());
+
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
+    console.info(`[api] ${req.method} ${req.path} started`);
+
+    _res.on("finish", () => {
+      const durationMs = Date.now() - startedAt;
+      console.info(
+        `[api] ${req.method} ${req.path} completed status=${_res.statusCode} duration_ms=${durationMs}`,
+      );
+    });
+
+    next();
+  });
 
   // ── Health ───────────────────────────────────────────────────────────────────
 
@@ -37,8 +66,8 @@ export function createApp() {
       );
       res.json({ circles });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error("[api] Failed to list circles", err);
+      sendError(res, 500, "Failed to list circles", getErrorMessage(err));
     }
   });
 
@@ -50,7 +79,7 @@ export function createApp() {
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: "Circle not found" });
+        sendError(res, 404, "Circle not found");
         return;
       }
 
@@ -99,8 +128,8 @@ export function createApp() {
         latestLedger,
       });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load circle ${address}`, err);
+      sendError(res, 500, "Failed to load circle", getErrorMessage(err));
     }
   });
 
@@ -124,8 +153,8 @@ export function createApp() {
       );
       res.json({ members });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load members for circle ${address}`, err);
+      sendError(res, 500, "Failed to load circle members", getErrorMessage(err));
     }
   });
 
@@ -162,8 +191,8 @@ export function createApp() {
         (d) => !payouts.find((p) => p.round_index === d.round_index)
       )});
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load rounds for circle ${address}`, err);
+      sendError(res, 500, "Failed to load circle rounds", getErrorMessage(err));
     }
   });
 
@@ -200,9 +229,14 @@ export function createApp() {
         updatedAt: row?.updated_at ?? null,
       });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load reputation for member ${member}`, err);
+      sendError(res, 500, "Failed to load reputation", getErrorMessage(err));
     }
+  });
+
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error("[api] Unhandled error", err);
+    sendError(res, 500, "Internal server error", getErrorMessage(err));
   });
 
   return app;

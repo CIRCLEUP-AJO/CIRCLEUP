@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS reputation (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS ingested_events (
+    event_key       TEXT PRIMARY KEY,
+    contract_id     TEXT,
+    ledger          BIGINT NOT NULL,
+    tx_hash         TEXT,
+    event_type      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS indexer_state (
     id              INTEGER PRIMARY KEY DEFAULT 1,
     last_ledger     BIGINT NOT NULL DEFAULT 0,
@@ -80,3 +89,4 @@ CREATE INDEX IF NOT EXISTS idx_circle_members_address ON circle_members(member_a
 CREATE INDEX IF NOT EXISTS idx_contributions_member ON contributions(member_address);
 CREATE INDEX IF NOT EXISTS idx_payouts_recipient ON payouts(recipient);
 CREATE INDEX IF NOT EXISTS idx_defaults_member ON defaults(member_address);
+CREATE INDEX IF NOT EXISTS idx_ingested_events_ledger ON ingested_events(ledger);
