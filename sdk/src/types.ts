@@ -14,6 +14,12 @@ export interface CircleUpConfig {
     reputation: string;
     usdc: string;
   };
+  /**
+   * Base URL of the CircleUp indexer REST API (e.g. "http://localhost:3001").
+   * Required only when using {@link IndexerClient}. If omitted, IndexerClient
+   * construction will throw so the misconfiguration is caught early.
+   */
+  indexerUrl?: string;
 }
 
 // ── Circle state types (mirrors contract structs) ─────────────────────────────
@@ -52,12 +58,66 @@ export interface MemberState {
 }
 
 // ── Tx result ─────────────────────────────────────────────────────────────────
+//
+// A discriminated union so callers can pattern-match on `success` and get
+// correct types in each branch — no need to check for optional fields or cast.
+//
+//   const result = await client.join(keypair);
+//   if (result.success) {
+//     console.log(result.txHash, result.ledger);   // ledger is number here
+//   } else {
+//     console.error(result.errorMessage);          // errorMessage is string here
+//   }
 
-export interface TxResult {
-  txHash: string;
-  ledger?: number;
-  success: boolean;
-  error?: string;
+/** A transaction that was confirmed on-chain successfully. */
+export interface TxSuccess {
+  readonly success: true;
+  /** The transaction hash on the Stellar network. */
+  readonly txHash: string;
+  /** The ledger number in which the transaction was included. */
+  readonly ledger: number;
+}
+
+/** A transaction that failed to submit, was rejected, or timed out. */
+export interface TxFailure {
+  readonly success: false;
+  /**
+   * The transaction hash, if the transaction reached the network before
+   * failing. Empty string when the failure occurred before submission (e.g.
+   * simulation error or user rejection).
+   */
+  readonly txHash: string;
+  /** Human-readable description of what went wrong. */
+  readonly errorMessage: string;
+}
+
+/** Discriminated union of all possible transaction outcomes. */
+export type TxResult = TxSuccess | TxFailure;
+
+/**
+ * Type-guard — narrows `TxResult` to `TxSuccess`.
+ *
+ * @example
+ * const res = await circleClient.join(keypair);
+ * if (isTxSuccess(res)) {
+ *   console.log(`Confirmed in ledger ${res.ledger}`);
+ * }
+ */
+export function isTxSuccess(result: TxResult): result is TxSuccess {
+  return result.success === true;
+}
+
+/**
+ * Type-guard — narrows `TxResult` to `TxFailure`.
+ *
+ * @example
+ * const res = await circleClient.contribute(keypair);
+ * if (isTxFailure(res)) {
+ *   alert(res.errorMessage);
+ * }
+ */
+export function isTxFailure(result: TxResult): result is TxFailure {
+  return result.success === false;
 }
 
 // ─── Indexer REST API models ───────────────────────────────────────────────────
