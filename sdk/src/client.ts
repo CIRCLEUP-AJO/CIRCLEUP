@@ -17,6 +17,7 @@ import type {
   MemberState,
   TxResult,
 } from "./types";
+import { validateCircleUpConfig, isValidContractAddress } from "./types";
 
 const MAX_RETRIES = 3;
 const POLL_INTERVAL_MS = 2000;
@@ -29,6 +30,9 @@ export class CircleUpClient {
   protected config: CircleUpConfig;
 
   constructor(config: CircleUpConfig) {
+    // Validate upfront so callers get a clear message for misconfiguration
+    // rather than an obscure RPC error on the first method call.
+    validateCircleUpConfig(config);
     this.config = config;
     this.rpc = new SorobanRpc.Server(config.rpcUrl, { allowHttp: true });
   }
@@ -185,6 +189,15 @@ export class CircleClient extends CircleUpClient {
 
   constructor(config: CircleUpConfig, circleAddress: string) {
     super(config);
+    if (!circleAddress || typeof circleAddress !== "string") {
+      throw new Error("CircleClient: circleAddress is required.");
+    }
+    if (!isValidContractAddress(circleAddress)) {
+      throw new Error(
+        `CircleClient: "${circleAddress}" is not a valid Soroban contract address ` +
+          `(expected a 56-character string starting with "C").`,
+      );
+    }
     this.circleAddress = circleAddress;
   }
 
