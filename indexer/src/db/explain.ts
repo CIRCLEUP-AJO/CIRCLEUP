@@ -51,6 +51,16 @@ function buildQueries(circleAddress: string, memberAddress: string) {
       params: [memberAddress],
     },
     {
+      label: "GET /members/:member/contributions",
+      sql: `SELECT c.circle_address, c.member_address, c.round_index, c.amount::text as amount,
+                   c.tx_hash, c.ledger, c.created_at
+            FROM contributions c
+            WHERE c.member_address = $1
+            ORDER BY c.ledger DESC, c.round_index DESC, c.created_at DESC
+            LIMIT $2 OFFSET $3`,
+      params: [memberAddress, 20, 0],
+    },
+    {
       label: "GET /reputation/:member — defaults",
       sql: `SELECT circle_address, COUNT(*) as count
             FROM defaults WHERE member_address = $1 GROUP BY circle_address`,

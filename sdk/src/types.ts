@@ -341,6 +341,34 @@ export interface ApiReputationResponse {
   updatedAt: string | null;
 }
 
+/**
+ * A single row from GET /members/:member/contributions.
+ * Amounts are in stroops (string-serialised).
+ */
+export interface ApiMemberContributionRow {
+  circle_address: string;
+  member_address: string;
+  round_index: number;
+  amount: string;
+  tx_hash: string;
+  ledger: string;
+  created_at: string;
+}
+
+/** Response body for GET /members/:member/contributions */
+export interface ApiMemberContributionsResponse {
+  member: string;
+  /** Circle filter applied, or null when returning history across all circles. */
+  circle: string | null;
+  contributions: ApiMemberContributionRow[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+}
+
 /** Response body for GET /health */
 export interface ApiHealthResponse {
   status: "ok";

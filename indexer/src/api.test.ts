@@ -40,3 +40,15 @@ test("buildCorsOptions allows everything when no allow-list is configured", () =
   const options = buildCorsOptions([]);
   assert.equal(options.origin, true);
 });
+
+test("member contribution history route is documented in the module header", async () => {
+  // Lightweight guard so the read-only history endpoint is not dropped from
+  // the public surface without updating the file header / this assertion.
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  assert.match(source, /GET \/members\/:member\/contributions/);
+  assert.match(source, /app\.get\("\/members\/:member\/contributions"/);
+  assert.match(source, /Failed to load member contributions/);
+  assert.match(source, /Member address is required/);
+});
