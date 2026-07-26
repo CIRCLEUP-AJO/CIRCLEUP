@@ -11,41 +11,111 @@
 
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
 
-function getErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  return "Unknown error";
+interface CircleRow {
+  address: string;
+  creator: string;
+  round_amount: string;
+  member_count: number;
+  status: string;
+  current_round: number;
+  total_rounds: number;
+  created_ledger: string;
+  round_deadline_ledgers: number | null;
+  updated_at: string;
 }
 
-function sendError(res: Response, status: number, message: string, details?: unknown) {
-  res.status(status).json({
-    error: {
-      message,
-      details: details ?? null,
-    },
-  });
+interface CircleMemberRow {
+  circle_address: string;
+  member_address: string;
+  payout_order: number;
+  collateral: string;
+  defaults: number;
+  joined_at: string | null;
+  reputation_score: number | null;
+}
+
+interface CircleMemberWithContributionsRow extends CircleMemberRow {
+  total_contributions: string;
+}
+
+interface ContributionRow {
+  circle_address: string;
+  member_address: string;
+  round_index: number;
+  amount: string;
+  tx_hash: string;
+  ledger: string;
+  created_at: string;
+}
+
+interface PayoutRow {
+  circle_address: string;
+  recipient: string;
+  round_index: number;
+  amount: string;
+  tx_hash: string;
+  ledger: string;
+  created_at: string;
+}
+
+interface DefaultRow {
+  circle_address: string;
+  member_address: string;
+  round_index: number;
+  penalty: string;
+  tx_hash: string;
+  ledger: string;
+  created_at: string;
+}
+
+interface ReputationRow {
+  member_address: string;
+  score: number;
+  updated_at: string;
+}
+
+interface ReputationContributionSummaryRow {
+  circle_address: string;
+  contributions: string;
+  total_rounds: number;
+}
+
+interface ReputationDefaultSummaryRow {
+  circle_address: string;
+  count: string;
+}
+
+interface IndexerStateRow {
+  last_ledger: string;
+}
+
+/** Returns a trimmed, non-empty version of a route param, or null if it's missing/blank. */
+function nonBlankParam(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
 }
 
 export function createApp() {
   const app = express();
-  app.use(cors());
+  app.use(cors(buildCorsOptions()));
+  app.use(apiRateLimiter);
   app.use(express.json());
 
-  app.use((req: Request, _res: Response, next: NextFunction) => {
-    const startedAt = Date.now();
-    console.info(`[api] ${req.method} ${req.path} started`);
-
-    _res.on("finish", () => {
-      const durationMs = Date.now() - startedAt;
-      console.info(
-        `[api] ${req.method} ${req.path} completed status=${_res.statusCode} duration_ms=${durationMs}`,
-      );
-    });
-
-    next();
-  });
+  // cors() calls next(err) for rejected origins instead of sending a response
+  // itself — without this handler, Express's default error page would leak a
+  // stack trace instead of a clean 403.
+  app.use(
+    (err: Error, _req: Request, res: Response, next: express.NextFunction) => {
+      if (err.message.startsWith("Origin ")) {
+        res.status(403).json({ error: err.message });
+        return;
+      }
+      next(err);
+    },
+  );
 
   // ── Health ───────────────────────────────────────────────────────────────────
 
@@ -57,7 +127,20 @@ export function createApp() {
 
   app.get("/circles", async (_req: Request, res: Response) => {
     try {
-      const circles = await query(
+      const circles = await query<
+        Pick<
+          CircleRow,
+          | "address"
+          | "creator"
+          | "round_amount"
+          | "member_count"
+          | "status"
+          | "current_round"
+          | "total_rounds"
+          | "created_ledger"
+          | "updated_at"
+        >
+      >(
         `SELECT c.address, c.creator, c.round_amount, c.member_count,
                 c.status, c.current_round, c.total_rounds, c.created_ledger,
                 c.updated_at
@@ -72,18 +155,22 @@ export function createApp() {
   });
 
   app.get("/circles/:address", async (req: Request, res: Response) => {
-    const { address } = req.params;
+    const address = nonBlankParam(req.params.address);
+    if (!address) {
+      res.status(400).json({ error: "Circle address is required" });
+      return;
+    }
     try {
-      const [circle] = await query(
+      const [circle] = await query<CircleRow>(
         `SELECT * FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
-        sendError(res, 404, "Circle not found");
+        res.status(404).json({ error: `Circle '${address}' not found` });
         return;
       }
 
-      const members = await query(
+      const members = await query<CircleMemberRow>(
         `SELECT cm.*, r.score as reputation_score
          FROM circle_members cm
          LEFT JOIN reputation r ON r.member_address = cm.member_address
@@ -94,7 +181,7 @@ export function createApp() {
 
       // Attach the latest indexed ledger so the client can derive wall-clock
       // estimates for the deadline countdown without a separate request.
-      const [indexerState] = await query<{ last_ledger: string }>(
+      const [indexerState] = await query<IndexerStateRow>(
         `SELECT last_ledger FROM indexer_state WHERE id = 1`,
       );
       const latestLedger = indexerState ? Number(indexerState.last_ledger) : null;
@@ -134,9 +221,22 @@ export function createApp() {
   });
 
   app.get("/circles/:address/members", async (req: Request, res: Response) => {
-    const { address } = req.params;
+    const address = nonBlankParam(req.params.address);
+    if (!address) {
+      res.status(400).json({ error: "Circle address is required" });
+      return;
+    }
     try {
-      const members = await query(
+      const [circle] = await query<Pick<CircleRow, "address">>(
+        `SELECT address FROM circles WHERE address = $1`,
+        [address],
+      );
+      if (!circle) {
+        res.status(404).json({ error: `Circle '${address}' not found` });
+        return;
+      }
+
+      const members = await query<CircleMemberWithContributionsRow>(
         `SELECT cm.member_address, cm.payout_order, cm.collateral,
                 cm.defaults, cm.joined_at,
                 r.score as reputation_score,
@@ -159,17 +259,30 @@ export function createApp() {
   });
 
   app.get("/circles/:address/rounds", async (req: Request, res: Response) => {
-    const { address } = req.params;
+    const address = nonBlankParam(req.params.address);
+    if (!address) {
+      res.status(400).json({ error: "Circle address is required" });
+      return;
+    }
     try {
-      const payouts = await query(
+      const [circle] = await query<Pick<CircleRow, "address">>(
+        `SELECT address FROM circles WHERE address = $1`,
+        [address],
+      );
+      if (!circle) {
+        res.status(404).json({ error: `Circle '${address}' not found` });
+        return;
+      }
+
+      const payouts = await query<PayoutRow>(
         `SELECT * FROM payouts WHERE circle_address = $1 ORDER BY round_index`,
         [address],
       );
-      const contributions = await query(
+      const contributions = await query<ContributionRow>(
         `SELECT * FROM contributions WHERE circle_address = $1 ORDER BY round_index, created_at`,
         [address],
       );
-      const defaults = await query(
+      const defaults = await query<DefaultRow>(
         `SELECT * FROM defaults WHERE circle_address = $1 ORDER BY round_index`,
         [address],
       );
@@ -199,13 +312,17 @@ export function createApp() {
   // ── Reputation ───────────────────────────────────────────────────────────────
 
   app.get("/reputation/:member", async (req: Request, res: Response) => {
-    const { member } = req.params;
+    const member = nonBlankParam(req.params.member);
+    if (!member) {
+      res.status(400).json({ error: "Member address is required" });
+      return;
+    }
     try {
-      const [row] = await query(
+      const [row] = await query<ReputationRow>(
         `SELECT * FROM reputation WHERE member_address = $1`,
         [member],
       );
-      const contributions = await query(
+      const contributions = await query<ReputationContributionSummaryRow>(
         `SELECT c.circle_address, COUNT(*) as contributions,
                 ci.total_rounds
          FROM contributions c
@@ -214,15 +331,20 @@ export function createApp() {
          GROUP BY c.circle_address, ci.total_rounds`,
         [member],
       );
-      const defaults = await query(
+      const defaults = await query<ReputationDefaultSummaryRow>(
         `SELECT circle_address, COUNT(*) as count
          FROM defaults WHERE member_address = $1
          GROUP BY circle_address`,
         [member],
       );
 
+      // A missing reputation row is not an error — it just means this member
+      // has no recorded activity yet, so a fresh score of 0 is returned.
+      // `found` lets clients distinguish that from a member with a real,
+      // explicitly-tracked zero score.
       res.json({
         member,
+        found: row != null,
         score: row?.score ?? 0,
         contributions,
         defaults,
