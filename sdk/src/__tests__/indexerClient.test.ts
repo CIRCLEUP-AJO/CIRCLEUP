@@ -313,6 +313,61 @@ describe("IndexerClient.getReputation", () => {
   });
 });
 
+// ─── getMemberContributions ───────────────────────────────────────────────────
+
+describe("IndexerClient.getMemberContributions", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("returns contribution rows and pagination", async () => {
+    const payload = {
+      member: MEMBER_ADDR,
+      circle: null,
+      contributions: [
+        {
+          circle_address: CIRCLE_ADDR,
+          member_address: MEMBER_ADDR,
+          round_index: 1,
+          amount: "100000000",
+          tx_hash: "abc",
+          ledger: "123",
+          created_at: "2024-01-01T00:00:00Z",
+        },
+      ],
+      pagination: { page: 1, limit: 20, total: 1, totalPages: 1 },
+    };
+    vi.stubGlobal("fetch", mockOk(payload));
+
+    const result = await new IndexerClient(BASE_CONFIG).getMemberContributions(MEMBER_ADDR);
+
+    expect(result.member).toBe(MEMBER_ADDR);
+    expect(result.contributions).toHaveLength(1);
+    expect(result.contributions[0].round_index).toBe(1);
+    expect(result.pagination.total).toBe(1);
+  });
+
+  it("appends circle and pagination query params", async () => {
+    const mockFetch = mockOk({
+      member: MEMBER_ADDR,
+      circle: CIRCLE_ADDR,
+      contributions: [],
+      pagination: { page: 2, limit: 10, total: 0, totalPages: 0 },
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    await new IndexerClient(BASE_CONFIG).getMemberContributions(MEMBER_ADDR, {
+      circle: CIRCLE_ADDR,
+      page: 2,
+      limit: 10,
+    });
+
+    const calledUrl = mockFetch.mock.calls[0][0] as string;
+    expect(calledUrl).toContain(`/members/${MEMBER_ADDR}/contributions?`);
+    expect(calledUrl).toContain(`circle=${encodeURIComponent(CIRCLE_ADDR)}`);
+    expect(calledUrl).toContain("page=2");
+    expect(calledUrl).toContain("limit=10");
+  });
+});
+
 // ─── health ───────────────────────────────────────────────────────────────────
 
 describe("IndexerClient.health", () => {
