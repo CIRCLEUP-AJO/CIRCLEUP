@@ -8,9 +8,13 @@ import clsx from "clsx";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 //
-// All `any` usages have been replaced with explicit shapes. These are the
-// minimal contracts the indexer API returns; extend as the API evolves.
+// These shapes mirror the canonical API model types defined in
+// sdk/src/types.ts (ApiMemberRow, ApiRoundRow, ApiDefaultRecord, etc.).
+// They are re-declared here because the app package does not take a direct
+// dependency on @circleup/sdk; keep them in sync when the indexer schema
+// changes and update sdk/src/types.ts as the source of truth.
 
+/** @see ApiMemberRow in sdk/src/types.ts */
 export interface CircleMember {
   member_address: string;
   payout_order: number;
@@ -21,17 +25,20 @@ export interface CircleMember {
   total_contributions: number;
 }
 
+/** @see ApiContributionRecord in sdk/src/types.ts */
 export interface ContributionRecord {
   member_address: string;
   amount: string;
   tx_hash: string;
 }
 
+/** @see ApiDefaultRecord in sdk/src/types.ts */
 export interface DefaultRecord {
   member_address: string;
   penalty: string;
 }
 
+/** @see ApiRoundRow in sdk/src/types.ts */
 export interface CircleRound {
   roundIndex: number;
   recipient: string;
@@ -41,11 +48,15 @@ export interface CircleRound {
   defaults: DefaultRecord[];
 }
 
+/** Pending default — a DefaultRecord not yet associated with a payout round.
+ *  @see ApiDefaultRecord in sdk/src/types.ts */
 export interface CirclePendingDefault {
   member_address: string;
   penalty: string;
 }
 
+/** Subset of ApiCircleRow fields used by the detail view.
+ *  @see ApiCircleRow in sdk/src/types.ts */
 export interface CircleState {
   status: string;
   current_round: number;
@@ -56,6 +67,8 @@ export interface CircleState {
   deadline_ledger?: number | null;
 }
 
+/** Composite data object for the circle detail page.
+ *  @see ApiCircleDetailResponse + ApiRoundsResponse in sdk/src/types.ts */
 export interface CircleDetailData {
   circle: CircleState;
   members: CircleMember[];
@@ -76,6 +89,13 @@ interface Props {
 // typos from leaving the spinner stuck forever.
 
 type ActionKey = "join" | "contribute" | "payout" | "close";
+
+// ─── Success state shape ──────────────────────────────────────────────────────
+
+interface SuccessState {
+  message: string;
+  txHash?: string;
+}
 
 // ─── Round deadline countdown ─────────────────────────────────────────────────
 
@@ -308,15 +328,42 @@ function WorkflowBanner({
   return null;
 }
 
+// ─── Success state type ───────────────────────────────────────────────────────
+
+interface SuccessState {
+  message: string;
+  txHash: string;
+}
+
+// ─── getMemberContributionStatus ─────────────────────────────────────────────
+//
+// Determines whether a member has contributed, is pending, or has defaulted
+// for the current active round. Returns "not_applicable" for non-active
+// circles or for the recipient slot itself.
+
+function getMemberContributionStatus(
+  member: CircleMember,
+  currentRound: number,
+  status: string,
+): "contributed" | "pending" | "defaulted" | "not_applicable" {
+  if (status !== "Active") return "not_applicable";
+  // The recipient slot for this round is handled separately in the render
+  if (member.payout_order === currentRound) return "not_applicable";
+  // total_contributions is 0-indexed: if it's > currentRound the member has
+  // already contributed this round.
+  if (Number(member.total_contributions) > currentRound) return "contributed";
+  if (member.defaults > 0) return "defaulted";
+  return "pending";
+}
+
 // ─── Main client component ────────────────────────────────────────────────────
 
 export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  // null  → no action in flight
-  // ActionKey → that specific action is running
+  // null  → no action in flight; ActionKey → that specific action is running
   const [loading, setLoading] = useState<ActionKey | null>(null);
-  const [error,   setError]   = useState("");
-  const [success, setSuccess] = useState("");
+  const [error,   setError]   = useState<string>("");
+  const [success, setSuccess] = useState<SuccessState | null>(null);
   const [data,    setData]    = useState<CircleDetailData>(circleData);
   // Invite link URL — populated client-side to avoid SSR window access
   const [inviteUrl, setInviteUrl] = useState("");
@@ -358,7 +405,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     );
   }
 
-  async function doAction(action: string, args: xdr.ScVal[] = []) {
+  async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
@@ -368,7 +415,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
     setError("");
     setSuccess(null);
-    setRetryAction(null);
     setLoading(action);
     try {
       const result = await invokeContract(
@@ -378,21 +424,23 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         walletAddress,
       );
       if (!result.success) {
-        const errMsg = result.error || "Transaction failed";
-        setError(errMsg);
-        // Offer a retry button for transient failures
-        if (isRetryableError(errMsg)) {
-          setRetryAction(() => () => doAction(action, args));
-        }
+        setError(result.error || "Transaction failed");
       } else {
-        setSuccess(`${action} successful! Tx: ${shortAddress(result.txHash)}`);
-        // Refresh data after a successful action
-        const res = await fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
-          cache: "no-store",
+        setSuccess({
+          message: `${action} successful!`,
+          txHash: result.txHash,
         });
-        if (res.ok) {
-          const updated = (await res.json()) as Partial<CircleDetailData>;
-          setData((prev) => ({ ...prev, ...updated }));
+        // Refresh circle data after a successful action
+        try {
+          const res = await fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
+            cache: "no-store",
+          });
+          if (res.ok) {
+            const updated = (await res.json()) as Partial<CircleDetailData>;
+            setData((prev) => ({ ...prev, ...updated }));
+          }
+        } catch {
+          // Data refresh failure is non-fatal — the action already succeeded
         }
       }
     } catch (err: unknown) {
@@ -433,6 +481,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 mb-3"
           >
             {error}
+            {retryAction && (
+              <button
+                onClick={retryAction}
+                className="ml-3 underline font-medium hover:text-red-900"
+              >
+                Retry
+              </button>
+            )}
           </div>
         )}
 
@@ -700,6 +756,33 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       </div>
     </div>
   );
+}
+
+// ─── getMemberContributionStatus ─────────────────────────────────────────────
+//
+// Determines a member's contribution status for the current active round.
+//
+// Logic:
+//   - "not_applicable" → circle is not Active, or the member is the next payout
+//                         recipient (payout_order === current_round)
+//   - "contributed"    → member's total_contributions count is > current_round
+//                         index (they have already paid for this round)
+//   - "defaulted"      → member has at least one default and has NOT contributed
+//   - "pending"        → anything else (active round, no contribution yet)
+
+function getMemberContributionStatus(
+  member: CircleMember,
+  currentRound: number,
+  status: string,
+): "contributed" | "pending" | "defaulted" | "not_applicable" {
+  if (status !== "Active") return "not_applicable";
+  // The next payout recipient is index currentRound — they don't contribute
+  if (member.payout_order === currentRound) return "not_applicable";
+
+  const hasContributed = Number(member.total_contributions) > currentRound;
+  if (hasContributed) return "contributed";
+  if (member.defaults > 0) return "defaulted";
+  return "pending";
 }
 
 // ─── Contribution status badge ────────────────────────────────────────────────
