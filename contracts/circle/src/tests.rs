@@ -2,7 +2,10 @@
 
 #[cfg(test)]
 mod circle_tests {
-    use crate::{CircleContract, CircleContractClient, CircleStatus};
+    use crate::{
+        CircleContract, CircleContractClient, CircleStatus, MAX_ROUND_DEADLINE_LEDGERS,
+        MIN_ROUND_DEADLINE_LEDGERS,
+    };
     use reputation::{ReputationContract, ReputationContractClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -18,6 +21,8 @@ mod circle_tests {
         circle: CircleContractClient<'a>,
         circle_id: Address,
         token: TokenClient<'a>,
+        token_address: Address,
+        reputation_id: Address,
         #[allow(dead_code)]
         members: soroban_sdk::Vec<Address>,
         alice: Address,
@@ -76,6 +81,8 @@ mod circle_tests {
             circle,
             circle_id,
             token,
+            token_address: token_id.address(),
+            reputation_id: rep_id,
             members,
             alice,
             bob,
@@ -385,5 +392,200 @@ mod circle_tests {
 
         // Late contribution must be rejected even though payout has not run
         t.circle.contribute(&t.bob);
+    }
+
+    // ── Active transition / join gate tests ───────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "circle is not active")]
+    fn test_contribute_before_all_joined_panics() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+        // carol and dave have not joined — still Pending
+        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
+        t.circle.contribute(&t.alice);
+    }
+
+    #[test]
+    #[should_panic(expected = "circle not accepting members")]
+    fn test_join_after_active_panics() {
+        let t = setup_circle();
+        activate(&t);
+        assert_eq!(t.circle.get_status(), CircleStatus::Active);
+        // Status gate rejects further joins once Active (even for listed members)
+        t.circle.join(&t.alice);
+    }
+
+    #[test]
+    fn test_active_resets_round_deadline_from_activation() {
+        let t = setup_circle();
+
+        // Advance ledgers during the join window
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += 500;
+        });
+
+        let seq_before_last_join = t.env.ledger().sequence();
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+        t.circle.join(&t.carol);
+        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
+
+        t.circle.join(&t.dave);
+        assert_eq!(t.circle.get_status(), CircleStatus::Active);
+
+        let round = t.circle.get_current_round();
+        assert_eq!(
+            round.deadline_ledger,
+            seq_before_last_join as u64 + ROUND_DEADLINE as u64
+        );
+    }
+
+    // ── Cancel / Cancelled semantics tests ────────────────────────────────────
+
+    #[test]
+    fn test_cancel_pending_sets_cancelled() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_close_after_cancel_returns_joined_collateral() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+        t.circle.cancel(&t.carol);
+
+        let alice_before = t.token.balance(&t.alice);
+        let bob_before = t.token.balance(&t.bob);
+        t.circle.close();
+        assert_eq!(t.token.balance(&t.alice) - alice_before, ROUND_AMOUNT);
+        assert_eq!(t.token.balance(&t.bob) - bob_before, ROUND_AMOUNT);
+        assert_eq!(t.circle.get_collateral(&t.alice), 0);
+        assert_eq!(t.circle.get_collateral(&t.bob), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "can only cancel a pending circle")]
+    fn test_cancel_active_panics() {
+        let t = setup_circle();
+        activate(&t);
+        t.circle.cancel(&t.alice);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a circle member")]
+    fn test_cancel_by_non_member_panics() {
+        let t = setup_circle();
+        let outsider = Address::generate(&t.env);
+        t.circle.cancel(&outsider);
+    }
+
+    // ── round_deadline_ledgers bounds tests ───────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "round_deadline_ledgers below minimum")]
+    fn test_initialize_deadline_below_minimum_panics() {
+        let t = setup_circle();
+        let circle_id = t.env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&t.env, &circle_id);
+        circle.initialize(
+            &t.members,
+            &ROUND_AMOUNT,
+            &t.token_address,
+            &t.reputation_id,
+            &(MIN_ROUND_DEADLINE_LEDGERS - 1),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "round_deadline_ledgers above maximum")]
+    fn test_initialize_deadline_above_maximum_panics() {
+        let t = setup_circle();
+        let circle_id = t.env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&t.env, &circle_id);
+        circle.initialize(
+            &t.members,
+            &ROUND_AMOUNT,
+            &t.token_address,
+            &t.reputation_id,
+            &(MAX_ROUND_DEADLINE_LEDGERS + 1),
+        );
+    }
+
+    #[test]
+    fn test_initialize_deadline_at_bounds_succeeds() {
+        let t = setup_circle();
+
+        let circle_lo = t.env.register_contract(None, CircleContract);
+        let client_lo = CircleContractClient::new(&t.env, &circle_lo);
+        client_lo.initialize(
+            &t.members,
+            &ROUND_AMOUNT,
+            &t.token_address,
+            &t.reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert_eq!(
+            client_lo.get_config().round_deadline_ledgers,
+            MIN_ROUND_DEADLINE_LEDGERS
+        );
+
+        let circle_hi = t.env.register_contract(None, CircleContract);
+        let client_hi = CircleContractClient::new(&t.env, &circle_hi);
+        client_hi.initialize(
+            &t.members,
+            &ROUND_AMOUNT,
+            &t.token_address,
+            &t.reputation_id,
+            &MAX_ROUND_DEADLINE_LEDGERS,
+        );
+        assert_eq!(
+            client_hi.get_config().round_deadline_ledgers,
+            MAX_ROUND_DEADLINE_LEDGERS
+        );
+    }
+
+    // ── mark_default current-round-only tests ─────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "already marked default this round")]
+    fn test_mark_default_twice_same_round_panics() {
+        let t = setup_circle();
+        activate(&t);
+
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += ROUND_DEADLINE + 1;
+        });
+
+        t.circle.mark_default(&t.carol);
+        t.circle.mark_default(&t.carol); // second flag for same round must fail
+    }
+
+    #[test]
+    fn test_mark_default_only_penalizes_non_contributors() {
+        let t = setup_circle();
+        activate(&t);
+
+        t.circle.contribute(&t.alice);
+        t.circle.contribute(&t.bob);
+
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += ROUND_DEADLINE + 1;
+        });
+
+        // Alice contributed — cannot be flagged
+        // Carol did not — can be flagged
+        t.circle.mark_default(&t.carol);
+        assert_eq!(t.circle.get_defaults(&t.carol), 1);
+        assert_eq!(t.circle.get_defaults(&t.alice), 0);
+
+        let expected = ROUND_AMOUNT - (ROUND_AMOUNT * 2000 / 10000);
+        assert_eq!(t.circle.get_collateral(&t.carol), expected);
+        assert_eq!(t.circle.get_collateral(&t.alice), ROUND_AMOUNT);
     }
 }
