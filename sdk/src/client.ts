@@ -326,7 +326,9 @@ export class CircleClient extends CircleUpClient {
   }
 
   async close(caller: Keypair): Promise<TxResult> {
-    const result = await this.buildAndSend(caller, this.circleAddress, "close", []);
+    const result = await this.buildAndSend(caller, this.circleAddress, "close", [
+      new Address(caller.publicKey()).toScVal(),
+    ]);
     if (result.success) this.invalidateCache();
     return result;
   }
