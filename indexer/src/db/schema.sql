@@ -99,6 +99,10 @@ CREATE INDEX IF NOT EXISTS idx_contributions_member ON contributions(member_addr
 CREATE INDEX IF NOT EXISTS idx_payouts_recipient ON payouts(recipient);
 CREATE INDEX IF NOT EXISTS idx_defaults_member ON defaults(member_address);
 
+-- Supports the GROUP BY event_type aggregate used by the indexer state audit
+-- query (GET /indexer/state in api.ts).
+CREATE INDEX IF NOT EXISTS idx_ingested_events_event_type ON ingested_events(event_type);
+
 -- circles.created_ledger: GET /circles orders the full circle list by this
 -- column (see api.ts). circle_members(circle_address, payout_order) and
 -- contributions/defaults(circle_address, ...) support the circle-detail

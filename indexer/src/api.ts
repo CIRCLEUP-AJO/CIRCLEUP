@@ -7,6 +7,7 @@
  * GET /circles/:address/members        → members with contribution status
  * GET /circles/:address/rounds         → all rounds (payouts + defaults)
  * GET /reputation/:member              → member reputation score
+ * GET /indexer/state                   → indexer audit: last ledger + event counts
  * GET /health                          → health check (db + RPC status)
  */
 
@@ -15,6 +16,81 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
 import { rpc, USDC } from "./indexer";
+
+// ── CORS ─────────────────────────────────────────────────────────────────────
+//
+// ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
+// "https://app.circleup.xyz,https://staging.circleup.xyz". If unset, every
+// origin is allowed (useful for local dev) but a warning is logged so this
+// isn't mistaken for a deliberate production setting.
+function parseAllowedOrigins(raw: string | undefined): string[] {
+  return (raw || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+export function buildCorsOptions(
+  allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS),
+): cors.CorsOptions {
+  if (allowedOrigins.length === 0) {
+    console.warn(
+      "[api] ALLOWED_ORIGINS is not set — allowing all origins. " +
+        "Set ALLOWED_ORIGINS to a comma-separated list in production.",
+    );
+    return { origin: true };
+  }
+
+  return {
+    origin(origin, callback) {
+      // requests with no Origin header (curl, server-to-server, health checks)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error(`Origin ${origin} is not allowed`));
+    },
+  };
+}
+
+// ── Rate limiting ────────────────────────────────────────────────────────────
+//
+// Applies to every route including /health. Defaults to 100 requests per
+// minute per IP; both are configurable so ops can tune per-deployment without
+// a code change.
+const RATE_LIMIT_WINDOW_MS = parseInt(
+  process.env.RATE_LIMIT_WINDOW_MS || "60000",
+  10,
+);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
+
+const apiRateLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  limit: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later" },
+});
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  return "Unknown error";
+}
+
+function sendError(
+  res: Response,
+  status: number,
+  message: string,
+  details?: unknown,
+) {
+  res.status(status).json({
+    error: {
+      message,
+      details: details ?? null,
+    },
+  });
+}
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 20;
@@ -155,6 +231,14 @@ function parseStatus(value: unknown): ParseResult<CircleStatus | undefined> {
   return { error: `status must be one of: ${CIRCLE_STATUSES.join(", ")}` };
 }
 
+function parseCircleFilter(value: unknown): ParseResult<string | undefined> {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.trim() === "") {
+    return { error: "circle must be a non-empty string" };
+  }
+  return value.trim();
+}
+
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
@@ -212,6 +296,12 @@ interface CircleMemberWithContributionsRow extends CircleMemberRow {
   total_contributions: string;
 }
 
+interface CircleMemberTotalsRow {
+  member_count: string;
+  total_collateral: string;
+  total_contributions: string;
+}
+
 interface ContributionRow {
   circle_address: string;
   member_address: string;
@@ -261,6 +351,16 @@ interface ReputationDefaultSummaryRow {
 
 interface IndexerStateRow {
   last_ledger: string;
+}
+
+interface IndexerStateAuditRow {
+  last_ledger: string;
+  updated_at: string;
+}
+
+interface EventTypeCountRow {
+  event_type: string | null;
+  count: string;
 }
 
 /** Returns a trimmed, non-empty version of a route param, or null if it's missing/blank. */
@@ -338,35 +438,36 @@ export function createApp() {
     const whereParams = status ? [status] : [];
 
     try {
-      const [{ count }] = await query<{ count: string }>(
-        `SELECT COUNT(*) as count FROM circles c ${whereClause}`,
-        whereParams,
-      );
-      const total = Number(count);
-
-      const circles = await query<
-        Pick<
-          CircleRow,
-          | "address"
-          | "creator"
-          | "round_amount"
-          | "member_count"
-          | "status"
-          | "current_round"
-          | "total_rounds"
-          | "created_ledger"
-          | "updated_at"
-        >
-      >(
-        `SELECT c.address, c.creator, c.round_amount, c.member_count,
-                c.status, c.current_round, c.total_rounds, c.created_ledger,
-                c.updated_at
-         FROM circles c
-         ${whereClause}
-         ORDER BY c.${sort} ${order.toUpperCase()}
-         LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
-        [...whereParams, limit, offset],
-      );
+      const [circles, [countRow]] = await Promise.all([
+        query<
+          Pick<
+            CircleRow,
+            | "address"
+            | "creator"
+            | "round_amount"
+            | "member_count"
+            | "status"
+            | "current_round"
+            | "total_rounds"
+            | "created_ledger"
+            | "updated_at"
+          >
+        >(
+          `SELECT c.address, c.creator, c.round_amount, c.member_count,
+                  c.status, c.current_round, c.total_rounds, c.created_ledger,
+                  c.updated_at
+           FROM circles c
+           ${whereClause}
+           ORDER BY c.${sort} ${order.toUpperCase()}
+           LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
+          [...whereParams, limit, offset],
+        ),
+        query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM circles c ${whereClause}`,
+          whereParams,
+        ),
+      ]);
+      const total = Number(countRow.count);
 
       res.json({
         circles,
@@ -492,22 +593,49 @@ export function createApp() {
         return;
       }
 
-      const members = await query<CircleMemberWithContributionsRow>(
-        `SELECT cm.member_address, cm.payout_order, cm.collateral,
-                cm.defaults, cm.joined_at,
-                r.score as reputation_score,
-                (
-                  SELECT COUNT(*) FROM contributions c2
-                  WHERE c2.circle_address = cm.circle_address
-                    AND c2.member_address = cm.member_address
-                ) as total_contributions
-         FROM circle_members cm
-         LEFT JOIN reputation r ON r.member_address = cm.member_address
-         WHERE cm.circle_address = $1
-         ORDER BY cm.payout_order`,
-        [address],
-      );
-      res.json({ members });
+      const [members, [totals]] = await Promise.all([
+        query<CircleMemberWithContributionsRow>(
+          `SELECT cm.member_address, cm.payout_order, cm.collateral,
+                  cm.defaults, cm.joined_at,
+                  r.score as reputation_score,
+                  (
+                    SELECT COUNT(*) FROM contributions c2
+                    WHERE c2.circle_address = cm.circle_address
+                      AND c2.member_address = cm.member_address
+                  ) as total_contributions
+           FROM circle_members cm
+           LEFT JOIN reputation r ON r.member_address = cm.member_address
+           WHERE cm.circle_address = $1
+           ORDER BY cm.payout_order`,
+          [address],
+        ),
+        // COALESCE guards SUM/COUNT-derived totals against NULL, which
+        // Postgres returns for aggregates over zero rows (e.g. a circle with
+        // no members yet, or no contributions recorded) — without it, a
+        // freshly created circle would report total_collateral: null instead
+        // of "0", inconsistent with member_count: 0.
+        query<CircleMemberTotalsRow>(
+          `SELECT
+             COUNT(cm.*) as member_count,
+             COALESCE(SUM(cm.collateral), 0) as total_collateral,
+             COALESCE(
+               (SELECT COUNT(*) FROM contributions c WHERE c.circle_address = $1),
+               0
+             ) as total_contributions
+           FROM circle_members cm
+           WHERE cm.circle_address = $1`,
+          [address],
+        ),
+      ]);
+
+      res.json({
+        members,
+        totals: {
+          memberCount: Number(totals.member_count),
+          totalCollateral: totals.total_collateral,
+          totalContributions: Number(totals.total_contributions),
+        },
+      });
     } catch (err) {
       console.error(`[api] Failed to load members for circle ${address}`, err);
       sendError(res, 500, "Failed to load circle members", getErrorMessage(err));
@@ -521,8 +649,10 @@ export function createApp() {
       return;
     }
     try {
-      const [circle] = await query<Pick<CircleRow, "address">>(
-        `SELECT address FROM circles WHERE address = $1`,
+      const [circle] = await query<
+        Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status">
+      >(
+        `SELECT address, current_round, total_rounds, status FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
@@ -546,6 +676,7 @@ export function createApp() {
       // Group contributions and defaults by round
       const rounds = payouts.map((p) => ({
         roundIndex: p.round_index,
+        status: "completed" as const,
         recipient: p.recipient,
         amount: p.amount,
         txHash: p.tx_hash,
@@ -556,9 +687,41 @@ export function createApp() {
         defaults: defaults.filter((d) => d.round_index === p.round_index),
       }));
 
-      res.json({ rounds, pendingDefaults: defaults.filter(
-        (d) => !payouts.find((p) => p.round_index === d.round_index)
-      )});
+      // The round in progress has no payout yet, so it isn't in `rounds`
+      // above — surface it separately (status "current" while the circle is
+      // still Active, "cancelled" if it was cut short) rather than mixing an
+      // incomplete entry into the completed-rounds list.
+      const currentRoundHasPayout = payouts.some(
+        (p) => p.round_index === circle.current_round,
+      );
+      const currentRound =
+        !currentRoundHasPayout &&
+        (circle.status === "Active" || circle.status === "Cancelled")
+          ? {
+              roundIndex: circle.current_round,
+              status: circle.status === "Cancelled"
+                ? ("cancelled" as const)
+                : ("current" as const),
+              recipient: null,
+              amount: null,
+              txHash: null,
+              ledger: null,
+              contributions: contributions.filter(
+                (c) => c.round_index === circle.current_round,
+              ),
+              defaults: defaults.filter(
+                (d) => d.round_index === circle.current_round,
+              ),
+            }
+          : null;
+
+      res.json({
+        rounds,
+        currentRound,
+        pendingDefaults: defaults.filter(
+          (d) => !payouts.find((p) => p.round_index === d.round_index),
+        ),
+      });
     } catch (err) {
       console.error(`[api] Failed to load rounds for circle ${address}`, err);
       sendError(res, 500, "Failed to load circle rounds", getErrorMessage(err));
@@ -573,6 +736,17 @@ export function createApp() {
       res.status(400).json({ error: "Member address is required" });
       return;
     }
+
+    // Optional ?circle=<address> narrows the contributions/defaults
+    // breakdown to a single circle, e.g. for a member-in-circle detail view
+    // instead of the member's activity across every circle they've joined.
+    const circleResult = parseCircleFilter(req.query.circle);
+    if (isParseError(circleResult)) {
+      res.status(400).json({ error: circleResult.error });
+      return;
+    }
+    const circleFilter = circleResult;
+
     try {
       const [row] = await query<ReputationRow>(
         `SELECT * FROM reputation WHERE member_address = $1`,
@@ -584,14 +758,16 @@ export function createApp() {
          FROM contributions c
          JOIN circles ci ON ci.address = c.circle_address
          WHERE c.member_address = $1
+         ${circleFilter ? "AND c.circle_address = $2" : ""}
          GROUP BY c.circle_address, ci.total_rounds`,
-        [member],
+        circleFilter ? [member, circleFilter] : [member],
       );
       const defaults = await query<ReputationDefaultSummaryRow>(
         `SELECT circle_address, COUNT(*) as count
          FROM defaults WHERE member_address = $1
+         ${circleFilter ? "AND circle_address = $2" : ""}
          GROUP BY circle_address`,
-        [member],
+        circleFilter ? [member, circleFilter] : [member],
       );
 
       // A missing reputation row is not an error — it just means this member
@@ -609,6 +785,48 @@ export function createApp() {
     } catch (err) {
       console.error(`[api] Failed to load reputation for member ${member}`, err);
       sendError(res, 500, "Failed to load reputation", getErrorMessage(err));
+    }
+  });
+
+  // ── Indexer ──────────────────────────────────────────────────────────────────
+
+  // Audit endpoint for ops/monitoring: reports how far the indexer has
+  // progressed and how many events it has ingested per type, independent of
+  // /health (which only checks connectivity, not indexing progress).
+  app.get("/indexer/state", async (_req: Request, res: Response) => {
+    try {
+      const [stateRows, eventCountRows] = await Promise.all([
+        query<IndexerStateAuditRow>(
+          `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
+        ),
+        query<EventTypeCountRow>(
+          `SELECT event_type, COUNT(*) as count FROM ingested_events GROUP BY event_type`,
+        ),
+      ]);
+
+      const [state] = stateRows;
+      if (!state) {
+        sendError(res, 500, "Indexer state has not been initialized");
+        return;
+      }
+
+      const eventCounts: Record<string, number> = {};
+      let totalEvents = 0;
+      for (const row of eventCountRows) {
+        const count = Number(row.count);
+        totalEvents += count;
+        eventCounts[row.event_type ?? "unknown"] = count;
+      }
+
+      res.json({
+        lastLedger: Number(state.last_ledger),
+        updatedAt: state.updated_at,
+        totalEvents,
+        eventCounts,
+      });
+    } catch (err) {
+      console.error("[api] Failed to load indexer state", err);
+      sendError(res, 500, "Failed to load indexer state", getErrorMessage(err));
     }
   });
 

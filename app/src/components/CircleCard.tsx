@@ -116,8 +116,13 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
 
   // Human-readable label used both by the aria-label on the link and the
   // screen-reader-only heading inside the card, so assistive technology
-  // announces the card's purpose unambiguously.
-  const cardLabel = `Circle ${shortAddress(circle.address)} — $${safeFormatUsdc(circle.round_amount)} per round, ${status.label}`;
+  // announces the card's purpose unambiguously. Round progress is only
+  // included when total_rounds is valid — a malformed row must not produce
+  // "round 0 of 0" in the announcement.
+  const cardLabel =
+    `Circle ${shortAddress(circle.address)} — $${safeFormatUsdc(circle.round_amount)} per round, ` +
+    `${status.label}` +
+    (totalRounds > 0 ? `, round ${currentRound} of ${totalRounds}` : "");
 
   return (
     <Link
@@ -137,18 +142,22 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
               ${safeFormatUsdc(circle.round_amount)} / round
             </p>
           </div>
+          {/* `title` supplies the sighted tooltip, but it also wins the
+              accessible-name computation, which would make the chip announce
+              only its description ("Rounds in progress") and drop the status
+              itself. An explicit aria-label keeps both, in a fixed order. */}
           <span
             className={clsx(
               "inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium px-2 py-1 rounded-full",
               status.chipClasses,
             )}
             title={status.description}
+            aria-label={`Status: ${status.label}. ${status.description}`}
           >
             <span
               className={clsx("h-1.5 w-1.5 rounded-full", status.dotClasses)}
               aria-hidden="true"
             />
-            <span className="sr-only">Status: </span>
             {status.label}
           </span>
         </div>
@@ -160,10 +169,21 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
             <p className="text-slate-500">members</p>
           </div>
           <div className="bg-slate-50 rounded-lg py-2">
+            {/* "2/10" is announced as "two slash ten" — replace it with a
+                spoken-friendly equivalent for assistive technology. */}
             <p className="font-semibold text-slate-800">
-              {currentRound}/{totalRounds}
+              <span aria-hidden="true">
+                {currentRound}/{totalRounds}
+              </span>
+              <span className="sr-only">
+                {totalRounds > 0
+                  ? `Round ${currentRound} of ${totalRounds}`
+                  : "Rounds not yet set"}
+              </span>
             </p>
-            <p className="text-slate-500">rounds</p>
+            <p className="text-slate-500" aria-hidden="true">
+              rounds
+            </p>
           </div>
           <div className="bg-slate-50 rounded-lg py-2">
             {/* safeFormatPot → pot = round_amount × member_count, 2 dp */}
