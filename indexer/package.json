@@ -11,7 +11,7 @@
     "migrate:dev": "ts-node src/db/migrate.ts",
     "migrate:status": "ts-node src/db/migrate.ts --status",
     "explain": "ts-node src/db/explain.ts",
-    "test": "node --require ts-node/register --test src/indexer.test.ts src/api.test.ts src/db/migrate.test.ts"
+    "test": "node --require ts-node/register --test src/indexer.test.ts src/api.test.ts src/config.test.ts src/db/migrate.test.ts src/db/pool.test.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^12.3.0",
