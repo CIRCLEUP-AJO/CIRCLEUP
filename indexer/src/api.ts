@@ -11,6 +11,7 @@
 
 import express, { Request, Response } from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
 
 interface CircleRow {
@@ -99,8 +100,22 @@ function nonBlankParam(value: string | undefined): string | null {
 
 export function createApp() {
   const app = express();
-  app.use(cors());
+  app.use(cors(buildCorsOptions()));
+  app.use(apiRateLimiter);
   app.use(express.json());
+
+  // cors() calls next(err) for rejected origins instead of sending a response
+  // itself — without this handler, Express's default error page would leak a
+  // stack trace instead of a clean 403.
+  app.use(
+    (err: Error, _req: Request, res: Response, next: express.NextFunction) => {
+      if (err.message.startsWith("Origin ")) {
+        res.status(403).json({ error: err.message });
+        return;
+      }
+      next(err);
+    },
+  );
 
   // ── Health ───────────────────────────────────────────────────────────────────
 
