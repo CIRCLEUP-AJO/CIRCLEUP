@@ -11,12 +11,82 @@
 
 import express, { Request, Response } from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
+
+// ── CORS ─────────────────────────────────────────────────────────────────────
+//
+// ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
+// "https://app.circleup.xyz,https://staging.circleup.xyz". If unset, every
+// origin is allowed (useful for local dev) but a warning is logged so this
+// isn't mistaken for a deliberate production setting.
+function parseAllowedOrigins(raw: string | undefined): string[] {
+  return (raw || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+export function buildCorsOptions(
+  allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS),
+): cors.CorsOptions {
+  if (allowedOrigins.length === 0) {
+    console.warn(
+      "[api] ALLOWED_ORIGINS is not set — allowing all origins. " +
+        "Set ALLOWED_ORIGINS to a comma-separated list in production.",
+    );
+    return { origin: true };
+  }
+
+  return {
+    origin(origin, callback) {
+      // requests with no Origin header (curl, server-to-server, health checks)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error(`Origin ${origin} is not allowed`));
+    },
+  };
+}
+
+// ── Rate limiting ────────────────────────────────────────────────────────────
+//
+// Applies to every route including /health. Defaults to 100 requests per
+// minute per IP; both are configurable so ops can tune per-deployment without
+// a code change.
+const RATE_LIMIT_WINDOW_MS = parseInt(
+  process.env.RATE_LIMIT_WINDOW_MS || "60000",
+  10,
+);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
+
+const apiRateLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  limit: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later" },
+});
 
 export function createApp() {
   const app = express();
-  app.use(cors());
+  app.use(cors(buildCorsOptions()));
+  app.use(apiRateLimiter);
   app.use(express.json());
+
+  // cors() calls next(err) for rejected origins instead of sending a response
+  // itself — without this handler, Express's default error page would leak a
+  // stack trace instead of a clean 403.
+  app.use(
+    (err: Error, _req: Request, res: Response, next: express.NextFunction) => {
+      if (err.message.startsWith("Origin ")) {
+        res.status(403).json({ error: err.message });
+        return;
+      }
+      next(err);
+    },
+  );
 
   // ── Health ───────────────────────────────────────────────────────────────────
 
