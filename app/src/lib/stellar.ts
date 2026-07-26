@@ -63,11 +63,13 @@ export function isFreighterInstalled(): boolean {
  *  - `permission_denied` → user dismissed the access prompt
  */
 export async function getWalletAddress(): Promise<string | null> {
+  if (!isFreighterInstalled()) {
+    throw new WalletError(
+      "not_installed",
+      "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
+    );
+  }
   try {
-    if (!isFreighterInstalled()) {
-      // Extension is absent — not an error worth throwing here, just not connected
-      return null;
-    }
     const connected = await isConnected();
     if (!connected) return null;
     const pk = await getPublicKey();
@@ -152,6 +154,14 @@ export function formatContractError(raw: string | undefined): string {
   if (!raw) return "Transaction failed for an unknown reason.";
 
   const lower = raw.toLowerCase();
+
+  if (lower === "transaction failed") {
+    return (
+      "The transaction was rejected on-chain. This may be due to a contract rule violation, " +
+      "insufficient balance, or an expired transaction. " +
+      "Check Stellar Expert for the full error detail."
+    );
+  }
 
   if (lower === "timeout") {
     return (
