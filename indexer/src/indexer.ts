@@ -24,7 +24,7 @@ dotenv.config();
 const POLL_INTERVAL_MS = 5_000;
 const EVENTS_LIMIT = 100;
 
-const rpc = new SorobanRpc.Server(process.env.STELLAR_RPC_URL!, {
+export const rpc = new SorobanRpc.Server(process.env.STELLAR_RPC_URL!, {
   allowHttp: true,
 });
 
