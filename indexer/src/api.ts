@@ -15,7 +15,7 @@ import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
-import { rpc } from "./indexer";
+import { rpc, USDC } from "./indexer";
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
@@ -109,6 +109,75 @@ const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const
 type CircleStatus = (typeof CIRCLE_STATUSES)[number];
 
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+
+// ── CORS ─────────────────────────────────────────────────────────────────────
+//
+// ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
+// "https://app.circleup.xyz,https://staging.circleup.xyz". If unset, every
+// origin is allowed (useful for local dev) but a warning is logged so this
+// isn't mistaken for a deliberate production setting.
+function parseAllowedOrigins(raw: string | undefined): string[] {
+  return (raw || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+export function buildCorsOptions(
+  allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS),
+): cors.CorsOptions {
+  if (allowedOrigins.length === 0) {
+    console.warn(
+      "[api] ALLOWED_ORIGINS is not set — allowing all origins. " +
+        "Set ALLOWED_ORIGINS to a comma-separated list in production.",
+    );
+    return { origin: true };
+  }
+
+  return {
+    origin(origin, callback) {
+      // requests with no Origin header (curl, server-to-server, health checks)
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error(`Origin ${origin} not allowed by CORS`));
+    },
+  };
+}
+
+// ── Rate limiting ────────────────────────────────────────────────────────────
+
+const RATE_LIMIT_WINDOW_MS = parseInt(
+  process.env.RATE_LIMIT_WINDOW_MS || "60000",
+  10,
+);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
+
+const apiRateLimiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  limit: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later" },
+});
+
+// ── Error helpers ────────────────────────────────────────────────────────────
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  return "Unknown error";
+}
+
+function sendError(res: Response, status: number, message: string, details?: unknown) {
+  res.status(status).json({
+    error: {
+      message,
+      details: details ?? null,
+    },
+  });
+}
 
 type ParseResult<T> = T | { error: string };
 
@@ -333,6 +402,10 @@ export function createApp() {
       timestamp: new Date().toISOString(),
       db,
       rpc: rpcHealth,
+      // Surfaces the configured USDC token address so operators can confirm
+      // the indexer and app (NEXT_PUBLIC_USDC_ADDRESS) are tracking the same
+      // token without cross-referencing separate .env files.
+      config: { usdcAddress: USDC },
     });
   });
 
