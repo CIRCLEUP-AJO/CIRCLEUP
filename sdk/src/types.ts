@@ -16,6 +16,79 @@ export interface CircleUpConfig {
   };
 }
 
+// ─── Config validation ────────────────────────────────────────────────────────
+
+/** Regex for a Stellar/Soroban contract address: starts with C, 56 chars total. */
+const CONTRACT_ADDRESS_RE = /^C[A-Z2-7]{55}$/;
+
+/** Returns true when `addr` looks like a valid Soroban contract address. */
+export function isValidContractAddress(addr: string): boolean {
+  return CONTRACT_ADDRESS_RE.test(addr);
+}
+
+/**
+ * Validate a `CircleUpConfig` object and throw a descriptive `Error` listing
+ * every problem found.  Called automatically by `CircleUpClient` in its
+ * constructor so misconfiguration surfaces immediately instead of producing
+ * a cryptic RPC error on the first call.
+ *
+ * @throws `Error` with a human-readable summary of all validation failures.
+ */
+export function validateCircleUpConfig(config: unknown): asserts config is CircleUpConfig {
+  const errors: string[] = [];
+
+  if (!config || typeof config !== "object") {
+    throw new Error("CircleUpConfig must be a non-null object.");
+  }
+
+  const cfg = config as Record<string, unknown>;
+
+  // rpcUrl
+  if (!cfg.rpcUrl || typeof cfg.rpcUrl !== "string") {
+    errors.push('config.rpcUrl is required and must be a string (e.g. "https://soroban-testnet.stellar.org").');
+  } else if (!/^https?:\/\/.+/.test(cfg.rpcUrl)) {
+    errors.push(`config.rpcUrl "${cfg.rpcUrl}" does not look like a valid URL.`);
+  }
+
+  // networkPassphrase
+  const validPassphrases: NetworkPassphrase[] = [
+    "Test SDF Network ; September 2015",
+    "Public Global Stellar Network ; September 2015",
+  ];
+  if (!cfg.networkPassphrase || typeof cfg.networkPassphrase !== "string") {
+    errors.push("config.networkPassphrase is required. Use TESTNET_PASSPHRASE or MAINNET_PASSPHRASE from @circleup/sdk.");
+  } else if (!validPassphrases.includes(cfg.networkPassphrase as NetworkPassphrase)) {
+    errors.push(
+      `config.networkPassphrase "${cfg.networkPassphrase}" is not recognised. ` +
+        `Expected one of: ${validPassphrases.map((p) => `"${p}"`).join(", ")}.`,
+    );
+  }
+
+  // contracts block
+  if (!cfg.contracts || typeof cfg.contracts !== "object") {
+    errors.push("config.contracts is required and must be an object with circleFactory, reputation, and usdc addresses.");
+  } else {
+    const contracts = cfg.contracts as Record<string, unknown>;
+    for (const key of ["circleFactory", "reputation", "usdc"] as const) {
+      const addr = contracts[key];
+      if (!addr || typeof addr !== "string") {
+        errors.push(`config.contracts.${key} is required.`);
+      } else if (!isValidContractAddress(addr)) {
+        errors.push(
+          `config.contracts.${key} "${addr}" does not look like a valid Soroban contract address ` +
+            `(expected a 56-character string starting with "C").`,
+        );
+      }
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(
+      `Invalid CircleUpConfig:\n${errors.map((e) => `  • ${e}`).join("\n")}`,
+    );
+  }
+}
+
 // ── Circle state types (mirrors contract structs) ─────────────────────────────
 
 export type CircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
