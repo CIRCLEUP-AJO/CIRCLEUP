@@ -787,12 +787,23 @@ export function createApp() {
       // has no recorded activity yet, so a fresh score of 0 is returned.
       // `found` lets clients distinguish that from a member with a real,
       // explicitly-tracked zero score.
+      //
+      // COUNT(*) in PostgreSQL always comes back as a string over the wire;
+      // cast to number here so the JSON response shape matches the declared
+      // ApiReputationResponse type in sdk/src/types.ts.
       res.json({
         member,
         found: row != null,
         score: row?.score ?? 0,
-        contributions,
-        defaults,
+        contributions: contributions.map((c) => ({
+          circle_address: c.circle_address,
+          contributions: Number(c.contributions),
+          total_rounds: Number(c.total_rounds),
+        })),
+        defaults: defaults.map((d) => ({
+          circle_address: d.circle_address,
+          count: Number(d.count),
+        })),
         updatedAt: row?.updated_at ?? null,
       });
     } catch (err) {
