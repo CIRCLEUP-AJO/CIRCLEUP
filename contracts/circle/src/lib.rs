@@ -138,14 +138,19 @@ impl CircleContract {
             panic!("not a circle member");
         }
 
-        let existing: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Collateral(member.clone()))
-            .unwrap_or(0);
-        if existing > 0 {
+        // Use `has` (not collateral > 0) so a member whose balance was later
+        // reduced to 0 (penalties / release) cannot join again and transfer
+        // a second collateral deposit. Reserve the slot *before* the token
+        // transfer (checks-effects-interactions) so a reentrant join during
+        // transfer cannot double-pull funds.
+        let collateral_key = DataKey::Collateral(member.clone());
+        if env.storage().persistent().has(&collateral_key) {
             panic!("already joined");
         }
+
+        env.storage()
+            .persistent()
+            .set(&collateral_key, &config.round_amount);
 
         // Transfer collateral from member to this contract
         let token_client = token::Client::new(&env, &config.usdc_token);
@@ -155,17 +160,11 @@ impl CircleContract {
             &config.round_amount,
         );
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Collateral(member.clone()), &config.round_amount);
-
         // If every member has joined → activate the circle
         let all_joined = config.members.iter().all(|m| {
             env.storage()
                 .persistent()
-                .get::<DataKey, i128>(&DataKey::Collateral(m))
-                .unwrap_or(0)
-                > 0
+                .has(&DataKey::Collateral(m))
         });
 
         if all_joined {
@@ -200,8 +199,12 @@ impl CircleContract {
             panic!("round already paid out");
         }
 
-        if env.ledger().sequence() as u64 > round.deadline_ledger {
-            panic!("round deadline passed");
+        // Reject late contributions even when payout has not run yet (e.g. the
+        // pot is incomplete and callers are waiting on mark_default / payout).
+        // Must stay consistent with mark_default, which becomes available once
+        // sequence > deadline_ledger.
+        if (env.ledger().sequence() as u64) > round.deadline_ledger {
+            panic!("round deadline passed; cannot contribute before payout");
         }
 
         if !config.members.contains(&member) {
@@ -368,8 +371,11 @@ impl CircleContract {
     // ── Close ─────────────────────────────────────────────────────────────────
 
     /// Release remaining collateral back to all members.
-    /// Only callable when the circle is Completed or Cancelled.
-    pub fn close(env: Env) {
+    /// Only callable when the circle is Completed or Cancelled, and only by an
+    /// authorized circle member (`closer.require_auth()` + membership check).
+    pub fn close(env: Env, closer: Address) {
+        closer.require_auth();
+
         let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
         let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
 
@@ -377,7 +383,12 @@ impl CircleContract {
             panic!("circle still active");
         }
 
+        if !config.members.contains(&closer) {
+            panic!("not authorized to close: caller is not a circle member");
+        }
+
         let token_client = token::Client::new(&env, &config.usdc_token);
+        let mut total_released: i128 = 0;
 
         for member in config.members.iter() {
             let collateral: i128 = env
@@ -395,11 +406,23 @@ impl CircleContract {
                 env.storage()
                     .persistent()
                     .set(&DataKey::Collateral(member.clone()), &0i128);
+                total_released += collateral;
+
+                // Per-member audit trail for indexers / off-chain reconciler
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "circle"),
+                        Symbol::new(&env, "collateral_released"),
+                    ),
+                    (member.clone(), collateral),
+                );
             }
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "closed")), ());
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
+            (closer, total_released),
+        );
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────

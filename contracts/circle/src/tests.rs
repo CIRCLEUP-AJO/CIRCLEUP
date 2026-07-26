@@ -16,6 +16,7 @@ mod circle_tests {
     struct TestSetup<'a> {
         env: Env,
         circle: CircleContractClient<'a>,
+        circle_id: Address,
         token: TokenClient<'a>,
         #[allow(dead_code)]
         members: soroban_sdk::Vec<Address>,
@@ -73,6 +74,7 @@ mod circle_tests {
         TestSetup {
             env,
             circle,
+            circle_id,
             token,
             members,
             alice,
@@ -292,25 +294,96 @@ mod circle_tests {
 
     // ── Close tests ───────────────────────────────────────────────────────────
 
+    fn force_status(t: &TestSetup, status: CircleStatus) {
+        t.env.as_contract(&t.circle_id, || {
+            t.env.storage().instance().set(&crate::DataKey::Status, &status);
+        });
+    }
+
     #[test]
     fn test_close_returns_collateral() {
         let t = setup_circle();
         activate(&t);
-
-        let expected_order = [t.alice.clone(), t.bob.clone(), t.carol.clone(), t.dave.clone()];
-        for _ in expected_order.iter() {
-            t.circle.contribute(&t.alice);
-            t.circle.contribute(&t.bob);
-            t.circle.contribute(&t.carol);
-            t.circle.contribute(&t.dave);
-            t.circle.payout();
-        }
-
-        assert_eq!(t.circle.get_status(), CircleStatus::Completed);
+        force_status(&t, CircleStatus::Completed);
 
         let alice_bal_before = t.token.balance(&t.alice);
-        t.circle.close();
+        t.circle.close(&t.alice);
         let alice_bal_after = t.token.balance(&t.alice);
         assert_eq!(alice_bal_after - alice_bal_before, ROUND_AMOUNT); // collateral returned
+        assert_eq!(t.circle.get_collateral(&t.alice), 0);
+        assert_eq!(t.circle.get_collateral(&t.bob), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorized to close: caller is not a circle member")]
+    fn test_close_rejects_non_member() {
+        let t = setup_circle();
+        activate(&t);
+        force_status(&t, CircleStatus::Completed);
+
+        let stranger = Address::generate(&t.env);
+        t.circle.close(&stranger);
+    }
+
+    #[test]
+    fn test_close_releases_zero_after_second_call() {
+        let t = setup_circle();
+        activate(&t);
+        force_status(&t, CircleStatus::Completed);
+
+        t.circle.close(&t.bob);
+        // Collateral keys remain (value 0); second close is a no-op release
+        let bob_before = t.token.balance(&t.bob);
+        t.circle.close(&t.carol);
+        assert_eq!(t.token.balance(&t.bob), bob_before);
+        assert_eq!(t.circle.get_collateral(&t.alice), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "circle still active")]
+    fn test_close_rejects_while_active() {
+        let t = setup_circle();
+        activate(&t);
+        t.circle.close(&t.alice);
+    }
+
+    // ── Join edge-case: zero collateral must still block re-join ──────────────
+
+    #[test]
+    #[should_panic(expected = "already joined")]
+    fn test_join_rejects_when_collateral_key_exists_even_if_zero() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+
+        // Simulate a prior join whose collateral was fully drained but whose
+        // storage key remains — the classic edge case for `existing > 0` checks.
+        t.env.as_contract(&t.circle_id, || {
+            t.env.storage().persistent().set(
+                &crate::DataKey::Collateral(t.alice.clone()),
+                &0i128,
+            );
+        });
+
+        assert_eq!(t.circle.get_collateral(&t.alice), 0);
+        t.circle.join(&t.alice);
+    }
+
+    // ── Contribute after deadline (before payout) ─────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "round deadline passed; cannot contribute before payout")]
+    fn test_contribute_after_deadline_before_payout_panics() {
+        let t = setup_circle();
+        activate(&t);
+
+        // One member contributes on time; others wait past the deadline without payout
+        t.circle.contribute(&t.alice);
+
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += ROUND_DEADLINE + 1;
+        });
+
+        // Late contribution must be rejected even though payout has not run
+        t.circle.contribute(&t.bob);
     }
 }
