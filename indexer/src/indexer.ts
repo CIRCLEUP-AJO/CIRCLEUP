@@ -18,19 +18,27 @@
 import { SorobanRpc, xdr, scValToNative } from "@stellar/stellar-sdk";
 import type { PoolClient } from "pg";
 import { query, withTransaction } from "./db/pool";
-import * as dotenv from "dotenv";
+import {
+  STELLAR_RPC_URL,
+  CIRCLE_FACTORY_ADDRESS,
+  REPUTATION_ADDRESS,
+  USDC_ADDRESS,
+  START_LEDGER,
+  POLL_INTERVAL_MS,
+  EVENTS_LIMIT,
+} from "./config";
 
-dotenv.config();
-
-const POLL_INTERVAL_MS = 5_000;
-const EVENTS_LIMIT = 100;
-
-export const rpc = new SorobanRpc.Server(process.env.STELLAR_RPC_URL!, {
+export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
   allowHttp: true,
 });
 
-const FACTORY = process.env.CIRCLE_FACTORY_ADDRESS!;
-const REPUTATION = process.env.REPUTATION_ADDRESS!;
+const FACTORY = CIRCLE_FACTORY_ADDRESS;
+const REPUTATION = REPUTATION_ADDRESS;
+// Not consumed by any on-chain call today — the indexer doesn't need to
+// distinguish contribution assets — but validated at startup and surfaced via
+// GET /health so operators can confirm the indexer and app agree on which
+// USDC token they're tracking.
+export const USDC = USDC_ADDRESS;
 
 // The SDK's getEvents returns EventResponse; extract the string contractId safely.
 type SdkEvent = SorobanRpc.Api.EventResponse;
@@ -333,9 +341,9 @@ async function processEvents(fromLedger: number, toLedger: number) {
 
     let handler: (() => Promise<void>) | null = null;
     if (topic0 === "factory" && topic1 === "circle_created") {
-      handler = () => handleFactoryCircleCreated(event);
+      handler = () => ingestEvent(event, (client) => handleFactoryCircleCreated(client, event)).then(() => {});
     } else if (topic0 === "reputation" && topic1 === "increment") {
-      handler = () => handleReputationIncrement(event);
+      handler = () => ingestEvent(event, (client) => handleReputationIncrement(client, event)).then(() => {});
     }
     if (!handler) continue;
 
@@ -373,12 +381,24 @@ async function processEvents(fromLedger: number, toLedger: number) {
 
       let handler: (() => Promise<void>) | null = null;
       switch (topic1) {
-        case "joined":       handler = () => handleCircleJoined(contractId, event);      break;
-        case "active":       handler = () => handleCircleActive(contractId);            break;
-        case "contributed":  handler = () => handleCircleContributed(contractId, event); break;
-        case "payout":       handler = () => handleCirclePayout(contractId, event);      break;
-        case "default":      handler = () => handleCircleDefault(contractId, event);     break;
-        case "completed":    handler = () => handleCircleCompleted(contractId);          break;
+        case "joined":
+          handler = () => ingestEvent(event, (client) => handleCircleJoined(client, contractId, event)).then(() => {});
+          break;
+        case "active":
+          handler = () => ingestEvent(event, (client) => handleCircleActive(client, contractId)).then(() => {});
+          break;
+        case "contributed":
+          handler = () => ingestEvent(event, (client) => handleCircleContributed(client, contractId, event)).then(() => {});
+          break;
+        case "payout":
+          handler = () => ingestEvent(event, (client) => handleCirclePayout(client, contractId, event)).then(() => {});
+          break;
+        case "default":
+          handler = () => ingestEvent(event, (client) => handleCircleDefault(client, contractId, event)).then(() => {});
+          break;
+        case "completed":
+          handler = () => ingestEvent(event, (client) => handleCircleCompleted(client, contractId)).then(() => {});
+          break;
       }
       if (!handler) continue;
 
@@ -402,12 +422,14 @@ async function processEvents(fromLedger: number, toLedger: number) {
 }
 
 export async function startIndexer() {
-  console.log("[indexer] Starting CircleUp event indexer...");
+  console.log(
+    `[indexer] Starting CircleUp event indexer ` +
+      `(poll interval: ${POLL_INTERVAL_MS}ms, events per page: ${EVENTS_LIMIT})...`,
+  );
 
   let lastLedger = await getLastLedger();
   if (lastLedger === 0) {
-    const startLedger = parseInt(process.env.START_LEDGER || "0", 10);
-    lastLedger = startLedger;
+    lastLedger = START_LEDGER;
   }
 
   console.log(`[indexer] Starting from ledger ${lastLedger}`);
