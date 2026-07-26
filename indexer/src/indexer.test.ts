@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runEventHandler, getIndexerMetrics, USDC } from "./indexer";
+import {
+  runEventHandler,
+  getIndexerMetrics,
+  USDC,
+  stopIndexer,
+  isIndexerRunning,
+} from "./indexer";
 
 test("USDC is read from the validated USDC_ADDRESS env var, not left dangling", () => {
   assert.equal(USDC, process.env.USDC_ADDRESS);
@@ -36,4 +42,10 @@ test("runEventHandler isolates a throwing handler instead of propagating", async
   const after = getIndexerMetrics();
   assert.equal(after.totalEventsFailed, before.totalEventsFailed + 1);
   assert.equal(after.totalEventsProcessed, before.totalEventsProcessed);
+});
+
+test("stopIndexer is a safe no-op when the poller was never started", async () => {
+  assert.equal(isIndexerRunning(), false);
+  await assert.doesNotReject(() => stopIndexer());
+  assert.equal(isIndexerRunning(), false);
 });
