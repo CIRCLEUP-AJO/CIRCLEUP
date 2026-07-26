@@ -12,18 +12,61 @@ export interface Circle {
   /** Per-member round contribution, in stroops */
   round_amount: string;
   member_count: number;
+  /** Canonical values from the contract's CircleStatus enum:
+   *  "Pending" | "Active" | "Completed" | "Cancelled". Kept as string
+   *  because the value arrives from the indexer/RPC untyped. */
   status: string;
   current_round: number;
   total_rounds: number;
   created_ledger: number;
 }
 
-const STATUS_COLORS: Record<string, string> = {
-  Pending: "bg-yellow-100 text-yellow-800",
-  Active: "bg-brand-100 text-brand-800",
-  Completed: "bg-blue-100 text-blue-800",
-  Cancelled: "bg-red-100 text-red-800",
+interface StatusMeta {
+  label: string;
+  /** Plain-language explanation, surfaced as a tooltip */
+  description: string;
+  chipClasses: string;
+  dotClasses: string;
+}
+
+const STATUS_META: Record<string, StatusMeta> = {
+  pending: {
+    label: "Pending",
+    description: "Waiting for members to join",
+    chipClasses: "bg-yellow-100 text-yellow-800",
+    dotClasses: "bg-yellow-500",
+  },
+  active: {
+    label: "Active",
+    description: "Rounds in progress",
+    // brand-800 is not defined in the Tailwind palette; 700 matches ReputationBadge
+    chipClasses: "bg-brand-100 text-brand-700",
+    dotClasses: "bg-brand-500",
+  },
+  completed: {
+    label: "Completed",
+    description: "All rounds finished",
+    chipClasses: "bg-blue-100 text-blue-800",
+    dotClasses: "bg-blue-500",
+  },
+  cancelled: {
+    label: "Cancelled",
+    description: "Closed before all rounds completed",
+    chipClasses: "bg-red-100 text-red-800",
+    dotClasses: "bg-red-400",
+  },
 };
+
+export function getStatusMeta(status: string): StatusMeta {
+  const known = STATUS_META[status?.trim().toLowerCase()];
+  if (known) return known;
+  return {
+    label: status?.trim() || "Unknown",
+    description: "Status not recognized",
+    chipClasses: "bg-slate-100 text-slate-700",
+    dotClasses: "bg-slate-400",
+  };
+}
 
 // ─── Input guards ─────────────────────────────────────────────────────────────
 //
@@ -63,6 +106,7 @@ function safeFormatPot(stroops: string, memberCount: number): string {
 // parent page re-renders due to router state changes.
 
 export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle }) {
+  const status = getStatusMeta(circle.status);
   const totalRounds = circle.total_rounds > 0 ? circle.total_rounds : 0;
   const currentRound = Math.max(0, circle.current_round);
   const progressPct =
@@ -73,7 +117,7 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
   // Human-readable label used both by the aria-label on the link and the
   // screen-reader-only heading inside the card, so assistive technology
   // announces the card's purpose unambiguously.
-  const cardLabel = `Circle ${shortAddress(circle.address)} — $${safeFormatUsdc(circle.round_amount)} per round, ${circle.status}`;
+  const cardLabel = `Circle ${shortAddress(circle.address)} — $${safeFormatUsdc(circle.round_amount)} per round, ${status.label}`;
 
   return (
     <Link
@@ -95,11 +139,17 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
           </div>
           <span
             className={clsx(
-              "text-xs font-medium px-2 py-1 rounded-full",
-              STATUS_COLORS[circle.status] || "bg-slate-100 text-slate-700",
+              "inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium px-2 py-1 rounded-full",
+              status.chipClasses,
             )}
+            title={status.description}
           >
-            {circle.status}
+            <span
+              className={clsx("h-1.5 w-1.5 rounded-full", status.dotClasses)}
+              aria-hidden="true"
+            />
+            <span className="sr-only">Status: </span>
+            {status.label}
           </span>
         </div>
 
