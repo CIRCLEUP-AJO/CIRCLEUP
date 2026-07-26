@@ -40,6 +40,126 @@ const REPUTATION = REPUTATION_ADDRESS;
 // USDC token they're tracking.
 export const USDC = USDC_ADDRESS;
 
+// ─── Soroban RPC retry ───────────────────────────────────────────────────────
+//
+// getEvents / getLatestLedger fail transiently under RPC rate limits, brief
+// network blips, and 5xx responses. Without an in-cycle retry the poll loop
+// would skip the whole ledger range until the next interval, delaying ingest
+// and flooding logs with one-shot errors.
+
+const RPC_RETRY_MAX_ATTEMPTS = parseInt(
+  process.env.RPC_RETRY_MAX_ATTEMPTS || "4",
+  10,
+);
+const RPC_RETRY_BASE_DELAY_MS = parseInt(
+  process.env.RPC_RETRY_BASE_DELAY_MS || "500",
+  10,
+);
+
+/** Error codes / substrings that are safe to retry. Exported for unit tests. */
+export function isTransientRpcError(err: unknown): boolean {
+  if (err == null) return false;
+
+  const code =
+    typeof err === "object" && err !== null && "code" in err
+      ? String((err as { code?: unknown }).code)
+      : "";
+  const status =
+    typeof err === "object" && err !== null && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  const message = err instanceof Error ? err.message : String(err);
+  const lower = message.toLowerCase();
+
+  if (
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND" ||
+    code === "EAI_AGAIN" ||
+    code === "EPIPE" ||
+    code === "EHOSTUNREACH"
+  ) {
+    return true;
+  }
+
+  if (status === 429 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+
+  return (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up") ||
+    lower.includes("network") ||
+    lower.includes("temporarily unavailable") ||
+    lower.includes("service unavailable") ||
+    lower.includes("bad gateway") ||
+    lower.includes("gateway timeout")
+  );
+}
+
+function describeRpcError(err: unknown): string {
+  if (err instanceof Error) {
+    const code =
+      typeof err === "object" && err !== null && "code" in err
+        ? String((err as { code?: unknown }).code)
+        : "";
+    return code ? `${err.message} (${code})` : err.message;
+  }
+  return String(err);
+}
+
+/**
+ * Run an RPC call with exponential backoff on transient failures.
+ * Non-transient errors (malformed request, auth, etc.) fail immediately.
+ * Exported for unit tests.
+ */
+export async function withRpcRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  {
+    maxAttempts = RPC_RETRY_MAX_ATTEMPTS,
+    baseDelayMs = RPC_RETRY_BASE_DELAY_MS,
+    sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  }: {
+    maxAttempts?: number;
+    baseDelayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<T> {
+  let lastErr: unknown;
+  const attempts = Math.max(1, maxAttempts);
+  let tried = 0;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    tried = attempt;
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const transient = isTransientRpcError(err);
+      if (!transient || attempt === attempts) {
+        break;
+      }
+      const delayMs = baseDelayMs * 2 ** (attempt - 1);
+      console.warn(
+        `[indexer] Transient RPC failure during ${label} ` +
+          `(attempt ${attempt}/${attempts}): ${describeRpcError(err)} ` +
+          `— retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  throw new Error(
+    `[indexer] Soroban RPC ${label} failed after ${tried} attempt(s): ` +
+      describeRpcError(lastErr),
+  );
+}
 // The SDK's getEvents returns EventResponse; extract the string contractId safely.
 type SdkEvent = SorobanRpc.Api.EventResponse;
 
@@ -323,16 +443,18 @@ async function processEvents(fromLedger: number, toLedger: number) {
   let eventsFailed = 0;
 
   // Factory + reputation events
-  const factoryResponse = await rpc.getEvents({
-    startLedger: fromLedger,
-    filters: [
-      {
-        type: "contract",
-        contractIds: [FACTORY, REPUTATION],
-      },
-    ],
-    limit: EVENTS_LIMIT,
-  });
+  const factoryResponse = await withRpcRetry("getEvents(factory+reputation)", () =>
+    rpc.getEvents({
+      startLedger: fromLedger,
+      filters: [
+        {
+          type: "contract",
+          contractIds: [FACTORY, REPUTATION],
+        },
+      ],
+      limit: EVENTS_LIMIT,
+    }),
+  );
 
   for (const event of factoryResponse.events) {
     if (!event.topic || event.topic.length < 2) continue;
@@ -362,11 +484,13 @@ async function processEvents(fromLedger: number, toLedger: number) {
 
   if (circles.length > 0) {
     const circleAddresses = circles.map((c) => c.address);
-    const circleResponse = await rpc.getEvents({
-      startLedger: fromLedger,
-      filters: [{ type: "contract", contractIds: circleAddresses }],
-      limit: EVENTS_LIMIT,
-    });
+    const circleResponse = await withRpcRetry("getEvents(circles)", () =>
+      rpc.getEvents({
+        startLedger: fromLedger,
+        filters: [{ type: "contract", contractIds: circleAddresses }],
+        limit: EVENTS_LIMIT,
+      }),
+    );
 
     for (const event of circleResponse.events) {
       if (!event.topic || event.topic.length < 2) continue;
@@ -436,14 +560,16 @@ export async function startIndexer() {
 
   setInterval(async () => {
     try {
-      const latestLedger = await rpc.getLatestLedger();
+      const latestLedger = await withRpcRetry("getLatestLedger", () =>
+        rpc.getLatestLedger(),
+      );
       const toLedger = latestLedger.sequence;
 
       if (toLedger > lastLedger) {
-        // processEvents isolates per-event failures internally; if it throws,
-        // the failure is at the batch level (RPC/DB unreachable) so we must
-        // NOT advance lastLedger — retry the same range next tick instead of
-        // silently skipping the ledgers we failed to fetch.
+        // processEvents isolates per-event failures internally; if it throws
+        // after exhausting RPC retries, the failure is at the batch level so
+        // we must NOT advance lastLedger — retry the same range next tick
+        // instead of silently skipping the ledgers we failed to fetch.
         await processEvents(lastLedger + 1, toLedger);
         lastLedger = toLedger;
         await setLastLedger(lastLedger);

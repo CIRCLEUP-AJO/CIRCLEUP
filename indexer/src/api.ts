@@ -5,7 +5,7 @@
  * GET /circles/summary                 → circle counts by status
  * GET /circles/:address                → circle detail + members + rounds
  * GET /circles/:address/members        → members with contribution status
- * GET /circles/:address/rounds         → all rounds (payouts + defaults)
+ * GET /circles/:address/rounds         → rounds grouped by round (payouts + contributions + defaults)
  * GET /reputation/:member              → member reputation score
  * GET /indexer/state                   → indexer audit: last ledger + event counts
  * GET /health                          → health check (db + RPC status)
@@ -16,6 +16,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
 import { rpc, USDC } from "./indexer";
+import { groupCircleRounds } from "./groupRounds";
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
@@ -673,67 +674,34 @@ export function createApp() {
         return;
       }
 
-      const payouts = await query<PayoutRow>(
-        `SELECT * FROM payouts WHERE circle_address = $1 ORDER BY round_index`,
-        [address],
-      );
-      const contributions = await query<ContributionRow>(
-        `SELECT * FROM contributions WHERE circle_address = $1 ORDER BY round_index, created_at`,
-        [address],
-      );
-      const defaults = await query<DefaultRow>(
-        `SELECT * FROM defaults WHERE circle_address = $1 ORDER BY round_index`,
-        [address],
-      );
-
-      // Group contributions and defaults by round
-      const rounds = payouts.map((p) => ({
-        roundIndex: p.round_index,
-        status: "completed" as const,
-        recipient: p.recipient,
-        amount: p.amount,
-        txHash: p.tx_hash,
-        ledger: p.ledger,
-        contributions: contributions.filter(
-          (c) => c.round_index === p.round_index,
+      const [payouts, contributions, defaults] = await Promise.all([
+        query<PayoutRow>(
+          `SELECT * FROM payouts WHERE circle_address = $1 ORDER BY round_index`,
+          [address],
         ),
-        defaults: defaults.filter((d) => d.round_index === p.round_index),
-      }));
+        query<ContributionRow>(
+          `SELECT * FROM contributions WHERE circle_address = $1 ORDER BY round_index, created_at`,
+          [address],
+        ),
+        query<DefaultRow>(
+          `SELECT * FROM defaults WHERE circle_address = $1 ORDER BY round_index`,
+          [address],
+        ),
+      ]);
 
-      // The round in progress has no payout yet, so it isn't in `rounds`
-      // above — surface it separately (status "current" while the circle is
-      // still Active, "cancelled" if it was cut short) rather than mixing an
-      // incomplete entry into the completed-rounds list.
-      const currentRoundHasPayout = payouts.some(
-        (p) => p.round_index === circle.current_round,
-      );
-      const currentRound =
-        !currentRoundHasPayout &&
-        (circle.status === "Active" || circle.status === "Cancelled")
-          ? {
-              roundIndex: circle.current_round,
-              status: circle.status === "Cancelled"
-                ? ("cancelled" as const)
-                : ("current" as const),
-              recipient: null,
-              amount: null,
-              txHash: null,
-              ledger: null,
-              contributions: contributions.filter(
-                (c) => c.round_index === circle.current_round,
-              ),
-              defaults: defaults.filter(
-                (d) => d.round_index === circle.current_round,
-              ),
-            }
-          : null;
+      // Single-pass grouping by round_index so contributions/defaults for
+      // unpaid rounds are never silently dropped, and we avoid O(n×m)
+      // filter scans per payout.
+      const { rounds, currentRound, openRounds, pendingDefaults } =
+        groupCircleRounds(circle, payouts, contributions, defaults);
 
       res.json({
         rounds,
         currentRound,
-        pendingDefaults: defaults.filter(
-          (d) => !payouts.find((p) => p.round_index === d.round_index),
-        ),
+        // Unpaid non-current rounds that still have activity (rare, but
+        // previously invisible to clients).
+        openRounds,
+        pendingDefaults,
       });
     } catch (err) {
       console.error(`[api] Failed to load rounds for circle ${address}`, err);
