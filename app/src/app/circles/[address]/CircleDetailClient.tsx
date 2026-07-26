@@ -328,13 +328,6 @@ function WorkflowBanner({
   return null;
 }
 
-// ─── Success state type ───────────────────────────────────────────────────────
-
-interface SuccessState {
-  message: string;
-  txHash: string;
-}
-
 // ─── getMemberContributionStatus ─────────────────────────────────────────────
 //
 // Determines whether a member has contributed, is pending, or has defaulted
@@ -361,10 +354,11 @@ function getMemberContributionStatus(
 export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   // null  → no action in flight; ActionKey → that specific action is running
-  const [loading, setLoading] = useState<ActionKey | null>(null);
-  const [error,   setError]   = useState<string>("");
-  const [success, setSuccess] = useState<SuccessState | null>(null);
-  const [data,    setData]    = useState<CircleDetailData>(circleData);
+  const [loading,     setLoading]     = useState<ActionKey | null>(null);
+  const [error,       setError]       = useState<string>("");
+  const [success,     setSuccess]     = useState<SuccessState | null>(null);
+  const [retryAction, setRetryAction] = useState<(() => void) | null>(null);
+  const [data,        setData]        = useState<CircleDetailData>(circleData);
   // Invite link URL — populated client-side to avoid SSR window access
   const [inviteUrl, setInviteUrl] = useState("");
 
@@ -379,6 +373,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   const isMember = walletAddress
     ? data.members.some((m) => m.member_address === walletAddress)
+    : false;
+
+  const myMember = walletAddress
+    ? data.members.find((m) => m.member_address === walletAddress) ?? null
+    : null;
+
+  const hasLockedCollateral = myMember
+    ? BigInt(myMember.collateral || "0") > BigInt(0)
     : false;
 
   const currentRound = data.circle.current_round;
@@ -405,6 +407,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     );
   }
 
+  const ACTION_SUCCESS_MESSAGES: Record<ActionKey, string> = {
+    join:       "Collateral locked — you have joined the circle!",
+    contribute: "Contribution submitted successfully.",
+    payout:     "Payout triggered successfully.",
+    close:      "Collateral released successfully.",
+  };
+
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
     if (!walletAddress) {
       setError("Connect your wallet first.");
@@ -415,6 +424,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
     setError("");
     setSuccess(null);
+    setRetryAction(null);
     setLoading(action);
     try {
       const result = await invokeContract(
@@ -424,10 +434,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         walletAddress,
       );
       if (!result.success) {
-        setError(result.error || "Transaction failed");
+        const errMsg = result.error || "Transaction failed";
+        setError(errMsg);
+        if (isRetryableError(errMsg)) {
+          setRetryAction(() => () => doAction(action, args));
+        }
       } else {
         setSuccess({
-          message: `${action} successful!`,
+          message: ACTION_SUCCESS_MESSAGES[action],
           txHash: result.txHash,
         });
         // Refresh circle data after a successful action
@@ -446,6 +460,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      if (isRetryableError(message)) {
+        setRetryAction(() => () => doAction(action, args));
+      }
     } finally {
       setLoading(null);
     }
@@ -517,7 +534,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )}
 
         <div className="flex flex-wrap gap-3">
-          {data.circle.status === "Pending" && isMember && (
+          {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
             <button
               onClick={handleJoin}
               disabled={loading !== null}
@@ -756,33 +773,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       </div>
     </div>
   );
-}
-
-// ─── getMemberContributionStatus ─────────────────────────────────────────────
-//
-// Determines a member's contribution status for the current active round.
-//
-// Logic:
-//   - "not_applicable" → circle is not Active, or the member is the next payout
-//                         recipient (payout_order === current_round)
-//   - "contributed"    → member's total_contributions count is > current_round
-//                         index (they have already paid for this round)
-//   - "defaulted"      → member has at least one default and has NOT contributed
-//   - "pending"        → anything else (active round, no contribution yet)
-
-function getMemberContributionStatus(
-  member: CircleMember,
-  currentRound: number,
-  status: string,
-): "contributed" | "pending" | "defaulted" | "not_applicable" {
-  if (status !== "Active") return "not_applicable";
-  // The next payout recipient is index currentRound — they don't contribute
-  if (member.payout_order === currentRound) return "not_applicable";
-
-  const hasContributed = Number(member.total_contributions) > currentRound;
-  if (hasContributed) return "contributed";
-  if (member.defaults > 0) return "defaulted";
-  return "pending";
 }
 
 // ─── Contribution status badge ────────────────────────────────────────────────

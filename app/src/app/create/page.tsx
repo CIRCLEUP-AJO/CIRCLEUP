@@ -6,7 +6,7 @@ import {
   usdcToStroops,
   shortAddress,
 } from "@/lib/config";
-import { getWalletAddress, invokeContract } from "@/lib/stellar";
+import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
@@ -17,6 +17,24 @@ const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
 /** Minimum and maximum number of members allowed by the contract. */
 const MIN_MEMBERS = 2;
 const MAX_MEMBERS = 20;
+
+function getFilledMembers(members: string[]): string[] {
+  return members.map((m) => m.trim()).filter((m) => m.length > 0);
+}
+
+function findDuplicateAddress(addresses: string[]): string | null {
+  const seen = new Set<string>();
+  for (const addr of addresses) {
+    if (seen.has(addr)) return addr;
+    seen.add(addr);
+  }
+  return null;
+}
+
+/** Validates that a string is a Stellar public key (G... with 56 base32 chars). */
+function isValidStellarAddress(address: string): boolean {
+  return /^G[A-Z2-7]{55}$/.test(address);
+}
 
 export default function CreatePage() {
   const router = useRouter();
@@ -80,13 +98,25 @@ export default function CreatePage() {
     setTxHash("");
     setCopied(false);
 
-    const walletAddress = await getWalletAddress();
+    let walletAddress: string | null;
+    try {
+      walletAddress = await getWalletAddress();
+    } catch (err) {
+      if (err instanceof WalletError && err.reason === "not_installed") {
+        setError(
+          "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
+        );
+      } else {
+        setError(err instanceof Error ? err.message : "Failed to access wallet.");
+      }
+      return;
+    }
     if (!walletAddress) {
       setError("Connect your Freighter wallet first.");
       return;
     }
 
-    const validMembers = members.filter((m) => m.trim().length > 0);
+    const validMembers = getFilledMembers(members);
     if (validMembers.length < MIN_MEMBERS) {
       setError(`A circle needs at least ${MIN_MEMBERS} members.`);
       return;
@@ -103,6 +133,14 @@ export default function CreatePage() {
     if (duplicate) {
       setError(
         `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
+      );
+      return;
+    }
+
+    const invalidAddr = validMembers.find((m) => !isValidStellarAddress(m));
+    if (invalidAddr) {
+      setError(
+        `Invalid Stellar address: "${shortAddress(invalidAddr)}". Each address must start with G and be 56 characters long.`,
       );
       return;
     }
