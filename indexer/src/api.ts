@@ -9,7 +9,7 @@
  * GET /health                          → health check
  */
 
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
@@ -149,8 +149,8 @@ export function createApp() {
       );
       res.json({ circles });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error("[api] Failed to list circles", err);
+      sendError(res, 500, "Failed to list circles", getErrorMessage(err));
     }
   });
 
@@ -215,8 +215,8 @@ export function createApp() {
         latestLedger,
       });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load circle ${address}`, err);
+      sendError(res, 500, "Failed to load circle", getErrorMessage(err));
     }
   });
 
@@ -253,8 +253,8 @@ export function createApp() {
       );
       res.json({ members });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load members for circle ${address}`, err);
+      sendError(res, 500, "Failed to load circle members", getErrorMessage(err));
     }
   });
 
@@ -304,8 +304,8 @@ export function createApp() {
         (d) => !payouts.find((p) => p.round_index === d.round_index)
       )});
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load rounds for circle ${address}`, err);
+      sendError(res, 500, "Failed to load circle rounds", getErrorMessage(err));
     }
   });
 
@@ -351,9 +351,14 @@ export function createApp() {
         updatedAt: row?.updated_at ?? null,
       });
     } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      console.error(`[api] Failed to load reputation for member ${member}`, err);
+      sendError(res, 500, "Failed to load reputation", getErrorMessage(err));
     }
+  });
+
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error("[api] Unhandled error", err);
+    sendError(res, 500, "Internal server error", getErrorMessage(err));
   });
 
   return app;

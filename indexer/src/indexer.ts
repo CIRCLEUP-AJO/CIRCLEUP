@@ -16,7 +16,8 @@
  */
 
 import { SorobanRpc, xdr, scValToNative } from "@stellar/stellar-sdk";
-import { query } from "./db/pool";
+import type { PoolClient } from "pg";
+import { query, withTransaction } from "./db/pool";
 import * as dotenv from "dotenv";
 
 dotenv.config();
@@ -56,6 +57,68 @@ function getValueNative(event: SdkEvent): unknown {
   return scValToNative(event.value as xdr.ScVal);
 }
 
+function normalizeForKey(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value === "bigint") return `bigint:${value.toString()}`;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map((item) => normalizeForKey(item)).join(",")}]`;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+export function createEventKey(event: SdkEvent): string {
+  const contractId = getContractIdStr(event) ?? "";
+  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(scValToNative(topic as xdr.ScVal)));
+  return [
+    event.ledger ?? 0,
+    event.txHash ?? "",
+    contractId,
+    topicParts.join("|"),
+    normalizeForKey(getValueNative(event)),
+  ].join(":");
+}
+
+async function queryClient<T = any>(client: PoolClient, text: string, params?: any[]): Promise<T[]> {
+  const res = await client.query(text, params);
+  return res.rows as T[];
+}
+
+async function ingestEvent<T>(event: SdkEvent, handleEvent: (client: PoolClient) => Promise<T>): Promise<boolean> {
+  const eventKey = createEventKey(event);
+
+  return withTransaction(async (client) => {
+    const existing = await queryClient<{ event_key: string }>(
+      client,
+      "SELECT event_key FROM ingested_events WHERE event_key = $1",
+      [eventKey],
+    );
+
+    if (existing.length > 0) {
+      return false;
+    }
+
+    const contractId = getContractIdStr(event) ?? "";
+    const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
+    const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
+    const eventType = topic0 && topic1 ? `${topic0}:${topic1}` : topic0;
+
+    await client.query(
+      `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (event_key) DO NOTHING`,
+      [eventKey, contractId, event.ledger, event.txHash, eventType],
+    );
+
+    await handleEvent(client);
+    return true;
+  });
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function getLastLedger(): Promise<number> {
@@ -74,13 +137,14 @@ async function setLastLedger(ledger: number) {
 
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
-async function handleFactoryCircleCreated(event: SdkEvent) {
+async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
   // The factory emits: (circle_address, creator, round_deadline_ledgers)
   // Index 2 (round_deadline_ledgers) may be absent on older contract versions.
   const value = getValueNative(event) as [string, string, number?];
   const [circleAddr, creator, roundDeadlineLedgers] = value;
 
-  await query(
+  await queryClient(
+    client,
     `INSERT INTO circles
        (address, creator, round_amount, member_count, total_rounds, status,
         current_round, created_ledger, round_deadline_ledgers)
@@ -101,10 +165,11 @@ async function handleFactoryCircleCreated(event: SdkEvent) {
   );
 }
 
-async function handleCircleJoined(circleAddr: string, event: SdkEvent) {
+async function handleCircleJoined(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const memberAddr = getValueNative(event) as string;
 
-  await query(
+  await queryClient(
+    client,
     `UPDATE circle_members SET joined_at = NOW()
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
@@ -112,24 +177,27 @@ async function handleCircleJoined(circleAddr: string, event: SdkEvent) {
   console.log(`[indexer] Member joined: ${memberAddr} → ${circleAddr}`);
 }
 
-async function handleCircleActive(circleAddr: string) {
-  await query(
+async function handleCircleActive(client: PoolClient, circleAddr: string) {
+  await queryClient(
+    client,
     "UPDATE circles SET status = 'Active', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
   console.log(`[indexer] Circle active: ${circleAddr}`);
 }
 
-async function handleCircleContributed(circleAddr: string, event: SdkEvent) {
+async function handleCircleContributed(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const [memberAddr, roundIndex] = getValueNative(event) as [string, number];
 
-  const rows = await query<{ round_amount: string }>(
+  const rows = await queryClient<{ round_amount: string }>(
+    client,
     "SELECT round_amount FROM circles WHERE address = $1",
     [circleAddr],
   );
   const amount = rows.length > 0 ? rows[0].round_amount : "0";
 
-  await query(
+  await queryClient(
+    client,
     `INSERT INTO contributions (circle_address, member_address, round_index, amount, tx_hash, ledger)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (circle_address, member_address, round_index) DO NOTHING`,
@@ -138,33 +206,37 @@ async function handleCircleContributed(circleAddr: string, event: SdkEvent) {
   console.log(`[indexer] Contribution: ${memberAddr} round ${roundIndex} → ${circleAddr}`);
 }
 
-async function handleCirclePayout(circleAddr: string, event: SdkEvent) {
+async function handleCirclePayout(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const [recipient, pot, roundIndex] = getValueNative(event) as [string, bigint, number];
 
-  await query(
+  await queryClient(
+    client,
     `INSERT INTO payouts (circle_address, recipient, round_index, amount, tx_hash, ledger)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (circle_address, round_index) DO NOTHING`,
     [circleAddr, recipient, roundIndex, pot.toString(), event.txHash, event.ledger],
   );
 
-  await query(
+  await queryClient(
+    client,
     `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
     [roundIndex + 1, circleAddr],
   );
   console.log(`[indexer] Payout: ${recipient} received ${pot} round ${roundIndex} from ${circleAddr}`);
 }
 
-async function handleCircleDefault(circleAddr: string, event: SdkEvent) {
+async function handleCircleDefault(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const [memberAddr, penalty, roundIndex] = getValueNative(event) as [string, bigint, number];
 
-  await query(
+  await queryClient(
+    client,
     `INSERT INTO defaults (circle_address, member_address, round_index, penalty, tx_hash, ledger)
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [circleAddr, memberAddr, roundIndex, penalty.toString(), event.txHash, event.ledger],
   );
 
-  await query(
+  await queryClient(
+    client,
     `UPDATE circle_members SET defaults = defaults + 1
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
@@ -172,20 +244,22 @@ async function handleCircleDefault(circleAddr: string, event: SdkEvent) {
   console.log(`[indexer] Default: ${memberAddr} penalty ${penalty} round ${roundIndex} in ${circleAddr}`);
 }
 
-async function handleCircleCompleted(circleAddr: string) {
-  await query(
+async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
+  await queryClient(
+    client,
     "UPDATE circles SET status = 'Completed', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
   console.log(`[indexer] Circle completed: ${circleAddr}`);
 }
 
-async function handleReputationIncrement(event: SdkEvent) {
+async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   const score = getValueNative(event) as number;
   // The member address is the second topic emitted by the reputation contract
   const memberAddr = scValToNative(event.topic[1] as xdr.ScVal) as string;
 
-  await query(
+  await queryClient(
+    client,
     `INSERT INTO reputation (member_address, score, updated_at)
      VALUES ($1, $2, NOW())
      ON CONFLICT (member_address) DO UPDATE SET score = $2, updated_at = NOW()`,
