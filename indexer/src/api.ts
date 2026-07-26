@@ -200,6 +200,19 @@ function nonBlankParam(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
+function getErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function sendError(
+  res: Response,
+  status: number,
+  message: string,
+  detail?: string,
+): void {
+  res.status(status).json({ error: message, ...(detail ? { detail } : {}) });
+}
+
 export function createApp() {
   const app = express();
   app.use(cors(buildCorsOptions()));
@@ -265,6 +278,12 @@ export function createApp() {
     const whereParams = status ? [status] : [];
 
     try {
+      const [countRow] = await query<{ count: string }>(
+        `SELECT COUNT(*) as count FROM circles c ${whereClause}`,
+        whereParams,
+      );
+      const total = Number(countRow?.count ?? 0);
+
       const circles = await query<
         Pick<
           CircleRow,
@@ -300,7 +319,7 @@ export function createApp() {
       });
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: "Internal server error" });
+      sendError(res, 500, "Internal server error", getErrorMessage(err));
     }
   });
 
