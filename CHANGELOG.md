@@ -9,7 +9,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- Nothing yet — be the first contributor!
+- Homepage hero: secondary "Browse N open circles" call-to-action that jumps to the
+  circles list, shown only when there are circles to browse
+- Homepage hero: hint line stating the Freighter wallet and 2–20 member
+  prerequisites before the visitor opens the create form
+- Homepage hero: explicit messages for the empty and indexer-unavailable cases in
+  place of a call-to-action that would lead nowhere
+- Keyboard focus rings on both homepage hero call-to-action buttons
+
+### Changed
+- Homepage hero copy rewritten around what the visitor does and gets
+- Homepage circles fetch is memoized per render, so the hero count, the heading
+  count and the list can no longer disagree
+
+### Fixed
+- Homepage returned a 500 after a 60-second hang when the indexer refused the
+  connection, so the "indexer is unreachable" banner never reached the user
 
 ---
 

@@ -1,4 +1,4 @@
-import { Suspense } from "react";
+import { Suspense, cache } from "react";
 import Link from "next/link";
 import { INDEXER_URL } from "@/lib/config";
 import { CircleCard } from "@/components/CircleCard";
@@ -30,7 +30,15 @@ function isValidUrl(url: string): boolean {
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-async function getCircles(): Promise<FetchResult> {
+/**
+ * Fetches the circle list, memoized for the lifetime of a single server render.
+ *
+ * Three parts of the page need this data: the hero's secondary CTA, the count
+ * beside the "Active Circles" heading, and the list itself. `cache()` collapses
+ * them into one request per render, so the hero can never advertise "Browse 3
+ * open circles" over a list that renders 4.
+ */
+const getCircles = cache(async function getCircles(): Promise<FetchResult> {
   // Catch misconfiguration before attempting the network request so that
   // developers get a targeted error message rather than a cryptic network failure.
   if (!isValidUrl(INDEXER_URL)) {
@@ -39,8 +47,15 @@ async function getCircles(): Promise<FetchResult> {
 
   let res: Response;
   try {
+    // `cache: "no-store"` rather than `next: { revalidate: 10 }`. When the
+    // indexer refuses the connection, Next's revalidate-cache wrapper leaves a
+    // rejected promise nobody awaits; the dev server reports it as an
+    // unhandledRejection and tears the render stream down with "failed to pipe
+    // response", so the page 500s after a 60s hang and the "network" branch
+    // below never reaches the user. `cache()` above already collapses this to
+    // one request per render, so the only cost is the 10s cross-request cache.
     res = await fetch(`${INDEXER_URL}/circles`, {
-      next: { revalidate: 10 },
+      cache: "no-store",
     });
   } catch {
     return { ok: false, error: "network" };
@@ -77,7 +92,7 @@ async function getCircles(): Promise<FetchResult> {
   });
 
   return { ok: true, circles };
-}
+});
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
@@ -187,36 +202,148 @@ async function CirclesList() {
   );
 }
 
+/**
+ * Count beside the "Active Circles" heading. Omitted entirely when the fetch
+ * failed, so a stale or missing number is never presented as fact — the error
+ * banner rendered by `CirclesList` explains why the list is empty.
+ */
+async function CircleCount() {
+  const result = await getCircles().catch(() => null);
+  if (!result || !result.ok) return null;
+
+  return (
+    <span className="ml-2 text-sm font-normal text-slate-400">
+      ({result.circles.length})
+    </span>
+  );
+}
+
+// ─── Hero call-to-action ──────────────────────────────────────────────────────
+
+type BrowseState =
+  | { kind: "browse"; count: number }
+  | { kind: "empty" }
+  | { kind: "unavailable" };
+
+/**
+ * Decides what the hero's secondary call-to-action should offer.
+ *
+ * "Browse open circles" jumps to the list further down this page, so it may
+ * only render when there is a list to jump to. Offering it when the indexer
+ * returned nothing (or could not be reached at all) sends the reader to an
+ * empty state or an error banner and reads as a broken button. Each case gets
+ * its own explicit message instead.
+ *
+ * @param result The circles fetch, or `null` if it threw unexpectedly.
+ */
+function getBrowseState(result: FetchResult | null): BrowseState {
+  if (!result || !result.ok) return { kind: "unavailable" };
+  if (result.circles.length === 0) return { kind: "empty" };
+  return { kind: "browse", count: result.circles.length };
+}
+
+/**
+ * Shared button geometry so the two CTAs line up and share focus styling. Both
+ * carry the border: on the solid primary it matches the fill and is invisible,
+ * on the outlined secondary it is the outline. Keeping it on both is what makes
+ * the two the same height when they sit side by side.
+ */
+const CTA_BASE =
+  "inline-block px-6 py-3 rounded-xl font-semibold text-lg transition-colors " +
+  "border border-brand-600 " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-600 " +
+  "focus-visible:ring-offset-2 focus-visible:ring-offset-slate-50";
+
+/**
+ * The one part of the hero that depends on the indexer: either a "Browse N open
+ * circles" button, or a line explaining why there is nothing to browse. Wrapped
+ * in its own Suspense boundary by the page so the headline and the primary
+ * "Create a circle" button paint without waiting on the network.
+ */
+async function HeroSecondaryCta() {
+  const result = await getCircles().catch(() => null);
+  const browse = getBrowseState(result);
+
+  return (
+    <>
+      {browse.kind === "browse" && (
+        <a
+          href="#circles"
+          className={`${CTA_BASE} bg-white text-brand-700 hover:bg-brand-50`}
+        >
+          Browse {browse.count} open{" "}
+          {browse.count === 1 ? "circle" : "circles"}
+        </a>
+      )}
+
+      {browse.kind === "empty" && (
+        <p className="text-slate-500 text-sm sm:self-center">
+          No circles have been created yet. Yours would be the first.
+        </p>
+      )}
+
+      {browse.kind === "unavailable" && (
+        <p className="text-slate-500 text-sm sm:self-center">
+          Existing circles cannot be listed right now. See the notice below.
+        </p>
+      )}
+    </>
+  );
+}
+
+/**
+ * Invisible stand-in with the same box as the secondary CTA, so the hint line
+ * underneath does not jump once the indexer responds.
+ */
+function HeroSecondaryCtaFallback() {
+  return (
+    <span className={`${CTA_BASE} invisible`} aria-hidden="true">
+      Browse open circles
+    </span>
+  );
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
-export default async function HomePage() {
-  // Pre-fetch so we can show the count in the heading without waiting for the
-  // Suspense boundary to resolve. If this fails the heading falls back to
-  // "Active Circles" without a count — the list section handles errors itself.
-  const countResult = await getCircles().catch(() => null);
-  const circleCount =
-    countResult?.ok ? countResult.circles.length : null;
-
+export default function HomePage() {
   return (
     <div>
       {/* Hero */}
-      <div className="text-center py-12">
-        <div className="text-5xl mb-4">🔄</div>
-        <h1 className="text-3xl font-bold text-slate-900 mb-3">
-          Savings circles, made trustless
+      <section aria-labelledby="hero-heading" className="text-center py-12">
+        <div className="text-5xl mb-4" aria-hidden="true">🔄</div>
+        <h1
+          id="hero-heading"
+          className="text-3xl font-bold text-slate-900 mb-3"
+        >
+          Start a savings circle no one can run off with
         </h1>
         <p className="text-slate-600 max-w-xl mx-auto mb-8 text-lg">
-          CircleUp brings Ajo, Esusu, Tanda, and Chama onto Stellar Soroban.
-          Every member contributes each round — the contract automatically pays
-          the pot to the scheduled member. No organizer can run off with the money.
+          Ajo, Esusu, Tanda, and Chama, on Stellar. Everyone pays in once a
+          round, and the contract hands the whole pot to whoever&apos;s turn it
+          is. Funds sit in the contract, never with an organizer.
         </p>
-        <Link
-          href="/create"
-          className="inline-block bg-brand-600 text-white px-6 py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors text-lg"
-        >
-          Create a Circle
-        </Link>
-      </div>
+
+        <div className="flex flex-col sm:flex-row gap-3 justify-center items-center">
+          <Link
+            href="/create"
+            className={`${CTA_BASE} bg-brand-600 text-white hover:bg-brand-700`}
+          >
+            Create a circle
+          </Link>
+
+          <Suspense fallback={<HeroSecondaryCtaFallback />}>
+            <HeroSecondaryCta />
+          </Suspense>
+        </div>
+
+        {/* Sets expectations for the primary CTA. Without this the wallet
+            requirement only surfaces as an error after the create form is
+            filled in and submitted. */}
+        <p className="text-slate-500 text-sm mt-4">
+          Setting one up takes about a minute. You will need a Freighter wallet
+          and the Stellar addresses of 2 to 20 members.
+        </p>
+      </section>
 
       {/* How it works */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-12">
@@ -292,15 +419,17 @@ export default async function HomePage() {
         </div>
       </div>
 
-      {/* Circles list */}
-      <div className="flex items-center justify-between mb-5">
+      {/* Circles list — `id` is the target of the hero's "Browse" CTA, and
+          scroll-mt keeps the heading clear of the top of the viewport. */}
+      <div
+        id="circles"
+        className="flex items-center justify-between mb-5 scroll-mt-6"
+      >
         <h2 className="text-xl font-bold text-slate-800">
           Active Circles
-          {circleCount !== null && (
-            <span className="ml-2 text-sm font-normal text-slate-400">
-              ({circleCount})
-            </span>
-          )}
+          <Suspense fallback={null}>
+            <CircleCount />
+          </Suspense>
         </h2>
         <Link
           href="/create"
