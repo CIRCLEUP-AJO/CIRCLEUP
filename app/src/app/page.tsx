@@ -1,8 +1,15 @@
 import { Suspense, cache } from "react";
 import Link from "next/link";
+import type { Metadata } from "next";
 import { INDEXER_URL } from "@/lib/config";
 import { CircleCard } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
+
+export const metadata: Metadata = {
+  title: "CircleUp — Trustless Savings Circles on Stellar",
+  description:
+    "Start a savings circle on Stellar. Ajo, Esusu, Tanda, and Chama — on-chain. Everyone pays in once a round, and the smart contract hands the pot to whoever's turn it is.",
+};
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 

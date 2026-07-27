@@ -1,31 +1,48 @@
-import type { Metadata } from "next";
-import CreateClient from "./CreateClient";
+"use client";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import {
+  CIRCLE_FACTORY_ADDRESS,
+  usdcToStroops,
+  shortAddress,
+} from "@/lib/config";
+import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
+import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
-export const metadata: Metadata = {
-  title: "Create a Circle — CircleUp",
-  description:
-    "Set up a trustless savings circle on Stellar. Choose members, contribution amount, and round duration. The smart contract holds all funds.",
-};
+const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
 
-// ── Per-field validation errors ───────────────────────────────────────────────
-//
-// Keyed by field name so each input can show its own inline error below it
-// rather than only surfacing problems in the top-level alert banner.
-interface FieldErrors {
-  roundUSDC?: string;
-  roundDays?: string;
-  /** member index → error message */
-  members?: Record<number, string>;
+/** Stellar Expert base URL for testnet transactions. */
+const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
+
+/** Minimum and maximum number of members allowed by the contract. */
+const MIN_MEMBERS = 2;
+const MAX_MEMBERS = 20;
+
+function getFilledMembers(members: string[]): string[] {
+  return members.map((m) => m.trim()).filter((m) => m.length > 0);
 }
 
-export default function CreatePage() {
+function findDuplicateAddress(addresses: string[]): string | null {
+  const seen = new Set<string>();
+  for (const addr of addresses) {
+    if (seen.has(addr)) return addr;
+    seen.add(addr);
+  }
+  return null;
+}
+
+/** Validates that a string is a Stellar public key (G... with 56 base32 chars). */
+function isValidStellarAddress(address: string): boolean {
+  return /^G[A-Z2-7]{55}$/.test(address);
+}
+
+export default function CreateClient() {
   const router = useRouter();
   const [members, setMembers] = useState<string[]>(["", "", "", ""]);
   const [roundUSDC, setRoundUSDC] = useState("100");
   const [roundDays, setRoundDays] = useState("30");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [fieldErrors, setFieldErrors] = useState<FieldErrors>({});
   const [txHash, setTxHash] = useState("");
   const [copied, setCopied] = useState(false);
 
@@ -78,7 +95,6 @@ export default function CreatePage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    setFieldErrors({});
     setTxHash("");
     setCopied(false);
 
@@ -100,43 +116,6 @@ export default function CreatePage() {
       return;
     }
 
-    // ── Per-field validation ─────────────────────────────────────────────────
-    // Collect all field-level errors before bailing out so the user sees every
-    // problem at once instead of fixing one at a time.
-    const nextFieldErrors: FieldErrors = {};
-    let hasFieldError = false;
-
-    const amount = parseFloat(roundUSDC);
-    if (isNaN(amount) || amount <= 0) {
-      nextFieldErrors.roundUSDC = "Enter a positive round amount.";
-      hasFieldError = true;
-    }
-
-    const days = parseInt(roundDays, 10);
-    if (isNaN(days) || days < 1) {
-      nextFieldErrors.roundDays = "Enter a round duration of at least 1 day.";
-      hasFieldError = true;
-    }
-
-    // Per-member address validation
-    const memberErrors: Record<number, string> = {};
-    members.forEach((m, i) => {
-      const trimmed = m.trim();
-      if (trimmed === "") return; // blank rows are filtered out later
-      if (!isValidStellarAddress(trimmed)) {
-        memberErrors[i] = "Must start with G and be exactly 56 characters.";
-        hasFieldError = true;
-      }
-    });
-    if (Object.keys(memberErrors).length > 0) {
-      nextFieldErrors.members = memberErrors;
-    }
-
-    if (hasFieldError) {
-      setFieldErrors(nextFieldErrors);
-      return;
-    }
-
     const validMembers = getFilledMembers(members);
     if (validMembers.length < MIN_MEMBERS) {
       setError(`A circle needs at least ${MIN_MEMBERS} members.`);
@@ -155,6 +134,26 @@ export default function CreatePage() {
       setError(
         `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
       );
+      return;
+    }
+
+    const invalidAddr = validMembers.find((m) => !isValidStellarAddress(m));
+    if (invalidAddr) {
+      setError(
+        `Invalid Stellar address: "${shortAddress(invalidAddr)}". Each address must start with G and be 56 characters long.`,
+      );
+      return;
+    }
+
+    const amount = parseFloat(roundUSDC);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Enter a valid round amount.");
+      return;
+    }
+
+    const days = parseInt(roundDays, 10);
+    if (isNaN(days) || days < 1) {
+      setError("Enter a valid round duration.");
       return;
     }
 
@@ -211,146 +210,83 @@ export default function CreatePage() {
       <form onSubmit={handleSubmit} className="space-y-6">
         {/* Round amount */}
         <div>
-          <label
-            htmlFor="round-usdc"
-            className="block text-sm font-medium text-slate-700 mb-1"
-          >
+          <label className="block text-sm font-medium text-slate-700 mb-1">
             Contribution per member / round (USDC)
           </label>
           <div className="flex items-center gap-2">
-            <span className="text-slate-400 text-lg" aria-hidden="true">$</span>
+            <span className="text-slate-400 text-lg">$</span>
             <input
-              id="round-usdc"
               type="number"
               min="1"
               step="1"
               value={roundUSDC}
-              onChange={(e) => {
-                setRoundUSDC(e.target.value);
-                if (fieldErrors.roundUSDC) setFieldErrors((prev) => ({ ...prev, roundUSDC: undefined }));
-              }}
-              className={`flex-1 border rounded-lg px-3 py-2 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${fieldErrors.roundUSDC ? "border-red-400" : "border-slate-300"}`}
-              aria-describedby={fieldErrors.roundUSDC ? "round-usdc-error" : "round-usdc-hint"}
-              aria-invalid={fieldErrors.roundUSDC ? "true" : "false"}
+              onChange={(e) => setRoundUSDC(e.target.value)}
+              className="flex-1 border border-slate-300 rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
               required
             />
             <span className="text-slate-500 text-sm">USDC</span>
           </div>
-          {fieldErrors.roundUSDC ? (
-            <p id="round-usdc-error" role="alert" className="text-xs text-red-600 mt-1">
-              {fieldErrors.roundUSDC}
-            </p>
-          ) : (
-            /* Hint uses filledCount so blank rows are not counted */
-            <p id="round-usdc-hint" className="text-xs text-slate-400 mt-1">
-              The full pot per round = ${roundUSDC || 0} ×{" "}
-              {filledCount > 0 ? filledCount : "…"} members
-            </p>
-          )}
+          {/* Hint uses filledCount so blank rows are not counted */}
+          <p className="text-xs text-slate-400 mt-1">
+            The full pot per round = ${roundUSDC || 0} ×{" "}
+            {filledCount > 0 ? filledCount : "…"} members
+          </p>
         </div>
 
         {/* Round duration */}
         <div>
-          <label
-            htmlFor="round-days"
-            className="block text-sm font-medium text-slate-700 mb-1"
-          >
+          <label className="block text-sm font-medium text-slate-700 mb-1">
             Round duration (days)
           </label>
           <input
-            id="round-days"
             type="number"
             min="1"
             value={roundDays}
-            onChange={(e) => {
-              setRoundDays(e.target.value);
-              if (fieldErrors.roundDays) setFieldErrors((prev) => ({ ...prev, roundDays: undefined }));
-            }}
-            className={`w-full border rounded-lg px-3 py-2 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${fieldErrors.roundDays ? "border-red-400" : "border-slate-300"}`}
-            aria-describedby={fieldErrors.roundDays ? "round-days-error" : "round-days-hint"}
-            aria-invalid={fieldErrors.roundDays ? "true" : "false"}
+            onChange={(e) => setRoundDays(e.target.value)}
+            className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
             required
           />
-          {fieldErrors.roundDays ? (
-            <p id="round-days-error" role="alert" className="text-xs text-red-600 mt-1">
-              {fieldErrors.roundDays}
-            </p>
-          ) : (
-            <p id="round-days-hint" className="text-xs text-slate-400 mt-1">
-              Each round gives members {roundDays || "…"} day{roundDays === "1" ? "" : "s"} to contribute.
-            </p>
-          )}
         </div>
 
         {/* Members */}
-        <fieldset>
-          <div className="flex items-center justify-between mb-2">
-            <legend className="block text-sm font-medium text-slate-700">
+        <div>
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 mb-2">
+            <label className="block text-sm font-medium text-slate-700">
               Members (Stellar addresses) — payout order top → bottom
-            </legend>
+            </label>
             <span
               className={`text-xs font-medium ${
                 members.length >= MAX_MEMBERS
                   ? "text-amber-600"
                   : "text-slate-400"
               }`}
-              aria-live="polite"
             >
               {members.length} / {MAX_MEMBERS}
             </span>
           </div>
           <div className="space-y-2">
-            {members.map((m, i) => {
-              const memberError = fieldErrors.members?.[i];
-              const inputId = `member-${i}`;
-              const errorId = `member-${i}-error`;
-              return (
-                <div key={i}>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-slate-400 w-5 text-right" aria-hidden="true">{i + 1}.</span>
-                    <input
-                      id={inputId}
-                      type="text"
-                      placeholder={`G… (member ${i + 1})`}
-                      value={m}
-                      onChange={(e) => {
-                        updateMember(i, e.target.value);
-                        if (fieldErrors.members?.[i]) {
-                          setFieldErrors((prev) => {
-                            const nextMembers = { ...(prev.members ?? {}) };
-                            delete nextMembers[i];
-                            return { ...prev, members: nextMembers };
-                          });
-                        }
-                      }}
-                      className={`flex-1 border rounded-lg px-3 py-2 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${memberError ? "border-red-400" : "border-slate-300"}`}
-                      aria-label={`Member ${i + 1} Stellar address`}
-                      aria-describedby={memberError ? errorId : undefined}
-                      aria-invalid={memberError ? "true" : "false"}
-                    />
-                    {members.length > MIN_MEMBERS && (
-                      <button
-                        type="button"
-                        onClick={() => removeMember(i)}
-                        className="text-slate-400 hover:text-red-500 text-lg leading-none"
-                        aria-label={`Remove member ${i + 1}`}
-                      >
-                        ×
-                      </button>
-                    )}
-                  </div>
-                  {memberError && (
-                    <p
-                      id={errorId}
-                      role="alert"
-                      className="text-xs text-red-600 mt-0.5 ml-7"
-                    >
-                      {memberError}
-                    </p>
-                  )}
-                </div>
-              );
-            })}
+            {members.map((m, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="text-xs text-slate-400 w-5 text-right">{i + 1}.</span>
+                <input
+                  type="text"
+                  placeholder={`G... (member ${i + 1})`}
+                  value={m}
+                  onChange={(e) => updateMember(i, e.target.value)}
+                  className="flex-1 min-w-0 border border-slate-300 rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                />
+                {members.length > MIN_MEMBERS && (
+                  <button
+                    type="button"
+                    onClick={() => removeMember(i)}
+                    className="p-1 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none"
+                    aria-label={`Remove member ${i + 1}`}
+                  >
+                    ×
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
           <div className="mt-2 flex items-center gap-3">
             <button
@@ -370,7 +306,7 @@ export default function CreatePage() {
           <p className="text-xs text-slate-400 mt-1">
             Minimum {MIN_MEMBERS} members · maximum {MAX_MEMBERS} members.
           </p>
-        </fieldset>
+        </div>
 
         {/* Summary card ─────────────────────────────────────────────────────── */}
         {/* All values derived from filledCount / potPerRound so blank rows     */}

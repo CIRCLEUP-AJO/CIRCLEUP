@@ -1,6 +1,4 @@
-import type { Metadata } from "next";
-import { notFound } from "next/navigation";
-import ReputationClient from "./ReputationClient";
+"use client";
 
 import { useState, useEffect, useCallback } from "react";
 import { INDEXER_URL, shortAddress } from "@/lib/config";
@@ -32,58 +30,39 @@ interface ReputationResponse {
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-// Three distinct outcomes for the fetch so the UI can show the right message:
-//   "outage"    — network error or non-2xx/404 response (indexer down / misconfigured)
-//   "not_found" — 404 or the indexer returned found:false with no activity
-//   data        — a valid ReputationResponse
+type FetchResult =
+  | { ok: true; data: ReputationResponse }
+  | { ok: false; reason: "not_found" | "network" | "unknown" };
 
-type FetchOutcome =
-  | { kind: "outage"; detail: string }
-  | { kind: "not_found" }
-  | { kind: "ok"; data: ReputationResponse };
-
-async function fetchReputation(member: string): Promise<FetchOutcome> {
+async function fetchReputation(member: string): Promise<FetchResult> {
   try {
     const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
       // Always fetch fresh data — the user can also trigger a manual refresh.
       cache: "no-store",
     });
-    if (res.status === 404) return { kind: "not_found" };
-    if (!res.ok) {
-      return {
-        kind: "outage",
-        detail: `Indexer returned HTTP ${res.status}. Check that the indexer service is running and NEXT_PUBLIC_INDEXER_URL is correct.`,
-      };
-    }
-    const data = (await res.json()) as ReputationResponse;
-    return { kind: "ok", data };
-  } catch (err) {
-    return {
-      kind: "outage",
-      detail:
-        "Could not reach the indexer. Check that the service is running and your network connection is stable.",
-    };
+    if (res.status === 404) return { ok: false, reason: "not_found" };
+    if (!res.ok) return { ok: false, reason: "unknown" };
+    return { ok: true, data: (await res.json()) as ReputationResponse };
+  } catch {
+    return { ok: false, reason: "network" };
   }
 }
 
-export default function ReputationPage({
-  params,
-}: {
-  params: { member: string };
-}) {
-  const { member } = params;
+// ─── Component ────────────────────────────────────────────────────────────────
 
-  // undefined  = initial loading
-  // FetchOutcome = settled (ok, not_found, or outage)
-  const [outcome, setOutcome] = useState<FetchOutcome | undefined>(undefined);
+export default function ReputationClient({ member }: { member: string }) {
+  const [result, setResult] = useState<FetchResult | undefined>(
+    // undefined = loading
+    undefined,
+  );
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
 
   const load = useCallback(
     async (isManual = false) => {
       if (isManual) setRefreshing(true);
-      const result = await fetchReputation(member);
-      setOutcome(result);
+      const fetched = await fetchReputation(member);
+      setResult(fetched);
       setLastRefreshed(new Date());
       if (isManual) setRefreshing(false);
     },
@@ -97,7 +76,7 @@ export default function ReputationPage({
 
   // ── Loading state ────────────────────────────────────────────────────────────
 
-  if (outcome === undefined) {
+  if (result === undefined) {
     return (
       <div
         className="text-center py-16 text-slate-500"
@@ -113,49 +92,35 @@ export default function ReputationPage({
     );
   }
 
-  // ── Indexer outage ───────────────────────────────────────────────────────────
+  // ── Error states ─────────────────────────────────────────────────────────────
 
-  if (outcome.kind === "outage") {
-    return (
-      <div className="max-w-xl mx-auto space-y-6">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-900">Reputation</h1>
-          <p className="font-mono text-sm text-slate-500 mt-1 break-all" aria-label={`Member address: ${member}`}>
+  if (!result.ok) {
+    if (result.reason === "not_found") {
+      return (
+        <div className="text-center py-16 text-slate-500">
+          <div className="text-4xl mb-3" aria-hidden="true">🔍</div>
+          <p className="font-medium text-slate-800">No reputation record found.</p>
+          <p className="text-sm mt-1 text-slate-500">
+            This address has no on-chain activity in CircleUp yet.
+          </p>
+          <p className="font-mono text-xs text-slate-400 mt-2 break-all max-w-xs mx-auto">
             {member}
           </p>
         </div>
-        <div
-          role="alert"
-          className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-6 flex items-start gap-3"
-        >
-          <span className="text-2xl mt-0.5" aria-hidden="true">⚠️</span>
-          <div>
-            <p className="font-semibold text-amber-800">Indexer unreachable</p>
-            <p className="text-amber-700 text-sm mt-1">{outcome.detail}</p>
-          </div>
-        </div>
-        <button
-          onClick={() => load(true)}
-          disabled={refreshing}
-          className="text-sm text-brand-600 hover:underline disabled:opacity-50"
-        >
-          {refreshing ? "Retrying…" : "Try again"}
-        </button>
-      </div>
-    );
-  }
+      );
+    }
 
-  // ── Not found ────────────────────────────────────────────────────────────────
+    const errorMessages: Record<string, string> = {
+      network: "The reputation service is unreachable. Check your connection and try again.",
+      unknown: "An unexpected error occurred loading reputation data.",
+    };
 
-  if (outcome.kind === "not_found") {
     return (
       <div className="text-center py-16 text-slate-500">
-        <div className="text-4xl mb-3" aria-hidden="true">
-          🔍
-        </div>
-        <p>No reputation data found for this member.</p>
-        <p className="text-sm text-slate-400 mt-1">
-          This address may not have participated in any circle yet.
+        <div className="text-4xl mb-3" aria-hidden="true">⚠️</div>
+        <p className="font-medium text-slate-800">Could not load reputation</p>
+        <p className="text-sm mt-1 text-slate-500">
+          {errorMessages[result.reason] ?? errorMessages.unknown}
         </p>
         <button
           onClick={() => load(true)}
@@ -170,7 +135,7 @@ export default function ReputationPage({
 
   // ── Loaded ───────────────────────────────────────────────────────────────────
 
-  const data = outcome.data;
+  const { data } = result;
 
   return (
     <div className="max-w-xl mx-auto space-y-6">
