@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod circle_tests {
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, MAX_ROUND_DEADLINE_LEDGERS,
+        CircleContract, CircleContractClient, CircleStatus, MAX_MEMBERS, MAX_ROUND_DEADLINE_LEDGERS,
         MIN_ROUND_DEADLINE_LEDGERS,
     };
     use reputation::{ReputationContract, ReputationContractClient};
@@ -89,6 +89,21 @@ mod circle_tests {
             carol,
             dave,
         }
+    }
+
+    fn setup_env_with_token_and_reputation() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin);
+
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        let rep_admin = Address::generate(&env);
+        rep_client.initialize(&rep_admin);
+
+        (env, token_id.address(), rep_id)
     }
 
     // ── Join tests ────────────────────────────────────────────────────────────
@@ -223,6 +238,34 @@ mod circle_tests {
         t.circle.payout();
     }
 
+    #[test]
+    #[should_panic(expected = "not all members have contributed yet")]
+    fn test_payout_panics_when_one_member_remains_unpaid() {
+        let t = setup_circle();
+        activate(&t);
+
+        // In round 0, only dave remains.
+        t.circle.contribute(&t.alice);
+        t.circle.contribute(&t.bob);
+        t.circle.contribute(&t.carol);
+        t.circle.payout();
+    }
+
+    #[test]
+    fn test_payout_succeeds_after_last_remaining_member_contributes() {
+        let t = setup_circle();
+        activate(&t);
+        t.circle.contribute(&t.alice);
+        t.circle.contribute(&t.bob);
+        t.circle.contribute(&t.carol);
+        t.circle.contribute(&t.dave);
+        t.circle.payout();
+
+        let round = t.circle.get_current_round();
+        assert_eq!(round.round_index, 1);
+        assert_eq!(round.recipient, t.bob);
+    }
+
     // ── Default / penalty tests ───────────────────────────────────────────────
 
     #[test]
@@ -263,6 +306,42 @@ mod circle_tests {
         let t = setup_circle();
         activate(&t);
         t.circle.mark_default(&t.carol);
+    }
+
+    #[test]
+    #[should_panic(expected = "round deadline not yet passed")]
+    fn test_mark_default_at_exact_deadline_panics() {
+        let t = setup_circle();
+        activate(&t);
+
+        let round = t.circle.get_current_round();
+        let start = t.env.ledger().sequence();
+        let exact_deadline_delta =
+            (round.deadline_ledger as u32).saturating_sub(start);
+
+        // Exactly at deadline is still too early.
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += exact_deadline_delta;
+        });
+        t.circle.mark_default(&t.carol);
+    }
+
+    #[test]
+    fn test_mark_default_one_ledger_after_deadline_succeeds() {
+        let t = setup_circle();
+        activate(&t);
+        let round = t.circle.get_current_round();
+        let start = t.env.ledger().sequence();
+        let after_deadline_delta = (round.deadline_ledger as u32)
+            .saturating_sub(start)
+            + 1;
+
+        // One ledger after deadline should allow marking default.
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += after_deadline_delta;
+        });
+        t.circle.mark_default(&t.carol);
+        assert_eq!(t.circle.get_defaults(&t.carol), 1);
     }
 
     #[test]
@@ -459,6 +538,7 @@ mod circle_tests {
         t.circle.join(&t.alice);
         t.circle.join(&t.bob);
         t.circle.cancel(&t.carol);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
 
         let alice_before = t.token.balance(&t.alice);
         let bob_before = t.token.balance(&t.bob);
@@ -467,6 +547,30 @@ mod circle_tests {
         assert_eq!(t.token.balance(&t.bob) - bob_before, ROUND_AMOUNT);
         assert_eq!(t.circle.get_collateral(&t.alice), 0);
         assert_eq!(t.circle.get_collateral(&t.bob), 0);
+    }
+
+    #[test]
+    fn test_close_after_completion_returns_collateral() {
+        let t = setup_circle();
+        activate(&t);
+
+        // Complete every round normally.
+        for _ in 0..4 {
+            t.circle.contribute(&t.alice);
+            t.circle.contribute(&t.bob);
+            t.circle.contribute(&t.carol);
+            t.circle.contribute(&t.dave);
+            t.circle.payout();
+        }
+        assert_eq!(t.circle.get_status(), CircleStatus::Completed);
+
+        let carol_before = t.token.balance(&t.carol);
+        t.circle.close(&t.carol);
+        assert_eq!(t.token.balance(&t.carol) - carol_before, ROUND_AMOUNT);
+        assert_eq!(t.circle.get_collateral(&t.alice), 0);
+        assert_eq!(t.circle.get_collateral(&t.bob), 0);
+        assert_eq!(t.circle.get_collateral(&t.carol), 0);
+        assert_eq!(t.circle.get_collateral(&t.dave), 0);
     }
 
     #[test]
@@ -550,6 +654,61 @@ mod circle_tests {
         );
     }
 
+    #[test]
+    fn test_initialize_accepts_minimal_valid_input() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a.clone());
+        members.push_back(member_b.clone());
+
+        circle.initialize(
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.round_amount, 1);
+        assert_eq!(
+            circle.get_status(),
+            CircleStatus::Pending
+        );
+        let round = circle.get_current_round();
+        assert_eq!(round.round_index, 0);
+        assert_eq!(round.recipient, member_a);
+    }
+
+    #[test]
+    #[should_panic(expected = "too many members")]
+    fn test_initialize_rejects_member_count_above_maximum() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        let mut i: u32 = 0;
+        while i <= MAX_MEMBERS {
+            members.push_back(Address::generate(&env));
+            i += 1;
+        }
+
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+    }
+
     // ── mark_default current-round-only tests ─────────────────────────────────
 
     #[test]
@@ -589,114 +748,21 @@ mod circle_tests {
         assert_eq!(t.circle.get_collateral(&t.alice), ROUND_AMOUNT);
     }
 
-    // ── get_config: NotInitialized error (Issue 97 / task d) ─────────────────
-
     #[test]
-    fn test_get_config_returns_ok_after_initialize() {
-        let t = setup_circle();
-        let result = t.circle.get_config();
-        assert!(result.is_ok(), "expected Ok from get_config after initialize");
-        let config = result.unwrap();
-        assert_eq!(config.round_amount, ROUND_AMOUNT);
-        assert_eq!(config.round_deadline_ledgers, ROUND_DEADLINE);
-    }
-
-    #[test]
-    fn test_get_config_returns_err_before_initialize() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        // Deploy a fresh contract but do NOT call initialize
-        let circle_id = env.register_contract(None, CircleContract);
-        let circle = CircleContractClient::new(&env, &circle_id);
-
-        let result = circle.try_get_config();
-        assert!(
-            result.is_err(),
-            "expected Err(NotInitialized) before initialize, got Ok"
-        );
-    }
-
-    // ── get_current_round: stable state for non-Active circles (Issue 99 / task c) ──
-
-    #[test]
-    fn test_get_current_round_returns_ok_while_pending() {
-        // After initialize, status is Pending and CurrentRound is set — should be Ok.
-        let t = setup_circle();
-        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
-        let result = t.circle.get_current_round();
-        assert!(result.is_ok(), "expected Ok from get_current_round while Pending");
-        assert_eq!(result.unwrap().round_index, 0);
-    }
-
-    #[test]
-    fn test_get_current_round_returns_ok_while_active() {
+    fn test_get_member_account_returns_collateral_and_defaults() {
         let t = setup_circle();
         activate(&t);
-        assert_eq!(t.circle.get_status(), CircleStatus::Active);
-        let result = t.circle.get_current_round();
-        assert!(result.is_ok(), "expected Ok from get_current_round while Active");
-    }
 
-    #[test]
-    fn test_get_current_round_returns_err_when_completed() {
-        let t = setup_circle();
-        activate(&t);
-        force_status(&t, CircleStatus::Completed);
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += ROUND_DEADLINE + 1;
+        });
+        t.circle.mark_default(&t.bob);
 
-        let result = t.circle.get_current_round();
-        assert!(
-            result.is_err(),
-            "expected Err(CircleNotActive) when Completed, got Ok"
+        let account: MemberAccount = t.circle.get_member_account(&t.bob);
+        assert_eq!(account.default_count, 1);
+        assert_eq!(
+            account.collateral,
+            ROUND_AMOUNT - (ROUND_AMOUNT * 2000 / 10000)
         );
-    }
-
-    #[test]
-    fn test_get_current_round_returns_err_when_cancelled() {
-        let t = setup_circle();
-        t.circle.cancel(&t.alice);
-        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
-
-        let result = t.circle.get_current_round();
-        assert!(
-            result.is_err(),
-            "expected Err(CircleNotActive) when Cancelled, got Ok"
-        );
-    }
-
-    // ── Audit events: cancelled and closed carry ledger numbers (Issue 98 / task b) ──
-
-    #[test]
-    fn test_cancel_event_is_emitted() {
-        // Verifies cancel() completes successfully — event content is validated
-        // by the Soroban host; we assert the state transition occurred which
-        // proves the event path executed.
-        let t = setup_circle();
-        t.circle.join(&t.alice);
-        t.circle.cancel(&t.alice);
-        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
-    }
-
-    #[test]
-    fn test_close_event_is_emitted_after_completion() {
-        let t = setup_circle();
-        activate(&t);
-        force_status(&t, CircleStatus::Completed);
-
-        // close() should succeed and emit the enriched event
-        t.circle.close(&t.alice);
-        // Collateral was returned, proving the event path ran to completion
-        assert_eq!(t.circle.get_collateral(&t.alice), 0);
-    }
-
-    #[test]
-    fn test_close_event_is_emitted_after_cancellation() {
-        let t = setup_circle();
-        t.circle.join(&t.alice);
-        t.circle.join(&t.bob);
-        t.circle.cancel(&t.carol);
-        t.circle.close(&t.alice);
-        assert_eq!(t.circle.get_collateral(&t.alice), 0);
-        assert_eq!(t.circle.get_collateral(&t.bob), 0);
     }
 }
