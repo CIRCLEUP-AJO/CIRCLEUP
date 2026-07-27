@@ -19,6 +19,7 @@ import type {
   TxResult,
   TxSuccess,
   TxFailure,
+  TxErrorCode,
   SimulateResult,
   ApiCirclesListResponse,
   ApiCircleDetailResponse,
@@ -36,13 +37,50 @@ const POLL_TIMEOUT_MS = 60_000;
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /** Build a typed failure result. */
-function txFailure(txHash: string, errorMessage: string): TxFailure {
-  return { success: false, txHash, errorMessage };
+function txFailure(
+  txHash: string,
+  errorMessage: string,
+  errorCode: TxErrorCode = "unknown",
+): TxFailure {
+  return { success: false, txHash, errorMessage, errorCode };
 }
 
 /** Build a typed success result. */
 function txSuccess(txHash: string, ledger: number): TxSuccess {
   return { success: true, txHash, ledger };
+}
+
+/**
+ * Extract a human-readable error string from the Soroban simulation error.
+ *
+ * The raw `simResult.error` is an XDR-encoded diagnostic string that often
+ * contains the contract panic message, e.g.:
+ *   "HostError: Value(UnexpectedType)\n  ... contract backtrace ...\nError(Contract, #1)"
+ *
+ * We try to surface the most actionable part:
+ * 1. A quoted contract message (text between "contract backtrace" or panic string)
+ * 2. The last `Error(...)` segment which encodes the contract error code
+ * 3. Fall back to the full string if neither pattern matches
+ */
+function extractSimulationError(raw: string): string {
+  // Soroban contract panics embed the message as a quoted string, e.g.:
+  //   Event contract log (debug): "already joined"
+  const logMatch = raw.match(/contract\s+log\s+\(debug\):\s+"([^"]+)"/i);
+  if (logMatch) return logMatch[1];
+
+  // Panic messages appear as: panic called with: "message"
+  const panicMatch = raw.match(/panic called with:\s+"([^"]+)"/i);
+  if (panicMatch) return panicMatch[1];
+
+  // ContractError enum variant: Error(Contract, #N) — extract code number
+  const errCodeMatch = raw.match(/Error\(Contract,\s*#(\d+)\)/);
+  if (errCodeMatch) {
+    return `Contract error code ${errCodeMatch[1]}. Check that the operation is valid for the current circle state.`;
+  }
+
+  // If the raw string is short enough to be user-visible, pass it through;
+  // otherwise trim it to avoid dumping a multi-KB XDR blob into a UI toast.
+  return raw.length <= 300 ? raw : raw.slice(0, 297) + "...";
 }
 
 // ─── Base client ─────────────────────────────────────────────────────────────
@@ -67,11 +105,28 @@ export class CircleUpClient {
     method: string,
     args: xdr.ScVal[],
   ): Promise<TxResult> {
+    // Context string prepended to every error from this invocation so callers
+    // can correlate an error back to the contract method without a stack trace.
+    const ctx = `${contractId}.${method}`;
+
     let account: Awaited<ReturnType<typeof this.rpc.getAccount>>;
     try {
       account = await this.rpc.getAccount(sourceKeypair.publicKey());
     } catch (err: any) {
-      return txFailure("", `Failed to load account: ${err?.message ?? "network error"}`);
+      const msg = err?.message ?? "network error";
+      // HTTP 404 from getAccount means the account has never been funded.
+      const isNotFound =
+        msg.includes("404") ||
+        msg.toLowerCase().includes("not found") ||
+        msg.toLowerCase().includes("does not exist");
+      return txFailure(
+        "",
+        isNotFound
+          ? `Account ${sourceKeypair.publicKey()} not found on the network. ` +
+            `Fund it with Friendbot (testnet) or a real XLM transfer before calling ${ctx}.`
+          : `Failed to load account for ${ctx}: ${msg}`,
+        isNotFound ? "account_not_found" : "network_error",
+      );
     }
 
     const contract = new Contract(contractId);
@@ -90,11 +145,21 @@ export class CircleUpClient {
     try {
       simResult = await this.rpc.simulateTransaction(tx);
     } catch (err: any) {
-      return txFailure("", `Simulation network error: ${err?.message ?? "unknown"}`);
+      return txFailure(
+        "",
+        `Network error while simulating ${ctx}: ${err?.message ?? "unknown"}. ` +
+          `Check your RPC endpoint (${this.config.rpcUrl}).`,
+        "network_error",
+      );
     }
 
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      return txFailure("", simResult.error);
+      const humanMessage = extractSimulationError(simResult.error);
+      return txFailure(
+        "",
+        `Simulation failed for ${ctx}: ${humanMessage}`,
+        "simulation_failed",
+      );
     }
 
     const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
@@ -104,27 +169,62 @@ export class CircleUpClient {
     try {
       sendResult = await this.rpc.sendTransaction(preparedTx);
     } catch (err: any) {
-      return txFailure("", `Submit network error: ${err?.message ?? "unknown"}`);
+      return txFailure(
+        "",
+        `Network error while submitting ${ctx}: ${err?.message ?? "unknown"}. ` +
+          `Check your RPC endpoint (${this.config.rpcUrl}).`,
+        "network_error",
+      );
     }
 
     if (sendResult.status === "ERROR") {
+      // errorResult is an XDR TransactionResult.  The most useful part for
+      // developers is the result code; pull it out rather than dumping raw JSON.
+      let detail = "";
+      try {
+        const resultJson = sendResult.errorResult?.toXDR?.("base64") ?? "";
+        detail = resultJson
+          ? ` (XDR result: ${resultJson.slice(0, 120)})`
+          : ` (raw: ${JSON.stringify(sendResult.errorResult).slice(0, 120)})`;
+      } catch {
+        // If XDR serialisation fails, omit the detail rather than crashing.
+      }
       return txFailure(
         sendResult.hash,
-        `Transaction rejected by network: ${JSON.stringify(sendResult.errorResult)}`,
+        `Transaction rejected by the Stellar network for ${ctx}.${detail} ` +
+          `This usually means the fee is too low, the sequence number is wrong, ` +
+          `or the transaction expired. Try again.`,
+        "tx_rejected",
       );
     }
 
     // Poll for confirmation
     const hash = sendResult.hash;
     const start = Date.now();
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 5;
+
     while (Date.now() - start < POLL_TIMEOUT_MS) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
 
       let status: Awaited<ReturnType<typeof this.rpc.getTransaction>>;
       try {
         status = await this.rpc.getTransaction(hash);
-      } catch {
-        // Transient polling error — keep trying until timeout
+        consecutiveErrors = 0; // reset on success
+      } catch (err: any) {
+        consecutiveErrors++;
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          // Too many consecutive polling failures — likely a persistent RPC
+          // issue; surface it rather than silently looping until timeout.
+          return txFailure(
+            hash,
+            `Lost RPC connectivity while waiting for ${ctx} (tx: ${hash}). ` +
+              `Last error: ${(err as any)?.message ?? "unknown"}. ` +
+              `The transaction may still confirm — check Stellar Expert before retrying.`,
+            "network_error",
+          );
+        }
+        // Transient polling error — keep trying
         continue;
       }
 
@@ -132,11 +232,33 @@ export class CircleUpClient {
         return txSuccess(hash, status.ledger);
       }
       if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-        return txFailure(hash, "Transaction was included in a ledger but marked as failed.");
+        // Extract the result code from the transaction result XDR when
+        // available so developers see a Soroban-level error, not just "failed".
+        let detail = "";
+        try {
+          if ("resultXdr" in status && status.resultXdr) {
+            const resultMeta = status.resultXdr;
+            detail = ` Result XDR: ${resultMeta.toString().slice(0, 120)}`;
+          }
+        } catch {
+          // Ignore XDR parse errors in the error path
+        }
+        return txFailure(
+          hash,
+          `Transaction ${hash} was included in a ledger but failed for ${ctx}.${detail} ` +
+            `Review the contract state and your inputs, then try again.`,
+          "tx_failed",
+        );
       }
     }
 
-    return txFailure(hash, "Timed out waiting for transaction confirmation. The transaction may still confirm — check Stellar Expert before retrying.");
+    return txFailure(
+      hash,
+      `Timed out waiting for confirmation of ${ctx} (tx: ${hash}) after ` +
+        `${POLL_TIMEOUT_MS / 1000}s. The transaction may still confirm — ` +
+        `check Stellar Expert before retrying.`,
+      "timeout",
+    );
   }
 
   protected async simulateAndRead(
@@ -241,7 +363,27 @@ export class FactoryClient extends CircleUpClient {
       ],
     );
 
-    return { result };
+    if (!result.success) {
+      return { result };
+    }
+
+    // The factory `create_circle` entry-point returns the new circle's Address.
+    // Read it back via simulation so callers don't have to query get_circles()
+    // and guess which address is new.
+    let circleAddress: string | undefined;
+    try {
+      const circles = await this.getCircles();
+      // The last entry in the registry is always the one we just created
+      // because the factory appends and never reorders.
+      if (circles.length > 0) {
+        circleAddress = circles[circles.length - 1];
+      }
+    } catch {
+      // Non-fatal: the transaction succeeded; we just can't resolve the address
+      // right now.  Callers can fall back to getCircles() themselves.
+    }
+
+    return { result, circleAddress };
   }
 
   async getCircles(): Promise<string[]> {

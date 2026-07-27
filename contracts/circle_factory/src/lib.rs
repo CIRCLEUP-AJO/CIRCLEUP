@@ -271,7 +271,26 @@ mod tests {
         Env,
     };
 
-    fn setup_factory(env: &Env) -> (CircleFactoryClient, Address) {
+    // ── FactorySetup — type-safe test fixture ─────────────────────────────────
+    //
+    // Returning a named struct instead of a bare tuple means tests can access
+    // every field by name (`setup.admin`, `setup.usdc`, …) without positional
+    // guesswork.  Adding a new fixture field is a one-line change here rather
+    // than a cascading refactor across every call-site.
+
+    struct FactorySetup<'a> {
+        client: CircleFactoryClient<'a>,
+        admin: Address,
+        #[allow(dead_code)]
+        rep: Address,
+        usdc: Address,
+        #[allow(dead_code)]
+        wasm_hash: BytesN<32>,
+    }
+
+    /// Deploy and initialize a fresh factory, returning every fixture address
+    /// that tests may need to assert against.
+    fn setup_factory(env: &Env) -> FactorySetup {
         env.mock_all_auths();
         let id = env.register_contract(None, CircleFactory);
         let client = CircleFactoryClient::new(env, &id);
@@ -280,22 +299,43 @@ mod tests {
         let usdc = Address::generate(env);
         let wasm_hash: BytesN<32> = BytesN::from_array(env, &[0u8; 32]);
         client.initialize(&admin, &wasm_hash, &rep, &usdc);
-        (client, admin)
+        FactorySetup { client, admin, rep, usdc, wasm_hash }
     }
 
     #[test]
     fn test_factory_initializes() {
         let env = Env::default();
-        let (client, _) = setup_factory(&env);
-        assert_eq!(client.get_circle_count(), 0);
+        let setup = setup_factory(&env);
+        assert_eq!(setup.client.get_circle_count(), 0);
     }
 
     #[test]
     fn test_get_admin_and_usdc_token() {
         let env = Env::default();
-        let (client, admin, _, usdc) = setup_factory(&env);
-        assert_eq!(client.get_admin(), admin);
-        assert_eq!(client.get_usdc_token(), usdc);
+        let setup = setup_factory(&env);
+        assert_eq!(setup.client.get_admin(), setup.admin);
+        assert_eq!(setup.client.get_usdc_token(), setup.usdc);
+    }
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_double_initialize_panics() {
+        let env = Env::default();
+        let setup = setup_factory(&env);
+        // A second initialize call on the same contract must be rejected.
+        let admin2 = Address::generate(&env);
+        let rep2 = Address::generate(&env);
+        let usdc2 = Address::generate(&env);
+        setup.client.initialize(&admin2, &setup.wasm_hash, &rep2, &usdc2);
+    }
+
+    #[test]
+    fn test_initial_circle_count_is_zero() {
+        // Explicit assertion to guard against any future default-value change.
+        let env = Env::default();
+        let setup = setup_factory(&env);
+        assert_eq!(setup.client.get_circle_count(), 0);
+        assert!(setup.client.get_circles().is_empty());
     }
 
     #[test]
