@@ -3,8 +3,8 @@
 #[cfg(test)]
 mod circle_tests {
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, MAX_ROUND_DEADLINE_LEDGERS,
-        MIN_ROUND_DEADLINE_LEDGERS,
+        CircleContract, CircleContractClient, CircleStatus, MemberAccount,
+        MAX_ROUND_DEADLINE_LEDGERS, MIN_ROUND_DEADLINE_LEDGERS,
     };
     use reputation::{ReputationContract, ReputationContractClient};
     use soroban_sdk::{
@@ -223,6 +223,34 @@ mod circle_tests {
         t.circle.payout();
     }
 
+    #[test]
+    #[should_panic(expected = "not all members have contributed yet")]
+    fn test_payout_panics_when_one_member_remains_unpaid() {
+        let t = setup_circle();
+        activate(&t);
+
+        // In round 0, only dave remains.
+        t.circle.contribute(&t.alice);
+        t.circle.contribute(&t.bob);
+        t.circle.contribute(&t.carol);
+        t.circle.payout();
+    }
+
+    #[test]
+    fn test_payout_succeeds_after_last_remaining_member_contributes() {
+        let t = setup_circle();
+        activate(&t);
+        t.circle.contribute(&t.alice);
+        t.circle.contribute(&t.bob);
+        t.circle.contribute(&t.carol);
+        t.circle.contribute(&t.dave);
+        t.circle.payout();
+
+        let round = t.circle.get_current_round();
+        assert_eq!(round.round_index, 1);
+        assert_eq!(round.recipient, t.bob);
+    }
+
     // ── Default / penalty tests ───────────────────────────────────────────────
 
     #[test]
@@ -263,6 +291,42 @@ mod circle_tests {
         let t = setup_circle();
         activate(&t);
         t.circle.mark_default(&t.carol);
+    }
+
+    #[test]
+    #[should_panic(expected = "round deadline not yet passed")]
+    fn test_mark_default_at_exact_deadline_panics() {
+        let t = setup_circle();
+        activate(&t);
+
+        let round = t.circle.get_current_round();
+        let start = t.env.ledger().sequence();
+        let exact_deadline_delta =
+            (round.deadline_ledger as u32).saturating_sub(start);
+
+        // Exactly at deadline is still too early.
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += exact_deadline_delta;
+        });
+        t.circle.mark_default(&t.carol);
+    }
+
+    #[test]
+    fn test_mark_default_one_ledger_after_deadline_succeeds() {
+        let t = setup_circle();
+        activate(&t);
+        let round = t.circle.get_current_round();
+        let start = t.env.ledger().sequence();
+        let after_deadline_delta = (round.deadline_ledger as u32)
+            .saturating_sub(start)
+            + 1;
+
+        // One ledger after deadline should allow marking default.
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += after_deadline_delta;
+        });
+        t.circle.mark_default(&t.carol);
+        assert_eq!(t.circle.get_defaults(&t.carol), 1);
     }
 
     #[test]
@@ -462,7 +526,7 @@ mod circle_tests {
 
         let alice_before = t.token.balance(&t.alice);
         let bob_before = t.token.balance(&t.bob);
-        t.circle.close();
+        t.circle.close(&t.alice);
         assert_eq!(t.token.balance(&t.alice) - alice_before, ROUND_AMOUNT);
         assert_eq!(t.token.balance(&t.bob) - bob_before, ROUND_AMOUNT);
         assert_eq!(t.circle.get_collateral(&t.alice), 0);
@@ -587,5 +651,23 @@ mod circle_tests {
         let expected = ROUND_AMOUNT - (ROUND_AMOUNT * 2000 / 10000);
         assert_eq!(t.circle.get_collateral(&t.carol), expected);
         assert_eq!(t.circle.get_collateral(&t.alice), ROUND_AMOUNT);
+    }
+
+    #[test]
+    fn test_get_member_account_returns_collateral_and_defaults() {
+        let t = setup_circle();
+        activate(&t);
+
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += ROUND_DEADLINE + 1;
+        });
+        t.circle.mark_default(&t.bob);
+
+        let account: MemberAccount = t.circle.get_member_account(&t.bob);
+        assert_eq!(account.default_count, 1);
+        assert_eq!(
+            account.collateral,
+            ROUND_AMOUNT - (ROUND_AMOUNT * 2000 / 10000)
+        );
     }
 }

@@ -54,6 +54,13 @@ pub struct RoundState {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberAccount {
+    pub collateral: i128,
+    pub default_count: u32,
+}
+
+#[contracttype]
 pub enum DataKey {
     Config,
     Status,
@@ -332,7 +339,10 @@ impl CircleContract {
         }
 
         // Transfer pot (member_count × round_amount) to this round's recipient
-        let pot: i128 = config.round_amount * member_count as i128;
+        let pot: i128 = config
+            .round_amount
+            .checked_mul(member_count as i128)
+            .unwrap_or_else(|| panic!("payout amount overflow"));
         let token_client = token::Client::new(&env, &config.usdc_token);
         token_client.transfer(&env.current_contract_address(), &round.recipient, &pot);
 
@@ -436,8 +446,13 @@ impl CircleContract {
         }
 
         // Deduct penalty from collateral
-        let penalty = collateral * PENALTY_BPS / BPS_DENOM;
-        let new_collateral = collateral - penalty;
+        let penalty_numerator = collateral
+            .checked_mul(PENALTY_BPS)
+            .unwrap_or_else(|| panic!("penalty overflow"));
+        let penalty = penalty_numerator / BPS_DENOM;
+        let new_collateral = collateral
+            .checked_sub(penalty)
+            .unwrap_or_else(|| panic!("penalty exceeds collateral"));
         env.storage()
             .persistent()
             .set(&DataKey::Collateral(member.clone()), &new_collateral);
@@ -451,9 +466,12 @@ impl CircleContract {
             .persistent()
             .get(&DataKey::Defaults(member.clone()))
             .unwrap_or(0);
+        let next_defaults = defaults
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("default counter overflow"));
         env.storage()
             .persistent()
-            .set(&DataKey::Defaults(member.clone()), &(defaults + 1));
+            .set(&DataKey::Defaults(member.clone()), &next_defaults);
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
@@ -499,7 +517,9 @@ impl CircleContract {
                 env.storage()
                     .persistent()
                     .set(&DataKey::Collateral(member.clone()), &0i128);
-                total_released += collateral;
+                total_released = total_released
+                    .checked_add(collateral)
+                    .unwrap_or_else(|| panic!("released collateral overflow"));
 
                 // Per-member audit trail for indexers / off-chain reconciler
                 env.events().publish(
@@ -544,6 +564,24 @@ impl CircleContract {
             .persistent()
             .get(&DataKey::Defaults(member))
             .unwrap_or(0)
+    }
+
+    pub fn get_member_account(env: Env, member: Address) -> MemberAccount {
+        let collateral = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Collateral(member.clone()))
+            .unwrap_or(0);
+        let default_count = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Defaults(member))
+            .unwrap_or(0);
+
+        MemberAccount {
+            collateral,
+            default_count,
+        }
     }
 
     pub fn has_contributed(env: Env, member: Address, round_index: u32) -> bool {
