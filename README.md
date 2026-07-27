@@ -21,6 +21,7 @@ CircleUp brings Rotating Savings & Credit Associations (ROSCAs) — known as **A
 - [SDK](#sdk)
 - [Environment Variables](#environment-variables)
 - [Contracts Reference](#contracts-reference)
+- [Gas and Storage Estimation](#gas-and-storage-estimation)
 - [API Reference](#api-reference)
 - [Demo Flow](#demo-flow)
 - [Tech Stack](#tech-stack)
@@ -484,6 +485,110 @@ formatPot("10000000", 4);      // → "4.00"
 | `increment` | member (via circle) | Add 1 completed round to score |
 | `score` | anyone | Read a wallet's score |
 
+### Protocol constants
+
+All financial parameters that govern on-chain behaviour are defined as named public constants in `contracts/circle/src/lib.rs` and surfaced through the `get_protocol_params` view so clients stay in sync without hard-coding values.
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `PENALTY_BPS` | 2 000 | Collateral penalty per missed round (basis points; 2 000 bp = 20 %) |
+| `BPS_DENOM` | 10 000 | Denominator for all basis-point calculations |
+| `COLLATERAL_MULTIPLIER` | 1 | Collateral = `round_amount × COLLATERAL_MULTIPLIER` |
+| `MIN_ROUND_DEADLINE_LEDGERS` | 100 | Minimum deadline (~8 min at 5 s/ledger) |
+| `MAX_ROUND_DEADLINE_LEDGERS` | 1 036 800 | Maximum deadline (~60 days at 5 s/ledger) |
+| `MAX_MEMBERS` | 256 | Maximum members per circle |
+
+Read the live values at any time:
+
+```ts
+const params = await circle.simulateAndReadOrThrow("get_protocol_params", []);
+console.log(`Penalty: ${params.penalty_bps / params.bps_denom * 100}%`);
+// → "Penalty: 20%"
+```
+
+---
+
+## Gas and Storage Estimation
+
+Soroban charges separately for **compute** (CPU instructions) and **storage** (bytes written/extended). Understanding both is important before broadcasting transactions with real funds.
+
+### Fee anatomy
+
+A Soroban transaction fee has two parts:
+
+| Part | How it's determined |
+|------|---------------------|
+| Base inclusion fee | Passed in `TransactionBuilder` (`BASE_FEE` = 100 stroops) |
+| Resource fee | Returned by `simulate_transaction` as `min_resource_fee`; covers CPU, read/write bytes, and ledger entry rentals |
+
+Always use the resource fee from the simulation response rather than hard-coding a value:
+
+```ts
+import {
+  SorobanRpc,
+  TransactionBuilder,
+  BASE_FEE,
+} from "@stellar/stellar-sdk";
+
+const sim = await rpc.simulateTransaction(tx);
+if (SorobanRpc.Api.isSimulationError(sim)) {
+  throw new Error(sim.error);
+}
+// min_resource_fee is in stroops; it must be paid on top of BASE_FEE
+console.log("Resource fee:", sim.minResourceFee, "stroops");
+
+const prepared = SorobanRpc.assembleTransaction(tx, sim).build();
+```
+
+`assembleTransaction` automatically merges the footprint, auth entries, and resource fee into the transaction so the prepared transaction is ready to sign.
+
+### Dry-run with stellar-cli
+
+For a quick cost estimate without writing code, use `stellar-cli contract invoke --cost`:
+
+```bash
+# Estimate the cost of a join call (--cost suppresses the actual broadcast)
+stellar contract invoke \
+  --id <CIRCLE_CONTRACT_ID> \
+  --source-account <YOUR_KEY_NAME> \
+  --network testnet \
+  --cost \
+  -- join \
+  --member <MEMBER_ADDRESS>
+```
+
+The output includes `instructions`, `read_bytes`, `write_bytes`, and the computed `min_resource_fee`. The `--cost` flag is safe — it simulates only and never submits.
+
+### Storage budget per entry-point
+
+Soroban charges a rent fee for every ledger entry created or extended. The table below shows the new storage entries created by each `circle` contract call so you can budget accordingly.
+
+| Entry-point | New entries | Type | Notes |
+|-------------|-------------|------|-------|
+| `initialize` | 4 | Instance | `Config`, `Status`, `RoundsCompleted`, `CurrentRound` |
+| `join` | 1 per member | Persistent | `Collateral(member)`; last join also writes `Status` + `CurrentRound` (instance) |
+| `contribute` | 1 | Persistent | `Contributed(member, round_index)` |
+| `payout` | 0 | — | Updates `CurrentRound` + `RoundsCompleted` (instance) only |
+| `mark_default` | 2 | Persistent | `Defaulted(member, round)`, `Defaults(member)` |
+| `close` | 0 | — | Writes `Collateral(member)` = 0 for each member; no new entries |
+
+Persistent entries have a TTL (time-to-live) that must be extended periodically or the entry is archived. The SDK's `simulateTransaction` call will include the minimum TTL extension in the footprint automatically.
+
+### Typical fee ranges (Stellar testnet, July 2025)
+
+These are approximate ranges observed in practice. Actual fees depend on ledger load.
+
+| Operation | Approximate resource fee |
+|-----------|--------------------------|
+| `initialize` | 60 000 – 90 000 stroops |
+| `join` | 30 000 – 50 000 stroops |
+| `contribute` | 25 000 – 40 000 stroops |
+| `payout` (4 members) | 80 000 – 130 000 stroops |
+| `mark_default` | 25 000 – 45 000 stroops |
+| `close` (4 members) | 60 000 – 100 000 stroops |
+
+At 10 000 000 stroops per XLM these fees are fractions of a cent at current prices. Always rely on `simulate_transaction` for exact values before broadcasting.
+
 ---
 
 ## API Reference
@@ -551,7 +656,8 @@ Step 4: Explorer
 3. Make your changes, run tests
 4. For contract changes: `cargo test` in `contracts/`
 5. For TS changes: `npx tsc --noEmit` in the relevant package
-6. Submit a pull request
+6. To estimate fees for a new contract entry-point: `stellar contract invoke --cost` (see [Gas and Storage Estimation](#gas-and-storage-estimation))
+7. Submit a pull request
 
 ---
 
