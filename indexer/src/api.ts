@@ -50,99 +50,6 @@ export function buildCorsOptions(
         callback(null, true);
         return;
       }
-      callback(new Error(`Origin ${origin} is not allowed`));
-    },
-  };
-}
-
-// ── Rate limiting ────────────────────────────────────────────────────────────
-//
-// Applies to every route including /health. Defaults to 100 requests per
-// minute per IP; both are configurable so ops can tune per-deployment without
-// a code change.
-const RATE_LIMIT_WINDOW_MS = parseInt(
-  process.env.RATE_LIMIT_WINDOW_MS || "60000",
-  10,
-);
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
-
-const apiRateLimiter = rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  limit: RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests, please try again later" },
-});
-
-function getErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  return "Unknown error";
-}
-
-function sendError(
-  res: Response,
-  status: number,
-  message: string,
-  details?: unknown,
-) {
-  res.status(status).json({
-    error: {
-      message,
-      details: details ?? null,
-    },
-  });
-}
-
-const DEFAULT_PAGE = 1;
-const DEFAULT_LIMIT = 20;
-const MAX_LIMIT = 100;
-
-const SORTABLE_FIELDS = [
-  "created_ledger",
-  "updated_at",
-  "round_amount",
-  "member_count",
-  "status",
-] as const;
-type SortableField = (typeof SORTABLE_FIELDS)[number];
-
-const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const;
-type CircleStatus = (typeof CIRCLE_STATUSES)[number];
-
-const HEALTH_CHECK_TIMEOUT_MS = 5_000;
-
-// ── CORS ─────────────────────────────────────────────────────────────────────
-//
-// ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
-// "https://app.circleup.xyz,https://staging.circleup.xyz". If unset, every
-// origin is allowed (useful for local dev) but a warning is logged so this
-// isn't mistaken for a deliberate production setting.
-function parseAllowedOrigins(raw: string | undefined): string[] {
-  return (raw || "")
-    .split(",")
-    .map((o) => o.trim())
-    .filter(Boolean);
-}
-
-export function buildCorsOptions(
-  allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS),
-): cors.CorsOptions {
-  if (allowedOrigins.length === 0) {
-    console.warn(
-      "[api] ALLOWED_ORIGINS is not set — allowing all origins. " +
-        "Set ALLOWED_ORIGINS to a comma-separated list in production.",
-    );
-    return { origin: true };
-  }
-
-  return {
-    origin(origin, callback) {
-      // requests with no Origin header (curl, server-to-server, health checks)
-      if (!origin || allowedOrigins.includes(origin)) {
-        callback(null, true);
-        return;
-      }
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
   };
@@ -180,6 +87,28 @@ function sendError(res: Response, status: number, message: string, details?: unk
     },
   });
 }
+
+// ── Pagination / query-param constants ───────────────────────────────────────
+
+const DEFAULT_PAGE = 1;
+const DEFAULT_LIMIT = 20;
+const MAX_LIMIT = 100;
+
+const SORTABLE_FIELDS = [
+  "created_ledger",
+  "updated_at",
+  "round_amount",
+  "member_count",
+  "status",
+] as const;
+type SortableField = (typeof SORTABLE_FIELDS)[number];
+
+const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const;
+type CircleStatus = (typeof CIRCLE_STATUSES)[number];
+
+const HEALTH_CHECK_TIMEOUT_MS = 5_000;
+
+// ── Query-param parsing helpers ───────────────────────────────────────────────
 
 type ParseResult<T> = T | { error: string };
 
@@ -369,19 +298,6 @@ interface EventTypeCountRow {
 function nonBlankParam(value: string | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
-}
-
-function getErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-function sendError(
-  res: Response,
-  status: number,
-  message: string,
-  detail?: string,
-): void {
-  res.status(status).json({ error: message, ...(detail ? { detail } : {}) });
 }
 
 export function createApp() {
