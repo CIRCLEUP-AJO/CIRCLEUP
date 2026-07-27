@@ -87,9 +87,9 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
   try {
     roundsData = roundsRes.ok
       ? ((await roundsRes.json()) as Record<string, unknown>)
-      : { rounds: [], pendingDefaults: [] };
+      : { rounds: [], pendingDefaults: [], currentRound: null };
   } catch {
-    roundsData = { rounds: [], pendingDefaults: [] };
+    roundsData = { rounds: [], pendingDefaults: [], currentRound: null };
   }
 
   // Validate the shape we depend on to avoid runtime errors in the render tree
@@ -121,6 +121,14 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
       latestLedger:
         typeof circleData.latestLedger === "number"
           ? circleData.latestLedger
+          : null,
+      // currentRound from the /rounds response contains the actual
+      // contributions list for the in-progress round — used by
+      // CircleDetailClient to accurately gate the Contribute button.
+      currentRound:
+        roundsData.currentRound != null &&
+        typeof roundsData.currentRound === "object"
+          ? (roundsData.currentRound as CircleRound)
           : null,
     },
   };

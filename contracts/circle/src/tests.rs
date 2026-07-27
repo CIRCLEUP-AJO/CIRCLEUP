@@ -200,7 +200,7 @@ mod circle_tests {
         t.circle.contribute(&t.dave);
         t.circle.payout();
 
-        let round = t.circle.get_current_round();
+        let round = t.circle.get_current_round().unwrap();
         assert_eq!(round.round_index, 1);
         assert_eq!(round.recipient, t.bob);
     }
@@ -213,7 +213,7 @@ mod circle_tests {
         let expected_order = [t.alice.clone(), t.bob.clone(), t.carol.clone(), t.dave.clone()];
 
         for (i, expected) in expected_order.iter().enumerate() {
-            let round = t.circle.get_current_round();
+            let round = t.circle.get_current_round().unwrap();
             assert_eq!(round.round_index, i as u32);
             assert_eq!(&round.recipient, expected);
 
@@ -370,7 +370,7 @@ mod circle_tests {
         t.circle.contribute(&t.carol);
         t.circle.contribute(&t.dave);
 
-        let config = t.circle.get_config();
+        let config = t.circle.get_config().unwrap();
         let rep_client = ReputationContractClient::new(&t.env, &config.reputation_contract);
 
         assert_eq!(rep_client.score(&t.alice), 0);
@@ -514,7 +514,7 @@ mod circle_tests {
         t.circle.join(&t.dave);
         assert_eq!(t.circle.get_status(), CircleStatus::Active);
 
-        let round = t.circle.get_current_round();
+        let round = t.circle.get_current_round().unwrap();
         assert_eq!(
             round.deadline_ledger,
             seq_before_last_join as u64 + ROUND_DEADLINE as u64
@@ -635,7 +635,7 @@ mod circle_tests {
             &MIN_ROUND_DEADLINE_LEDGERS,
         );
         assert_eq!(
-            client_lo.get_config().round_deadline_ledgers,
+            client_lo.get_config().unwrap().round_deadline_ledgers,
             MIN_ROUND_DEADLINE_LEDGERS
         );
 
@@ -649,7 +649,7 @@ mod circle_tests {
             &MAX_ROUND_DEADLINE_LEDGERS,
         );
         assert_eq!(
-            client_hi.get_config().round_deadline_ledgers,
+            client_hi.get_config().unwrap().round_deadline_ledgers,
             MAX_ROUND_DEADLINE_LEDGERS
         );
     }
