@@ -73,6 +73,8 @@ const BPS_DENOM: i128 = 10_000;
 pub const MIN_ROUND_DEADLINE_LEDGERS: u32 = 100;
 /// ~60 days at 5s/ledger — upper bound against accidental multi-year lockups
 pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
+/// Practical upper bound to keep initialize/join/payout loops predictable.
+pub const MAX_MEMBERS: u32 = 256;
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -81,6 +83,21 @@ pub struct CircleContract;
 
 #[contractimpl]
 impl CircleContract {
+    fn assert_unique_members(members: &Vec<Address>) {
+        let len = members.len();
+        let mut i: u32 = 0;
+        while i < len {
+            let mut j = i + 1;
+            while j < len {
+                if members.get(i).unwrap() == members.get(j).unwrap() {
+                    panic!("duplicate members");
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
     // ── Initialize ────────────────────────────────────────────────────────────
 
     /// Called once by the factory immediately after deployment.
@@ -98,6 +115,10 @@ impl CircleContract {
         if members.len() < 2 {
             panic!("need at least 2 members");
         }
+        if members.len() > MAX_MEMBERS {
+            panic!("too many members");
+        }
+        Self::assert_unique_members(&members);
         if round_amount <= 0 {
             panic!("round_amount must be positive");
         }
@@ -327,12 +348,26 @@ impl CircleContract {
         }
 
         let member_count = config.members.len();
-        if round.contributions_received < member_count {
+        if round.contributions_received != member_count {
             panic!("not all members have contributed yet");
         }
 
+        // Strong invariant: contribution counter must match persisted records.
+        let mut persisted_contributors: u32 = 0;
+        for member in config.members.iter() {
+            if env.storage().persistent().has(&DataKey::Contributed(member, round.round_index)) {
+                persisted_contributors += 1;
+            }
+        }
+        if persisted_contributors != member_count {
+            panic!("round contribution tally mismatch");
+        }
+
         // Transfer pot (member_count × round_amount) to this round's recipient
-        let pot: i128 = config.round_amount * member_count as i128;
+        let pot: i128 = config
+            .round_amount
+            .checked_mul(member_count as i128)
+            .unwrap_or_else(|| panic!("pot amount overflow"));
         let token_client = token::Client::new(&env, &config.usdc_token);
         token_client.transfer(&env.current_contract_address(), &round.recipient, &pot);
 
