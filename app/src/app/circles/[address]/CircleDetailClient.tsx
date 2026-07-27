@@ -76,6 +76,13 @@ export interface CircleDetailData {
   pendingDefaults: CirclePendingDefault[];
   /** Latest ledger the indexer has processed (used for countdown math) */
   latestLedger?: number | null;
+  /**
+   * The in-progress round returned by the indexer's /rounds endpoint.
+   * Contains the actual contributions list for the current round, used to
+   * determine whether the connected wallet has already contributed this round.
+   * Null when the circle is not Active or the indexer hasn't processed it yet.
+   */
+  currentRound?: CircleRound | null;
 }
 
 interface Props {
@@ -96,6 +103,13 @@ interface SuccessState {
   message: string;
   txHash?: string;
 }
+
+// ─── Data-refresh state ───────────────────────────────────────────────────────
+//
+// Tracks whether the post-action background refresh is in flight so we can
+// show a subtle "updating…" indicator rather than stale data silently persisting.
+
+type RefreshState = "idle" | "refreshing" | "error";
 
 // ─── Round deadline countdown ─────────────────────────────────────────────────
 
@@ -354,11 +368,12 @@ function getMemberContributionStatus(
 export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   // null  → no action in flight; ActionKey → that specific action is running
-  const [loading,     setLoading]     = useState<ActionKey | null>(null);
-  const [error,       setError]       = useState<string>("");
-  const [success,     setSuccess]     = useState<SuccessState | null>(null);
-  const [retryAction, setRetryAction] = useState<(() => void) | null>(null);
-  const [data,        setData]        = useState<CircleDetailData>(circleData);
+  const [loading,      setLoading]      = useState<ActionKey | null>(null);
+  const [error,        setError]        = useState<string>("");
+  const [success,      setSuccess]      = useState<SuccessState | null>(null);
+  const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
+  const [data,         setData]         = useState<CircleDetailData>(circleData);
+  const [refreshState, setRefreshState] = useState<RefreshState>("idle");
   // Invite link URL — populated client-side to avoid SSR window access
   const [inviteUrl, setInviteUrl] = useState("");
 
@@ -389,14 +404,25 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   const currentRound = data.circle.current_round;
 
-  // A member has contributed to the current round when their
-  // total_contributions count exceeds the (0-indexed) current round index.
+  // Determine whether the connected wallet has already contributed this round.
+  //
+  // Preferred: check the actual contribution list for the current round returned
+  // by the indexer's /rounds endpoint (data.currentRound.contributions).
+  // This is accurate regardless of how many rounds have elapsed.
+  //
+  // Fallback: total_contributions > currentRound (a lifetime count). This can
+  // over-count if the indexer hasn't processed the latest round yet, so it is
+  // only used when data.currentRound is not yet available.
   const myContributedThisRound = walletAddress
-    ? data.members.some(
-        (m) =>
-          m.member_address === walletAddress &&
-          Number(m.total_contributions) > currentRound,
-      )
+    ? data.currentRound != null
+      ? data.currentRound.contributions.some(
+          (c) => c.member_address === walletAddress,
+        )
+      : data.members.some(
+          (m) =>
+            m.member_address === walletAddress &&
+            Number(m.total_contributions) > currentRound,
+        )
     : false;
 
   /** Returns true when the error looks like a timeout or network failure. */
@@ -449,16 +475,24 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           txHash: result.txHash,
         });
         // Refresh circle data after a successful action
+        setRefreshState("refreshing");
         try {
-          const res = await fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
-            cache: "no-store",
-          });
-          if (res.ok) {
-            const updated = (await res.json()) as Partial<CircleDetailData>;
-            setData((prev) => ({ ...prev, ...updated }));
+          const [circleRes, roundsRes] = await Promise.all([
+            fetch(`${INDEXER_URL}/circles/${circleAddress}`, { cache: "no-store" }),
+            fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, { cache: "no-store" }),
+          ]);
+          if (circleRes.ok) {
+            const updatedCircle = (await circleRes.json()) as Partial<CircleDetailData>;
+            const updatedRounds = roundsRes.ok
+              ? ((await roundsRes.json()) as Partial<CircleDetailData>)
+              : {};
+            setData((prev) => ({ ...prev, ...updatedCircle, ...updatedRounds }));
           }
+          setRefreshState("idle");
         } catch {
-          // Data refresh failure is non-fatal — the action already succeeded
+          // Data refresh failure is non-fatal — the action already succeeded.
+          // Show a subtle warning so the user knows to refresh manually.
+          setRefreshState("error");
         }
       }
     } catch (err: unknown) {
@@ -553,6 +587,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 >
                   {shortAddress(success.txHash)}
                 </a>
+              </p>
+            )}
+            {refreshState === "refreshing" && (
+              <p className="flex items-center gap-1.5 text-xs text-brand-600">
+                <span
+                  className="inline-block w-3 h-3 border-2 border-brand-300 border-t-brand-600 rounded-full animate-spin"
+                  aria-hidden="true"
+                />
+                Refreshing circle data…
+              </p>
+            )}
+            {refreshState === "error" && (
+              <p className="text-xs text-amber-700">
+                ⚠️ Could not refresh data automatically — reload the page to see the latest state.
               </p>
             )}
           </div>
