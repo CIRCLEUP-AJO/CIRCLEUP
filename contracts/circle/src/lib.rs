@@ -16,7 +16,7 @@
 mod tests; // tests are in tests.rs
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
+    contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -82,6 +82,28 @@ pub const MIN_ROUND_DEADLINE_LEDGERS: u32 = 100;
 pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
 /// Practical upper bound to keep initialize/join/payout loops predictable.
 pub const MAX_MEMBERS: u32 = 256;
+
+// ─── Contract errors ───────────────────────────────────────────────────────────
+//
+// Used by the public read-only views so callers receive a typed, inspectable
+// error code rather than an opaque panic when the contract has not been
+// initialised or is called in an invalid state.
+//
+// Mutating entry-points (initialize, join, contribute, …) intentionally use
+// `panic!` because Soroban rolls back the whole invocation on panic anyway, and
+// the panic message propagates back to the caller as a diagnostic string via
+// the simulation result.  Read-only views that are frequently called from the
+// SDK/indexer use `contracterror` so consumers can handle them gracefully.
+
+#[contracterror]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContractError {
+    /// `get_config` was called before `initialize` (Config key is absent).
+    NotInitialized = 1,
+    /// `get_current_round` was called when the circle is not Active.
+    /// The caller should inspect `get_status` to determine the true state.
+    CircleNotActive = 2,
+}
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -274,7 +296,7 @@ impl CircleContract {
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "cancelled")),
-            caller,
+            (caller, env.ledger().sequence()),
         );
     }
 
@@ -566,22 +588,70 @@ impl CircleContract {
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
-            (closer, total_released),
+            (closer, total_released, env.ledger().sequence()),
         );
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────
 
-    pub fn get_config(env: Env) -> CircleConfig {
-        env.storage().instance().get(&DataKey::Config).unwrap()
+    /// Returns the circle configuration.
+    ///
+    /// Returns `Err(ContractError::NotInitialized)` when `initialize` has not
+    /// been called yet, giving the SDK and indexer a typed, inspectable error
+    /// rather than an opaque contract trap.
+    pub fn get_config(env: Env) -> Result<CircleConfig, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(ContractError::NotInitialized)
     }
 
+    /// Returns the current circle status.
+    ///
+    /// Panics with a clear message when called before `initialize` so
+    /// developers get an actionable diagnostic instead of a cryptic XDR error.
     pub fn get_status(env: Env) -> CircleStatus {
-        env.storage().instance().get(&DataKey::Status).unwrap()
+        env.storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: get_status called before initialize"))
     }
 
-    pub fn get_current_round(env: Env) -> RoundState {
-        env.storage().instance().get(&DataKey::CurrentRound).unwrap()
+    /// Returns the current round state.
+    ///
+    /// When the circle is `Completed` or `Cancelled` there is no *active*
+    /// round, so this view returns `Err(ContractError::CircleNotActive)`.
+    /// Callers that need the last-seen round data should inspect `get_status`
+    /// first and fall back to indexer history for completed/cancelled circles.
+    ///
+    /// Panics with a clear message when called before `initialize`.
+    pub fn get_current_round(env: Env) -> Result<RoundState, ContractError> {
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: get_current_round called before initialize"));
+
+        match status {
+            CircleStatus::Active | CircleStatus::Pending => {
+                // Both states always have a valid CurrentRound written by
+                // `initialize` (and kept current by `payout`).
+                let round: RoundState = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CurrentRound)
+                    .unwrap_or_else(|| {
+                        panic!("circle: CurrentRound missing for an Active/Pending circle — storage inconsistency")
+                    });
+                Ok(round)
+            }
+            CircleStatus::Completed | CircleStatus::Cancelled => {
+                // The circle has no in-progress round.  Return a typed error so
+                // the SDK / front-end can show an appropriate message without
+                // causing a host-level contract trap.
+                Err(ContractError::CircleNotActive)
+            }
+        }
     }
 
     pub fn get_collateral(env: Env, member: Address) -> i128 {
