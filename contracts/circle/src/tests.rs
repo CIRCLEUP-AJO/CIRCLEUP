@@ -765,4 +765,121 @@ mod circle_tests {
             ROUND_AMOUNT - (ROUND_AMOUNT * 2000 / 10000)
         );
     }
+
+    // ── Invalid join order / address-mismatch tests ───────────────────────────
+
+    #[test]
+    #[should_panic(expected = "not a circle member")]
+    fn test_join_rejects_non_member_address() {
+        let t = setup_circle();
+        let stranger = Address::generate(&t.env);
+        t.circle.join(&stranger);
+    }
+
+    #[test]
+    fn test_join_order_independent_of_configured_payout_order() {
+        let t = setup_circle();
+
+        // Join in an order that does not match the configured payout order
+        // (alice, bob, carol, dave). The circle must still activate once
+        // everyone has joined, regardless of join sequence.
+        t.circle.join(&t.dave);
+        t.circle.join(&t.bob);
+        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
+        t.circle.join(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
+        t.circle.join(&t.carol);
+        assert_eq!(t.circle.get_status(), CircleStatus::Active);
+
+        // Round-0 recipient is still the first *configured* member (alice),
+        // independent of the order members actually joined in.
+        let round = t.circle.get_current_round().unwrap();
+        assert_eq!(round.round_index, 0);
+        assert_eq!(round.recipient, t.alice);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a member")]
+    fn test_contribute_rejects_non_member_address() {
+        let t = setup_circle();
+        activate(&t);
+        let stranger = Address::generate(&t.env);
+        t.circle.contribute(&stranger);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a member")]
+    fn test_mark_default_rejects_non_member_address() {
+        let t = setup_circle();
+        activate(&t);
+
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number += ROUND_DEADLINE + 1;
+        });
+
+        let stranger = Address::generate(&t.env);
+        t.circle.mark_default(&stranger);
+    }
+
+    // ── initialize reentrancy-guard tests ──────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_initialize_twice_panics() {
+        let t = setup_circle();
+        t.circle.initialize(
+            &t.members,
+            &ROUND_AMOUNT,
+            &t.token_address,
+            &t.reputation_id,
+            &ROUND_DEADLINE,
+        );
+    }
+
+    // ── round_amount overflow / signed-bounds tests ────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "round_amount too large: overflows pot calculation for this member count")]
+    fn test_initialize_rejects_round_amount_that_overflows_pot() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a);
+        members.push_back(member_b);
+
+        // i128::MAX / 2 members overflows when multiplied by member_count (2).
+        circle.initialize(
+            &members,
+            &(i128::MAX / 2 + 1),
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "round_amount must be positive")]
+    fn test_initialize_rejects_negative_round_amount() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a);
+        members.push_back(member_b);
+
+        circle.initialize(
+            &members,
+            &-1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+    }
 }
