@@ -30,18 +30,37 @@ interface ReputationResponse {
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
-async function fetchReputation(
-  member: string,
-): Promise<ReputationResponse | null> {
+// Three distinct outcomes for the fetch so the UI can show the right message:
+//   "outage"    — network error or non-2xx/404 response (indexer down / misconfigured)
+//   "not_found" — 404 or the indexer returned found:false with no activity
+//   data        — a valid ReputationResponse
+
+type FetchOutcome =
+  | { kind: "outage"; detail: string }
+  | { kind: "not_found" }
+  | { kind: "ok"; data: ReputationResponse };
+
+async function fetchReputation(member: string): Promise<FetchOutcome> {
   try {
     const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
       // Always fetch fresh data — the user can also trigger a manual refresh.
       cache: "no-store",
     });
-    if (!res.ok) return null;
-    return (await res.json()) as ReputationResponse;
-  } catch {
-    return null;
+    if (res.status === 404) return { kind: "not_found" };
+    if (!res.ok) {
+      return {
+        kind: "outage",
+        detail: `Indexer returned HTTP ${res.status}. Check that the indexer service is running and NEXT_PUBLIC_INDEXER_URL is correct.`,
+      };
+    }
+    const data = (await res.json()) as ReputationResponse;
+    return { kind: "ok", data };
+  } catch (err) {
+    return {
+      kind: "outage",
+      detail:
+        "Could not reach the indexer. Check that the service is running and your network connection is stable.",
+    };
   }
 }
 
@@ -54,10 +73,9 @@ export default function ReputationPage({
 }) {
   const { member } = params;
 
-  const [data, setData] = useState<ReputationResponse | null | undefined>(
-    // undefined = loading, null = not found / error
-    undefined,
-  );
+  // undefined  = initial loading
+  // FetchOutcome = settled (ok, not_found, or outage)
+  const [outcome, setOutcome] = useState<FetchOutcome | undefined>(undefined);
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
 
@@ -65,7 +83,7 @@ export default function ReputationPage({
     async (isManual = false) => {
       if (isManual) setRefreshing(true);
       const result = await fetchReputation(member);
-      setData(result);
+      setOutcome(result);
       setLastRefreshed(new Date());
       if (isManual) setRefreshing(false);
     },
@@ -79,7 +97,7 @@ export default function ReputationPage({
 
   // ── Loading state ────────────────────────────────────────────────────────────
 
-  if (data === undefined) {
+  if (outcome === undefined) {
     return (
       <div
         className="text-center py-16 text-slate-500"
@@ -95,15 +113,50 @@ export default function ReputationPage({
     );
   }
 
+  // ── Indexer outage ───────────────────────────────────────────────────────────
+
+  if (outcome.kind === "outage") {
+    return (
+      <div className="max-w-xl mx-auto space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900">Reputation</h1>
+          <p className="font-mono text-sm text-slate-500 mt-1 break-all" aria-label={`Member address: ${member}`}>
+            {member}
+          </p>
+        </div>
+        <div
+          role="alert"
+          className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-6 flex items-start gap-3"
+        >
+          <span className="text-2xl mt-0.5" aria-hidden="true">⚠️</span>
+          <div>
+            <p className="font-semibold text-amber-800">Indexer unreachable</p>
+            <p className="text-amber-700 text-sm mt-1">{outcome.detail}</p>
+          </div>
+        </div>
+        <button
+          onClick={() => load(true)}
+          disabled={refreshing}
+          className="text-sm text-brand-600 hover:underline disabled:opacity-50"
+        >
+          {refreshing ? "Retrying…" : "Try again"}
+        </button>
+      </div>
+    );
+  }
+
   // ── Not found ────────────────────────────────────────────────────────────────
 
-  if (data === null) {
+  if (outcome.kind === "not_found") {
     return (
       <div className="text-center py-16 text-slate-500">
         <div className="text-4xl mb-3" aria-hidden="true">
           🔍
         </div>
-        <p>Member not found or reputation data is unavailable.</p>
+        <p>No reputation data found for this member.</p>
+        <p className="text-sm text-slate-400 mt-1">
+          This address may not have participated in any circle yet.
+        </p>
         <button
           onClick={() => load(true)}
           disabled={refreshing}
@@ -116,6 +169,8 @@ export default function ReputationPage({
   }
 
   // ── Loaded ───────────────────────────────────────────────────────────────────
+
+  const data = outcome.data;
 
   return (
     <div className="max-w-xl mx-auto space-y-6">
