@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod circle_tests {
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, MAX_ROUND_DEADLINE_LEDGERS,
+        CircleContract, CircleContractClient, CircleStatus, MAX_MEMBERS, MAX_ROUND_DEADLINE_LEDGERS,
         MIN_ROUND_DEADLINE_LEDGERS,
     };
     use reputation::{ReputationContract, ReputationContractClient};
@@ -89,6 +89,21 @@ mod circle_tests {
             carol,
             dave,
         }
+    }
+
+    fn setup_env_with_token_and_reputation() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin);
+
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        let rep_admin = Address::generate(&env);
+        rep_client.initialize(&rep_admin);
+
+        (env, token_id.address(), rep_id)
     }
 
     // ── Join tests ────────────────────────────────────────────────────────────
@@ -459,14 +474,39 @@ mod circle_tests {
         t.circle.join(&t.alice);
         t.circle.join(&t.bob);
         t.circle.cancel(&t.carol);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
 
         let alice_before = t.token.balance(&t.alice);
         let bob_before = t.token.balance(&t.bob);
-        t.circle.close();
+        t.circle.close(&t.alice);
         assert_eq!(t.token.balance(&t.alice) - alice_before, ROUND_AMOUNT);
         assert_eq!(t.token.balance(&t.bob) - bob_before, ROUND_AMOUNT);
         assert_eq!(t.circle.get_collateral(&t.alice), 0);
         assert_eq!(t.circle.get_collateral(&t.bob), 0);
+    }
+
+    #[test]
+    fn test_close_after_completion_returns_collateral() {
+        let t = setup_circle();
+        activate(&t);
+
+        // Complete every round normally.
+        for _ in 0..4 {
+            t.circle.contribute(&t.alice);
+            t.circle.contribute(&t.bob);
+            t.circle.contribute(&t.carol);
+            t.circle.contribute(&t.dave);
+            t.circle.payout();
+        }
+        assert_eq!(t.circle.get_status(), CircleStatus::Completed);
+
+        let carol_before = t.token.balance(&t.carol);
+        t.circle.close(&t.carol);
+        assert_eq!(t.token.balance(&t.carol) - carol_before, ROUND_AMOUNT);
+        assert_eq!(t.circle.get_collateral(&t.alice), 0);
+        assert_eq!(t.circle.get_collateral(&t.bob), 0);
+        assert_eq!(t.circle.get_collateral(&t.carol), 0);
+        assert_eq!(t.circle.get_collateral(&t.dave), 0);
     }
 
     #[test]
@@ -547,6 +587,61 @@ mod circle_tests {
         assert_eq!(
             client_hi.get_config().round_deadline_ledgers,
             MAX_ROUND_DEADLINE_LEDGERS
+        );
+    }
+
+    #[test]
+    fn test_initialize_accepts_minimal_valid_input() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a.clone());
+        members.push_back(member_b.clone());
+
+        circle.initialize(
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.round_amount, 1);
+        assert_eq!(
+            circle.get_status(),
+            CircleStatus::Pending
+        );
+        let round = circle.get_current_round();
+        assert_eq!(round.round_index, 0);
+        assert_eq!(round.recipient, member_a);
+    }
+
+    #[test]
+    #[should_panic(expected = "too many members")]
+    fn test_initialize_rejects_member_count_above_maximum() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        let mut i: u32 = 0;
+        while i <= MAX_MEMBERS {
+            members.push_back(Address::generate(&env));
+            i += 1;
+        }
+
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
         );
     }
 
