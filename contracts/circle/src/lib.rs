@@ -63,6 +63,7 @@ pub enum DataKey {
     Defaults(Address),           // missed-contribution count per member
     Defaulted(Address, u32),     // member already flagged for a given round
     RoundsCompleted,
+    Initializing,                // reentrancy guard held for the duration of `initialize`
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution
@@ -105,6 +106,25 @@ pub struct CircleContract;
 
 #[contractimpl]
 impl CircleContract {
+    /// Executes a USDC transfer via `try_transfer` so a token-contract
+    /// failure (insufficient balance, missing trustline, frozen account,
+    /// deauthorized asset, etc.) surfaces as a clear, contextual panic
+    /// message instead of an opaque trap propagated from the token contract.
+    fn safe_transfer(
+        token_client: &token::Client,
+        from: &Address,
+        to: &Address,
+        amount: &i128,
+        context: &str,
+    ) {
+        if token_client.try_transfer(from, to, amount).is_err() {
+            panic!(
+                "USDC transfer failed during {}: check balance, trustline, and authorization",
+                context
+            );
+        }
+    }
+
     fn assert_unique_members(members: &Vec<Address>) {
         let len = members.len();
         let mut i: u32 = 0;
@@ -134,6 +154,17 @@ impl CircleContract {
         if env.storage().instance().has(&DataKey::Config) {
             panic!("already initialized");
         }
+
+        // Reentrancy guard: flip an explicit "initializing" flag before any
+        // other storage write. Config absence alone is not a safe guard if a
+        // reentrant call lands mid-initialize (e.g. a future change adds a
+        // cross-contract call here) — the flag is checked and set atomically
+        // as the very first action, and cleared once setup fully commits.
+        if env.storage().instance().has(&DataKey::Initializing) {
+            panic!("initialize already in progress");
+        }
+        env.storage().instance().set(&DataKey::Initializing, &true);
+
         if members.len() < 2 {
             panic!("need at least 2 members");
         }
@@ -144,6 +175,16 @@ impl CircleContract {
         if round_amount <= 0 {
             panic!("round_amount must be positive");
         }
+        // round_amount is later multiplied by member_count (payout's pot) and
+        // by PENALTY_BPS (mark_default's penalty). Reject configurations that
+        // would overflow i128 in those paths instead of deferring the failure
+        // to a runtime panic deep in an unrelated call.
+        round_amount
+            .checked_mul(members.len() as i128)
+            .unwrap_or_else(|| panic!("round_amount too large: overflows pot calculation for this member count"));
+        round_amount
+            .checked_mul(PENALTY_BPS)
+            .unwrap_or_else(|| panic!("round_amount too large: overflows penalty calculation"));
         if round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS {
             panic!("round_deadline_ledgers below minimum");
         }
@@ -175,6 +216,8 @@ impl CircleContract {
             paid_out: false,
         };
         env.storage().instance().set(&DataKey::CurrentRound, &initial_round);
+
+        env.storage().instance().remove(&DataKey::Initializing);
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "initialized")),
@@ -219,10 +262,12 @@ impl CircleContract {
 
         // Transfer collateral from member to this contract
         let token_client = token::Client::new(&env, &config.usdc_token);
-        token_client.transfer(
+        Self::safe_transfer(
+            &token_client,
             &member,
             &env.current_contract_address(),
             &config.round_amount,
+            "join collateral deposit",
         );
 
         env.storage()
@@ -334,10 +379,12 @@ impl CircleContract {
 
         // Transfer round amount from member to contract
         let token_client = token::Client::new(&env, &config.usdc_token);
-        token_client.transfer(
+        Self::safe_transfer(
+            &token_client,
             &member,
             &env.current_contract_address(),
             &config.round_amount,
+            "round contribution",
         );
 
         env.storage().persistent().set(&key, &true);
@@ -391,7 +438,13 @@ impl CircleContract {
             .checked_mul(member_count as i128)
             .unwrap_or_else(|| panic!("pot amount overflow"));
         let token_client = token::Client::new(&env, &config.usdc_token);
-        token_client.transfer(&env.current_contract_address(), &round.recipient, &pot);
+        Self::safe_transfer(
+            &token_client,
+            &env.current_contract_address(),
+            &round.recipient,
+            &pot,
+            "round payout",
+        );
 
         round.paid_out = true;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
@@ -548,10 +601,12 @@ impl CircleContract {
                 .unwrap_or(0);
 
             if collateral > 0 {
-                token_client.transfer(
+                Self::safe_transfer(
+                    &token_client,
                     &env.current_contract_address(),
                     &member,
                     &collateral,
+                    "collateral release",
                 );
                 env.storage()
                     .persistent()
