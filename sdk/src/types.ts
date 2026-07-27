@@ -258,6 +258,32 @@ export interface TxSuccess {
   readonly ledger: number;
 }
 
+/**
+ * Machine-readable error category for a {@link TxFailure}.
+ *
+ * | Code | When it fires |
+ * |------|---------------|
+ * | `"account_not_found"` | The source account does not exist on the network. |
+ * | `"simulation_failed"` | The Soroban simulation rejected the invocation (contract panic / validation). |
+ * | `"network_error"` | A network-level fetch failure before or during submission. |
+ * | `"tx_rejected"` | The transaction was submitted but immediately rejected (`status === "ERROR"`). |
+ * | `"tx_failed"` | The transaction was included in a ledger but its status is FAILED. |
+ * | `"timeout"` | Confirmation polling exceeded the timeout window. |
+ * | `"unknown"` | An unclassified error (should not normally occur). |
+ *
+ * Use this field to branch on the error type without parsing `errorMessage`
+ * strings — e.g. show a wallet-funding prompt on `"account_not_found"` or a
+ * "check your inputs" banner on `"simulation_failed"`.
+ */
+export type TxErrorCode =
+  | "account_not_found"
+  | "simulation_failed"
+  | "network_error"
+  | "tx_rejected"
+  | "tx_failed"
+  | "timeout"
+  | "unknown";
+
 /** A transaction that failed to submit, was rejected, or timed out. */
 export interface TxFailure {
   readonly success: false;
@@ -269,6 +295,13 @@ export interface TxFailure {
   readonly txHash: string;
   /** Human-readable description of what went wrong. */
   readonly errorMessage: string;
+  /**
+   * Machine-readable error category.  Use this to branch on error type in
+   * UI logic without parsing the `errorMessage` string.
+   *
+   * @see {@link TxErrorCode} for the full list of codes and their meanings.
+   */
+  readonly errorCode: TxErrorCode;
 }
 
 /** Discriminated union of all possible transaction outcomes. */

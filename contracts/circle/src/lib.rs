@@ -1,6 +1,7 @@
 //! Circle contract — core ROSCA logic.
 //!
-//! Lifecycle:
+//! # Lifecycle
+//!
 //!   1. `initialize` — sets members, contribution amount, payout order, schedule
 //!   2. Members call `join` to lock collateral (1× round amount) while Pending
 //!   3. When every member has joined, status transitions to Active (deadline clock starts)
@@ -9,6 +10,42 @@
 //!      for the *current* round only
 //!   6. After all rounds complete → Completed; or while still Pending → `cancel` → Cancelled
 //!   7. `close` releases remaining collateral once Completed or Cancelled
+//!
+//! # Protocol constants
+//!
+//! All numeric parameters that affect the on-chain financial model are defined as
+//! named `pub const` items in this module.  They are re-exported through
+//! `get_protocol_params` so the SDK and front-end can read the live values without
+//! hard-coding them.
+//!
+//! | Constant | Value | Meaning |
+//! |---|---|---|
+//! | [`PENALTY_BPS`] | 2 000 | Penalty deducted from collateral per missed round (basis points) |
+//! | [`BPS_DENOM`] | 10 000 | Denominator for all basis-point calculations |
+//! | [`COLLATERAL_MULTIPLIER`] | 1 | Collateral required as a multiple of `round_amount` |
+//! | [`MIN_ROUND_DEADLINE_LEDGERS`] | 100 | Minimum deadline window (~8 min at 5 s/ledger) |
+//! | [`MAX_ROUND_DEADLINE_LEDGERS`] | 1 036 800 | Maximum deadline window (~60 days at 5 s/ledger) |
+//! | [`MAX_MEMBERS`] | 256 | Maximum number of members per circle |
+//!
+//! # Storage budget guidance
+//!
+//! Soroban charges for every byte written and read.  The table below gives
+//! approximate storage entries created per lifecycle action so integrators can
+//! size their fee budgets accordingly:
+//!
+//! | Entry-point | New storage entries | Entry type | Notes |
+//! |---|---|---|---|
+//! | `initialize` | Config + Status + RoundsCompleted + CurrentRound | Instance | 4 entries, fixed cost regardless of member count |
+//! | `join` (per member) | Collateral(member) | Persistent | 1 persistent entry per member; last join also updates Status + CurrentRound (instance) |
+//! | `contribute` (per member) | Contributed(member, round) | Persistent | 1 persistent entry per contribution; also updates CurrentRound (instance) |
+//! | `payout` | — | — | Updates CurrentRound + RoundsCompleted (instance); no new persistent entries |
+//! | `mark_default` | Defaulted(member, round) + Defaults(member) | Persistent | 2 persistent entries; also updates Collateral(member) |
+//! | `close` | — | — | Zeroes Collateral(member) for each member; no new entries |
+//!
+//! Use `stellar-cli contract invoke --cost` to get instruction-count and
+//! read/write-byte estimates before broadcasting.  The `simulate_transaction`
+//! RPC endpoint returns `min_resource_fee` which should be added on top of the
+//! base fee passed to `TransactionBuilder`.  See the README for a worked example.
 
 #![no_std]
 
@@ -66,16 +103,77 @@ pub enum DataKey {
     Initializing,                // reentrancy guard held for the duration of `initialize`
 }
 
-/// Penalty: forfeit 20 % of collateral on a missed contribution
-const PENALTY_BPS: i128 = 2_000;
-const BPS_DENOM: i128 = 10_000;
+/// Penalty: forfeit 20 % of collateral on a missed contribution.
+///
+/// Expressed in basis points (1 bp = 0.01 %).  Divide by [`BPS_DENOM`] to get
+/// the fractional multiplier: `2_000 / 10_000 = 0.20` (20 %).
+///
+/// This value is intentionally public so the SDK and frontend can read it via
+/// [`CircleContract::get_protocol_params`] without hard-coding the number.
+pub const PENALTY_BPS: i128 = 2_000;
 
-/// ~8 minutes at 5s/ledger — keeps testnets usable while rejecting zero/near-zero deadlines
+/// Denominator used in all basis-point arithmetic throughout this contract.
+///
+/// All percentage calculations follow the pattern:
+/// ```text
+/// amount * NUMERATOR_BPS / BPS_DENOM
+/// ```
+/// Using integer arithmetic with this denominator avoids floating-point
+/// imprecision in the Soroban WASM environment.
+pub const BPS_DENOM: i128 = 10_000;
+
+/// Collateral required from each member, expressed as a multiple of
+/// `round_amount`.
+///
+/// A value of `1` means each member must lock exactly one round's worth of
+/// tokens when calling [`CircleContract::join`].  The constant is exported so
+/// UIs can display the collateral requirement without hard-coding the ratio.
+pub const COLLATERAL_MULTIPLIER: i128 = 1;
+
+/// Minimum allowed value for `round_deadline_ledgers` at initialize time.
+///
+/// At ~5 seconds per ledger this is approximately 8 minutes — long enough to
+/// be usable on testnets while rejecting zero or near-zero deadlines that would
+/// make it impossible for members to contribute before being marked defaulted.
 pub const MIN_ROUND_DEADLINE_LEDGERS: u32 = 100;
-/// ~60 days at 5s/ledger — upper bound against accidental multi-year lockups
+
+/// Maximum allowed value for `round_deadline_ledgers` at initialize time.
+///
+/// At ~5 seconds per ledger this is approximately 60 days.  The upper bound
+/// prevents accidental multi-year lockups from a typo in the deadline field.
 pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
-/// Practical upper bound to keep initialize/join/payout loops predictable.
+
+/// Maximum number of members a circle may have.
+///
+/// Keeping the member list bounded limits gas costs for `payout` (which
+/// iterates all members to verify the contribution tally) and `close` (which
+/// transfers collateral to every member).
 pub const MAX_MEMBERS: u32 = 256;
+
+// ─── Protocol params struct ───────────────────────────────────────────────────
+
+/// A snapshot of all tunable protocol constants for this contract.
+///
+/// Returned by [`CircleContract::get_protocol_params`] so clients can read the
+/// live values without maintaining a separate out-of-band constant table.  If a
+/// future upgrade changes `PENALTY_BPS` the SDK and frontend immediately see the
+/// new value through this view without any code change on their side.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolParams {
+    /// Penalty for a missed contribution in basis points (see [`PENALTY_BPS`]).
+    pub penalty_bps: i128,
+    /// Basis-point denominator (see [`BPS_DENOM`]).
+    pub bps_denom: i128,
+    /// Collateral multiplier: `collateral = round_amount × collateral_multiplier`.
+    pub collateral_multiplier: i128,
+    /// Minimum `round_deadline_ledgers` accepted by `initialize`.
+    pub min_round_deadline_ledgers: u32,
+    /// Maximum `round_deadline_ledgers` accepted by `initialize`.
+    pub max_round_deadline_ledgers: u32,
+    /// Maximum number of members per circle.
+    pub max_members: u32,
+}
 
 // ─── Contract errors ───────────────────────────────────────────────────────────
 //
@@ -227,11 +325,15 @@ impl CircleContract {
 
     // ── Join ──────────────────────────────────────────────────────────────────
 
-    /// Member locks collateral (1 × round_amount) to join.
+    /// Member locks collateral (`COLLATERAL_MULTIPLIER × round_amount`) to join.
     ///
     /// Join is only accepted while `Pending`. The circle transitions to `Active`
     /// exactly once — when every configured member has joined — and the round-0
     /// deadline clock starts at that moment.
+    ///
+    /// # Storage cost
+    /// Creates one new persistent entry (`Collateral(member)`).  The last member
+    /// to join also writes two instance entries (`Status`, `CurrentRound`).
     pub fn join(env: Env, member: Address) {
         member.require_auth();
 
@@ -256,9 +358,17 @@ impl CircleContract {
             panic!("already joined");
         }
 
+        // Collateral is COLLATERAL_MULTIPLIER × round_amount.
+        // Currently 1× — expressed via the named const so a future governance
+        // upgrade can change the ratio in one place.
+        let collateral_amount = config
+            .round_amount
+            .checked_mul(COLLATERAL_MULTIPLIER)
+            .unwrap_or_else(|| panic!("collateral amount overflow"));
+
         env.storage()
             .persistent()
-            .set(&collateral_key, &config.round_amount);
+            .set(&collateral_key, &collateral_amount);
 
         // Transfer collateral from member to this contract
         let token_client = token::Client::new(&env, &config.usdc_token);
@@ -269,10 +379,6 @@ impl CircleContract {
             &config.round_amount,
             "join collateral deposit",
         );
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Collateral(member.clone()), &config.round_amount);
 
         // Explicit Active transition only after every member has joined
         let all_joined = config.members.iter().all(|m| {
@@ -341,6 +447,10 @@ impl CircleContract {
     // ── Contribute ────────────────────────────────────────────────────────────
 
     /// Member deposits their round contribution for the current round.
+    ///
+    /// # Storage cost
+    /// Creates one new persistent entry (`Contributed(member, round_index)`) and
+    /// updates one instance entry (`CurrentRound`).
     pub fn contribute(env: Env, member: Address) {
         member.require_auth();
 
@@ -500,6 +610,14 @@ impl CircleContract {
     /// Can be called by anyone after `deadline_ledger` has passed. Only members
     /// who (1) have joined, (2) did not contribute in the current round, and
     /// (3) have not already been flagged for this round may be marked.
+    ///
+    /// The penalty is [`PENALTY_BPS`] / [`BPS_DENOM`] of the member's remaining
+    /// collateral (currently 20 %).
+    ///
+    /// # Storage cost
+    /// Creates two new persistent entries (`Defaulted(member, round)`,
+    /// `Defaults(member)`) and updates one persistent entry
+    /// (`Collateral(member)`).
     pub fn mark_default(env: Env, member: Address) {
         let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
         let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
@@ -576,6 +694,10 @@ impl CircleContract {
     /// Release remaining collateral back to all members.
     /// Only callable when the circle is Completed or Cancelled, and only by an
     /// authorized circle member (`closer.require_auth()` + membership check).
+    ///
+    /// # Storage cost
+    /// Updates one persistent entry (`Collateral(member)`) per member that still
+    /// holds a non-zero balance.  No new entries are created.
     pub fn close(env: Env, closer: Address) {
         closer.require_auth();
 
@@ -631,6 +753,27 @@ impl CircleContract {
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────
+
+    /// Returns all tunable protocol constants for this contract.
+    ///
+    /// Clients can call this view to display the penalty rate, collateral
+    /// requirement, and deadline bounds without maintaining a separate constant
+    /// table.  Because the values come from the contract's own compile-time
+    /// constants, the returned struct is always in sync with actual contract
+    /// behaviour.
+    ///
+    /// This function has no storage reads and does not require the contract to
+    /// be initialized — it returns static data unconditionally.
+    pub fn get_protocol_params(_env: Env) -> ProtocolParams {
+        ProtocolParams {
+            penalty_bps: PENALTY_BPS,
+            bps_denom: BPS_DENOM,
+            collateral_multiplier: COLLATERAL_MULTIPLIER,
+            min_round_deadline_ledgers: MIN_ROUND_DEADLINE_LEDGERS,
+            max_round_deadline_ledgers: MAX_ROUND_DEADLINE_LEDGERS,
+            max_members: MAX_MEMBERS,
+        }
+    }
 
     /// Returns the circle configuration.
     ///
