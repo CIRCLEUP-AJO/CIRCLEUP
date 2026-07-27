@@ -95,6 +95,54 @@ export function validateCircleUpConfig(config: unknown): asserts config is Circl
   }
 }
 
+// ── Raw wire types returned by scValToNative from Soroban simulation ──────────
+//
+// When `simulateAndRead` decodes a Soroban return value via `scValToNative` the
+// result is a plain JS object whose keys mirror the Rust snake_case field names
+// and whose numeric values are either `number` or `bigint` depending on the
+// Soroban XDR type.  These types make the `simulateAndRead` call-site explicit
+// and safe — no more `as any` or property-access guesswork.
+//
+// They are intentionally *not* exported as part of the public SDK surface (they
+// are implementation details of the mapping layer), but exporting them here
+// lets the test suite assert the mapping logic without re-importing from client.
+
+/**
+ * Raw scValToNative shape for `CircleConfig` (Rust: `CircleConfig` struct).
+ *
+ * Field mapping:
+ *   members                → string[]  (Stellar address strings)
+ *   round_amount           → bigint    (i128 in XDR)
+ *   usdc_token             → string
+ *   reputation_contract    → string
+ *   round_deadline_ledgers → number    (u32 in XDR)
+ */
+export interface RawCircleConfig {
+  members: string[];
+  round_amount: bigint;
+  usdc_token: string;
+  reputation_contract: string;
+  round_deadline_ledgers: number;
+}
+
+/**
+ * Raw scValToNative shape for `RoundState` (Rust: `RoundState` struct).
+ *
+ * Field mapping:
+ *   round_index            → number   (u32)
+ *   recipient              → string   (Stellar address)
+ *   contributions_received → number   (u32)
+ *   deadline_ledger        → bigint   (u64)
+ *   paid_out               → boolean
+ */
+export interface RawRoundState {
+  round_index: number;
+  recipient: string;
+  contributions_received: number;
+  deadline_ledger: bigint;
+  paid_out: boolean;
+}
+
 // ── Circle state types (mirrors contract structs) ─────────────────────────────
 
 export type CircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
@@ -128,6 +176,65 @@ export interface MemberState {
   defaults: number;
   reputationScore: number;
   hasContributedThisRound: boolean;
+}
+
+// ─── simulateAndRead result ───────────────────────────────────────────────────
+//
+// A discriminated union returned by the internal `simulateAndRead` helper.
+// Using a union here means:
+//   1. Callers can never accidentally treat a simulation failure as a valid
+//      decoded value — the `ok` flag must be checked before touching `value`.
+//   2. The `value` field is typed as `unknown` rather than `any`, forcing
+//      every call-site to narrow or explicitly cast, which surfaces
+//      mapping errors at compile time rather than silently at runtime.
+//   3. Error details (the raw simulation error string) are always available
+//      for logging / user-facing messages without a separate try/catch.
+//
+// Public methods (getConfig, getCurrentRound, …) unwrap this internally and
+// either throw a descriptive Error or return the narrowed domain type —
+// consumers never see SimulateResult directly.
+
+/** A simulation that returned a decoded return value. */
+export interface SimulateSuccess {
+  readonly ok: true;
+  /** Decoded contract return value. Type is `unknown` — callers must narrow. */
+  readonly value: unknown;
+}
+
+/** A simulation that produced an error from the Soroban host. */
+export interface SimulateFailure {
+  readonly ok: false;
+  /** Raw error string from the Soroban simulation response. */
+  readonly error: string;
+}
+
+/** Discriminated union of possible `simulateAndRead` outcomes. */
+export type SimulateResult = SimulateSuccess | SimulateFailure;
+
+/**
+ * Type-guard — narrows `SimulateResult` to `SimulateSuccess`.
+ *
+ * @example
+ * const result = await simulateAndRead(...);
+ * if (isSimulateSuccess(result)) {
+ *   const val = result.value as MyExpectedType;
+ * }
+ */
+export function isSimulateSuccess(r: SimulateResult): r is SimulateSuccess {
+  return r.ok === true;
+}
+
+/**
+ * Type-guard — narrows `SimulateResult` to `SimulateFailure`.
+ *
+ * @example
+ * const result = await simulateAndRead(...);
+ * if (isSimulateFailure(result)) {
+ *   throw new Error(result.error);
+ * }
+ */
+export function isSimulateFailure(r: SimulateResult): r is SimulateFailure {
+  return r.ok === false;
 }
 
 // ── Tx result ─────────────────────────────────────────────────────────────────

@@ -12,12 +12,14 @@ import {
 import type {
   CircleUpConfig,
   CircleConfig,
+  RawCircleConfig,
+  RawRoundState,
   RoundState,
   CircleStatus,
-  MemberState,
   TxResult,
   TxSuccess,
   TxFailure,
+  SimulateResult,
   ApiCirclesListResponse,
   ApiCircleDetailResponse,
   ApiMembersResponse,
@@ -137,18 +139,15 @@ export class CircleUpClient {
     return txFailure(hash, "Timed out waiting for transaction confirmation. The transaction may still confirm — check Stellar Expert before retrying.");
   }
 
-  protected async simulateAndRead<T>(
+  protected async simulateAndRead(
     contractId: string,
     method: string,
     args: xdr.ScVal[],
-  ): Promise<T> {
+  ): Promise<SimulateResult> {
     const dummyKeypair = Keypair.random();
-    // Use a funded testnet account for read-only simulation
-    // In production use a fixed funded source
     const account = await this.rpc
       .getAccount(dummyKeypair.publicKey())
       .catch(() => {
-        // Create a fake account for simulation
         return {
           id: dummyKeypair.publicKey(),
           sequence: "0",
@@ -165,14 +164,48 @@ export class CircleUpClient {
       .setTimeout(30)
       .build();
 
-    const simResult = await this.rpc.simulateTransaction(tx);
+    let simResult: Awaited<ReturnType<typeof this.rpc.simulateTransaction>>;
+    try {
+      simResult = await this.rpc.simulateTransaction(tx);
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: `Simulation network error: ${err?.message ?? "unknown"}`,
+      };
+    }
+
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      throw new Error(simResult.error);
+      return { ok: false, error: simResult.error };
     }
+
     if (!("result" in simResult) || !simResult.result) {
-      throw new Error("no result from simulation");
+      return { ok: false, error: "no result from simulation" };
     }
-    return scValToNative(simResult.result.retval) as T;
+
+    return { ok: true, value: scValToNative(simResult.result.retval) };
+  }
+
+  /**
+   * Convenience wrapper: runs `simulateAndRead` and throws a descriptive
+   * `Error` on failure instead of returning a `SimulateFailure`.  Used by
+   * every read-only method that has no meaningful fallback for a failed read.
+   *
+   * Keeping the throw here (rather than in each call-site) means the error
+   * message always includes the contract address and method name for easier
+   * debugging.
+   */
+  protected async simulateAndReadOrThrow<T>(
+    contractId: string,
+    method: string,
+    args: xdr.ScVal[],
+  ): Promise<T> {
+    const result = await this.simulateAndRead(contractId, method, args);
+    if (!result.ok) {
+      throw new Error(
+        `Contract call ${contractId}.${method} failed: ${result.error}`,
+      );
+    }
+    return result.value as T;
   }
 }
 
@@ -212,7 +245,7 @@ export class FactoryClient extends CircleUpClient {
   }
 
   async getCircles(): Promise<string[]> {
-    return this.simulateAndRead<string[]>(
+    return this.simulateAndReadOrThrow<string[]>(
       this.contractId,
       "get_circles",
       [],
@@ -220,7 +253,7 @@ export class FactoryClient extends CircleUpClient {
   }
 
   async getCircleCount(): Promise<number> {
-    return this.simulateAndRead<number>(
+    return this.simulateAndReadOrThrow<number>(
       this.contractId,
       "get_circle_count",
       [],
@@ -337,7 +370,7 @@ export class CircleClient extends CircleUpClient {
   // ── Queries ──────────────────────────────────────────────────────────────────
 
   async getConfig(): Promise<CircleConfig> {
-    const raw = await this.simulateAndRead<any>(
+    const raw = await this.simulateAndReadOrThrow<RawCircleConfig>(
       this.circleAddress,
       "get_config",
       [],
@@ -352,7 +385,7 @@ export class CircleClient extends CircleUpClient {
   }
 
   async getStatus(): Promise<CircleStatus> {
-    return this.simulateAndRead<CircleStatus>(
+    return this.simulateAndReadOrThrow<CircleStatus>(
       this.circleAddress,
       "get_status",
       [],
@@ -360,7 +393,11 @@ export class CircleClient extends CircleUpClient {
   }
 
   async getCurrentRound(): Promise<RoundState> {
-    const raw = await this.simulateAndRead<any>(
+    // The contract returns Err(ContractError::CircleNotActive) when the circle
+    // is Completed or Cancelled. simulateAndRead will return a SimulateFailure
+    // with the error message from the simulation, so callers receive a
+    // descriptive error rather than a silent undefined or a cryptic XDR decode.
+    const raw = await this.simulateAndReadOrThrow<RawRoundState>(
       this.circleAddress,
       "get_current_round",
       [],
@@ -375,7 +412,7 @@ export class CircleClient extends CircleUpClient {
   }
 
   async getCollateral(member: string): Promise<bigint> {
-    return this.simulateAndRead<bigint>(
+    return this.simulateAndReadOrThrow<bigint>(
       this.circleAddress,
       "get_collateral",
       [new Address(member).toScVal()],
@@ -383,7 +420,7 @@ export class CircleClient extends CircleUpClient {
   }
 
   async getDefaults(member: string): Promise<number> {
-    return this.simulateAndRead<number>(
+    return this.simulateAndReadOrThrow<number>(
       this.circleAddress,
       "get_defaults",
       [new Address(member).toScVal()],
@@ -406,7 +443,7 @@ export class CircleClient extends CircleUpClient {
    * @param roundIndex Zero-based round index to query.
    */
   async hasContributed(member: string, roundIndex: number): Promise<boolean> {
-    return this.simulateAndRead<boolean>(
+    return this.simulateAndReadOrThrow<boolean>(
       this.circleAddress,
       "has_contributed",
       [
@@ -519,7 +556,7 @@ export class ReputationClient extends CircleUpClient {
   }
 
   async getScore(member: string): Promise<number> {
-    return this.simulateAndRead<number>(
+    return this.simulateAndReadOrThrow<number>(
       this.contractId,
       "score",
       [new Address(member).toScVal()],
