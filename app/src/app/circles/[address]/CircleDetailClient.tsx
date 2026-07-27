@@ -564,7 +564,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               onClick={handleJoin}
               disabled={loading !== null}
               aria-busy={loading === "join" ? "true" : "false"}
-              className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "join" ? "Joining…" : "🔒 Lock Collateral & Join"}
             </button>
@@ -577,7 +577,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 onClick={handleContribute}
                 disabled={loading !== null}
                 aria-busy={loading === "contribute" ? "true" : "false"}
-                className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
               >
                 {loading === "contribute"
                   ? "Contributing…"
@@ -590,7 +590,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               onClick={handlePayout}
               disabled={loading !== null}
               aria-busy={loading === "payout" ? "true" : "false"}
-              className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="bg-blue-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "payout" ? "Paying out…" : "🎯 Trigger Payout"}
             </button>
@@ -602,7 +602,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               onClick={handleClose}
               disabled={loading !== null}
               aria-busy={loading === "close" ? "true" : "false"}
-              className="bg-slate-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              className="bg-slate-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "close" ? "Closing…" : "🔓 Release Collateral"}
             </button>
@@ -653,7 +653,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               <div
                 key={member.member_address}
                 className={clsx(
-                  "flex items-center gap-3 p-3 rounded-lg border transition-all",
+                  "flex items-center gap-2 sm:gap-3 p-2.5 sm:p-3 rounded-lg border transition-all",
                   isNext
                     ? "border-brand-400 bg-brand-50"
                     : isPaid
@@ -661,7 +661,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                     : "border-slate-200 bg-white",
                 )}
               >
-                <span className="text-slate-400 text-sm w-5 text-right">
+                <span className="text-slate-400 text-sm w-5 shrink-0 text-right">
                   {i + 1}
                 </span>
                 <div className="flex-1 min-w-0">
@@ -688,16 +688,16 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   </div>
                 </div>
 
-                {/* Right-hand status column */}
-                <div className="text-right text-sm shrink-0">
+                {/* Right-hand status column — shrink-0 keeps it visible on narrow screens */}
+                <div className="text-right text-sm shrink-0 max-w-[45%] sm:max-w-none">
                   {isPaid ? (
                     // Past round recipient
-                    <span className="text-slate-500">
+                    <span className="text-slate-500 text-xs sm:text-sm">
                       <span aria-hidden="true">✅ </span>
                       received ${formatUsdc(roundForMember?.amount ?? "0")}
                     </span>
                   ) : isNext ? (
-                    <span className="text-brand-700 font-semibold">
+                    <span className="text-brand-700 font-semibold text-xs sm:text-sm">
                       <span aria-hidden="true">← </span>
                       next payout
                     </span>
@@ -774,9 +774,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             {data.pendingDefaults.map((d) => (
               <div
                 key={d.member_address}
-                className="flex items-center justify-between text-sm text-red-700 bg-red-100 rounded-lg px-3 py-2"
+                className="flex flex-wrap items-center justify-between gap-2 text-sm text-red-700 bg-red-100 rounded-lg px-3 py-2"
               >
-                <span className="font-mono">{shortAddress(d.member_address)}</span>
+                <span className="font-mono text-xs">{shortAddress(d.member_address)}</span>
                 <span>Penalty: ${formatUsdc(d.penalty)}</span>
               </div>
             ))}
