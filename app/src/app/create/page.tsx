@@ -1,40 +1,11 @@
-"use client";
-import { useState } from "react";
-import { useRouter } from "next/navigation";
-import {
-  CIRCLE_FACTORY_ADDRESS,
-  usdcToStroops,
-  shortAddress,
-} from "@/lib/config";
-import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
-import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import type { Metadata } from "next";
+import CreateClient from "./CreateClient";
 
-const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
-
-/** Stellar Expert base URL for testnet transactions. */
-const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
-
-/** Minimum and maximum number of members allowed by the contract. */
-const MIN_MEMBERS = 2;
-const MAX_MEMBERS = 20;
-
-function getFilledMembers(members: string[]): string[] {
-  return members.map((m) => m.trim()).filter((m) => m.length > 0);
-}
-
-function findDuplicateAddress(addresses: string[]): string | null {
-  const seen = new Set<string>();
-  for (const addr of addresses) {
-    if (seen.has(addr)) return addr;
-    seen.add(addr);
-  }
-  return null;
-}
-
-/** Validates that a string is a Stellar public key (G... with 56 base32 chars). */
-function isValidStellarAddress(address: string): boolean {
-  return /^G[A-Z2-7]{55}$/.test(address);
-}
+export const metadata: Metadata = {
+  title: "Create a Circle — CircleUp",
+  description:
+    "Set up a trustless savings circle on Stellar. Choose members, contribution amount, and round duration. The smart contract holds all funds.",
+};
 
 // ── Per-field validation errors ───────────────────────────────────────────────
 //

@@ -1,4 +1,6 @@
-"use client";
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
+import ReputationClient from "./ReputationClient";
 
 import { useState, useEffect, useCallback } from "react";
 import { INDEXER_URL, shortAddress } from "@/lib/config";
@@ -63,8 +65,6 @@ async function fetchReputation(member: string): Promise<FetchOutcome> {
     };
   }
 }
-
-// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function ReputationPage({
   params,

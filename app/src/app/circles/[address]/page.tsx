@@ -1,4 +1,6 @@
 import React from "react";
+import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 import { INDEXER_URL, formatUsdc, formatPot } from "@/lib/config";
 import {
   CircleDetailClient,
@@ -7,6 +9,17 @@ import {
   type CircleRound,
   type CirclePendingDefault,
 } from "./CircleDetailClient";
+
+export async function generateMetadata({
+  params,
+}: {
+  params: { address: string };
+}): Promise<Metadata> {
+  return {
+    title: `Circle ${params.address.slice(0, 8)}… — CircleUp`,
+    description: `Savings circle at ${params.address} on CircleUp. Track rotation order, round progress, and contribution history.`,
+  };
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -253,9 +266,10 @@ export default async function CircleDetailPage({
 }) {
   const result = await getCircleDetail(params.address);
 
-  // Always render the header so the user has address context regardless of
-  // whether the data fetch succeeded.
   if (!result.ok) {
+    if (result.error === "not_found") {
+      notFound();
+    }
     return (
       <div>
         <CircleHeader address={params.address} circle={null} />
