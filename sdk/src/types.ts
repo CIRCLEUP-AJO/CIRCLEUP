@@ -178,6 +178,134 @@ export interface MemberState {
   hasContributedThisRound: boolean;
 }
 
+// ─── Read result ─────────────────────────────────────────────────────────────
+//
+// A discriminated union returned by the *non-throwing* read helpers
+// (getConfigResult, getStatusResult, getCurrentRoundResult).
+//
+// These complement the throwing variants (getConfig, getStatus, getCurrentRound)
+// for call-sites that want to handle errors gracefully — e.g. showing a UI
+// skeleton while the circle is still Pending — without wrapping every call in
+// try/catch.
+//
+//   const r = await client.getConfigResult();
+//   if (r.ok) {
+//     render(r.value);          // CircleConfig, fully typed
+//   } else {
+//     showError(r.error);       // human-readable string
+//   }
+//
+// The throwing helpers delegate to the same underlying simulation; callers that
+// only need one style do not pay for the other.
+
+/** A read that returned a decoded value. */
+export interface ReadSuccess<T> {
+  readonly ok: true;
+  readonly value: T;
+}
+
+/** A read that failed (network error, simulation error, decode error, …). */
+export interface ReadFailure {
+  readonly ok: false;
+  /** Human-readable description of what went wrong. */
+  readonly error: string;
+}
+
+/** Discriminated union of possible typed-read outcomes. */
+export type ReadResult<T> = ReadSuccess<T> | ReadFailure;
+
+/**
+ * Type-guard — narrows `ReadResult<T>` to `ReadSuccess<T>`.
+ *
+ * @example
+ * const r = await client.getConfigResult();
+ * if (isReadSuccess(r)) console.log(r.value.roundAmount);
+ */
+export function isReadSuccess<T>(r: ReadResult<T>): r is ReadSuccess<T> {
+  return r.ok === true;
+}
+
+/**
+ * Type-guard — narrows `ReadResult<T>` to `ReadFailure`.
+ *
+ * @example
+ * const r = await client.getStatusResult();
+ * if (isReadFailure(r)) showBanner(r.error);
+ */
+export function isReadFailure<T>(r: ReadResult<T>): r is ReadFailure {
+  return r.ok === false;
+}
+
+// ─── Raw → domain mapping helpers ────────────────────────────────────────────
+//
+// Extracted from the CircleClient method bodies so they can be unit-tested in
+// isolation without spinning up a mock RPC server.  The helpers are exported
+// so external packages (e.g. app/, indexer/) can reuse the same coercion logic
+// rather than duplicating it.
+
+/**
+ * Map a raw `scValToNative` wire object to the typed `CircleConfig` domain
+ * shape, coercing XDR numeric types as needed.
+ *
+ * @throws `Error` if `raw` is missing required fields or has wrong types —
+ *   surfaces decode bugs at the boundary rather than letting `undefined` leak
+ *   into domain code.
+ */
+export function mapRawConfig(raw: RawCircleConfig): CircleConfig {
+  if (!Array.isArray(raw.members)) {
+    throw new Error("mapRawConfig: members field is missing or not an array");
+  }
+  if (raw.round_amount === undefined || raw.round_amount === null) {
+    throw new Error("mapRawConfig: round_amount field is missing");
+  }
+  return {
+    members: raw.members,
+    roundAmount: BigInt(raw.round_amount),
+    usdcToken: raw.usdc_token,
+    reputationContract: raw.reputation_contract,
+    roundDeadlineLedgers: Number(raw.round_deadline_ledgers),
+  };
+}
+
+/**
+ * Map a raw `scValToNative` wire object to the typed `RoundState` domain shape.
+ *
+ * @throws `Error` if `raw` is missing required fields.
+ */
+export function mapRawRoundState(raw: RawRoundState): RoundState {
+  if (raw.round_index === undefined || raw.round_index === null) {
+    throw new Error("mapRawRoundState: round_index field is missing");
+  }
+  if (!raw.recipient) {
+    throw new Error("mapRawRoundState: recipient field is missing");
+  }
+  return {
+    roundIndex: Number(raw.round_index),
+    recipient: raw.recipient,
+    contributionsReceived: Number(raw.contributions_received),
+    deadlineLedger: BigInt(raw.deadline_ledger),
+    paidOut: Boolean(raw.paid_out),
+  };
+}
+
+/**
+ * Validate that a string returned by the contract's `get_status` view is a
+ * recognised `CircleStatus` variant.
+ *
+ * Returns the narrowed type on success; throws a descriptive `Error` on an
+ * unrecognised value so SDK consumers are never silently handed a garbage status.
+ */
+export function assertValidCircleStatus(value: unknown): CircleStatus {
+  const valid: CircleStatus[] = ["Pending", "Active", "Completed", "Cancelled"];
+  if (typeof value !== "string" || !valid.includes(value as CircleStatus)) {
+    throw new Error(
+      `assertValidCircleStatus: unexpected value "${String(value)}". ` +
+        `Expected one of: ${valid.map((v) => `"${v}"`).join(", ")}.`,
+    );
+  }
+  return value as CircleStatus;
+}
+
 // ─── simulateAndRead result ───────────────────────────────────────────────────
 //
 // A discriminated union returned by the internal `simulateAndRead` helper.
