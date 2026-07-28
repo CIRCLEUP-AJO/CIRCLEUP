@@ -21,6 +21,7 @@ import type {
   TxFailure,
   TxErrorCode,
   SimulateResult,
+  ReadResult,
   ApiCirclesListResponse,
   ApiCircleDetailResponse,
   ApiMembersResponse,
@@ -29,10 +30,84 @@ import type {
   ApiMemberContributionsResponse,
   ApiHealthResponse,
 } from "./types";
-import { validateCircleUpConfig, isValidContractAddress } from "./types";
+import {
+  validateCircleUpConfig,
+  isValidContractAddress,
+  mapRawConfig,
+  mapRawRoundState,
+  assertValidCircleStatus,
+} from "./types";
 
-const POLL_INTERVAL_MS = 2000;
-const POLL_TIMEOUT_MS = 60_000;
+// ─── Polling configuration ────────────────────────────────────────────────────
+
+/**
+ * Controls how `buildAndSend` polls for transaction confirmation after
+ * submission.
+ *
+ * All timing values are in milliseconds.  The polling loop uses exponential
+ * backoff with full jitter to avoid thundering-herd behaviour when many
+ * clients poll simultaneously after a network hiccup.
+ *
+ * Effective wait before attempt N (0-indexed):
+ *   min(maxIntervalMs, initialIntervalMs * backoffFactor^N) ± jitter
+ *
+ * @example
+ * // Aggressive polling for tests (fast, low noise)
+ * const cfg: PollConfig = { initialIntervalMs: 500, timeoutMs: 10_000 };
+ *
+ * // Conservative polling for mainnet (reduces RPC pressure)
+ * const cfg: PollConfig = {
+ *   initialIntervalMs: 3_000,
+ *   maxIntervalMs: 30_000,
+ *   backoffFactor: 1.5,
+ *   timeoutMs: 120_000,
+ * };
+ */
+export interface PollConfig {
+  /**
+   * Milliseconds to wait before the first poll attempt.
+   * @default 2000
+   */
+  initialIntervalMs?: number;
+
+  /**
+   * Maximum milliseconds between any two poll attempts regardless of backoff.
+   * @default 10_000
+   */
+  maxIntervalMs?: number;
+
+  /**
+   * Multiplier applied to the current interval after each attempt.
+   * Must be >= 1.  Set to 1 for a flat (non-backoff) retry schedule.
+   * @default 1.5
+   */
+  backoffFactor?: number;
+
+  /**
+   * Total time budget for confirmation polling.  If the transaction has not
+   * been confirmed (SUCCESS or FAILED) within this window the method returns
+   * a `TxFailure` with `errorCode: "timeout"`.
+   * @default 60_000
+   */
+  timeoutMs?: number;
+
+  /**
+   * How many consecutive `getTransaction` network errors are tolerated before
+   * giving up and returning a `TxFailure` with `errorCode: "network_error"`.
+   * Transient errors within this budget are retried silently.
+   * @default 5
+   */
+  maxConsecutiveErrors?: number;
+}
+
+/** Resolved defaults used when the caller omits individual fields. */
+const DEFAULT_POLL_CONFIG = {
+  initialIntervalMs: 2_000,
+  maxIntervalMs: 10_000,
+  backoffFactor: 1.5,
+  timeoutMs: 60_000,
+  maxConsecutiveErrors: 5,
+} as const satisfies Required<PollConfig>;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -83,18 +158,132 @@ function extractSimulationError(raw: string): string {
   return raw.length <= 300 ? raw : raw.slice(0, 297) + "...";
 }
 
+// ─── Contract argument helpers ────────────────────────────────────────────────
+//
+// Building Soroban contract arguments requires three layers of boilerplate:
+//   Address construction → toScVal() → nativeToScVal(value, {type})
+//
+// These thin wrappers give every call-site a single, readable expression that
+// names the XDR scalar type explicitly so reviewers can verify correctness at
+// a glance without cross-referencing the Soroban XDR spec.
+//
+// All helpers are exported so SDK consumers can build their own contract calls
+// without pulling in the Stellar SDK as a direct dependency.
+
+/**
+ * Encode a Stellar public key or contract address as an `ScVal` `address`.
+ *
+ * @param address A G-address (account) or C-address (contract).
+ *
+ * @example
+ * scAddress("GABC…") // → xdr.ScVal (address variant)
+ */
+export function scAddress(address: string): xdr.ScVal {
+  return new Address(address).toScVal();
+}
+
+/**
+ * Encode an unsigned 32-bit integer as an `ScVal` `u32`.
+ *
+ * @param value A non-negative integer that fits in a u32 (0 – 4_294_967_295).
+ *
+ * @throws `RangeError` if `value` is negative, non-integer, or exceeds u32 max.
+ *
+ * @example
+ * scU32(120_960) // round_deadline_ledgers
+ * scU32(0)       // round index
+ */
+export function scU32(value: number): xdr.ScVal {
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+    throw new RangeError(
+      `scU32: value ${value} is out of range for u32 (0–4294967295).`,
+    );
+  }
+  return nativeToScVal(value, { type: "u32" });
+}
+
+/**
+ * Encode a signed 128-bit integer as an `ScVal` `i128`.
+ *
+ * Accepts `bigint` (preferred — lossless) or `number` (converted to bigint).
+ *
+ * @throws `TypeError` if a non-integer `number` is passed.
+ *
+ * @example
+ * scI128(100_000_000n)        // round_amount in stroops
+ * scI128(BigInt("5000000"))   // from a string-serialised DB value
+ */
+export function scI128(value: bigint | number): xdr.ScVal {
+  let n: bigint;
+  if (typeof value === "number") {
+    if (!Number.isInteger(value)) {
+      throw new TypeError(
+        `scI128: non-integer number ${value} cannot be safely converted to i128. ` +
+          `Pass a bigint instead.`,
+      );
+    }
+    n = BigInt(value);
+  } else {
+    n = value;
+  }
+  return nativeToScVal(n, { type: "i128" });
+}
+
+/**
+ * Encode a boolean as an `ScVal` `bool`.
+ *
+ * @example
+ * scBool(true)  // paid_out flag
+ * scBool(false)
+ */
+export function scBool(value: boolean): xdr.ScVal {
+  return nativeToScVal(value, { type: "bool" });
+}
+
+/**
+ * Encode an array of Stellar addresses as an `ScVal` `vec` of `address` items.
+ *
+ * This is the correct encoding for the `members: Vec<Address>` parameter
+ * on `create_circle` and `initialize`.
+ *
+ * @param addresses Array of G-addresses (accounts) or C-addresses (contracts).
+ *
+ * @throws `Error` if `addresses` is empty — Soroban requires at least one member.
+ *
+ * @example
+ * scAddressVec(["GABC…", "GDEF…"])
+ */
+export function scAddressVec(addresses: string[]): xdr.ScVal {
+  if (addresses.length === 0) {
+    throw new Error(
+      "scAddressVec: addresses array must not be empty. " +
+        "A circle requires at least one member address.",
+    );
+  }
+  return xdr.ScVal.scvVec(addresses.map((a) => new Address(a).toScVal()));
+}
+
 // ─── Base client ─────────────────────────────────────────────────────────────
 
 export class CircleUpClient {
   protected rpc: SorobanRpc.Server;
   protected config: CircleUpConfig;
+  protected pollConfig: Required<PollConfig>;
 
-  constructor(config: CircleUpConfig) {
+  constructor(config: CircleUpConfig, pollConfig?: PollConfig) {
     // Validate upfront so callers get a clear message for misconfiguration
     // rather than an obscure RPC error on the first method call.
     validateCircleUpConfig(config);
     this.config = config;
     this.rpc = new SorobanRpc.Server(config.rpcUrl, { allowHttp: true });
+    // Merge caller-supplied overrides onto the defaults so every field is
+    // always present and the polling loop never has to deal with undefined.
+    this.pollConfig = { ...DEFAULT_POLL_CONFIG, ...pollConfig };
+    if (this.pollConfig.backoffFactor < 1) {
+      throw new RangeError(
+        `PollConfig.backoffFactor must be >= 1, got ${this.pollConfig.backoffFactor}.`,
+      );
+    }
   }
 
   // ── Tx helpers ──────────────────────────────────────────────────────────────
@@ -198,22 +387,28 @@ export class CircleUpClient {
       );
     }
 
-    // Poll for confirmation
+    // Poll for confirmation with exponential backoff + full jitter
     const hash = sendResult.hash;
+    const { timeoutMs, initialIntervalMs, maxIntervalMs, backoffFactor, maxConsecutiveErrors } =
+      this.pollConfig;
     const start = Date.now();
     let consecutiveErrors = 0;
-    const MAX_CONSECUTIVE_ERRORS = 5;
+    let currentInterval = initialIntervalMs;
 
-    while (Date.now() - start < POLL_TIMEOUT_MS) {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    while (Date.now() - start < timeoutMs) {
+      // Wait the current backoff interval before polling.
+      // Full jitter: actual wait is in [0, currentInterval] to spread load
+      // across clients that all submitted at the same time.
+      const jitteredWait = Math.floor(Math.random() * currentInterval);
+      await new Promise((r) => setTimeout(r, jitteredWait));
 
       let status: Awaited<ReturnType<typeof this.rpc.getTransaction>>;
       try {
         status = await this.rpc.getTransaction(hash);
-        consecutiveErrors = 0; // reset on success
+        consecutiveErrors = 0; // reset streak on a successful poll
       } catch (err: any) {
         consecutiveErrors++;
-        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        if (consecutiveErrors >= maxConsecutiveErrors) {
           // Too many consecutive polling failures — likely a persistent RPC
           // issue; surface it rather than silently looping until timeout.
           return txFailure(
@@ -224,7 +419,8 @@ export class CircleUpClient {
             "network_error",
           );
         }
-        // Transient polling error — keep trying
+        // Transient polling error — back off and keep trying
+        currentInterval = Math.min(maxIntervalMs, currentInterval * backoffFactor);
         continue;
       }
 
@@ -250,12 +446,15 @@ export class CircleUpClient {
           "tx_failed",
         );
       }
+
+      // NOT_FOUND / still PENDING — advance the backoff interval for next poll
+      currentInterval = Math.min(maxIntervalMs, currentInterval * backoffFactor);
     }
 
     return txFailure(
       hash,
       `Timed out waiting for confirmation of ${ctx} (tx: ${hash}) after ` +
-        `${POLL_TIMEOUT_MS / 1000}s. The transaction may still confirm — ` +
+        `${timeoutMs / 1000}s. The transaction may still confirm — ` +
         `check Stellar Expert before retrying.`,
       "timeout",
     );
@@ -345,21 +544,17 @@ export class FactoryClient extends CircleUpClient {
     roundAmountStroops: bigint;
     roundDeadlineLedgers: number;
   }): Promise<{ result: TxResult; circleAddress?: string }> {
-    const membersVal = xdr.ScVal.scvVec(
-      params.members.map((m) =>
-        new Address(m).toScVal()
-      ),
-    );
+    const membersVal = scAddressVec(params.members);
 
     const result = await this.buildAndSend(
       params.creator,
       this.contractId,
       "create_circle",
       [
-        new Address(params.creator.publicKey()).toScVal(),
+        scAddress(params.creator.publicKey()),
         membersVal,
-        nativeToScVal(params.roundAmountStroops, { type: "i128" }),
-        nativeToScVal(params.roundDeadlineLedgers, { type: "u32" }),
+        scI128(params.roundAmountStroops),
+        scU32(params.roundDeadlineLedgers),
       ],
     );
 
@@ -440,13 +635,17 @@ export class CircleClient extends CircleUpClient {
    * @param cacheTtlMs    How long (ms) `getFullState` results are cached.
    *                      Pass `0` to disable caching. Defaults to
    *                      {@link DEFAULT_FULL_STATE_CACHE_TTL_MS} (10 s).
+   * @param pollConfig    Optional override for the tx confirmation polling
+   *                      schedule (intervals, backoff, timeout).  Useful in
+   *                      tests (fast intervals) and on mainnet (longer budget).
    */
   constructor(
     config: CircleUpConfig,
     circleAddress: string,
     cacheTtlMs: number = DEFAULT_FULL_STATE_CACHE_TTL_MS,
+    pollConfig?: PollConfig,
   ) {
-    super(config);
+    super(config, pollConfig);
     if (!circleAddress || typeof circleAddress !== "string") {
       throw new Error("CircleClient: circleAddress is required.");
     }
@@ -467,7 +666,7 @@ export class CircleClient extends CircleUpClient {
       member,
       this.circleAddress,
       "join",
-      [new Address(member.publicKey()).toScVal()],
+      [scAddress(member.publicKey())],
     );
     if (result.success) this.invalidateCache();
     return result;
@@ -478,7 +677,7 @@ export class CircleClient extends CircleUpClient {
       member,
       this.circleAddress,
       "contribute",
-      [new Address(member.publicKey()).toScVal()],
+      [scAddress(member.publicKey())],
     );
     if (result.success) this.invalidateCache();
     return result;
@@ -495,7 +694,7 @@ export class CircleClient extends CircleUpClient {
       caller,
       this.circleAddress,
       "mark_default",
-      [new Address(member).toScVal()],
+      [scAddress(member)],
     );
     if (result.success) this.invalidateCache();
     return result;
@@ -503,7 +702,7 @@ export class CircleClient extends CircleUpClient {
 
   async close(caller: Keypair): Promise<TxResult> {
     const result = await this.buildAndSend(caller, this.circleAddress, "close", [
-      new Address(caller.publicKey()).toScVal(),
+      scAddress(caller.publicKey()),
     ]);
     if (result.success) this.invalidateCache();
     return result;
@@ -511,53 +710,132 @@ export class CircleClient extends CircleUpClient {
 
   // ── Queries ──────────────────────────────────────────────────────────────────
 
+  /**
+   * Fetch and decode the circle's configuration from the contract.
+   *
+   * **Throws** a descriptive `Error` on any simulation or decode failure.
+   * For a non-throwing alternative that returns a discriminated union instead
+   * of throwing, use {@link getConfigResult}.
+   */
   async getConfig(): Promise<CircleConfig> {
     const raw = await this.simulateAndReadOrThrow<RawCircleConfig>(
       this.circleAddress,
       "get_config",
       [],
     );
-    return {
-      members: raw.members,
-      roundAmount: BigInt(raw.round_amount),
-      usdcToken: raw.usdc_token,
-      reputationContract: raw.reputation_contract,
-      roundDeadlineLedgers: Number(raw.round_deadline_ledgers),
-    };
+    return mapRawConfig(raw);
   }
 
+  /**
+   * Non-throwing variant of {@link getConfig}.
+   *
+   * Returns a `ReadResult<CircleConfig>` discriminated union instead of
+   * throwing, so callers can handle failures inline without try/catch:
+   *
+   * @example
+   * const r = await client.getConfigResult();
+   * if (r.ok) {
+   *   console.log(r.value.roundAmount);
+   * } else {
+   *   showError(r.error); // human-readable string
+   * }
+   */
+  async getConfigResult(): Promise<ReadResult<CircleConfig>> {
+    try {
+      const value = await this.getConfig();
+      return { ok: true, value };
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? "getConfig failed" };
+    }
+  }
+
+  /**
+   * Fetch the circle's current lifecycle status from the contract.
+   *
+   * Validates that the returned value is a recognised {@link CircleStatus}
+   * variant and throws if it is not, so callers are never silently handed a
+   * garbage string if the contract changes.
+   *
+   * **Throws** on simulation failure or unrecognised status.
+   * For a non-throwing alternative use {@link getStatusResult}.
+   */
   async getStatus(): Promise<CircleStatus> {
-    return this.simulateAndReadOrThrow<CircleStatus>(
+    const raw = await this.simulateAndReadOrThrow<string>(
       this.circleAddress,
       "get_status",
       [],
     );
+    // Validate the returned string is a known variant before returning it.
+    // assertValidCircleStatus throws with a descriptive message if not.
+    return assertValidCircleStatus(raw);
   }
 
+  /**
+   * Non-throwing variant of {@link getStatus}.
+   *
+   * @example
+   * const r = await client.getStatusResult();
+   * if (r.ok && r.value === "Active") showContributeButton();
+   */
+  async getStatusResult(): Promise<ReadResult<CircleStatus>> {
+    try {
+      const value = await this.getStatus();
+      return { ok: true, value };
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? "getStatus failed" };
+    }
+  }
+
+  /**
+   * Fetch the current round state from the contract.
+   *
+   * The contract returns an error when the circle is `Completed` or
+   * `Cancelled` (no active round exists).  That error propagates as a thrown
+   * `Error` here. For a non-throwing alternative that lets you handle the
+   * not-active case inline, use {@link getCurrentRoundResult}.
+   *
+   * **Throws** on simulation failure or when the circle is not Active/Pending.
+   */
   async getCurrentRound(): Promise<RoundState> {
-    // The contract returns Err(ContractError::CircleNotActive) when the circle
-    // is Completed or Cancelled. simulateAndRead will return a SimulateFailure
-    // with the error message from the simulation, so callers receive a
-    // descriptive error rather than a silent undefined or a cryptic XDR decode.
     const raw = await this.simulateAndReadOrThrow<RawRoundState>(
       this.circleAddress,
       "get_current_round",
       [],
     );
-    return {
-      roundIndex: Number(raw.round_index),
-      recipient: raw.recipient,
-      contributionsReceived: Number(raw.contributions_received),
-      deadlineLedger: BigInt(raw.deadline_ledger),
-      paidOut: Boolean(raw.paid_out),
-    };
+    return mapRawRoundState(raw);
+  }
+
+  /**
+   * Non-throwing variant of {@link getCurrentRound}.
+   *
+   * This is the preferred method for UI components that need to handle
+   * `Completed` and `Cancelled` circles gracefully — the contract returns an
+   * error for those states, which surfaces here as `{ ok: false, error: "…" }`
+   * rather than an uncaught exception.
+   *
+   * @example
+   * const r = await client.getCurrentRoundResult();
+   * if (r.ok) {
+   *   showRoundProgress(r.value);
+   * } else {
+   *   // circle is Completed or Cancelled — show history instead
+   *   showHistory();
+   * }
+   */
+  async getCurrentRoundResult(): Promise<ReadResult<RoundState>> {
+    try {
+      const value = await this.getCurrentRound();
+      return { ok: true, value };
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? "getCurrentRound failed" };
+    }
   }
 
   async getCollateral(member: string): Promise<bigint> {
     return this.simulateAndReadOrThrow<bigint>(
       this.circleAddress,
       "get_collateral",
-      [new Address(member).toScVal()],
+      [scAddress(member)],
     );
   }
 
@@ -565,7 +843,7 @@ export class CircleClient extends CircleUpClient {
     return this.simulateAndReadOrThrow<number>(
       this.circleAddress,
       "get_defaults",
-      [new Address(member).toScVal()],
+      [scAddress(member)],
     );
   }
 
@@ -589,8 +867,8 @@ export class CircleClient extends CircleUpClient {
       this.circleAddress,
       "has_contributed",
       [
-        new Address(member).toScVal(),
-        nativeToScVal(roundIndex, { type: "u32" }),
+        scAddress(member),
+        scU32(roundIndex),
       ],
     );
   }
@@ -701,7 +979,7 @@ export class ReputationClient extends CircleUpClient {
     return this.simulateAndReadOrThrow<number>(
       this.contractId,
       "score",
-      [new Address(member).toScVal()],
+      [scAddress(member)],
     );
   }
 }
