@@ -593,13 +593,21 @@ impl CircleContract {
             let next_recipient = config.members.get(next_round_index).unwrap();
             let next_round = RoundState {
                 round_index: next_round_index,
-                recipient: next_recipient,
+                recipient: next_recipient.clone(),
                 contributions_received: 0,
                 deadline_ledger: env.ledger().sequence() as u64
                     + config.round_deadline_ledgers as u64,
                 paid_out: false,
             };
             env.storage().instance().set(&DataKey::CurrentRound, &next_round);
+
+            // Notify indexers and front-ends that a new contribution window has
+            // opened.  Consumers can use this event to reset contribution status
+            // displays and restart deadline countdowns without polling get_current_round.
+            env.events().publish(
+                (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
+                (next_round_index, next_recipient, next_round.deadline_ledger),
+            );
         }
     }
 
@@ -685,7 +693,7 @@ impl CircleContract {
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
-            (member, penalty, round.round_index),
+            (member, penalty, round.round_index, new_collateral),
         );
     }
 
@@ -748,7 +756,7 @@ impl CircleContract {
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
-            (closer, total_released, env.ledger().sequence()),
+            (closer, total_released, env.ledger().sequence(), Symbol::new(&env, if status == CircleStatus::Completed { "completed" } else { "cancelled" })),
         );
     }
 

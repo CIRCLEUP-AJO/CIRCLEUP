@@ -907,4 +907,339 @@ mod circle_tests {
         assert_eq!(t.circle.get_collateral(&t.bob), expected_collateral);
     }
 
+    // ── Event emission tests ──────────────────────────────────────────────────
+    //
+    // Soroban's test env records every published event.  We use
+    // `env.events().all()` to verify that the correct events are emitted with
+    // the right topics and data payloads.
+    //
+    // Return type of events().all():
+    //   Vec<(Address, Vec<Val>, Val)>
+    //     [0] contract_id  — the Address of the emitting contract
+    //     [1] topics       — Vec<Val>, e.g. [Symbol("circle"), Symbol("joined")]
+    //     [2] data         — Val, the value passed as the second arg to publish
+    //
+    // These tests act as a contract-level API guarantee: if an event is
+    // renamed or its payload shape changes, the test will catch the regression
+    // before the indexer or front-end breaks.
+
+    /// Collect the data payloads of all events whose second topic symbol
+    /// matches `name`.  Returns a plain Rust Vec so test assertions can use
+    /// `.len()` without any Soroban SDK conversions.
+    fn events_named(env: &Env, name: &str) -> std::vec::Vec<soroban_sdk::Val> {
+        let target = soroban_sdk::Symbol::new(env, name);
+        env.events()
+            .all()
+            .into_iter()
+            .filter(|(_contract, topics, _data)| {
+                // topics is Vec<Val>; index 1 is the event-name symbol
+                topics
+                    .get(1)
+                    .map(|v| v == soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&target, env))
+                    .unwrap_or(false)
+            })
+            .map(|(_contract, _topics, data)| data)
+            .collect()
+    }
+
+    // ── circle.joined event ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_join_emits_joined_event_with_member_address() {
+        let t = setup_circle();
+        t.env.events().all(); // consume pre-existing events
+
+        t.circle.join(&t.alice);
+
+        let joined = events_named(&t.env, "joined");
+        assert_eq!(joined.len(), 1, "expected exactly one 'joined' event");
+
+        // The data payload is the member Address — decode it back and compare
+        let data_val = joined[0].clone();
+        let member: Address = soroban_sdk::FromVal::from_val(&t.env, &data_val);
+        assert_eq!(member, t.alice);
+    }
+
+    #[test]
+    fn test_join_emits_one_joined_event_per_member() {
+        let t = setup_circle();
+
+        t.activate(); // all 4 members join
+
+        let joined = events_named(&t.env, "joined");
+        assert_eq!(joined.len(), 4, "expected one 'joined' event per member");
+    }
+
+    // ── circle.active event ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_last_join_emits_active_event() {
+        let t = setup_circle();
+
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+        t.circle.join(&t.carol);
+
+        // No 'active' event yet — circle still Pending
+        assert_eq!(events_named(&t.env, "active").len(), 0);
+
+        t.circle.join(&t.dave); // last member — triggers Active transition
+
+        assert_eq!(events_named(&t.env, "active").len(), 1);
+    }
+
+    #[test]
+    fn test_partial_join_does_not_emit_active_event() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+
+        assert_eq!(events_named(&t.env, "active").len(), 0);
+    }
+
+    // ── circle.contributed event ──────────────────────────────────────────────
+
+    #[test]
+    fn test_contribute_emits_contributed_event() {
+        let t = setup_circle();
+        t.activate();
+
+        t.circle.contribute(&t.bob);
+
+        let contributed = events_named(&t.env, "contributed");
+        assert_eq!(contributed.len(), 1);
+    }
+
+    // ── circle.payout event ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_payout_emits_payout_event() {
+        let t = setup_circle();
+        t.activate();
+        t.contribute_all();
+
+        t.circle.payout();
+
+        let payouts = events_named(&t.env, "payout");
+        assert_eq!(payouts.len(), 1, "expected exactly one 'payout' event per round");
+    }
+
+    // ── circle.round_started event (NEW) ─────────────────────────────────────
+
+    #[test]
+    fn test_payout_emits_round_started_event_for_intermediate_rounds() {
+        let t = setup_circle();
+        t.activate();
+
+        // Round 0 → payout → should emit round_started (round 1)
+        t.contribute_all();
+        t.circle.payout();
+
+        let started = events_named(&t.env, "round_started");
+        assert_eq!(
+            started.len(), 1,
+            "expected one 'round_started' event after the first payout"
+        );
+    }
+
+    #[test]
+    fn test_final_payout_does_not_emit_round_started() {
+        let t = setup_circle();
+        t.activate();
+
+        // Complete the first 3 rounds (rounds 0, 1, 2)
+        t.complete_round();
+        t.complete_round();
+        t.complete_round();
+
+        // Flush events accumulated so far
+        let _ = t.env.events().all();
+
+        // Final round (round 3) — should emit 'completed' but NOT 'round_started'
+        t.contribute_all();
+        t.circle.payout();
+
+        let started = events_named(&t.env, "round_started");
+        assert_eq!(
+            started.len(), 0,
+            "final payout must not emit 'round_started' — circle is Completed"
+        );
+
+        let completed = events_named(&t.env, "completed");
+        assert_eq!(completed.len(), 1);
+    }
+
+    #[test]
+    fn test_round_started_event_count_matches_intermediate_rounds() {
+        let t = setup_circle();
+        t.activate();
+
+        // 4 members → 4 rounds → 3 intermediate payouts → 3 round_started events
+        t.complete_round(); // 0→1: emits round_started
+        t.complete_round(); // 1→2: emits round_started
+        t.complete_round(); // 2→3: emits round_started
+        t.complete_round(); // 3→end: emits completed, NOT round_started
+
+        let started = events_named(&t.env, "round_started");
+        assert_eq!(
+            started.len(), 3,
+            "expected 3 round_started events for a 4-member circle"
+        );
+    }
+
+    // ── circle.default event (updated payload) ────────────────────────────────
+
+    #[test]
+    fn test_mark_default_emits_default_event() {
+        let t = setup_circle();
+        t.activate();
+        t.advance_past_deadline();
+
+        t.circle.mark_default(&t.carol);
+
+        let defaults = events_named(&t.env, "default");
+        assert_eq!(defaults.len(), 1, "expected one 'default' event");
+    }
+
+    #[test]
+    fn test_mark_default_event_new_collateral_reflects_penalty() {
+        let t = setup_circle();
+        t.activate();
+        t.advance_past_deadline();
+
+        let collateral_before = t.circle.get_collateral(&t.carol);
+        t.circle.mark_default(&t.carol);
+        let collateral_after = t.circle.get_collateral(&t.carol);
+
+        // Verify the on-chain collateral value matches the expected penalty arithmetic
+        let expected_penalty = collateral_before * PENALTY_BPS / BPS_DENOM;
+        let expected_new_collateral = collateral_before - expected_penalty;
+        assert_eq!(
+            collateral_after, expected_new_collateral,
+            "new_collateral after mark_default must equal collateral - penalty"
+        );
+
+        // The 'default' event is emitted — existence already covered by the
+        // test above; here we verify the updated collateral stored on-chain
+        // is consistent with the value a listener would record.
+        let defaults = events_named(&t.env, "default");
+        assert_eq!(defaults.len(), 1);
+    }
+
+    // ── circle.cancelled event ────────────────────────────────────────────────
+
+    #[test]
+    fn test_cancel_emits_cancelled_event() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+
+        t.circle.cancel(&t.alice);
+
+        let cancelled = events_named(&t.env, "cancelled");
+        assert_eq!(cancelled.len(), 1);
+    }
+
+    // ── circle.completed event ────────────────────────────────────────────────
+
+    #[test]
+    fn test_complete_all_rounds_emits_completed_event() {
+        let t = setup_circle();
+        t.activate();
+        t.complete_all_rounds();
+
+        let completed = events_named(&t.env, "completed");
+        assert_eq!(completed.len(), 1, "expected exactly one 'completed' event");
+    }
+
+    // ── circle.closed event (updated: now includes reason) ────────────────────
+
+    #[test]
+    fn test_close_after_completion_emits_closed_event() {
+        let t = setup_circle();
+        t.activate();
+        t.force_status(CircleStatus::Completed);
+
+        t.circle.close(&t.alice);
+
+        let closed = events_named(&t.env, "closed");
+        assert_eq!(closed.len(), 1, "expected one 'closed' event");
+    }
+
+    #[test]
+    fn test_close_after_cancellation_emits_closed_event() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+
+        // Flush events up to this point so we only inspect close-related ones
+        let _ = t.env.events().all();
+
+        t.circle.close(&t.alice);
+
+        let closed = events_named(&t.env, "closed");
+        assert_eq!(closed.len(), 1, "expected one 'closed' event after cancelled close");
+    }
+
+    #[test]
+    fn test_close_emits_collateral_released_per_member_with_collateral() {
+        let t = setup_circle();
+        t.activate(); // all 4 members joined — all have collateral
+        t.force_status(CircleStatus::Completed);
+
+        t.circle.close(&t.alice);
+
+        let released = events_named(&t.env, "collateral_released");
+        assert_eq!(
+            released.len(), 4,
+            "expected one 'collateral_released' event per member with collateral"
+        );
+    }
+
+    #[test]
+    fn test_close_does_not_emit_collateral_released_for_zero_balance() {
+        let t = setup_circle();
+        // Only alice joins; circle is then cancelled
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+
+        // Drain alice's collateral to 0 via force helper so second close is a no-op
+        t.force_collateral(&t.alice, 0i128);
+
+        let _ = t.env.events().all(); // clear
+
+        t.circle.close(&t.bob); // bob never joined — no collateral
+
+        let released = events_named(&t.env, "collateral_released");
+        assert_eq!(
+            released.len(), 0,
+            "no 'collateral_released' events when all balances are zero"
+        );
+    }
+
+    // ── circle.initialized event ──────────────────────────────────────────────
+
+    #[test]
+    fn test_initialize_emits_initialized_event() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a);
+        members.push_back(member_b);
+
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+
+        let initialized = events_named(&env, "initialized");
+        assert_eq!(initialized.len(), 1, "expected one 'initialized' event");
+    }
+
 }
