@@ -247,7 +247,48 @@ async function ingestEvent<T>(event: SdkEvent, handleEvent: (client: PoolClient)
   });
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Event data parsers (pure, no I/O — exported for unit tests) ─────────────
+
+/**
+ * Parse the data payload of a `factory/circle_created` event.
+ *
+ * Contract data tuple (contracts/circle_factory/src/lib.rs):
+ *   (circle_address: Address, creator: Address, circle_index: u32)
+ *
+ * Returns a typed object so callers never have to remember positional order,
+ * and so tests can assert on field names rather than array indices.
+ */
+export function parseCircleCreatedEvent(value: unknown): {
+  circleAddress: string;
+  creator: string;
+  circleIndex: number;
+} {
+  if (!Array.isArray(value) || value.length < 3) {
+    throw new Error(
+      `factory/circle_created: expected data tuple [address, creator, circle_index] ` +
+        `but received ${JSON.stringify(value)}`,
+    );
+  }
+  const [circleAddress, creator, circleIndex] = value as [string, string, number];
+  if (typeof circleAddress !== "string" || circleAddress.length === 0) {
+    throw new Error(
+      `factory/circle_created: circle_address must be a non-empty string, got ${JSON.stringify(circleAddress)}`,
+    );
+  }
+  if (typeof creator !== "string" || creator.length === 0) {
+    throw new Error(
+      `factory/circle_created: creator must be a non-empty string, got ${JSON.stringify(creator)}`,
+    );
+  }
+  if (typeof circleIndex !== "number" || !Number.isInteger(circleIndex) || circleIndex < 0) {
+    throw new Error(
+      `factory/circle_created: circle_index must be a non-negative integer, got ${JSON.stringify(circleIndex)}`,
+    );
+  }
+  return { circleAddress, creator, circleIndex };
+}
+
+
 
 async function getLastLedger(): Promise<number> {
   const rows = await query<{ last_ledger: string }>(
@@ -266,30 +307,24 @@ async function setLastLedger(ledger: number) {
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
 async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
-  // The factory emits: (circle_address, creator, round_deadline_ledgers)
-  // Index 2 (round_deadline_ledgers) may be absent on older contract versions.
-  const value = getValueNative(event) as [string, string, number?];
-  const [circleAddr, creator, roundDeadlineLedgers] = value;
+  // Delegate data extraction to the pure parser so the shape is validated
+  // before any DB writes are attempted.  See parseCircleCreatedEvent for the
+  // full field documentation.
+  const { circleAddress, creator, circleIndex } = parseCircleCreatedEvent(
+    getValueNative(event),
+  );
 
   await queryClient(
     client,
     `INSERT INTO circles
        (address, creator, round_amount, member_count, total_rounds, status,
-        current_round, created_ledger, round_deadline_ledgers)
-     VALUES ($1, $2, 0, 0, 0, 'Pending', 0, $3, $4)
+        current_round, created_ledger)
+     VALUES ($1, $2, 0, 0, 0, 'Pending', 0, $3)
      ON CONFLICT (address) DO NOTHING`,
-    [
-      circleAddr,
-      creator,
-      event.ledger,
-      roundDeadlineLedgers != null ? Number(roundDeadlineLedgers) : null,
-    ],
+    [circleAddress, creator, event.ledger],
   );
   console.log(
-    `[indexer] New circle created: ${circleAddr} by ${creator}` +
-      (roundDeadlineLedgers != null
-        ? ` (deadline: ${roundDeadlineLedgers} ledgers/round)`
-        : ""),
+    `[indexer] New circle created: ${circleAddress} by ${creator} (factory index: ${circleIndex})`,
   );
 }
 
