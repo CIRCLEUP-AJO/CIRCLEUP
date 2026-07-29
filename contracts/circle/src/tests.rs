@@ -943,21 +943,77 @@ mod circle_tests {
     }
 
     // ── circle.joined event ───────────────────────────────────────────────────
+    //
+    // The `joined` event data is a tuple `(Address, u32)` where the first
+    // element is the joining member's address and the second is their 1-based
+    // position in the join queue (1 = first to join, N = last / activating join).
+    // These tests act as a contract-level API guarantee for the event shape.
 
     #[test]
-    fn test_join_emits_joined_event_with_member_address() {
+    fn test_join_emits_joined_event_with_member_and_order() {
         let t = setup_circle();
-        t.env.events().all(); // consume pre-existing events
+        t.env.events().all(); // consume pre-existing events (e.g. "initialized")
 
         t.circle.join(&t.alice);
 
         let joined = events_named(&t.env, "joined");
         assert_eq!(joined.len(), 1, "expected exactly one 'joined' event");
 
-        // The data payload is the member Address — decode it back and compare
+        // The data payload is `(member: Address, order: u32)`.
+        // Decode via the tuple IntoVal / FromVal round-trip.
         let data_val = joined[0].clone();
-        let member: Address = soroban_sdk::FromVal::from_val(&t.env, &data_val);
-        assert_eq!(member, t.alice);
+        let (member, order): (Address, u32) =
+            soroban_sdk::FromVal::from_val(&t.env, &data_val);
+        assert_eq!(member, t.alice, "event member must be the joining address");
+        assert_eq!(order, 1u32, "alice is the first to join — order must be 1");
+    }
+
+    #[test]
+    fn test_join_order_increments_per_member() {
+        let t = setup_circle();
+        // Join all four members one by one and verify order 1..=4.
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+        t.circle.join(&t.carol);
+        t.circle.join(&t.dave);
+
+        let joined = events_named(&t.env, "joined");
+        assert_eq!(joined.len(), 4, "expected one 'joined' event per member");
+
+        let expected_members = [&t.alice, &t.bob, &t.carol, &t.dave];
+        for (i, (val, &expected_member)) in joined.iter().zip(expected_members.iter()).enumerate() {
+            let (member, order): (Address, u32) =
+                soroban_sdk::FromVal::from_val(&t.env, val);
+            assert_eq!(
+                member, *expected_member,
+                "event[{i}] member mismatch"
+            );
+            assert_eq!(
+                order,
+                (i + 1) as u32,
+                "event[{i}] order must be 1-based index into join queue"
+            );
+        }
+    }
+
+    #[test]
+    fn test_last_join_order_equals_member_count() {
+        let t = setup_circle();
+        t.activate(); // all 4 members join
+
+        let joined = events_named(&t.env, "joined");
+        assert_eq!(joined.len(), 4, "expected one 'joined' event per member");
+
+        // The final join (dave) should carry order == 4 == total member count.
+        let last_val = joined.last().unwrap().clone();
+        let (member, order): (Address, u32) =
+            soroban_sdk::FromVal::from_val(&t.env, &last_val);
+        assert_eq!(member, t.dave);
+        assert_eq!(
+            order,
+            t.members.len(),
+            "last joiner's order must equal the total member count"
+        );
     }
 
     #[test]
