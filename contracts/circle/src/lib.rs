@@ -235,7 +235,13 @@ impl CircleContract {
         while i < len {
             let mut j = i + 1;
             while j < len {
-                if members.get(i).unwrap() == members.get(j).unwrap() {
+                let a = members
+                    .get(i)
+                    .unwrap_or_else(|| panic!("circle: member index {} out of bounds", i));
+                let b = members
+                    .get(j)
+                    .unwrap_or_else(|| panic!("circle: member index {} out of bounds", j));
+                if a == b {
                     panic!("duplicate members");
                 }
                 j += 1;
@@ -310,7 +316,9 @@ impl CircleContract {
 
         // Round 0 is prepared at init; the live deadline is refreshed when the
         // circle becomes Active (all members joined), not at initialize time.
-        let first_recipient = members.get(0).unwrap();
+        let first_recipient = members
+            .get(0)
+            .unwrap_or_else(|| panic!("circle: member list is empty after validation — storage inconsistency"));
         let initial_round = RoundState {
             round_index: 0,
             recipient: first_recipient,
@@ -337,14 +345,30 @@ impl CircleContract {
     /// exactly once — when every configured member has joined — and the round-0
     /// deadline clock starts at that moment.
     ///
+    /// # Events
+    ///
+    /// Emits `circle` / `joined` with data `(member: Address, order: u32)` where
+    /// `order` is the 1-based position this member filled in the join queue
+    /// (1 = first to join, N = last to join and triggers the Active transition).
+    /// Consumers can use `order` to display a live join-progress indicator
+    /// without polling `get_collateral` for every configured member.
+    ///
     /// # Storage cost
     /// Creates one new persistent entry (`Collateral(member)`).  The last member
     /// to join also writes two instance entries (`Status`, `CurrentRound`).
     pub fn join(env: Env, member: Address) {
         member.require_auth();
 
-        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: join called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Pending {
             panic!("circle not accepting members");
@@ -386,12 +410,18 @@ impl CircleContract {
             "join collateral deposit",
         );
 
+        // Count how many members have now joined (including this one, whose
+        // Collateral key was written above).  This is the 1-based join order
+        // emitted in the `joined` event so listeners can track join progress
+        // without polling collateral keys for every configured member.
+        let join_order: u32 = config
+            .members
+            .iter()
+            .filter(|m| env.storage().persistent().has(&DataKey::Collateral(m)))
+            .count() as u32;
+
         // Explicit Active transition only after every member has joined
-        let all_joined = config.members.iter().all(|m| {
-            env.storage()
-                .persistent()
-                .has(&DataKey::Collateral(m))
-        });
+        let all_joined = join_order == config.members.len();
 
         if all_joined {
             env.storage()
@@ -404,7 +434,7 @@ impl CircleContract {
                 .storage()
                 .instance()
                 .get(&DataKey::CurrentRound)
-                .unwrap();
+                .unwrap_or_else(|| panic!("circle: CurrentRound missing during join activation — storage inconsistency"));
             round.deadline_ledger = env.ledger().sequence() as u64
                 + config.round_deadline_ledgers as u64;
             env.storage().instance().set(&DataKey::CurrentRound, &round);
@@ -413,8 +443,13 @@ impl CircleContract {
                 .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "active")), ());
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "joined")), member);
+        // Emit (member, join_order) so indexers and front-ends can show a live
+        // join-progress indicator ("2 of 4 members joined") and record who
+        // claimed which position in the queue without secondary lookups.
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "joined")),
+            (member, join_order),
+        );
     }
 
     // ── Cancel ────────────────────────────────────────────────────────────────
@@ -429,8 +464,16 @@ impl CircleContract {
     pub fn cancel(env: Env, caller: Address) {
         caller.require_auth();
 
-        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: cancel called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Pending {
             panic!("can only cancel a pending circle");
@@ -460,15 +503,26 @@ impl CircleContract {
     pub fn contribute(env: Env, member: Address) {
         member.require_auth();
 
-        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: contribute called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
             panic!("circle is not active");
         }
 
-        let mut round: RoundState =
-            env.storage().instance().get(&DataKey::CurrentRound).unwrap();
+        let mut round: RoundState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
         if round.paid_out {
             panic!("round already paid out");
@@ -518,15 +572,26 @@ impl CircleContract {
     /// Transfer the pot to this round's recipient once all members have contributed.
     /// Anyone may call this.
     pub fn payout(env: Env) {
-        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: payout called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
             panic!("circle is not active");
         }
 
-        let mut round: RoundState =
-            env.storage().instance().get(&DataKey::CurrentRound).unwrap();
+        let mut round: RoundState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
         if round.paid_out {
             panic!("already paid out");
@@ -576,15 +641,17 @@ impl CircleContract {
             .set(&DataKey::RoundsCompleted, &(completed + 1));
 
         // Increment on-chain reputation for the recipient.
-        // Pass the circle contract's own address as `caller` so the reputation
-        // contract can verify this sub-call is authorized by a known circle
-        // (the circle is the admin of the reputation contract when deployed via
-        // the factory — or the factory itself delegates that role).  Using
-        // `env.current_contract_address()` ensures no external wallet needs to
-        // co-sign the payout transaction just to record a score update.
+        // Pass the circle's own address as the `circle` argument — Soroban's
+        // Contract Invoker rule auto-grants require_auth for the calling
+        // contract's own address, so no external signature is needed.
+        // try_increment surfaces any reputation contract error (e.g. circle
+        // not yet registered as authorized caller) as a clear panic instead of
+        // a silent trap from the callee.
         let rep_client =
             reputation::ReputationContractClient::new(&env, &config.reputation_contract);
-        rep_client.increment(&env.current_contract_address(), &round.recipient);
+        rep_client
+            .try_increment(&env.current_contract_address(), &round.recipient)
+            .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
@@ -602,7 +669,10 @@ impl CircleContract {
                 (),
             );
         } else {
-            let next_recipient = config.members.get(next_round_index).unwrap();
+            let next_recipient = config
+                .members
+                .get(next_round_index)
+                .unwrap_or_else(|| panic!("circle: next recipient at index {} missing — storage inconsistency", next_round_index));
             let next_round = RoundState {
                 round_index: next_round_index,
                 recipient: next_recipient.clone(),
@@ -639,15 +709,26 @@ impl CircleContract {
     /// `Defaults(member)`) and updates one persistent entry
     /// (`Collateral(member)`).
     pub fn mark_default(env: Env, member: Address) {
-        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: mark_default called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
             panic!("circle is not active");
         }
 
-        let round: RoundState =
-            env.storage().instance().get(&DataKey::CurrentRound).unwrap();
+        let round: RoundState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
         if round.paid_out {
             panic!("round already paid out");
@@ -721,10 +802,16 @@ impl CircleContract {
     pub fn close(env: Env, closer: Address) {
         closer.require_auth();
 
-        let config: CircleConfig = env.storage().instance().get(&DataKey::Config).unwrap();
-        let status: CircleStatus = env.storage().instance().get(&DataKey::Status).unwrap();
-
-        if status != CircleStatus::Completed && status != CircleStatus::Cancelled {
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: close called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
             panic!("circle still active");
         }
 
