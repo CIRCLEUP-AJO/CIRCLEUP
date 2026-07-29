@@ -331,6 +331,14 @@ impl CircleContract {
     /// exactly once — when every configured member has joined — and the round-0
     /// deadline clock starts at that moment.
     ///
+    /// # Events
+    ///
+    /// Emits `circle` / `joined` with data `(member: Address, order: u32)` where
+    /// `order` is the 1-based position this member filled in the join queue
+    /// (1 = first to join, N = last to join and triggers the Active transition).
+    /// Consumers can use `order` to display a live join-progress indicator
+    /// without polling `get_collateral` for every configured member.
+    ///
     /// # Storage cost
     /// Creates one new persistent entry (`Collateral(member)`).  The last member
     /// to join also writes two instance entries (`Status`, `CurrentRound`).
@@ -380,12 +388,18 @@ impl CircleContract {
             "join collateral deposit",
         );
 
+        // Count how many members have now joined (including this one, whose
+        // Collateral key was written above).  This is the 1-based join order
+        // emitted in the `joined` event so listeners can track join progress
+        // without polling collateral keys for every configured member.
+        let join_order: u32 = config
+            .members
+            .iter()
+            .filter(|m| env.storage().persistent().has(&DataKey::Collateral(m)))
+            .count() as u32;
+
         // Explicit Active transition only after every member has joined
-        let all_joined = config.members.iter().all(|m| {
-            env.storage()
-                .persistent()
-                .has(&DataKey::Collateral(m))
-        });
+        let all_joined = join_order == config.members.len();
 
         if all_joined {
             env.storage()
@@ -407,8 +421,13 @@ impl CircleContract {
                 .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "active")), ());
         }
 
-        env.events()
-            .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "joined")), member);
+        // Emit (member, join_order) so indexers and front-ends can show a live
+        // join-progress indicator ("2 of 4 members joined") and record who
+        // claimed which position in the queue without secondary lookups.
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "joined")),
+            (member, join_order),
+        );
     }
 
     // ── Cancel ────────────────────────────────────────────────────────────────
