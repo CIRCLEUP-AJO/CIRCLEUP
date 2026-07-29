@@ -378,6 +378,7 @@ mod tests {
         assert!(s.client.get_authorized_callers().contains(&circle));
     }
 
+    /// Incrementing one member's score must never affect a different member's score.
     #[test]
     fn test_add_authorized_caller_is_idempotent() {
         let s = setup();

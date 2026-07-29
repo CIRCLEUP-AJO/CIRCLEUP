@@ -147,12 +147,6 @@ mod circle_tests {
         let token = TokenClient::new(&env, &token_id.address());
         let token_asset_client = StellarAssetClient::new(&env, &token_id.address());
 
-        // Deploy reputation contract
-        let rep_id = env.register_contract(None, ReputationContract);
-        let rep_client = ReputationContractClient::new(&env, &rep_id);
-        let rep_admin = Address::generate(&env);
-        rep_client.initialize(&rep_admin);
-
         // Create 4 members
         let alice = Address::generate(&env);
         let bob = Address::generate(&env);
@@ -164,9 +158,20 @@ mod circle_tests {
             token_asset_client.mint(m, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 4)));
         }
 
-        // Deploy circle contract
+        // Deploy circle contract first so we know its address before deploying
+        // the reputation contract.  The circle contract is the authorized caller
+        // of reputation.increment (it calls it from payout), so the reputation
+        // contract must be initialized with the circle address as admin.
         let circle_id = env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&env, &circle_id);
+
+        // Deploy reputation contract and initialize it with the circle address
+        // as admin.  This mirrors production: the factory deploys the reputation
+        // contract and sets the first circle (or itself) as admin so only
+        // authorized circle contracts can write scores.
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        rep_client.initialize(&circle_id);
 
         let mut members = Vec::new(&env);
         members.push_back(alice.clone());
@@ -1301,6 +1306,151 @@ mod circle_tests {
 
         let initialized = events_named(&env, "initialized");
         assert_eq!(initialized.len(), 1, "expected one 'initialized' event");
+    }
+
+    // ── get_pot_amount tests ──────────────────────────────────────────────────
+    //
+    // get_pot_amount is a pure read-only view that returns round_amount × member_count.
+    // It must:
+    //  • Return NotInitialized before initialize has been called
+    //  • Return the correct product for any valid circle configuration
+    //  • Stay consistent with the actual pot transferred during payout
+    //  • Remain stable across all lifecycle states (Pending, Active, Completed, Cancelled)
+
+    /// Before `initialize` the Config key is absent; `get_pot_amount` must
+    /// return `NotInitialized` rather than panicking or returning 0.
+    #[test]
+    fn test_get_pot_amount_before_initialize_returns_not_initialized() {
+        let (env, _token, _rep) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let result = circle.get_pot_amount();
+        assert_eq!(
+            result,
+            Err(crate::ContractError::NotInitialized),
+            "get_pot_amount must return NotInitialized before initialize"
+        );
+    }
+
+    /// After initialize the pot equals round_amount × member_count.
+    /// For the standard 4-member fixture: 100_000_000 × 4 = 400_000_000.
+    #[test]
+    fn test_get_pot_amount_equals_round_amount_times_member_count() {
+        let t = setup_circle();
+        let config = t.circle.get_config().unwrap();
+        let expected = config.round_amount * config.members.len() as i128;
+
+        let pot = t.circle.get_pot_amount().unwrap();
+
+        assert_eq!(pot, expected, "pot must be round_amount × member_count");
+        assert_eq!(pot, ROUND_AMOUNT * 4, "4-member fixture pot must be 4 × ROUND_AMOUNT");
+    }
+
+    /// The pot returned by `get_pot_amount` matches the actual token amount
+    /// transferred to the recipient when `payout` runs.
+    ///
+    /// This test acts as a cross-check between the view and the mutating path:
+    /// if payout's pot calculation ever diverges from get_pot_amount, this test
+    /// will catch it before a recipient receives the wrong amount.
+    #[test]
+    fn test_get_pot_amount_matches_actual_payout_received() {
+        let t = setup_circle();
+        t.activate();
+
+        // The pot view must be readable while the circle is Active
+        let pot = t.circle.get_pot_amount().unwrap();
+        assert_eq!(pot, ROUND_AMOUNT * 4);
+
+        let alice_before = t.token.balance(&t.alice);
+        t.contribute_all();
+        t.circle.payout(); // alice is round-0 recipient
+        let alice_after = t.token.balance(&t.alice);
+
+        // Alice contributed ROUND_AMOUNT (outflow) and received `pot` (inflow).
+        // Net change == pot - ROUND_AMOUNT == 3 × ROUND_AMOUNT.
+        let net = alice_after - alice_before;
+        assert_eq!(
+            net, pot - ROUND_AMOUNT,
+            "alice's net balance change must equal pot − her own contribution"
+        );
+    }
+
+    /// `get_pot_amount` must remain readable and correct in `Pending` state
+    /// (before all members join) so UIs can display the expected payout before
+    /// the circle activates.
+    #[test]
+    fn test_get_pot_amount_readable_while_pending() {
+        let t = setup_circle();
+        assert_eq!(t.circle.get_status(), CircleStatus::Pending);
+
+        let pot = t.circle.get_pot_amount().unwrap();
+        assert_eq!(pot, ROUND_AMOUNT * 4);
+    }
+
+    /// `get_pot_amount` must remain readable after all rounds complete.
+    /// The value stays constant because Config is never mutated post-initialize.
+    #[test]
+    fn test_get_pot_amount_readable_after_completed() {
+        let t = setup_circle();
+        t.activate();
+        t.complete_all_rounds();
+        assert_eq!(t.circle.get_status(), CircleStatus::Completed);
+
+        let pot = t.circle.get_pot_amount().unwrap();
+        assert_eq!(pot, ROUND_AMOUNT * 4, "pot must be unchanged after circle completes");
+    }
+
+    /// `get_pot_amount` must remain readable after a circle is cancelled.
+    #[test]
+    fn test_get_pot_amount_readable_after_cancelled() {
+        let t = setup_circle();
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
+
+        let pot = t.circle.get_pot_amount().unwrap();
+        assert_eq!(pot, ROUND_AMOUNT * 4, "pot must be readable after cancellation");
+    }
+
+    /// Minimal 2-member circle: pot must be 2 × round_amount.
+    ///
+    /// Exercises the lower bound of member count to ensure the calculation is
+    /// correct for circles smaller than the 4-member default fixture.
+    #[test]
+    fn test_get_pot_amount_two_member_circle() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a);
+        members.push_back(member_b);
+
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let pot = circle.get_pot_amount().unwrap();
+        assert_eq!(pot, ROUND_AMOUNT * 2, "2-member pot must be 2 × ROUND_AMOUNT");
+    }
+
+    /// `get_pot_amount` must return the same value across consecutive calls —
+    /// it must have no side-effects and no dependency on call count.
+    #[test]
+    fn test_get_pot_amount_is_idempotent() {
+        let t = setup_circle();
+        let first  = t.circle.get_pot_amount().unwrap();
+        let second = t.circle.get_pot_amount().unwrap();
+        let third  = t.circle.get_pot_amount().unwrap();
+        assert_eq!(first, second, "get_pot_amount must return the same value on repeated calls");
+        assert_eq!(second, third,  "get_pot_amount must be idempotent");
     }
 
 }
