@@ -182,6 +182,11 @@ mod circle_tests {
             &ROUND_DEADLINE,
         );
 
+        // Register the circle as an authorized caller on the reputation contract
+        // so payout can award reputation scores.  The rep_admin performs this
+        // registration — in production the factory does it automatically.
+        rep_client.add_authorized_caller(&rep_admin, &circle_id);
+
         TestSetup {
             env,
             circle,
