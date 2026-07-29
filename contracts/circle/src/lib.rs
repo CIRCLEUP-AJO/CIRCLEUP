@@ -195,6 +195,12 @@ pub enum ContractError {
     /// `get_current_round` was called when the circle is not Active.
     /// The caller should inspect `get_status` to determine the true state.
     CircleNotActive = 2,
+    /// `get_pot_amount` detected that `round_amount × member_count` overflows
+    /// `i128`.  This can only happen if the circle was somehow initialized with
+    /// an astronomically large `round_amount`; the `initialize` overflow guards
+    /// should prevent it in practice, but the view returns a typed error rather
+    /// than panicking so read-only callers can handle it gracefully.
+    PotOverflow = 3,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -569,10 +575,16 @@ impl CircleContract {
             .instance()
             .set(&DataKey::RoundsCompleted, &(completed + 1));
 
-        // Increment on-chain reputation for the recipient
+        // Increment on-chain reputation for the recipient.
+        // Pass the circle contract's own address as `caller` so the reputation
+        // contract can verify this sub-call is authorized by a known circle
+        // (the circle is the admin of the reputation contract when deployed via
+        // the factory — or the factory itself delegates that role).  Using
+        // `env.current_contract_address()` ensures no external wallet needs to
+        // co-sign the payout transaction just to record a score update.
         let rep_client =
             reputation::ReputationContractClient::new(&env, &config.reputation_contract);
-        rep_client.increment(&round.recipient);
+        rep_client.increment(&env.current_contract_address(), &round.recipient);
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
@@ -841,6 +853,42 @@ impl CircleContract {
                 Err(ContractError::CircleNotActive)
             }
         }
+    }
+
+    /// Returns the total pot amount that will be paid out at the end of the
+    /// current round: `round_amount × member_count`.
+    ///
+    /// This is a pure read — it reads `Config` from instance storage and
+    /// computes the product with checked arithmetic.
+    ///
+    /// # Return values
+    ///
+    /// | Condition | Result |
+    /// |---|---|
+    /// | Normal case | `Ok(round_amount × member_count)` |
+    /// | Called before `initialize` | `Err(ContractError::NotInitialized)` |
+    /// | Arithmetic overflow (theoretical) | `Err(ContractError::PotOverflow)` |
+    ///
+    /// # Notes
+    ///
+    /// The `initialize` entry-point already rejects `round_amount` values that
+    /// would overflow this multiplication, so `PotOverflow` should never be
+    /// returned on a correctly-deployed circle.  The error variant exists so
+    /// the SDK / front-end can handle the case gracefully rather than receiving
+    /// an opaque contract trap if they ever call this view on an edge-case
+    /// deployment.
+    pub fn get_pot_amount(env: Env) -> Result<i128, ContractError> {
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .ok_or(ContractError::NotInitialized)?;
+
+        let member_count = config.members.len() as i128;
+        config
+            .round_amount
+            .checked_mul(member_count)
+            .ok_or(ContractError::PotOverflow)
     }
 
     pub fn get_collateral(env: Env, member: Address) -> i128 {
