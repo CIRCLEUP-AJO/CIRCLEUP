@@ -71,7 +71,13 @@ fn assert_unique_members(members: &Vec<Address>) {
     while i < len {
         let mut j = i + 1;
         while j < len {
-            if members.get(i).unwrap() == members.get(j).unwrap() {
+            let a = members
+                .get(i)
+                .unwrap_or_else(|| panic!("factory: member index {} out of bounds", i));
+            let b = members
+                .get(j)
+                .unwrap_or_else(|| panic!("factory: member index {} out of bounds", j));
+            if a == b {
                 panic!("duplicate members");
             }
             j += 1;
@@ -163,17 +169,17 @@ impl CircleFactory {
             .storage()
             .instance()
             .get(&DataKey::CircleWasmHash)
-            .unwrap();
+            .unwrap_or_else(|| panic!("factory: create_circle called before initialize"));
         let reputation: Address = env
             .storage()
             .instance()
             .get(&DataKey::ReputationContract)
-            .unwrap();
+            .unwrap_or_else(|| panic!("factory: ReputationContract missing — storage inconsistency"));
         let usdc: Address = env
             .storage()
             .instance()
             .get(&DataKey::UsdcToken)
-            .unwrap();
+            .unwrap_or_else(|| panic!("factory: UsdcToken missing — storage inconsistency"));
 
         // Monotonic counter mixed into the salt — incremented only after a
         // successful deploy + init so failed creates do not burn an index.
@@ -205,6 +211,25 @@ impl CircleFactory {
             &circle_address,
             &Symbol::new(&env, "initialize"),
             init_args,
+        );
+
+        // Register the new circle as an authorized caller on the reputation
+        // contract so it can award reputation scores during payout.
+        // The factory is the admin of the reputation contract (set at
+        // reputation.initialize time), so this cross-contract call is
+        // authorized by the factory's own contract address.
+        let add_caller_args = soroban_sdk::vec![
+            &env,
+            soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(
+                &env.current_contract_address(),
+                &env,
+            ),
+            soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&circle_address, &env),
+        ];
+        env.invoke_contract::<()>(
+            &reputation,
+            &Symbol::new(&env, "add_authorized_caller"),
+            add_caller_args,
         );
 
         // Register in list
