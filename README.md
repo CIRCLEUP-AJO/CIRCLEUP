@@ -21,6 +21,7 @@ CircleUp brings Rotating Savings & Credit Associations (ROSCAs) — known as **A
 - [SDK](#sdk)
 - [Environment Variables](#environment-variables)
 - [Contracts Reference](#contracts-reference)
+- [Contract Invariants](#contract-invariants)
 - [Gas and Storage Estimation](#gas-and-storage-estimation)
 - [API Reference](#api-reference)
 - [Demo Flow](#demo-flow)
@@ -454,36 +455,41 @@ formatPot("10000000", 4);      // → "4.00"
 
 ### `circle_factory`
 
-| Function | Parameters | Description |
-|----------|-----------|-------------|
-| `initialize` | `admin, circle_wasm_hash, reputation_contract, usdc_token` | One-time setup |
-| `create_circle` | `creator, members[], round_amount, round_deadline_ledgers` | Deploy a new circle |
-| `get_circles` | — | List all deployed circle addresses |
-| `get_circle_count` | — | Total number of circles |
+| Function | Auth | Parameters | Returns | Description |
+|----------|------|-----------|---------|-------------|
+| `initialize` | admin | `admin, circle_wasm_hash, reputation_contract, usdc_token` | — | One-time setup; rejects re-initialization |
+| `create_circle` | creator | `creator, members[], round_amount, round_deadline_ledgers` | `Address` | Deploy + initialize a new circle in one tx; emits `factory/circle_created` |
+| `get_circles` | — | — | `Vec<Address>` | List all deployed circle addresses in creation order |
+| `get_circle_count` | — | — | `u32` | Total number of deployed circles |
+| `get_admin` | — | — | `Address` | Factory admin; panics if not initialized |
+| `get_usdc_token` | — | — | `Address` | USDC token configured at initialize; panics if not initialized |
 
 ### `circle`
 
-| Function | Auth | Description |
-|----------|------|-------------|
-| `initialize` | factory | Set up members, amount, schedule |
-| `join` | member | Lock collateral (1× round_amount) |
-| `contribute` | member | Deposit round contribution |
-| `payout` | anyone | Transfer pot to current round recipient |
-| `mark_default` | anyone (post-deadline) | Flag + penalize a missed contribution |
-| `close` | anyone (post-completion) | Release collateral to all members |
-| `get_config` | — | Read circle configuration |
-| `get_status` | — | `Pending / Active / Completed / Cancelled` |
-| `get_current_round` | — | Current round index, recipient, deadline |
-| `get_collateral` | — | Member's locked collateral balance |
-| `get_defaults` | — | Member's missed-contribution count |
+| Function | Auth | Parameters | Returns | Description |
+|----------|------|-----------|---------|-------------|
+| `initialize` | factory | `members[], round_amount, usdc_token, reputation_contract, round_deadline_ledgers` | — | One-time setup; locked by reentrancy guard |
+| `join` | member | `member` | — | Lock collateral (1× round_amount); emits `circle/joined` with `(member, order)` |
+| `contribute` | member | `member` | — | Deposit round contribution; rejected after deadline |
+| `payout` | anyone | — | — | Transfer pot to current round's recipient once all members have contributed |
+| `mark_default` | anyone | `member` | — | Flag + penalize a member who missed the round deadline (20% collateral penalty) |
+| `cancel` | member | `caller` | — | Cancel a `Pending` circle before it goes `Active` |
+| `close` | member | `closer` | — | Release remaining collateral to all members; only callable when `Completed` or `Cancelled` |
+| `get_protocol_params` | — | — | `ProtocolParams` | All tunable constants in one struct; works before `initialize` |
+| `get_config` | — | — | `Result<CircleConfig, ContractError>` | Full circle configuration; returns `NotInitialized` error before init |
+| `get_status` | — | — | `CircleStatus` | `Pending / Active / Completed / Cancelled`; panics before init |
+| `get_current_round` | — | — | `Result<RoundState, ContractError>` | Active round state; returns `CircleNotActive` when `Completed` or `Cancelled` |
+| `get_collateral` | — | `member` | `i128` | Member's locked collateral balance (0 if not joined) |
+| `get_defaults` | — | `member` | `u32` | Member's missed-contribution count (0 if none) |
+| `has_contributed` | — | `member, round_index` | `bool` | Whether a member contributed in a given round |
 
 ### `reputation`
 
-| Function | Auth | Description |
-|----------|------|-------------|
-| `initialize` | deployer | Set admin |
-| `increment` | member (via circle) | Add 1 completed round to score |
-| `score` | anyone | Read a wallet's score |
+| Function | Auth | Parameters | Returns | Description |
+|----------|------|-----------|---------|-------------|
+| `initialize` | deployer | `admin` | — | One-time setup; rejects re-initialization |
+| `increment` | member | `member` | — | Add 1 completed-round to the member's score; emits `reputation/increment` |
+| `score` | anyone | `member` | `u32` | Read a wallet's completed-rounds score (0 if none) |
 
 ### Protocol constants
 
@@ -505,6 +511,108 @@ const params = await circle.simulateAndReadOrThrow("get_protocol_params", []);
 console.log(`Penalty: ${params.penalty_bps / params.bps_denom * 100}%`);
 // → "Penalty: 20%"
 ```
+
+---
+
+## Contract Invariants
+
+The following invariants are enforced by the contract at all times. They are expressed as preconditions, postconditions, and state constraints so integrators can reason about the system without reading the full contract source.
+
+### `circle` lifecycle invariants
+
+**Status transitions are one-way and irreversible:**
+
+```
+Pending ──(all joined)──▶ Active ──(all rounds done)──▶ Completed
+Pending ──(cancel)──────▶ Cancelled
+```
+
+- `Active`, `Completed`, and `Cancelled` are terminal states that cannot revert.
+- Once `Active`, the circle cannot be cancelled.
+
+**Collateral invariant:**
+
+- `collateral(member) = round_amount × COLLATERAL_MULTIPLIER` after a successful `join`, before any `mark_default` calls.
+- `collateral(member)` decreases by `collateral × PENALTY_BPS / BPS_DENOM` per `mark_default` call and never goes negative.
+- `collateral(member) = 0` for all members after a successful `close`.
+- The `Collateral` storage key existing (even with value 0) means the member has joined and cannot join again.
+
+**Round invariants:**
+
+- `round.round_index` is monotonically increasing; never decrements.
+- `round.recipient = config.members[round.round_index]` — the recipient is always the member at the current round's index in the configured member list.
+- `round.contributions_received` equals the count of `Contributed(member, round_index)` persistent keys that exist for the current round.
+- `payout` may only execute when `contributions_received == config.members.len()` **and** the on-chain persistent records confirm the same count (double-checked tally).
+- After `payout`, `rounds_completed` increments by 1. When `rounds_completed == config.members.len()` the status transitions to `Completed`.
+
+**Deadline invariant:**
+
+- `contribute` is accepted only while `ledger.sequence <= round.deadline_ledger`.
+- `mark_default` is accepted only while `ledger.sequence > round.deadline_ledger`.
+- The boundary is strict on both sides — the deadline ledger itself rejects contributions and also rejects defaults (only `> deadline_ledger` triggers the default window).
+
+**Reentrancy / initialization guard:**
+
+- `initialize` sets an `Initializing` flag as its very first storage write and removes it as its last, so any reentrant call during initialization is rejected with `"initialize already in progress"`.
+- `join` writes the `Collateral` key before performing the token transfer (checks-effects-interactions pattern), preventing a reentrant `join` call during the token transfer from double-depositing collateral.
+
+### `circle` event invariants
+
+Every state-changing entry-point emits at least one event. The table below is the authoritative event catalogue; indexers and front-ends should treat any deviation as a contract regression.
+
+| Event | Topics | Data | When emitted |
+|-------|--------|------|-------------|
+| `circle/initialized` | `("circle", "initialized")` | `u32` (member count) | End of `initialize` |
+| `circle/joined` | `("circle", "joined")` | `(Address, u32)` — member + 1-based join order | End of every successful `join` |
+| `circle/active` | `("circle", "active")` | `()` | When the last member joins and circle transitions to `Active` |
+| `circle/contributed` | `("circle", "contributed")` | `(Address, u32)` — member + round index | End of every successful `contribute` |
+| `circle/payout` | `("circle", "payout")` | `(Address, i128, u32)` — recipient + pot + round index | End of every successful `payout` |
+| `circle/round_started` | `("circle", "round_started")` | `(u32, Address, u64)` — round index + recipient + deadline ledger | After each non-final `payout` (rounds 0 … N−2) |
+| `circle/completed` | `("circle", "completed")` | `()` | After the final `payout` |
+| `circle/default` | `("circle", "default")` | `(Address, i128, u32, i128)` — member + penalty + round index + new collateral | End of every successful `mark_default` |
+| `circle/cancelled` | `("circle", "cancelled")` | `(Address, u32)` — caller + ledger sequence | End of `cancel` |
+| `circle/collateral_released` | `("circle", "collateral_released")` | `(Address, i128)` — member + amount | Once per member with non-zero collateral during `close` |
+| `circle/closed` | `("circle", "closed")` | `(Address, i128, u32, Symbol)` — closer + total released + ledger + reason ("completed"\|"cancelled") | End of `close` |
+
+### `circle_factory` event invariants
+
+| Event | Topics | Data | When emitted |
+|-------|--------|------|-------------|
+| `factory/circle_created` | `("factory", "circle_created")` | `(Address, Address, u32)` — circle address + creator + circle index | End of `create_circle` |
+
+### `reputation` event invariants
+
+| Event | Topics | Data | When emitted |
+|-------|--------|------|-------------|
+| `reputation/increment` | `("reputation", "increment")` | `u32` — new score | End of `increment` |
+
+### Error codes (`circle` contract)
+
+Read-only views return typed errors instead of panicking so callers can handle them gracefully.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 1 | `NotInitialized` | `get_config` was called before `initialize` |
+| 2 | `CircleNotActive` | `get_current_round` was called when status is `Completed` or `Cancelled` |
+
+Mutating entry-points (`initialize`, `join`, `contribute`, …) panic with a descriptive message that propagates back to the caller via the simulation result. Example messages:
+
+| Panic message | Entry-point | Cause |
+|--------------|-------------|-------|
+| `"already initialized"` | `initialize` | Called more than once |
+| `"circle not accepting members"` | `join` | Status is not `Pending` |
+| `"already joined"` | `join` | `Collateral` key already exists for this member |
+| `"not a circle member"` | `join`, `contribute`, `cancel` | Address not in configured member list |
+| `"circle is not active"` | `contribute`, `payout`, `mark_default` | Status is not `Active` |
+| `"already contributed this round"` | `contribute` | Duplicate contribution in same round |
+| `"round deadline passed; cannot contribute before payout"` | `contribute` | `ledger.sequence > deadline_ledger` |
+| `"not all members have contributed yet"` | `payout` | `contributions_received < member_count` |
+| `"round deadline not yet passed"` | `mark_default` | `ledger.sequence <= deadline_ledger` |
+| `"already marked default this round"` | `mark_default` | Member already flagged for current round |
+| `"member did contribute"` | `mark_default` | `Contributed(member, round)` key exists |
+| `"can only cancel a pending circle"` | `cancel` | Status is not `Pending` |
+| `"circle still active"` | `close` | Status is not `Completed` or `Cancelled` |
+| `"USDC transfer failed during {context}"` | `join`, `contribute`, `payout`, `close` | Token transfer rejected (balance, trustline, or auth) |
 
 ---
 
