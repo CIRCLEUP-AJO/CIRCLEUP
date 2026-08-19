@@ -15,13 +15,13 @@ const SDK_CONFIG: CircleUpConfig = {
   rpcUrl: "https://soroban-testnet.stellar.org",
   networkPassphrase: "Test SDF Network ; September 2015",
   contracts: {
-    circleFactory: "CFACTORY000000000000000000000000000000000000000000000000",
-    reputation: "CREP00000000000000000000000000000000000000000000000000000",
-    usdc: "CUSDC0000000000000000000000000000000000000000000000000000",
+    circleFactory: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    reputation: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    usdc: "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
   },
 };
 
-const CIRCLE_ADDR = "CCIRCLE00000000000000000000000000000000000000000000000000";
+const CIRCLE_ADDR = "CEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
 
 const MOCK_CONFIG: CircleConfig = {
   members: ["GABC", "GDEF"],
@@ -53,9 +53,11 @@ function makeClient(ttlMs?: number) {
   const getStatusSpy = vi
     .spyOn(client as any, "getStatus")
     .mockResolvedValue(MOCK_STATUS);
+  // getFullState now calls getCurrentRoundResult (non-throwing wrapper) internally
+  // for Active/Pending circles, so mock that instead of getCurrentRound.
   const getRoundSpy = vi
-    .spyOn(client as any, "getCurrentRound")
-    .mockResolvedValue(MOCK_ROUND);
+    .spyOn(client as any, "getCurrentRoundResult")
+    .mockResolvedValue({ ok: true, value: MOCK_ROUND });
 
   return { client, getConfigSpy, getStatusSpy, getRoundSpy };
 }
