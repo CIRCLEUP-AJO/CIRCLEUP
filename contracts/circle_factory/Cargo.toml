@@ -8,9 +8,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { version = "21.7.7" }
+circle       = { path = "../circle" }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.7.7", features = ["testutils"] }
+circle       = { path = "../circle", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

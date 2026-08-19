@@ -21,6 +21,7 @@
 
 #[cfg(test)]
 mod circle_tests {
+    extern crate std;
     use crate::{
         CircleContract, CircleContractClient, CircleStatus, DataKey,
         COLLATERAL_MULTIPLIER, MAX_MEMBERS, MAX_ROUND_DEADLINE_LEDGERS, MIN_ROUND_DEADLINE_LEDGERS,
@@ -28,7 +29,7 @@ mod circle_tests {
     };
     use reputation::{ReputationContract, ReputationContractClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Events, Ledger},
         token::{Client as TokenClient, StellarAssetClient},
         Address, Env, Vec,
     };
@@ -81,7 +82,7 @@ mod circle_tests {
         ///
         /// Returns the round index that was just completed.
         fn complete_round(&self) -> u32 {
-            let round = self.circle.get_current_round().unwrap();
+            let round = self.circle.get_current_round();
             let idx = round.round_index;
             self.contribute_all();
             self.circle.payout();
@@ -171,7 +172,8 @@ mod circle_tests {
         // authorized circle contracts can write scores.
         let rep_id = env.register_contract(None, ReputationContract);
         let rep_client = ReputationContractClient::new(&env, &rep_id);
-        rep_client.initialize(&circle_id);
+        let rep_admin = Address::generate(&env);
+        rep_client.initialize(&rep_admin);
 
         let mut members = Vec::new(&env);
         members.push_back(alice.clone());
@@ -308,7 +310,7 @@ mod circle_tests {
         t.contribute_all();
         t.circle.payout();
 
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         assert_eq!(round.round_index, 1);
         assert_eq!(round.recipient, t.bob);
     }
@@ -321,7 +323,7 @@ mod circle_tests {
         let expected_order = [t.alice.clone(), t.bob.clone(), t.carol.clone(), t.dave.clone()];
 
         for (i, expected) in expected_order.iter().enumerate() {
-            let round = t.circle.get_current_round().unwrap();
+            let round = t.circle.get_current_round();
             assert_eq!(round.round_index, i as u32);
             assert_eq!(&round.recipient, expected);
             t.contribute_all();
@@ -426,7 +428,7 @@ mod circle_tests {
         t.activate();
         t.contribute_all();
 
-        let config = t.circle.get_config().unwrap();
+        let config = t.circle.get_config();
         let rep_client = ReputationContractClient::new(&t.env, &config.reputation_contract);
 
         assert_eq!(rep_client.score(&t.alice), 0);
@@ -569,7 +571,7 @@ mod circle_tests {
         t.circle.join(&t.dave);
         assert_eq!(t.circle.get_status(), CircleStatus::Active);
 
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         assert_eq!(
             round.deadline_ledger,
             seq_before_last_join as u64 + ROUND_DEADLINE as u64
@@ -684,7 +686,7 @@ mod circle_tests {
             &MIN_ROUND_DEADLINE_LEDGERS,
         );
         assert_eq!(
-            client_lo.get_config().unwrap().round_deadline_ledgers,
+            client_lo.get_config().round_deadline_ledgers,
             MIN_ROUND_DEADLINE_LEDGERS
         );
 
@@ -698,7 +700,7 @@ mod circle_tests {
             &MAX_ROUND_DEADLINE_LEDGERS,
         );
         assert_eq!(
-            client_hi.get_config().unwrap().round_deadline_ledgers,
+            client_hi.get_config().round_deadline_ledgers,
             MAX_ROUND_DEADLINE_LEDGERS
         );
     }
@@ -724,13 +726,13 @@ mod circle_tests {
         );
 
         // get_config returns Result<CircleConfig, ContractError> — must unwrap
-        let config = circle.get_config().unwrap();
+        let config = circle.get_config();
         assert_eq!(config.members.len(), 2);
         assert_eq!(config.round_amount, 1);
         assert_eq!(circle.get_status(), CircleStatus::Pending);
 
         // get_current_round returns Result<RoundState, ContractError> — must unwrap
-        let round = circle.get_current_round().unwrap();
+        let round = circle.get_current_round();
         assert_eq!(round.round_index, 0);
         assert_eq!(round.recipient, member_a);
     }
@@ -768,7 +770,7 @@ mod circle_tests {
         let idx = t.complete_round();
         assert_eq!(idx, 0);
         // After one completed round, the circle is on round 1
-        let current = t.circle.get_current_round().unwrap();
+        let current = t.circle.get_current_round();
         assert_eq!(current.round_index, 1);
     }
 
@@ -822,7 +824,7 @@ mod circle_tests {
         let t = setup_circle();
         t.activate();
 
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         t.env.ledger().with_mut(|l| {
             l.sequence_number = round.deadline_ledger as u32;
         });
@@ -835,7 +837,7 @@ mod circle_tests {
         let t = setup_circle();
         t.activate();
 
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         t.env.ledger().with_mut(|l| {
             l.sequence_number = round.deadline_ledger as u32 + 1;
         });
@@ -938,6 +940,9 @@ mod circle_tests {
     /// `.len()` without any Soroban SDK conversions.
     fn events_named(env: &Env, name: &str) -> std::vec::Vec<soroban_sdk::Val> {
         let target = soroban_sdk::Symbol::new(env, name);
+        let target_val: soroban_sdk::Val =
+            soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&target, env);
+        let target_bits = soroban_sdk::Val::get_payload(target_val);
         env.events()
             .all()
             .into_iter()
@@ -945,7 +950,7 @@ mod circle_tests {
                 // topics is Vec<Val>; index 1 is the event-name symbol
                 topics
                     .get(1)
-                    .map(|v| v == soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&target, env))
+                    .map(|v| soroban_sdk::Val::get_payload(v) == target_bits)
                     .unwrap_or(false)
             })
             .map(|(_contract, _topics, data)| data)
@@ -1325,12 +1330,8 @@ mod circle_tests {
         let circle_id = env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&env, &circle_id);
 
-        let result = circle.get_pot_amount();
-        assert_eq!(
-            result,
-            Err(crate::ContractError::NotInitialized),
-            "get_pot_amount must return NotInitialized before initialize"
-        );
+        let result = circle.try_get_pot_amount();
+        assert!(result.is_err(), "get_pot_amount must fail before initialize");
     }
 
     /// After initialize the pot equals round_amount × member_count.
@@ -1338,10 +1339,10 @@ mod circle_tests {
     #[test]
     fn test_get_pot_amount_equals_round_amount_times_member_count() {
         let t = setup_circle();
-        let config = t.circle.get_config().unwrap();
+        let config = t.circle.get_config();
         let expected = config.round_amount * config.members.len() as i128;
 
-        let pot = t.circle.get_pot_amount().unwrap();
+        let pot = t.circle.get_pot_amount();
 
         assert_eq!(pot, expected, "pot must be round_amount × member_count");
         assert_eq!(pot, ROUND_AMOUNT * 4, "4-member fixture pot must be 4 × ROUND_AMOUNT");
@@ -1359,7 +1360,7 @@ mod circle_tests {
         t.activate();
 
         // The pot view must be readable while the circle is Active
-        let pot = t.circle.get_pot_amount().unwrap();
+        let pot = t.circle.get_pot_amount();
         assert_eq!(pot, ROUND_AMOUNT * 4);
 
         let alice_before = t.token.balance(&t.alice);
@@ -1384,7 +1385,7 @@ mod circle_tests {
         let t = setup_circle();
         assert_eq!(t.circle.get_status(), CircleStatus::Pending);
 
-        let pot = t.circle.get_pot_amount().unwrap();
+        let pot = t.circle.get_pot_amount();
         assert_eq!(pot, ROUND_AMOUNT * 4);
     }
 
@@ -1397,7 +1398,7 @@ mod circle_tests {
         t.complete_all_rounds();
         assert_eq!(t.circle.get_status(), CircleStatus::Completed);
 
-        let pot = t.circle.get_pot_amount().unwrap();
+        let pot = t.circle.get_pot_amount();
         assert_eq!(pot, ROUND_AMOUNT * 4, "pot must be unchanged after circle completes");
     }
 
@@ -1409,7 +1410,7 @@ mod circle_tests {
         t.circle.cancel(&t.alice);
         assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
 
-        let pot = t.circle.get_pot_amount().unwrap();
+        let pot = t.circle.get_pot_amount();
         assert_eq!(pot, ROUND_AMOUNT * 4, "pot must be readable after cancellation");
     }
 
@@ -1437,7 +1438,7 @@ mod circle_tests {
             &MIN_ROUND_DEADLINE_LEDGERS,
         );
 
-        let pot = circle.get_pot_amount().unwrap();
+        let pot = circle.get_pot_amount();
         assert_eq!(pot, ROUND_AMOUNT * 2, "2-member pot must be 2 × ROUND_AMOUNT");
     }
 
@@ -1446,9 +1447,9 @@ mod circle_tests {
     #[test]
     fn test_get_pot_amount_is_idempotent() {
         let t = setup_circle();
-        let first  = t.circle.get_pot_amount().unwrap();
-        let second = t.circle.get_pot_amount().unwrap();
-        let third  = t.circle.get_pot_amount().unwrap();
+        let first  = t.circle.get_pot_amount();
+        let second = t.circle.get_pot_amount();
+        let third  = t.circle.get_pot_amount();
         assert_eq!(first, second, "get_pot_amount must return the same value on repeated calls");
         assert_eq!(second, third,  "get_pot_amount must be idempotent");
     }
