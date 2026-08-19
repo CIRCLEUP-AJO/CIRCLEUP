@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- SDK: `invalid_argument`, `try_again_later` and `stale_rpc` transaction error codes,
+  so callers can tell a bad input from a congested RPC, a stalled RPC, and a real
+  on-chain failure without parsing error strings
+- SDK: `TxSuccess.returnValue`, the contract's return value decoded from the
+  confirming transaction
+- SDK: `decodeU32`, `decodeBigInt`, `decodeBoolean`, `decodeAddress` and
+  `decodeAddressList` wire decoders, so a contract whose return shape has drifted
+  names the offending field instead of leaking `undefined` into domain code
+- SDK: full `PollConfig` validation at construction, reporting every problem at once
+  instead of only rejecting `backoffFactor`
+- SDK: integration tests covering `create_circle` through `join`, `contribute`,
+  `payout` and `mark_default`, plus contract panic, on-chain failure, stale RPC,
+  malformed arguments and a drifted return shape
 - Homepage hero: secondary "Browse N open circles" call-to-action that jumps to the
   circles list, shown only when there are circles to browse
 - Homepage hero: hint line stating the Freighter wallet and 2–20 member
@@ -18,11 +31,39 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Keyboard focus rings on both homepage hero call-to-action buttons
 
 ### Changed
+- SDK: every contract call is validated before any network request, so a malformed
+  address, method name or argument is reported as a typed failure naming the
+  offending value rather than as an opaque Stellar SDK or host error
+- SDK: mutation methods always resolve to a `TxResult`; an argument that fails to
+  encode no longer throws out of `join`, `contribute`, `markDefault` or `close`
+- SDK: `simulateAndReadOrThrow` returns `unknown` instead of an unchecked cast, so
+  every read narrows through a mapping helper
+- SDK: read failures are given the same human-readable treatment as write failures,
+  so a contract panic reads identically from `getConfig` and `getConfigResult`
+- SDK: `FactoryClient.createCircle` resolves the new circle's address from the
+  transaction's own return value instead of the last entry of `get_circles()`,
+  which named another caller's circle when two creations landed in one ledger
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
 
 ### Fixed
+- SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with
+  `this.source.sequenceNumber is not a function`. The read path built its
+  transaction from an account stub that was missing that method, and it always
+  reached that stub because it looked up a throwaway account that never exists on
+  chain. Reads now use a fixed placeholder source and make no account lookup at all
+- SDK: a transaction the RPC declined to queue (`TRY_AGAIN_LATER`) was polled for
+  the full confirmation budget and then reported as a timeout, hiding the fact that
+  it simply needed resubmitting
+- SDK: an RPC that stops advancing its ledger answers `NOT_FOUND` forever, which was
+  indistinguishable from a slow ledger and consumed the whole timeout budget
+- SDK: `scI128` accepted numbers above `Number.MAX_SAFE_INTEGER`, which round
+  silently on conversion to `bigint` and would have signed a payment for the wrong
+  amount
+- SDK: the test suite could not run. Every fixture used placeholder addresses that
+  the config validator and the address encoder both reject, and several files mocked
+  the read helper with a raw value rather than its result type
 - Homepage returned a 500 after a 60-second hang when the indexer refused the
   connection, so the "indexer is unreachable" banner never reached the user
 
