@@ -23,38 +23,24 @@ import {
   DEFAULT_POLL_CONFIG,
   type PollConfig,
 } from "../client";
-import { isTxSuccess, isTxFailure, type CircleUpConfig } from "../types";
+import { isTxSuccess, isTxFailure } from "../types";
+import {
+  CIRCLE_ADDR,
+  MEMBER_A,
+  MOCK_ACCOUNT,
+  SDK_CONFIG,
+  simulationSuccess,
+} from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const SDK_CONFIG: CircleUpConfig = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  contracts: {
-    circleFactory: "CFACTORY000000000000000000000000000000000000000000000000",
-    reputation: "CREP00000000000000000000000000000000000000000000000000000",
-    usdc: "CUSDC0000000000000000000000000000000000000000000000000000",
-  },
-};
-
-const CONTRACT_ID = "CCIRCLE00000000000000000000000000000000000000000000000000";
-
-const MOCK_KEYPAIR = {
-  publicKey: () => "GABC0000000000000000000000000000000000000000000000000000",
-  sign: () => Buffer.alloc(64),
-} as any;
-
-const MOCK_ACCOUNT = {
-  id: "GABC0000000000000000000000000000000000000000000000000000",
-  sequence: "100",
-  incrementSequenceNumber: () => {},
-} as any;
+const CONTRACT_ID = CIRCLE_ADDR;
 
 // ─── Thin subclass that exposes the protected method ─────────────────────────
 
 class TestClient extends CircleUpClient {
   call(method = "join") {
-    return this.buildAndSend(MOCK_KEYPAIR, CONTRACT_ID, method, []);
+    return this.buildAndSend(MEMBER_A, CONTRACT_ID, method, []);
   }
 }
 
@@ -62,18 +48,9 @@ class TestClient extends CircleUpClient {
 
 function mockHappyPath() {
   vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
-  vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue({
-    result: { retval: {} },
-    transactionData: {},
-    events: [],
-    minResourceFee: "100",
-    cost: {},
-    latestLedger: 1,
-  } as any);
-  vi.spyOn(SorobanRpc.Api, "isSimulationError").mockReturnValue(false);
-  vi.spyOn(SorobanRpc, "assembleTransaction" as any).mockReturnValue({
-    build: () => ({ sign: () => {}, toXDR: () => "" }),
-  });
+  vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+    simulationSuccess(),
+  );
 }
 
 function mockSendOk(hash = "TXHASH") {
@@ -90,10 +67,25 @@ function mockGetTxSuccess(ledger = 10) {
   } as any);
 }
 
-function mockGetTxNotFound() {
-  vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue({
-    status: SorobanRpc.Api.GetTransactionStatus.NOT_FOUND,
-  } as any);
+/**
+ * Poll forever with NOT_FOUND on a virtual clock that advances one second per
+ * poll — the rough cost of a real RPC round-trip — so the timeout branch is
+ * reached deterministically.
+ *
+ * Counting `Date.now` calls instead would couple the test to how many times the
+ * SDK (and the Stellar SDK underneath it) happens to read the clock, which is
+ * the kind of brittleness that turns a timeout test into an infinite loop as
+ * soon as an unrelated call is added.
+ */
+function mockGetTxNotFoundOnVirtualClock() {
+  let now = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockImplementation(
+    async () => {
+      now += 1_000;
+      return { status: SorobanRpc.Api.GetTransactionStatus.NOT_FOUND } as any;
+    },
+  );
 }
 
 function mockGetTxError(message = "RPC error") {
@@ -186,15 +178,7 @@ describe("buildAndSend — timeoutMs controls timeout duration", () => {
   it("times out when getTransaction always returns NOT_FOUND within budget", async () => {
     mockHappyPath();
     mockSendOk("HASH_TIMEOUT");
-    mockGetTxNotFound();
-
-    // Stub Date.now so the loop believes time has passed immediately
-    // after the first NOT_FOUND poll: start=0, next call=timeoutMs+1
-    let callCount = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => {
-      // First call is the loop start; every subsequent call is well past timeout
-      return callCount++ === 0 ? 0 : 9_999_999;
-    });
+    mockGetTxNotFoundOnVirtualClock();
 
     const client = new TestClient(SDK_CONFIG, { timeoutMs: 5_000 });
     const result = await client.call();
@@ -211,10 +195,7 @@ describe("buildAndSend — timeoutMs controls timeout duration", () => {
   it("timeout message reflects the configured timeoutMs value", async () => {
     mockHappyPath();
     mockSendOk("HASH_T");
-    mockGetTxNotFound();
-
-    let callCount = 0;
-    vi.spyOn(Date, "now").mockImplementation(() => (callCount++ === 0 ? 0 : 9_999_999));
+    mockGetTxNotFoundOnVirtualClock();
 
     const client = new TestClient(SDK_CONFIG, { timeoutMs: 120_000 });
     const result = await client.call();
@@ -417,5 +398,56 @@ describe("buildAndSend — success with custom PollConfig", () => {
       expect(result.txHash).toBe("HASH_CUSTOM");
       expect(result.ledger).toBe(42);
     }
+  });
+});
+
+// ─── Full PollConfig validation ───────────────────────────────────────────────
+
+describe("CircleUpClient constructor — rejects unusable poll schedules", () => {
+  const cases: Array<[string, PollConfig, RegExp]> = [
+    ["zero timeoutMs", { timeoutMs: 0 }, /timeoutMs/],
+    ["negative initialIntervalMs", { initialIntervalMs: -1 }, /initialIntervalMs/],
+    ["NaN maxIntervalMs", { maxIntervalMs: NaN }, /maxIntervalMs/],
+    ["Infinity backoffFactor", { backoffFactor: Infinity }, /backoffFactor/],
+    ["zero maxConsecutiveErrors", { maxConsecutiveErrors: 0 }, /maxConsecutiveErrors/],
+    [
+      "fractional maxConsecutiveErrors",
+      { maxConsecutiveErrors: 2.5 },
+      /whole number/,
+    ],
+    [
+      "maxIntervalMs below initialIntervalMs",
+      { initialIntervalMs: 5_000, maxIntervalMs: 1_000 },
+      /must be >= initialIntervalMs/,
+    ],
+    [
+      "timeoutMs below initialIntervalMs",
+      { initialIntervalMs: 5_000, maxIntervalMs: 10_000, timeoutMs: 1_000 },
+      /times out before its first poll/,
+    ],
+  ];
+
+  it.each(cases)("rejects %s", (_label, cfg, expected) => {
+    expect(() => new TestClient(SDK_CONFIG, cfg)).toThrow(RangeError);
+    expect(() => new TestClient(SDK_CONFIG, cfg)).toThrow(expected);
+  });
+
+  it("reports every problem in one error rather than only the first", () => {
+    try {
+      new TestClient(SDK_CONFIG, { timeoutMs: 0, backoffFactor: 0.5 });
+      expect.fail("should have thrown");
+    } catch (err: any) {
+      expect(err.message).toContain("timeoutMs");
+      expect(err.message).toContain("backoffFactor");
+    }
+  });
+
+  it("rejects an explicitly undefined field instead of silently polling on NaN", () => {
+    // `{ timeoutMs: opts.timeout }` where opts.timeout is undefined used to
+    // produce `Date.now() - start < undefined`, i.e. an instant timeout whose
+    // message read "NaNs".
+    expect(
+      () => new TestClient(SDK_CONFIG, { timeoutMs: undefined as any }),
+    ).toThrow(/timeoutMs/);
   });
 });

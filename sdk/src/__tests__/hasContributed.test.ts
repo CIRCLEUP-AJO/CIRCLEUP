@@ -1,36 +1,32 @@
 /**
  * Tests for the hasContributed / hasContributedCurrentRound methods on CircleClient.
  *
- * We mock simulateAndRead at the prototype level so no RPC or Stellar SDK
+ * We mock simulateAndReadOrThrow at the prototype level so no RPC or Stellar SDK
  * validation is triggered — the tests stay pure unit tests.
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { CircleClient, CircleUpClient } from "../client";
-import type { CircleConfig, CircleStatus, CircleUpConfig, RoundState } from "../types";
+import type { CircleConfig, CircleStatus, RoundState } from "../types";
+import {
+  CIRCLE_ADDR,
+  MEMBER_A_ADDR,
+  MEMBER_B_ADDR,
+  REPUTATION_ADDR,
+  SDK_CONFIG,
+  USDC_ADDR,
+} from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const SDK_CONFIG: CircleUpConfig = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  contracts: {
-    circleFactory: "CFACTORY",
-    reputation: "CREP",
-    usdc: "CUSDC",
-  },
-};
-
-const CIRCLE_ADDR = "CCIRCLE";
-// Real Stellar public keys (generated via Keypair.random()) required by Address()
-const MEMBER  = "GAY7IWZV4TBZN7CLNXVNUHI7H4URMZH2A7PXV7KQXAHW2BGTMKVRTHLH";
-const MEMBER2 = "GDVNYFT3WRIFNYNHRXZFY3D5XQ2YI3YOKPEIHNRMVSIEHUE367CQIZPV";
+const MEMBER = MEMBER_A_ADDR;
+const MEMBER2 = MEMBER_B_ADDR;
 
 const MOCK_CONFIG: CircleConfig = {
   members: [MEMBER, MEMBER2],
   roundAmount: 100_000_000n,
-  usdcToken: "CUSDC",
-  reputationContract: "CREP",
+  usdcToken: USDC_ADDR,
+  reputationContract: REPUTATION_ADDR,
   roundDeadlineLedgers: 120_960,
 };
 
@@ -48,7 +44,7 @@ function mockRound(roundIndex: number): RoundState {
 
 // ─── hasContributed ───────────────────────────────────────────────────────────
 //
-// hasContributed builds Stellar xdr args before calling simulateAndRead, so we
+// hasContributed builds Stellar xdr args before calling simulateAndReadOrThrow, so we
 // mock the entire method on the prototype for the behavioural tests. The
 // address-encoding logic is covered by the Stellar SDK's own tests; what we
 // want to assert here is the routing and return-value plumbing.
@@ -56,8 +52,8 @@ function mockRound(roundIndex: number): RoundState {
 describe("CircleClient.hasContributed", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("returns true when simulateAndRead returns true", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(true);
+  it("returns true when simulateAndReadOrThrow returns true", async () => {
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(true);
     const client = new CircleClient(SDK_CONFIG, CIRCLE_ADDR, 0);
 
     // Bypass address validation by mocking hasContributed on this instance
@@ -65,19 +61,19 @@ describe("CircleClient.hasContributed", () => {
     expect(await client.hasContributed(MEMBER, 0)).toBe(true);
   });
 
-  it("returns false when simulateAndRead returns false", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(false);
+  it("returns false when simulateAndReadOrThrow returns false", async () => {
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(false);
     const client = new CircleClient(SDK_CONFIG, CIRCLE_ADDR, 0);
 
     vi.spyOn(client, "hasContributed").mockResolvedValue(false);
     expect(await client.hasContributed(MEMBER, 2)).toBe(false);
   });
 
-  it("delegates to simulateAndRead with method 'has_contributed'", async () => {
+  it("delegates to simulateAndReadOrThrow with method 'has_contributed'", async () => {
     // Test the routing: use a real address so Address() succeeds, and verify
-    // simulateAndRead is called with the right contract method.
+    // simulateAndReadOrThrow is called with the right contract method.
     const spy = vi
-      .spyOn(CircleUpClient.prototype as any, "simulateAndRead")
+      .spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow")
       .mockResolvedValue(true);
     const client = new CircleClient(SDK_CONFIG, CIRCLE_ADDR, 0);
 
@@ -86,8 +82,8 @@ describe("CircleClient.hasContributed", () => {
     expect(spy).toHaveBeenCalledWith(CIRCLE_ADDR, "has_contributed", expect.any(Array));
   });
 
-  it("propagates errors thrown by simulateAndRead", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+  it("propagates errors thrown by simulateAndReadOrThrow", async () => {
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("RPC unavailable"),
     );
     const client = new CircleClient(SDK_CONFIG, CIRCLE_ADDR, 0);
