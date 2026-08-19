@@ -40,7 +40,7 @@
 //! | `contribute` (per member) | Contributed(member, round) | Persistent | 1 persistent entry per contribution; also updates CurrentRound (instance) |
 //! | `payout` | — | — | Updates CurrentRound + RoundsCompleted (instance); no new persistent entries |
 //! | `mark_default` | Defaulted(member, round) + Defaults(member) | Persistent | 2 persistent entries; also updates Collateral(member) |
-//! | `close` | — | — | Zeroes Collateral(member) for each member; no new entries |
+//! | `close` | Closed | Instance | Boolean flag set after all collateral is released; guards against re-invocation |
 //!
 //! Use `stellar-cli contract invoke --cost` to get instruction-count and
 //! read/write-byte estimates before broadcasting.  The `simulate_transaction`
@@ -101,6 +101,7 @@ pub enum DataKey {
     Defaulted(Address, u32),     // member already flagged for a given round
     RoundsCompleted,
     Initializing,                // reentrancy guard held for the duration of `initialize`
+    Closed,                      // true after close() successfully settles all collateral; re-invocation guard
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
@@ -792,13 +793,47 @@ impl CircleContract {
 
     // ── Close ─────────────────────────────────────────────────────────────────
 
-    /// Release remaining collateral back to all members.
-    /// Only callable when the circle is Completed or Cancelled, and only by an
-    /// authorized circle member (`closer.require_auth()` + membership check).
+    /// Settle and release remaining collateral back to all members.
+    ///
+    /// # Preconditions (enforced, not assumed)
+    ///
+    /// - The circle must be in a terminal state (`Completed` or `Cancelled`).
+    ///   Active and Pending circles are explicitly rejected with distinct messages.
+    /// - The `closer` must be a configured circle member.
+    /// - For `Completed` circles the `RoundsCompleted` counter must equal the
+    ///   member count — this cross-checks that every round was paid out before
+    ///   the status was set, guarding against storage-level inconsistencies.
+    /// - The circle must not have been closed before (`DataKey::Closed` absent).
+    ///   Duplicate invocations are rejected so no partial-release state can
+    ///   accumulate across multiple calls.
+    ///
+    /// # Settlement semantics
+    ///
+    /// For each member the contract reads their `Collateral(member)` balance and,
+    /// if positive, zeroes the key in storage *before* performing the transfer
+    /// (checks-effects-interactions per member).  The `Closed` flag is set
+    /// *before* the release loop begins so any reentrant call immediately sees
+    /// the closed state and panics, preventing double-releases through a
+    /// hostile token contract.
+    ///
+    /// Members whose collateral was fully consumed by `mark_default` penalties
+    /// (balance == 0) are silently skipped — no transfer or event is emitted for
+    /// them.  Members who never joined (no `Collateral` key at all, possible only
+    /// in Cancelled circles) are also skipped.
+    ///
+    /// # Events
+    ///
+    /// Emits one `collateral_released` event per member with a non-zero balance,
+    /// then one aggregate `closed` event.  An off-chain auditor can replay the
+    /// event log and verify that the sum of all `collateral_released` amounts
+    /// equals `total_released` in the `closed` event.  The `closed` event also
+    /// carries `total_expected_collateral` (what would have been released without
+    /// any penalties) so auditors can compute total penalty forfeitures as
+    /// `total_expected_collateral − total_released`.
     ///
     /// # Storage cost
-    /// Updates one persistent entry (`Collateral(member)`) per member that still
-    /// holds a non-zero balance.  No new entries are created.
+    /// Writes one instance entry (`Closed = true`) and zeroes one persistent
+    /// entry (`Collateral(member)`) per member that held a non-zero balance.
     pub fn close(env: Env, closer: Address) {
         closer.require_auth();
 
@@ -807,31 +842,83 @@ impl CircleContract {
             .instance()
             .get(&DataKey::Config)
             .unwrap_or_else(|| panic!("circle: close called before initialize"));
+
+        // Reject duplicate close invocations before touching any other state.
+        if env.storage().instance().has(&DataKey::Closed) {
+            panic!("circle already closed");
+        }
+
         let status: CircleStatus = env
             .storage()
             .instance()
             .get(&DataKey::Status)
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
-        if status != CircleStatus::Completed && status != CircleStatus::Cancelled {
-            panic!("circle still active");
+        // Only terminal states may trigger settlement.  Each non-terminal state
+        // gets its own message so callers receive an actionable diagnostic.
+        match &status {
+            CircleStatus::Completed | CircleStatus::Cancelled => {}
+            CircleStatus::Active => {
+                panic!("circle still active")
+            }
+            CircleStatus::Pending => {
+                panic!("circle still pending; call cancel first to reach a terminal state")
+            }
         }
 
         if !config.members.contains(&closer) {
             panic!("not authorized to close: caller is not a circle member");
         }
 
+        // For Completed circles, cross-check that every round was paid out.
+        // This guards against a hypothetical state corruption where Status was
+        // set to Completed before all payouts ran.
+        if matches!(status, CircleStatus::Completed) {
+            let rounds_completed: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoundsCompleted)
+                .unwrap_or(0);
+            if rounds_completed != config.members.len() {
+                panic!("circle: Completed status set but not all rounds paid out — storage inconsistency");
+            }
+        }
+
+        // Expected collateral if every member joined and incurred no penalties.
+        // Used in the closed event so auditors can reconcile penalty forfeitures:
+        //   total_expected_collateral - total_released == total penalties forfeited.
+        let collateral_per_member = config
+            .round_amount
+            .checked_mul(COLLATERAL_MULTIPLIER)
+            .unwrap_or_else(|| panic!("collateral per member amount overflow"));
+        let total_expected_collateral = collateral_per_member
+            .checked_mul(config.members.len() as i128)
+            .unwrap_or_else(|| panic!("total expected collateral overflow"));
+
+        // Set the Closed flag before any transfers (checks-effects-interactions).
+        // A reentrant call to close() — e.g. through a hostile token contract —
+        // will hit this guard immediately and panic, preventing double-releases.
+        // If any subsequent transfer fails the entire transaction rolls back,
+        // resetting Closed to absent so the caller can retry.
+        env.storage().instance().set(&DataKey::Closed, &true);
+
         let token_client = token::Client::new(&env, &config.usdc_token);
         let mut total_released: i128 = 0;
+        let mut members_released: u32 = 0;
 
         for member in config.members.iter() {
+            let collateral_key = DataKey::Collateral(member.clone());
             let collateral: i128 = env
                 .storage()
                 .persistent()
-                .get(&DataKey::Collateral(member.clone()))
+                .get(&collateral_key)
                 .unwrap_or(0);
 
             if collateral > 0 {
+                // Zero storage before the transfer so a reentrant call on this
+                // specific member cannot observe a non-zero balance.
+                env.storage().persistent().set(&collateral_key, &0i128);
+
                 Self::safe_transfer(
                     &token_client,
                     &env.current_contract_address(),
@@ -839,26 +926,46 @@ impl CircleContract {
                     &collateral,
                     "collateral release",
                 );
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Collateral(member.clone()), &0i128);
-                total_released += collateral;
 
-                // Per-member audit trail for indexers / off-chain reconciler
+                total_released = total_released
+                    .checked_add(collateral)
+                    .unwrap_or_else(|| panic!("total released overflow"));
+                members_released += 1;
+
+                // Per-member audit trail: indexers sum these to reconcile
+                // with total_released in the closed event.
                 env.events().publish(
                     (
                         Symbol::new(&env, "circle"),
                         Symbol::new(&env, "collateral_released"),
                     ),
-                    (member.clone(), collateral),
+                    (member, collateral),
                 );
             }
         }
 
+        let reason = if matches!(status, CircleStatus::Completed) {
+            Symbol::new(&env, "completed")
+        } else {
+            Symbol::new(&env, "cancelled")
+        };
+
+        // Aggregate settlement event.
+        // Data: (closer, total_released, total_expected_collateral, reason)
+        //   total_expected_collateral - total_released = total penalties forfeited
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
-            (closer, total_released, env.ledger().sequence(), Symbol::new(&env, if status == CircleStatus::Completed { "completed" } else { "cancelled" })),
+            (closer, total_released, total_expected_collateral, reason),
         );
+    }
+
+    /// Returns `true` if `close` has been successfully called and all collateral
+    /// has been settled.  Returns `false` for uninitialized or still-open circles.
+    ///
+    /// This view lets SDKs and indexers check terminal settlement state without
+    /// replaying the event log.
+    pub fn is_closed(env: Env) -> bool {
+        env.storage().instance().has(&DataKey::Closed)
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────
