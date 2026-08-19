@@ -63,7 +63,7 @@ pub enum DataKey {
 // ─── Contract errors ──────────────────────────────────────────────────────────
 
 #[contracterror]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ReputationError {
     /// `increment` was called by an address that is not in `AuthorizedCallers`.
     UnauthorizedCaller = 1,
@@ -323,8 +323,9 @@ impl ReputationContract {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Events};
     use soroban_sdk::Env;
 
     // ── Fixture ───────────────────────────────────────────────────────────────
@@ -387,7 +388,7 @@ mod tests {
         s.client.add_authorized_caller(&s.admin, &circle);
         // Should appear exactly once in the list.
         let callers = s.client.get_authorized_callers();
-        let count = callers.iter().filter(|a| a == circle).count();
+        let count = callers.iter().filter(|a| *a == circle).count();
         assert_eq!(count, 1);
     }
 
@@ -497,15 +498,16 @@ mod tests {
     /// Collect data payloads of all events whose second topic matches `name`.
     fn events_named(env: &Env, name: &str) -> std::vec::Vec<soroban_sdk::Val> {
         let target = soroban_sdk::Symbol::new(env, name);
+        let target_val: soroban_sdk::Val =
+            soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&target, env);
+        let target_bits = soroban_sdk::Val::get_payload(target_val);
         env.events()
             .all()
             .into_iter()
             .filter(|(_contract, topics, _data)| {
                 topics
                     .get(1)
-                    .map(|v| {
-                        v == soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&target, env)
-                    })
+                    .map(|v| soroban_sdk::Val::get_payload(v) == target_bits)
                     .unwrap_or(false)
             })
             .map(|(_contract, _topics, data)| data)
