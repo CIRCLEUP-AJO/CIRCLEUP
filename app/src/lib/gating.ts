@@ -1,0 +1,297 @@
+/**
+ * Canonical action-gating model for the CircleUp app.
+ *
+ * Before any contract write (join, contribute, payout, close) is submitted,
+ * the action must pass a deterministic gate check against a fresh state
+ * snapshot.  This prevents stale UI state from causing invalid on-chain writes.
+ *
+ * This module is pure: no RPC calls, no I/O.  It takes a {@link AppStateSnapshot}
+ * (built from the indexer data already loaded in the component) and returns a
+ * {@link GateResult} the caller acts on synchronously.
+ *
+ * Mirror of sdk/src/gating.ts — kept in sync manually because the app does
+ * not take a direct dependency on the @circleup/sdk package.
+ */
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+/**
+ * Default maximum age (ms) for a state snapshot before action-gating blocks
+ * any write.  30 s is conservative enough to absorb a slow render cycle while
+ * tight enough to catch a missed payout or default event.
+ */
+export const DEFAULT_MAX_SNAPSHOT_AGE_MS = 30_000;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/** The four contract writes that require state-based gating. */
+export type CircleAction = "join" | "contribute" | "payout" | "close";
+
+/**
+ * Snapshot of the circle state as seen by the app at a specific point in time.
+ * Built from the indexer response already present in component state — no extra
+ * RPC call is needed.
+ */
+export interface AppStateSnapshot {
+  /** Circle lifecycle status at fetch time. */
+  readonly status: string;
+  /** Current round index (0-based). */
+  readonly currentRound: number;
+  /** Total rounds in the circle. */
+  readonly totalRounds: number;
+  /** Deadline ledger for the current active round (null = unknown). */
+  readonly deadlineLedger: number | null;
+  /** Latest ledger the indexer has processed (null = unknown). */
+  readonly latestLedger: number | null;
+  /** Member addresses configured in this circle. */
+  readonly memberAddresses: string[];
+  /** Whether the acting wallet has already locked collateral (joined). */
+  readonly hasLockedCollateral: boolean;
+  /** Whether the acting wallet has already contributed to the current round. */
+  readonly hasContributedCurrentRound: boolean;
+  /** Number of contributions received in the current round (from indexer). */
+  readonly contributionsReceived: number;
+  /** Wall-clock ms when this snapshot was constructed. */
+  readonly fetchedAtMs: number;
+}
+
+/** Gate allowed — action may proceed. */
+export interface GateAllowed {
+  readonly allowed: true;
+}
+
+/** Gate blocked — action must not proceed. */
+export interface GateBlocked {
+  readonly allowed: false;
+  /** Machine-readable block reason for programmatic branching. */
+  readonly reason: GateBlockReason;
+  /** Human-readable message suitable for display in a UI error toast. */
+  readonly message: string;
+}
+
+export type GateResult = GateAllowed | GateBlocked;
+
+export type GateBlockReason =
+  | "stale_snapshot"
+  | "wrong_status"
+  | "not_a_member"
+  | "already_joined"
+  | "already_contributed"
+  | "deadline_passed"
+  | "round_not_complete"
+  | "no_active_round";
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+function allowed(): GateAllowed {
+  return { allowed: true };
+}
+
+function blocked(reason: GateBlockReason, message: string): GateBlocked {
+  return { allowed: false, reason, message };
+}
+
+/**
+ * Returns true when `snapshot` is younger than `maxAgeMs` milliseconds.
+ * The boundary is exclusive: age === maxAgeMs is already stale.
+ */
+export function isSnapshotFresh(
+  fetchedAtMs: number,
+  maxAgeMs: number = DEFAULT_MAX_SNAPSHOT_AGE_MS,
+  nowMs: number = Date.now(),
+): boolean {
+  if (maxAgeMs === Infinity) return true;
+  return nowMs - fetchedAtMs < maxAgeMs;
+}
+
+// ─── Per-action gate logic ────────────────────────────────────────────────────
+
+function gateJoin(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
+  if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs)) {
+    return blocked(
+      "stale_snapshot",
+      `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before joining.`,
+    );
+  }
+  if (snap.status !== "Pending") {
+    return blocked(
+      "wrong_status",
+      `Join is only available while the circle is Pending. Current status: ${snap.status}.`,
+    );
+  }
+  if (snap.hasLockedCollateral) {
+    return blocked(
+      "already_joined",
+      "You have already locked collateral for this circle.",
+    );
+  }
+  return allowed();
+}
+
+function gateContribute(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
+  if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs)) {
+    return blocked(
+      "stale_snapshot",
+      `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before contributing.`,
+    );
+  }
+  if (snap.status !== "Active") {
+    return blocked(
+      "wrong_status",
+      `Contribute is only available on an Active circle. Current status: ${snap.status}.`,
+    );
+  }
+  // Deadline check when ledger data is available
+  if (snap.deadlineLedger !== null && snap.latestLedger !== null) {
+    if (snap.latestLedger > snap.deadlineLedger) {
+      return blocked(
+        "deadline_passed",
+        `Round ${snap.currentRound} deadline has passed (deadline ledger ${snap.deadlineLedger}, ` +
+          `latest ledger ${snap.latestLedger}). You cannot contribute after the deadline.`,
+      );
+    }
+  }
+  if (snap.hasContributedCurrentRound) {
+    return blocked(
+      "already_contributed",
+      `You have already contributed to round ${snap.currentRound}.`,
+    );
+  }
+  return allowed();
+}
+
+function gatePayout(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
+  if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs)) {
+    return blocked(
+      "stale_snapshot",
+      `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before triggering payout.`,
+    );
+  }
+  if (snap.status !== "Active") {
+    return blocked(
+      "wrong_status",
+      `Payout is only available on an Active circle. Current status: ${snap.status}.`,
+    );
+  }
+  if (snap.contributionsReceived < snap.memberAddresses.length) {
+    return blocked(
+      "round_not_complete",
+      `Payout requires all ${snap.memberAddresses.length} members to contribute; ` +
+        `${snap.contributionsReceived} received so far in round ${snap.currentRound}.`,
+    );
+  }
+  return allowed();
+}
+
+function gateClose(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
+  if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs)) {
+    return blocked(
+      "stale_snapshot",
+      `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before closing.`,
+    );
+  }
+  if (snap.status !== "Completed" && snap.status !== "Cancelled") {
+    return blocked(
+      "wrong_status",
+      `Close is only available on a Completed or Cancelled circle. Current status: ${snap.status}.`,
+    );
+  }
+  return allowed();
+}
+
+// ─── Primary export ───────────────────────────────────────────────────────────
+
+/**
+ * Evaluate whether a contract action is safe to submit given the current
+ * app-side state snapshot.
+ *
+ * This is the single authoritative gating function for the app layer.  Every
+ * path that can produce a write transaction must call this and honour a
+ * {@link GateBlocked} result by aborting the transaction and showing the
+ * human-readable `message` to the user.
+ *
+ * The function is synchronous and pure — no RPC calls, safe to call in render
+ * paths and in tests without any network setup.
+ *
+ * @param action   The contract action being requested.
+ * @param snapshot The most-recently-built app state snapshot.
+ * @param opts     Optional overrides for `maxSnapshotAgeMs` and `nowMs`.
+ *
+ * @example
+ * const gate = computeActionEligibility("contribute", snapshot);
+ * if (!gate.allowed) { setError(gate.message); return; }
+ * await doContribute();
+ */
+export function computeActionEligibility(
+  action: CircleAction,
+  snapshot: AppStateSnapshot,
+  opts: { maxSnapshotAgeMs?: number; nowMs?: number } = {},
+): GateResult {
+  const nowMs  = opts.nowMs  ?? Date.now();
+  const maxAge = opts.maxSnapshotAgeMs ?? DEFAULT_MAX_SNAPSHOT_AGE_MS;
+
+  switch (action) {
+    case "join":       return gateJoin(snapshot, nowMs, maxAge);
+    case "contribute": return gateContribute(snapshot, nowMs, maxAge);
+    case "payout":     return gatePayout(snapshot, nowMs, maxAge);
+    case "close":      return gateClose(snapshot, nowMs, maxAge);
+    default: {
+      const _exhaustive: never = action;
+      throw new Error(`computeActionEligibility: unknown action "${String(_exhaustive)}"`);
+    }
+  }
+}
+
+/** Type-guard — narrows {@link GateResult} to {@link GateAllowed}. */
+export function isGateAllowed(result: GateResult): result is GateAllowed {
+  return result.allowed === true;
+}
+
+/** Type-guard — narrows {@link GateResult} to {@link GateBlocked}. */
+export function isGateBlocked(result: GateResult): result is GateBlocked {
+  return result.allowed === false;
+}
+
+/**
+ * Build an {@link AppStateSnapshot} from the data already present in the
+ * `CircleDetailClient` component state.  Call this immediately before
+ * computing gate eligibility so the `fetchedAtMs` reflects when the gate
+ * check is actually run, not some earlier render time.
+ *
+ * @param circleStatus     `data.circle.status`
+ * @param currentRound     `data.circle.current_round`
+ * @param totalRounds      `data.circle.total_rounds`
+ * @param deadlineLedger   `data.circle.deadline_ledger ?? null`
+ * @param latestLedger     `data.latestLedger ?? null`
+ * @param members          `data.members` — array of member objects
+ * @param walletAddress    Connected wallet address (used for member-specific flags)
+ * @param hasLockedCollateral   Whether the wallet has collateral > 0
+ * @param hasContributed   Whether the wallet has already contributed this round
+ * @param contributionsReceived  Number of contributions received in current round
+ * @param nowMs            Override for `Date.now()` (useful in tests)
+ */
+export function buildAppSnapshot(
+  circleStatus: string,
+  currentRound: number,
+  totalRounds: number,
+  deadlineLedger: number | null | undefined,
+  latestLedger: number | null | undefined,
+  memberAddresses: string[],
+  hasLockedCollateral: boolean,
+  hasContributed: boolean,
+  contributionsReceived: number,
+  nowMs: number = Date.now(),
+): AppStateSnapshot {
+  return {
+    status: circleStatus,
+    currentRound,
+    totalRounds,
+    deadlineLedger: deadlineLedger ?? null,
+    latestLedger: latestLedger ?? null,
+    memberAddresses,
+    hasLockedCollateral,
+    hasContributedCurrentRound: hasContributed,
+    contributionsReceived,
+    fetchedAtMs: nowMs,
+  };
+}
