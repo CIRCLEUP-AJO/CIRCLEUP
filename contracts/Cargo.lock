@@ -162,6 +162,7 @@ dependencies = [
 name = "circle_factory"
 version = "0.1.0"
 dependencies = [
+ "circle",
  "soroban-sdk",
 ]
 
