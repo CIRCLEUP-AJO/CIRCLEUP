@@ -188,7 +188,7 @@ pub struct ProtocolParams {
 // SDK/indexer use `contracterror` so consumers can handle them gracefully.
 
 #[contracterror]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ContractError {
     /// `get_config` was called before `initialize` (Config key is absent).
     NotInitialized = 1,
@@ -417,7 +417,7 @@ impl CircleContract {
         let join_order: u32 = config
             .members
             .iter()
-            .filter(|m| env.storage().persistent().has(&DataKey::Collateral(m)))
+            .filter(|m| env.storage().persistent().has(&DataKey::Collateral(m.clone())))
             .count() as u32;
 
         // Explicit Active transition only after every member has joined
@@ -649,7 +649,7 @@ impl CircleContract {
         // a silent trap from the callee.
         let rep_client =
             reputation::ReputationContractClient::new(&env, &config.reputation_contract);
-        rep_client
+        let _ = rep_client
             .try_increment(&env.current_contract_address(), &round.recipient)
             .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
 
@@ -812,6 +812,8 @@ impl CircleContract {
             .instance()
             .get(&DataKey::Status)
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
+
+        if status != CircleStatus::Completed && status != CircleStatus::Cancelled {
             panic!("circle still active");
         }
 
