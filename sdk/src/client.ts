@@ -37,6 +37,19 @@ import {
   mapRawRoundState,
   assertValidCircleStatus,
 } from "./types";
+import {
+  buildSnapshot,
+  computeActionEligibility,
+  isGateBlocked,
+  isSnapshotFresh,
+  DEFAULT_MAX_SNAPSHOT_AGE_MS,
+} from "./gating";
+import type {
+  CircleAction,
+  GateOptions,
+  GateResult,
+  StateSnapshot,
+} from "./gating";
 
 // ─── Polling configuration ────────────────────────────────────────────────────
 
@@ -604,7 +617,11 @@ export class FactoryClient extends CircleUpClient {
 export interface CircleFullState {
   config: CircleConfig;
   status: CircleStatus;
-  currentRound: RoundState;
+  /**
+   * Current round state.  `null` when the circle is `Completed` or
+   * `Cancelled` — callers must guard on `status` before accessing.
+   */
+  currentRound: RoundState | null;
 }
 
 interface CacheEntry {
@@ -621,6 +638,22 @@ interface CacheEntry {
  * Pass `cacheTtlMs: 0` to `CircleClient` to disable caching entirely.
  */
 export const DEFAULT_FULL_STATE_CACHE_TTL_MS = 10_000;
+
+/**
+ * Error thrown by {@link CircleClient.gateAction} when a gate check blocks
+ * the requested action.  Callers can `catch` this and inspect `reason` to
+ * branch on the specific cause without parsing the message string.
+ */
+export class GateError extends Error {
+  /** Machine-readable block reason — mirrors {@link GateBlocked.reason}. */
+  readonly reason: import("./gating").GateBlockReason;
+
+  constructor(reason: import("./gating").GateBlockReason, message: string) {
+    super(message);
+    this.name = "GateError";
+    this.reason = reason;
+  }
+}
 
 // ─── Circle client ────────────────────────────────────────────────────────────
 
@@ -891,8 +924,12 @@ export class CircleClient extends CircleUpClient {
    * @param member Stellar public key of the member to check.
    */
   async hasContributedCurrentRound(member: string): Promise<boolean> {
-    const { currentRound } = await this.getFullState();
-    return this.hasContributed(member, currentRound.roundIndex);
+    const state = await this.getFullState();
+    if (!state.currentRound) {
+      // Completed or Cancelled — no active round; member cannot contribute.
+      return false;
+    }
+    return this.hasContributed(member, state.currentRound.roundIndex);
   }
 
   /**
@@ -925,11 +962,26 @@ export class CircleClient extends CircleUpClient {
       return this._stateCache!.state;
     }
 
-    const [config, status, currentRound] = await Promise.all([
+    // Fetch config and status in parallel; current round is fetched separately
+    // because its result depends on status (Completed/Cancelled → no round).
+    const [config, status] = await Promise.all([
       this.getConfig(),
       this.getStatus(),
-      this.getCurrentRound(),
     ]);
+
+    // currentRound is only meaningful for Active and Pending circles.
+    // For terminal states (Completed / Cancelled) we store null rather than
+    // propagating the contract's CircleNotActive error.
+    let currentRound: RoundState | null = null;
+    if (status === "Active" || status === "Pending") {
+      const roundResult = await this.getCurrentRoundResult();
+      if (roundResult.ok) {
+        currentRound = roundResult.value;
+      }
+      // If the round fetch fails despite being in an active-ish state we leave
+      // currentRound as null — callers must guard on it, and the gate layer
+      // will block writes that require a valid round.
+    }
 
     const state: CircleFullState = { config, status, currentRound };
     this._stateCache = { state, fetchedAt: Date.now() };
@@ -953,6 +1005,90 @@ export class CircleClient extends CircleUpClient {
   }
 
   /**
+   * Build a {@link StateSnapshot} from the current cache entry (if valid) or
+   * by calling {@link getFullState}.  The snapshot's `fetchedAtMs` is set to
+   * the cache entry's `fetchedAt` so age calculations are accurate.
+   *
+   * @param latestLedger  Most-recently-indexed ledger for deadline math.
+   *                      Pass `null` when not available.
+   * @param forceRefresh  When `true`, bypass the cache.
+   */
+  async buildStateSnapshot(
+    latestLedger: number | null = null,
+    forceRefresh = false,
+  ): Promise<StateSnapshot> {
+    if (!forceRefresh && this.isCacheValid() && this._stateCache) {
+      const { state, fetchedAt } = this._stateCache;
+      return buildSnapshot(
+        state.status,
+        state.currentRound,
+        state.config,
+        latestLedger,
+        fetchedAt,
+      );
+    }
+
+    const state = await this.getFullState({ forceRefresh: true });
+    const fetchedAt = this._stateCache?.fetchedAt ?? Date.now();
+    return buildSnapshot(state.status, state.currentRound, state.config, latestLedger, fetchedAt);
+  }
+
+  /**
+   * Evaluate whether a contract action is safe to submit, using the most
+   * recently fetched (or freshly fetched) state snapshot as the source of
+   * truth.
+   *
+   * The method:
+   *   1. Fetches (or returns cached) full state.
+   *   2. Builds a {@link StateSnapshot} with `fetchedAtMs` tied to the cache
+   *      entry so age is measured from the actual RPC call, not from when
+   *      `gateAction` is called.
+   *   3. Delegates to {@link computeActionEligibility}.
+   *
+   * Returns the raw {@link GateResult} — callers decide whether to throw,
+   * surface a UI error, or silently skip.  For a throwing variant see
+   * {@link gateActionOrThrow}.
+   *
+   * @example
+   * const gate = await client.gateAction("contribute", {
+   *   memberAddress: wallet,
+   *   hasContributedCurrentRound: false,
+   * });
+   * if (!gate.allowed) { showError(gate.message); return; }
+   * await client.contribute(keypair);
+   */
+  async gateAction(
+    action: CircleAction,
+    opts: Omit<GateOptions, "nowMs"> & { latestLedger?: number | null } = {},
+  ): Promise<GateResult> {
+    const { latestLedger = null, ...gateOpts } = opts;
+    const snapshot = await this.buildStateSnapshot(latestLedger);
+    return computeActionEligibility(action, snapshot, gateOpts);
+  }
+
+  /**
+   * Like {@link gateAction} but throws a {@link GateError} instead of
+   * returning a blocked result.  Useful in async flows where propagating
+   * an exception is more ergonomic than checking the return value:
+   *
+   * @example
+   * await client.gateActionOrThrow("join", { memberAddress: wallet });
+   * // if we reach here the gate passed — safe to proceed
+   * await client.join(keypair);
+   *
+   * @throws {@link GateError} when the gate blocks the action.
+   */
+  async gateActionOrThrow(
+    action: CircleAction,
+    opts: Omit<GateOptions, "nowMs"> & { latestLedger?: number | null } = {},
+  ): Promise<void> {
+    const result = await this.gateAction(action, opts);
+    if (isGateBlocked(result)) {
+      throw new GateError(result.reason, result.message);
+    }
+  }
+
+  /**
    * Manually discard the in-memory state cache. Useful when an external event
    * (e.g. an indexer webhook or a Stellar event stream update) indicates the
    * on-chain state has changed but you haven't called a mutation through this
@@ -962,9 +1098,22 @@ export class CircleClient extends CircleUpClient {
     this._stateCache = null;
   }
 
+  /**
+   * Returns `true` when the cache holds a valid (non-expired) entry.
+   *
+   * Exposed as a public method so external code (e.g. app layer) can check
+   * staleness without triggering a fetch.
+   */
+  isCacheStale(): boolean {
+    return !this.isCacheValid();
+  }
+
   private isCacheValid(): boolean {
     if (this.cacheTtlMs === 0 || this._stateCache === null) return false;
-    return Date.now() - this._stateCache.fetchedAt < this.cacheTtlMs;
+    return isSnapshotFresh(
+      { fetchedAtMs: this._stateCache.fetchedAt },
+      this.cacheTtlMs,
+    );
   }
 }
 
