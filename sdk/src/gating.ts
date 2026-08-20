@@ -105,7 +105,6 @@ export interface GateBlocked {
    * | `deadline_passed` | The round deadline has expired; contributions are locked. |
    * | `round_not_complete` | Not all members have contributed; payout is premature. |
    * | `no_active_round` | No in-progress round exists (Completed or Cancelled). |
-   * | `round_advanced` | The snapshot's round index differs from the current on-chain round. |
    */
   readonly reason: GateBlockReason;
   /** Human-readable explanation of why the action is blocked. */
@@ -120,8 +119,7 @@ export type GateBlockReason =
   | "already_contributed"
   | "deadline_passed"
   | "round_not_complete"
-  | "no_active_round"
-  | "round_advanced";
+  | "no_active_round";
 
 /**
  * Per-check options that override the module-level defaults.
@@ -207,7 +205,7 @@ export function snapshotAgeMs(
  * Returns `true` when `address` is in `members`.
  * Comparison is case-sensitive (Stellar addresses are always uppercase).
  */
-export function isMemberAddress(members: string[], address: string): boolean {
+function isMemberAddress(members: string[], address: string): boolean {
   return members.includes(address);
 }
 

@@ -480,7 +480,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       const snapshot = buildAppSnapshot(
         data.circle.status,
         data.circle.current_round,
-        data.circle.total_rounds,
         data.circle.deadline_ledger,
         data.latestLedger,
         data.members.map((m) => m.member_address),
@@ -559,7 +558,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const handleJoin       = () => doAction("join",       [new Address(walletAddress!).toScVal()]);
   const handleContribute = () => doAction("contribute", [new Address(walletAddress!).toScVal()]);
   const handlePayout     = () => doAction("payout",     []);
-  const handleClose      = () => doAction("close",      []);
+  const handleClose      = () => doAction("close",      [new Address(walletAddress!).toScVal()]);
 
   // Spoken summary of circle status + round progress. Rendered in a polite
   // live region below so screen-reader users hear "Circle status: Active.
