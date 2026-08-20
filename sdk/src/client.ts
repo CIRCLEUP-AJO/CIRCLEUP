@@ -42,10 +42,10 @@ import {
   computeActionEligibility,
   isGateBlocked,
   isSnapshotFresh,
-  DEFAULT_MAX_SNAPSHOT_AGE_MS,
 } from "./gating";
 import type {
   CircleAction,
+  GateBlockReason,
   GateOptions,
   GateResult,
   StateSnapshot,
@@ -640,15 +640,15 @@ interface CacheEntry {
 export const DEFAULT_FULL_STATE_CACHE_TTL_MS = 10_000;
 
 /**
- * Error thrown by {@link CircleClient.gateAction} when a gate check blocks
- * the requested action.  Callers can `catch` this and inspect `reason` to
- * branch on the specific cause without parsing the message string.
+ * Error thrown by {@link CircleClient.gateActionOrThrow} when a gate check
+ * blocks the requested action.  Callers can `catch` this and inspect `reason`
+ * to branch on the specific cause without parsing the message string.
  */
 export class GateError extends Error {
   /** Machine-readable block reason — mirrors {@link GateBlocked.reason}. */
-  readonly reason: import("./gating").GateBlockReason;
+  readonly reason: GateBlockReason;
 
-  constructor(reason: import("./gating").GateBlockReason, message: string) {
+  constructor(reason: GateBlockReason, message: string) {
     super(message);
     this.name = "GateError";
     this.reason = reason;

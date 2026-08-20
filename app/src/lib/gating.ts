@@ -37,8 +37,6 @@ export interface AppStateSnapshot {
   readonly status: string;
   /** Current round index (0-based). */
   readonly currentRound: number;
-  /** Total rounds in the circle. */
-  readonly totalRounds: number;
   /** Deadline ledger for the current active round (null = unknown). */
   readonly deadlineLedger: number | null;
   /** Latest ledger the indexer has processed (null = unknown). */
@@ -258,22 +256,19 @@ export function isGateBlocked(result: GateResult): result is GateBlocked {
  * computing gate eligibility so the `fetchedAtMs` reflects when the gate
  * check is actually run, not some earlier render time.
  *
- * @param circleStatus     `data.circle.status`
- * @param currentRound     `data.circle.current_round`
- * @param totalRounds      `data.circle.total_rounds`
- * @param deadlineLedger   `data.circle.deadline_ledger ?? null`
- * @param latestLedger     `data.latestLedger ?? null`
- * @param members          `data.members` — array of member objects
- * @param walletAddress    Connected wallet address (used for member-specific flags)
- * @param hasLockedCollateral   Whether the wallet has collateral > 0
- * @param hasContributed   Whether the wallet has already contributed this round
- * @param contributionsReceived  Number of contributions received in current round
- * @param nowMs            Override for `Date.now()` (useful in tests)
+ * @param circleStatus        `data.circle.status`
+ * @param currentRound        `data.circle.current_round`
+ * @param deadlineLedger      `data.circle.deadline_ledger ?? null`
+ * @param latestLedger        `data.latestLedger ?? null`
+ * @param memberAddresses     `data.members.map(m => m.member_address)`
+ * @param hasLockedCollateral Whether the wallet has collateral > 0
+ * @param hasContributed      Whether the wallet has already contributed this round
+ * @param contributionsReceived Number of contributions received in current round
+ * @param nowMs               Override for `Date.now()` (useful in tests)
  */
 export function buildAppSnapshot(
   circleStatus: string,
   currentRound: number,
-  totalRounds: number,
   deadlineLedger: number | null | undefined,
   latestLedger: number | null | undefined,
   memberAddresses: string[],
@@ -285,7 +280,6 @@ export function buildAppSnapshot(
   return {
     status: circleStatus,
     currentRound,
-    totalRounds,
     deadlineLedger: deadlineLedger ?? null,
     latestLedger: latestLedger ?? null,
     memberAddresses,
