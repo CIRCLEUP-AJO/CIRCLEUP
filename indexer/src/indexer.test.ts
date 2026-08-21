@@ -7,6 +7,10 @@ import {
   stopIndexer,
   isIndexerRunning,
   parseCircleCreatedEvent,
+  groupEventsByLedger,
+  isTransientRpcError,
+  withRpcRetry,
+  createEventKey,
 } from "./indexer";
 
 test("USDC is read from the validated USDC_ADDRESS env var, not left dangling", () => {
@@ -129,4 +133,177 @@ test("parseCircleCreatedEvent: throws when circle_index is not an integer", () =
     () => parseCircleCreatedEvent(["CABC", "GDEF", 1.5]),
     /circle_index must be a non-negative integer/,
   );
+});
+
+// ─── groupEventsByLedger ──────────────────────────────────────────────────────
+
+function makeEvent(ledger: number, txHash = "deadbeef", extraTopic = "t"): any {
+  return { ledger, txHash, contractId: "CA", topic: [extraTopic, "x"], value: 0 };
+}
+
+test("groupEventsByLedger: returns an empty Map for an empty input", () => {
+  const result = groupEventsByLedger([]);
+  assert.equal(result.size, 0);
+});
+
+test("groupEventsByLedger: groups events by ledger sequence", () => {
+  const events = [makeEvent(100), makeEvent(102), makeEvent(100), makeEvent(101)];
+  const result = groupEventsByLedger(events);
+
+  assert.equal(result.size, 3);
+  assert.equal(result.get(100)!.length, 2);
+  assert.equal(result.get(101)!.length, 1);
+  assert.equal(result.get(102)!.length, 1);
+});
+
+test("groupEventsByLedger: iterates in ascending ledger order regardless of input order", () => {
+  const events = [makeEvent(300), makeEvent(100), makeEvent(200)];
+  const result = groupEventsByLedger(events);
+  const keys = [...result.keys()];
+  assert.deepEqual(keys, [100, 200, 300]);
+});
+
+test("groupEventsByLedger: single-ledger input produces one group", () => {
+  const events = [makeEvent(50), makeEvent(50), makeEvent(50)];
+  const result = groupEventsByLedger(events);
+  assert.equal(result.size, 1);
+  assert.equal(result.get(50)!.length, 3);
+});
+
+test("groupEventsByLedger: preserves per-ledger event order from RPC", () => {
+  const e1 = makeEvent(10, "tx1");
+  const e2 = makeEvent(10, "tx2");
+  const e3 = makeEvent(10, "tx3");
+  const result = groupEventsByLedger([e1, e2, e3]);
+  assert.deepEqual(result.get(10), [e1, e2, e3]);
+});
+
+// ─── createEventKey ───────────────────────────────────────────────────────────
+//
+// createEventKey calls scValToNative on both topic entries and value, so the
+// stubs must be real xdr.ScVal objects (not plain JS values).
+
+import { xdr as stellarXdr } from "@stellar/stellar-sdk";
+
+function makeFullEvent(overrides: Partial<{
+  ledger: number;
+  txHash: string;
+  contractId: string;
+}> = {}): any {
+  return {
+    ledger: overrides.ledger ?? 42,
+    txHash: overrides.txHash ?? "abc123",
+    contractId: overrides.contractId ?? "CABC",
+    // Empty topic array — topicParts joins to "" without calling scValToNative
+    topic: [],
+    // scvVoid() is the simplest valid xdr.ScVal; scValToNative returns null
+    value: stellarXdr.ScVal.scvVoid(),
+  };
+}
+
+test("createEventKey: identical inputs produce the same key", () => {
+  const k1 = createEventKey(makeFullEvent());
+  const k2 = createEventKey(makeFullEvent());
+  assert.equal(k1, k2);
+});
+
+test("createEventKey: different ledgers produce different keys", () => {
+  const k1 = createEventKey(makeFullEvent({ ledger: 100 }));
+  const k2 = createEventKey(makeFullEvent({ ledger: 101 }));
+  assert.notEqual(k1, k2);
+});
+
+test("createEventKey: different txHashes produce different keys", () => {
+  const k1 = createEventKey(makeFullEvent({ txHash: "aaaa" }));
+  const k2 = createEventKey(makeFullEvent({ txHash: "bbbb" }));
+  assert.notEqual(k1, k2);
+});
+
+// ─── isTransientRpcError ──────────────────────────────────────────────────────
+
+test("isTransientRpcError: returns false for null/undefined", () => {
+  assert.equal(isTransientRpcError(null), false);
+  assert.equal(isTransientRpcError(undefined), false);
+});
+
+test("isTransientRpcError: returns true for ECONNRESET code", () => {
+  const err = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  assert.equal(isTransientRpcError(err), true);
+});
+
+test("isTransientRpcError: returns true for HTTP 429", () => {
+  assert.equal(isTransientRpcError({ status: 429 }), true);
+});
+
+test("isTransientRpcError: returns true for HTTP 503", () => {
+  assert.equal(isTransientRpcError({ status: 503 }), true);
+});
+
+test("isTransientRpcError: returns false for a generic Error", () => {
+  assert.equal(isTransientRpcError(new Error("bad request")), false);
+});
+
+test("isTransientRpcError: returns true for 'rate limit' in message", () => {
+  assert.equal(isTransientRpcError(new Error("HTTP 429: rate limit exceeded")), true);
+});
+
+// ─── withRpcRetry ─────────────────────────────────────────────────────────────
+
+test("withRpcRetry: returns immediately on first-try success", async () => {
+  let calls = 0;
+  const result = await withRpcRetry("test", async () => {
+    calls++;
+    return "ok";
+  }, { maxAttempts: 3, baseDelayMs: 1, sleep: async () => {} });
+  assert.equal(result, "ok");
+  assert.equal(calls, 1);
+});
+
+test("withRpcRetry: retries transient errors and eventually succeeds", async () => {
+  let calls = 0;
+  const result = await withRpcRetry(
+    "test",
+    async () => {
+      calls++;
+      if (calls < 3) throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+      return "done";
+    },
+    { maxAttempts: 4, baseDelayMs: 1, sleep: async () => {} },
+  );
+  assert.equal(result, "done");
+  assert.equal(calls, 3);
+});
+
+test("withRpcRetry: fails immediately on non-transient error", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      withRpcRetry(
+        "test",
+        async () => {
+          calls++;
+          throw new Error("bad request");
+        },
+        { maxAttempts: 4, baseDelayMs: 1, sleep: async () => {} },
+      ),
+    /Soroban RPC test failed after 1 attempt/,
+  );
+  assert.equal(calls, 1);
+});
+
+test("withRpcRetry: exhausts all attempts for persistent transient error", async () => {
+  let calls = 0;
+  await assert.rejects(
+    () =>
+      withRpcRetry(
+        "test",
+        async () => {
+          calls++;
+          throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+        },
+        { maxAttempts: 3, baseDelayMs: 1, sleep: async () => {} },
+      ),
+    /failed after 3 attempt/,
+  );
+  assert.equal(calls, 3);
 });
