@@ -7,27 +7,23 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { CircleClient, DEFAULT_FULL_STATE_CACHE_TTL_MS } from "../client";
-import type { CircleConfig, RoundState, CircleStatus, CircleUpConfig } from "../types";
+import type { CircleConfig, RoundState, CircleStatus } from "../types";
+import {
+  CIRCLE_ADDR,
+  MEMBER_A_ADDR,
+  MEMBER_B_ADDR,
+  REPUTATION_ADDR,
+  SDK_CONFIG,
+  USDC_ADDR,
+} from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const SDK_CONFIG: CircleUpConfig = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  contracts: {
-    circleFactory: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    reputation: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-    usdc: "CDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-  },
-};
-
-const CIRCLE_ADDR = "CEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
-
 const MOCK_CONFIG: CircleConfig = {
-  members: ["GABC", "GDEF"],
+  members: [MEMBER_A_ADDR, MEMBER_B_ADDR],
   roundAmount: 100_000_000n,
-  usdcToken: "CUSDC",
-  reputationContract: "CREP",
+  usdcToken: USDC_ADDR,
+  reputationContract: REPUTATION_ADDR,
   roundDeadlineLedgers: 120_960,
 };
 
@@ -35,7 +31,7 @@ const MOCK_STATUS: CircleStatus = "Active";
 
 const MOCK_ROUND: RoundState = {
   roundIndex: 0,
-  recipient: "GABC",
+  recipient: MEMBER_A_ADDR,
   contributionsReceived: 1,
   deadlineLedger: 1_000_000n,
   paidOut: false,

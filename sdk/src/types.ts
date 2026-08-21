@@ -27,9 +27,27 @@ export interface CircleUpConfig {
 /** Regex for a Stellar/Soroban contract address: starts with C, 56 chars total. */
 const CONTRACT_ADDRESS_RE = /^C[A-Z2-7]{55}$/;
 
+/** Regex for a Stellar account address (public key): starts with G, 56 chars total. */
+const ACCOUNT_ADDRESS_RE = /^G[A-Z2-7]{55}$/;
+
 /** Returns true when `addr` looks like a valid Soroban contract address. */
 export function isValidContractAddress(addr: string): boolean {
   return CONTRACT_ADDRESS_RE.test(addr);
+}
+
+/**
+ * Returns true when `addr` is either a Stellar account (G…) or a Soroban
+ * contract (C…) address — the two forms accepted anywhere the contracts take
+ * an `Address` parameter.
+ *
+ * This is a shape check only; the strkey checksum is verified by the Stellar
+ * SDK when the address is actually encoded (see `scAddress` in client.ts).
+ */
+export function isValidStellarAddress(addr: unknown): addr is string {
+  return (
+    typeof addr === "string" &&
+    (ACCOUNT_ADDRESS_RE.test(addr) || CONTRACT_ADDRESS_RE.test(addr))
+  );
 }
 
 /**
@@ -244,47 +262,180 @@ export function isReadFailure<T>(r: ReadResult<T>): r is ReadFailure {
 // rather than duplicating it.
 
 /**
- * Map a raw `scValToNative` wire object to the typed `CircleConfig` domain
- * shape, coercing XDR numeric types as needed.
- *
- * @throws `Error` if `raw` is missing required fields or has wrong types —
- *   surfaces decode bugs at the boundary rather than letting `undefined` leak
- *   into domain code.
+ * Render an unexpected wire value for an error message without dumping an
+ * unbounded blob into a log line or a UI toast.
  */
-export function mapRawConfig(raw: RawCircleConfig): CircleConfig {
-  if (!Array.isArray(raw.members)) {
-    throw new Error("mapRawConfig: members field is missing or not an array");
+function describeValue(value: unknown): string {
+  if (typeof value === "bigint") return `bigint ${value}`;
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "object") {
+    const json = JSON.stringify(value, (_k, v) =>
+      typeof v === "bigint" ? `${v}` : v,
+    );
+    return json.length <= 120 ? json : `${json.slice(0, 117)}...`;
   }
-  if (raw.round_amount === undefined || raw.round_amount === null) {
-    throw new Error("mapRawConfig: round_amount field is missing");
+  return `${typeof value} ${JSON.stringify(value)}`;
+}
+
+/**
+ * Decode a `u32` field produced by `scValToNative`.
+ *
+ * `scValToNative` yields a plain `number` for XDR `u32`.  Anything else means
+ * the contract's return shape has drifted from what the SDK expects, so we
+ * fail loudly at the boundary instead of letting `NaN` or `undefined` flow
+ * into domain code.
+ *
+ * @param label Call-site context included in the error message,
+ *              e.g. `"getDefaults"` or `"mapRawRoundState.round_index"`.
+ * @throws `TypeError` when the value is not an in-range u32.
+ */
+export function decodeU32(value: unknown, label: string): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > 0xffffffff
+  ) {
+    throw new TypeError(
+      `${label}: expected a u32 (0–4294967295) but the contract returned ${describeValue(value)}.`,
+    );
   }
+  return value;
+}
+
+/**
+ * Decode an `i128` or `u64` field produced by `scValToNative`.
+ *
+ * `scValToNative` yields a `bigint` for both widths.  A plain `number` is
+ * accepted too — a narrower integer type on the contract side is not a
+ * correctness problem — but only when it is a safe integer, because beyond
+ * 2^53 the conversion would silently round a monetary amount.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value cannot be represented losslessly.
+ */
+export function decodeBigInt(value: unknown, label: string): bigint {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new TypeError(
+        `${label}: expected an integer amount but the contract returned ${describeValue(value)}, ` +
+          `which cannot be converted to bigint without losing precision.`,
+      );
+    }
+    return BigInt(value);
+  }
+  throw new TypeError(
+    `${label}: expected a bigint amount but the contract returned ${describeValue(value)}.`,
+  );
+}
+
+/**
+ * Decode a `bool` field produced by `scValToNative`.
+ *
+ * Deliberately strict: a truthy string or number here would mean the contract
+ * returned something other than a `bool`, and coercing it would hide the bug.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not a boolean.
+ */
+export function decodeBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") {
+    throw new TypeError(
+      `${label}: expected a boolean but the contract returned ${describeValue(value)}.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Decode an `Address` field produced by `scValToNative`.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not a Stellar account or contract address.
+ */
+export function decodeAddress(value: unknown, label: string): string {
+  if (!isValidStellarAddress(value)) {
+    throw new TypeError(
+      `${label}: expected a Stellar address (G… or C…) but the contract returned ${describeValue(value)}.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Decode a `Vec<Address>` field produced by `scValToNative`.
+ *
+ * Empty lists are valid — a freshly deployed factory has no circles yet.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not an array of Stellar addresses.
+ */
+export function decodeAddressList(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new TypeError(
+      `${label}: expected an array of Stellar addresses but the contract returned ${describeValue(value)}.`,
+    );
+  }
+  return value.map((entry, i) => decodeAddress(entry, `${label}[${i}]`));
+}
+
+/**
+ * Map a raw `scValToNative` wire object to the typed `CircleConfig` domain
+ * shape, validating every field as it is decoded.
+ *
+ * @throws `TypeError` if `raw` is not an object or any field has the wrong
+ *   type — surfaces decode bugs at the boundary rather than letting `undefined`
+ *   leak into domain code.
+ */
+export function mapRawConfig(raw: unknown): CircleConfig {
+  if (!raw || typeof raw !== "object") {
+    throw new TypeError(
+      `mapRawConfig: expected a CircleConfig object but the contract returned ${describeValue(raw)}.`,
+    );
+  }
+  const wire = raw as Partial<RawCircleConfig>;
   return {
-    members: raw.members,
-    roundAmount: BigInt(raw.round_amount),
-    usdcToken: raw.usdc_token,
-    reputationContract: raw.reputation_contract,
-    roundDeadlineLedgers: Number(raw.round_deadline_ledgers),
+    members: decodeAddressList(wire.members, "mapRawConfig.members"),
+    roundAmount: decodeBigInt(wire.round_amount, "mapRawConfig.round_amount"),
+    usdcToken: decodeAddress(wire.usdc_token, "mapRawConfig.usdc_token"),
+    reputationContract: decodeAddress(
+      wire.reputation_contract,
+      "mapRawConfig.reputation_contract",
+    ),
+    roundDeadlineLedgers: decodeU32(
+      wire.round_deadline_ledgers,
+      "mapRawConfig.round_deadline_ledgers",
+    ),
   };
 }
 
 /**
- * Map a raw `scValToNative` wire object to the typed `RoundState` domain shape.
+ * Map a raw `scValToNative` wire object to the typed `RoundState` domain shape,
+ * validating every field as it is decoded.
  *
- * @throws `Error` if `raw` is missing required fields.
+ * @throws `TypeError` if `raw` is not an object or any field has the wrong type.
  */
-export function mapRawRoundState(raw: RawRoundState): RoundState {
-  if (raw.round_index === undefined || raw.round_index === null) {
-    throw new Error("mapRawRoundState: round_index field is missing");
+export function mapRawRoundState(raw: unknown): RoundState {
+  if (!raw || typeof raw !== "object") {
+    throw new TypeError(
+      `mapRawRoundState: expected a RoundState object but the contract returned ${describeValue(raw)}.`,
+    );
   }
-  if (!raw.recipient) {
-    throw new Error("mapRawRoundState: recipient field is missing");
-  }
+  const wire = raw as Partial<RawRoundState>;
   return {
-    roundIndex: Number(raw.round_index),
-    recipient: raw.recipient,
-    contributionsReceived: Number(raw.contributions_received),
-    deadlineLedger: BigInt(raw.deadline_ledger),
-    paidOut: Boolean(raw.paid_out),
+    roundIndex: decodeU32(wire.round_index, "mapRawRoundState.round_index"),
+    recipient: decodeAddress(wire.recipient, "mapRawRoundState.recipient"),
+    contributionsReceived: decodeU32(
+      wire.contributions_received,
+      "mapRawRoundState.contributions_received",
+    ),
+    deadlineLedger: decodeBigInt(
+      wire.deadline_ledger,
+      "mapRawRoundState.deadline_ledger",
+    ),
+    paidOut: decodeBoolean(wire.paid_out, "mapRawRoundState.paid_out"),
   };
 }
 
@@ -384,31 +535,51 @@ export interface TxSuccess {
   readonly txHash: string;
   /** The ledger number in which the transaction was included. */
   readonly ledger: number;
+  /**
+   * The contract's return value, decoded with `scValToNative`.
+   *
+   * `undefined` when the invoked method returns `()` or when the RPC response
+   * carried no return value.  Typed as `unknown` so call-sites must narrow it
+   * through one of the `decode*` helpers — see
+   * {@link decodeAddress}, {@link decodeU32}, {@link decodeBigInt}.
+   */
+  readonly returnValue?: unknown;
 }
 
 /**
  * Machine-readable error category for a {@link TxFailure}.
  *
- * | Code | When it fires |
- * |------|---------------|
- * | `"account_not_found"` | The source account does not exist on the network. |
- * | `"simulation_failed"` | The Soroban simulation rejected the invocation (contract panic / validation). |
- * | `"network_error"` | A network-level fetch failure before or during submission. |
- * | `"tx_rejected"` | The transaction was submitted but immediately rejected (`status === "ERROR"`). |
- * | `"tx_failed"` | The transaction was included in a ledger but its status is FAILED. |
- * | `"timeout"` | Confirmation polling exceeded the timeout window. |
- * | `"unknown"` | An unclassified error (should not normally occur). |
+ * | Code | When it fires | Safe to retry? |
+ * |------|---------------|----------------|
+ * | `"invalid_argument"` | The call was rejected by SDK-side validation before any network I/O. | No — fix the inputs. |
+ * | `"account_not_found"` | The source account does not exist on the network. | No — fund the account first. |
+ * | `"simulation_failed"` | The Soroban simulation rejected the invocation (contract panic / validation). | No — the state or inputs are wrong. |
+ * | `"network_error"` | A network-level fetch failure before or during submission. | Yes. |
+ * | `"try_again_later"` | The RPC accepted the request but is currently congested (`status === "TRY_AGAIN_LATER"`). | Yes — resubmit. |
+ * | `"tx_rejected"` | The transaction was submitted but immediately rejected (`status === "ERROR"`). | Yes, after rebuilding. |
+ * | `"tx_failed"` | The transaction was included in a ledger but its status is FAILED. | No — it ran and failed on-chain. |
+ * | `"stale_rpc"` | The RPC stopped advancing its ledger while the transaction was pending. | Yes — against a healthy RPC. |
+ * | `"timeout"` | Confirmation polling exceeded the timeout window. | Check the hash before retrying. |
+ * | `"unknown"` | An unclassified error (should not normally occur). | Unknown. |
  *
  * Use this field to branch on the error type without parsing `errorMessage`
  * strings — e.g. show a wallet-funding prompt on `"account_not_found"` or a
  * "check your inputs" banner on `"simulation_failed"`.
+ *
+ * The three codes that mean "this transaction may still be in flight"
+ * (`"timeout"`, `"stale_rpc"`, `"try_again_later"`) carry the hash the RPC
+ * reported, so callers can look the transaction up before resubmitting rather
+ * than risk paying twice.
  */
 export type TxErrorCode =
+  | "invalid_argument"
   | "account_not_found"
   | "simulation_failed"
   | "network_error"
+  | "try_again_later"
   | "tx_rejected"
   | "tx_failed"
+  | "stale_rpc"
   | "timeout"
   | "unknown";
 
