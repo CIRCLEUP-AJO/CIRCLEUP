@@ -46,6 +46,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
   count and the list can no longer disagree
 
 ### Fixed
+- SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with
+  `this.source.sequenceNumber is not a function`. The read path built its
+  transaction from an account stub that was missing that method, and it always
+  reached that stub because it looked up a throwaway account that never exists on
+  chain. Reads now use a fixed placeholder source and make no account lookup at all
+- SDK: a transaction the RPC declined to queue (`TRY_AGAIN_LATER`) was polled for
+  the full confirmation budget and then reported as a timeout, hiding the fact that
+  it simply needed resubmitting
+- SDK: an RPC that stops advancing its ledger answers `NOT_FOUND` forever, which was
+  indistinguishable from a slow ledger and consumed the whole timeout budget
+- SDK: `scI128` accepted numbers above `Number.MAX_SAFE_INTEGER`, which round
+  silently on conversion to `bigint` and would have signed a payment for the wrong
+  amount
+- SDK: the test suite could not run. Every fixture used placeholder addresses that
+  the config validator and the address encoder both reject, and several files mocked
+  the read helper with a raw value rather than its result type
 - Homepage returned a 500 after a 60-second hang when the indexer refused the
   connection, so the "indexer is unreachable" banner never reached the user
 - `app/src/app/create/page.tsx` — restored to a thin server-component wrapper
