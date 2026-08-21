@@ -3,6 +3,11 @@ import { useState, useEffect } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { shortAddress, formatUsdc, INDEXER_URL } from "@/lib/config";
+import {
+  buildAppSnapshot,
+  computeActionEligibility,
+  isGateBlocked,
+} from "@/lib/gating";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import clsx from "clsx";
 
@@ -456,7 +461,49 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setSuccess(null);
     setRetryAction(null);
     setLoading(action);
+
     try {
+      // ── Stale-state protection ─────────────────────────────────────────────
+      //
+      // Build a snapshot from the component's current data object and run the
+      // canonical gate check before submitting any transaction.  This ensures
+      // that if the circle state changed on-chain since the last data refresh
+      // (e.g. another member already contributed, payout already ran, or the
+      // round deadline passed) the action is blocked immediately with a clear
+      // message instead of producing an on-chain contract error.
+      //
+      // contributionsReceived is derived from the current round's contributions
+      // list when available, otherwise falls back to the member count heuristic.
+      const currentRoundContributions =
+        data.currentRound?.contributions.length ?? 0;
+
+      const snapshot = buildAppSnapshot(
+        data.circle.status,
+        data.circle.current_round,
+        data.circle.deadline_ledger,
+        data.latestLedger,
+        data.members.map((m) => m.member_address),
+        /* hasLockedCollateral */ myMember != null
+          ? BigInt(myMember.collateral || "0") > BigInt(0)
+          : false,
+        /* hasContributedCurrentRound */ myContributedThisRound,
+        /* contributionsReceived */ currentRoundContributions,
+      );
+
+      const gate = computeActionEligibility(action, snapshot);
+      if (isGateBlocked(gate)) {
+        setError(gate.message);
+        // Stale snapshots are always retryable — the user just needs to refresh.
+        // Other block reasons (wrong_status, already_contributed, etc.) are not
+        // transient so we don't show a retry link for them.
+        if (gate.reason === "stale_snapshot") {
+          setRetryAction(() => () => doAction(action, args));
+        }
+        setLoading(null);
+        return;
+      }
+
+      // ── Submit transaction ─────────────────────────────────────────────────
       const result = await invokeContract(
         circleAddress,
         action,
@@ -511,7 +558,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const handleJoin       = () => doAction("join",       [new Address(walletAddress!).toScVal()]);
   const handleContribute = () => doAction("contribute", [new Address(walletAddress!).toScVal()]);
   const handlePayout     = () => doAction("payout",     []);
-  const handleClose      = () => doAction("close",      []);
+  const handleClose      = () => doAction("close",      [new Address(walletAddress!).toScVal()]);
 
   // Spoken summary of circle status + round progress. Rendered in a polite
   // live region below so screen-reader users hear "Circle status: Active.
