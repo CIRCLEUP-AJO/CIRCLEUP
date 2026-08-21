@@ -49,9 +49,11 @@ function makeClient(ttlMs?: number) {
   const getStatusSpy = vi
     .spyOn(client as any, "getStatus")
     .mockResolvedValue(MOCK_STATUS);
+  // getFullState now calls getCurrentRoundResult (non-throwing wrapper) internally
+  // for Active/Pending circles, so mock that instead of getCurrentRound.
   const getRoundSpy = vi
-    .spyOn(client as any, "getCurrentRound")
-    .mockResolvedValue(MOCK_ROUND);
+    .spyOn(client as any, "getCurrentRoundResult")
+    .mockResolvedValue({ ok: true, value: MOCK_ROUND });
 
   return { client, getConfigSpy, getStatusSpy, getRoundSpy };
 }
