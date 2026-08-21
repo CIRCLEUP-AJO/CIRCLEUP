@@ -9,7 +9,7 @@
  *   - getConfigResult / getStatusResult / getCurrentRoundResult
  *     (ok path, error path, shape of returned value)
  *
- * No RPC calls are made — simulateAndRead is mocked at the prototype level
+ * No RPC calls are made — simulateAndReadOrThrow is mocked at the prototype level
  * using the same pattern as the rest of the SDK test suite.
  */
 
@@ -21,47 +21,25 @@ import {
   assertValidCircleStatus,
   isReadSuccess,
   isReadFailure,
-  type CircleUpConfig,
+  decodeU32,
+  decodeBigInt,
+  decodeBoolean,
+  decodeAddress,
+  decodeAddressList,
   type CircleConfig,
   type RoundState,
   type CircleStatus,
-  type RawCircleConfig,
-  type RawRoundState,
   type ReadResult,
 } from "../types";
+import {
+  CIRCLE_ADDR,
+  MEMBER_A_ADDR,
+  SDK_CONFIG,
+  WIRE_CONFIG,
+  WIRE_ROUND,
+} from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
-
-const SDK_CONFIG: CircleUpConfig = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  contracts: {
-    circleFactory: "CFACTORY000000000000000000000000000000000000000000000000",
-    reputation: "CREP00000000000000000000000000000000000000000000000000000",
-    usdc: "CUSDC0000000000000000000000000000000000000000000000000000",
-  },
-};
-
-const CIRCLE_ADDR = "CCIRCLE00000000000000000000000000000000000000000000000000";
-
-const WIRE_CONFIG: RawCircleConfig = {
-  members: [
-    "GABC0000000000000000000000000000000000000000000000000000",
-    "GDEF0000000000000000000000000000000000000000000000000000",
-  ],
-  round_amount: 100_000_000n,
-  usdc_token: "CUSDC0000000000000000000000000000000000000000000000000000",
-  reputation_contract: "CREP00000000000000000000000000000000000000000000000000000",
-  round_deadline_ledgers: 120_960,
-};
-
-const WIRE_ROUND: RawRoundState = {
-  round_index: 2,
-  recipient: "GABC0000000000000000000000000000000000000000000000000000",
-  contributions_received: 3,
-  deadline_ledger: 5_000_000n,
-  paid_out: false,
-};
 
 function makeClient(): CircleClient {
   return new CircleClient(SDK_CONFIG, CIRCLE_ADDR, 0);
@@ -235,7 +213,7 @@ describe("CircleClient.getConfigResult", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("returns ok:true with a CircleConfig on success", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(
       WIRE_CONFIG,
     );
     const result = await makeClient().getConfigResult();
@@ -248,7 +226,7 @@ describe("CircleClient.getConfigResult", () => {
   });
 
   it("returns ok:false with an error string when simulation fails", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("RPC unavailable"),
     );
     const result = await makeClient().getConfigResult();
@@ -261,7 +239,7 @@ describe("CircleClient.getConfigResult", () => {
 
   it("returns ok:false when the raw wire data has missing fields", async () => {
     // Simulate a decode error by returning a wire object missing round_amount
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(
       { ...WIRE_CONFIG, round_amount: undefined },
     );
     const result = await makeClient().getConfigResult();
@@ -273,7 +251,7 @@ describe("CircleClient.getConfigResult", () => {
   });
 
   it("never throws — always returns a ReadResult", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("catastrophic failure"),
     );
     await expect(makeClient().getConfigResult()).resolves.toMatchObject({ ok: false });
@@ -288,7 +266,7 @@ describe("CircleClient.getStatusResult", () => {
   it.each(["Pending", "Active", "Completed", "Cancelled"] as CircleStatus[])(
     "returns ok:true with value '%s' for a valid status",
     async (status) => {
-      vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(status);
+      vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(status);
       const result = await makeClient().getStatusResult();
 
       expect(result.ok).toBe(true);
@@ -299,7 +277,7 @@ describe("CircleClient.getStatusResult", () => {
   );
 
   it("returns ok:false when simulation throws", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("timeout"),
     );
     const result = await makeClient().getStatusResult();
@@ -312,7 +290,7 @@ describe("CircleClient.getStatusResult", () => {
 
   it("returns ok:false when the contract returns an unrecognised status string", async () => {
     // assertValidCircleStatus will throw for an unknown variant
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(
       "InvalidStatus",
     );
     const result = await makeClient().getStatusResult();
@@ -324,7 +302,7 @@ describe("CircleClient.getStatusResult", () => {
   });
 
   it("never throws", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("boom"),
     );
     await expect(makeClient().getStatusResult()).resolves.toMatchObject({ ok: false });
@@ -337,7 +315,7 @@ describe("CircleClient.getCurrentRoundResult", () => {
   afterEach(() => vi.restoreAllMocks());
 
   it("returns ok:true with a RoundState on success", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(
       WIRE_ROUND,
     );
     const result = await makeClient().getCurrentRoundResult();
@@ -351,8 +329,8 @@ describe("CircleClient.getCurrentRoundResult", () => {
   });
 
   it("returns ok:false when the circle is Completed or Cancelled (contract error)", async () => {
-    // The contract's get_current_round returns an error for non-active circles.
-    // simulateAndReadOrThrow converts this into a thrown Error.
+    // The contract's get_current_round returns an error for non-active circles,
+    // which simulateAndRead reports as a SimulateFailure.
     vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue({
       ok: false,
       error: "CircleNotActive",
@@ -367,7 +345,7 @@ describe("CircleClient.getCurrentRoundResult", () => {
   });
 
   it("returns ok:false when simulation throws a network error", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("network unreachable"),
     );
     const result = await makeClient().getCurrentRoundResult();
@@ -379,7 +357,7 @@ describe("CircleClient.getCurrentRoundResult", () => {
   });
 
   it("returns ok:false when wire data has a missing round_index", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(
       { ...WIRE_ROUND, round_index: undefined },
     );
     const result = await makeClient().getCurrentRoundResult();
@@ -391,7 +369,7 @@ describe("CircleClient.getCurrentRoundResult", () => {
   });
 
   it("never throws", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("unexpected"),
     );
     await expect(makeClient().getCurrentRoundResult()).resolves.toMatchObject({ ok: false });
@@ -407,24 +385,133 @@ describe("CircleClient.getCurrentRoundResult", () => {
 describe("throwing variants still propagate errors", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("getConfig throws when simulateAndRead fails", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+  it("getConfig throws when simulateAndReadOrThrow fails", async () => {
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("get_config network error"),
     );
     await expect(makeClient().getConfig()).rejects.toThrow("get_config network error");
   });
 
   it("getStatus throws for an unrecognised status string", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockResolvedValue(
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockResolvedValue(
       "WeirdStatus",
     );
     await expect(makeClient().getStatus()).rejects.toThrow(/WeirdStatus/);
   });
 
-  it("getCurrentRound throws when simulateAndRead fails", async () => {
-    vi.spyOn(CircleUpClient.prototype as any, "simulateAndRead").mockRejectedValue(
+  it("getCurrentRound throws when simulateAndReadOrThrow fails", async () => {
+    vi.spyOn(CircleUpClient.prototype as any, "simulateAndReadOrThrow").mockRejectedValue(
       new Error("contract not active"),
     );
     await expect(makeClient().getCurrentRound()).rejects.toThrow("contract not active");
+  });
+});
+
+// ─── Wire decode helpers ──────────────────────────────────────────────────────
+//
+// Everything `scValToNative` hands back is unvalidated. These helpers are the
+// single place the SDK turns it into domain types, so a contract whose return
+// shape drifts produces a named-field error instead of an `undefined` that
+// only fails several layers later.
+
+describe("decodeU32", () => {
+  it("accepts an in-range integer", () => {
+    expect(decodeU32(0, "t")).toBe(0);
+    expect(decodeU32(0xffffffff, "t")).toBe(0xffffffff);
+  });
+
+  it("rejects values outside u32", () => {
+    expect(() => decodeU32(-1, "t")).toThrow(TypeError);
+    expect(() => decodeU32(0x100000000, "t")).toThrow(TypeError);
+  });
+
+  it("rejects a bigint, a float, and undefined", () => {
+    expect(() => decodeU32(1n, "t")).toThrow(TypeError);
+    expect(() => decodeU32(1.5, "t")).toThrow(TypeError);
+    expect(() => decodeU32(undefined, "t")).toThrow(TypeError);
+  });
+
+  it("includes the label and the offending value in the message", () => {
+    expect(() => decodeU32("7", "getDefaults")).toThrow(/getDefaults/);
+    expect(() => decodeU32("7", "getDefaults")).toThrow(/string "7"/);
+  });
+});
+
+describe("decodeBigInt", () => {
+  it("passes a bigint through unchanged", () => {
+    expect(decodeBigInt(5_000_000n, "t")).toBe(5_000_000n);
+  });
+
+  it("widens a safe integer number", () => {
+    expect(decodeBigInt(42, "t")).toBe(42n);
+  });
+
+  it("rejects a number that cannot be widened losslessly", () => {
+    expect(() => decodeBigInt(Number.MAX_SAFE_INTEGER + 2, "t")).toThrow(/precision/);
+  });
+
+  it("rejects a numeric string — silent coercion would hide a shape change", () => {
+    expect(() => decodeBigInt("100", "t")).toThrow(TypeError);
+  });
+});
+
+describe("decodeBoolean", () => {
+  it("accepts booleans", () => {
+    expect(decodeBoolean(true, "t")).toBe(true);
+    expect(decodeBoolean(false, "t")).toBe(false);
+  });
+
+  it("rejects truthy and falsy non-booleans", () => {
+    expect(() => decodeBoolean(1, "t")).toThrow(TypeError);
+    expect(() => decodeBoolean("", "t")).toThrow(TypeError);
+    expect(() => decodeBoolean(null, "t")).toThrow(TypeError);
+  });
+});
+
+describe("decodeAddress / decodeAddressList", () => {
+  it("accepts account and contract addresses", () => {
+    expect(decodeAddress(MEMBER_A_ADDR, "t")).toBe(MEMBER_A_ADDR);
+    expect(decodeAddress(CIRCLE_ADDR, "t")).toBe(CIRCLE_ADDR);
+  });
+
+  it("rejects a truncated address", () => {
+    expect(() => decodeAddress(MEMBER_A_ADDR.slice(0, 30), "t")).toThrow(TypeError);
+  });
+
+  it("accepts an empty list — a fresh factory has no circles yet", () => {
+    expect(decodeAddressList([], "t")).toEqual([]);
+  });
+
+  it("names the offending index in a list", () => {
+    expect(() => decodeAddressList([CIRCLE_ADDR, "nope"], "getCircles")).toThrow(
+      /getCircles\[1\]/,
+    );
+  });
+
+  it("rejects a non-array", () => {
+    expect(() => decodeAddressList(CIRCLE_ADDR, "t")).toThrow(TypeError);
+  });
+});
+
+describe("mapRawConfig / mapRawRoundState — non-object input", () => {
+  it("mapRawConfig rejects a non-object wire value", () => {
+    expect(() => mapRawConfig(null)).toThrow(/expected a CircleConfig object/);
+    expect(() => mapRawConfig("oops")).toThrow(TypeError);
+  });
+
+  it("mapRawRoundState rejects a non-object wire value", () => {
+    expect(() => mapRawRoundState(undefined)).toThrow(/expected a RoundState object/);
+  });
+
+  it("mapRawConfig rejects a members entry that is not an address", () => {
+    expect(() =>
+      mapRawConfig({ ...WIRE_CONFIG, members: [MEMBER_A_ADDR, "not-an-address"] }),
+    ).toThrow(/mapRawConfig\.members\[1\]/);
+  });
+
+  it("mapRawRoundState rejects a paid_out flag that is not a boolean", () => {
+    expect(() => mapRawRoundState({ ...WIRE_ROUND, paid_out: 1 })).toThrow(
+      /mapRawRoundState\.paid_out/,
+    );
   });
 });

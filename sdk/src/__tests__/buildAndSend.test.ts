@@ -6,88 +6,58 @@
  * is stubbed via vi.spyOn on the prototype.
  *
  * Covered scenarios:
+ *   - malformed invocations rejected before any network I/O
  *   - account not found (404 vs generic network error)
  *   - simulation network error
  *   - simulation contract error (human-readable extraction)
  *   - tx submission network error
  *   - tx rejected (status === "ERROR")
+ *   - RPC congestion (status === "TRY_AGAIN_LATER") vs resubmission (DUPLICATE)
  *   - tx confirmed as FAILED
  *   - polling timeout
  *   - consecutive polling errors exceeding threshold → surface RPC error
- *   - successful tx carries correct hash + ledger
+ *   - an RPC whose ledger stops advancing → stale_rpc rather than a full timeout
+ *   - successful tx carries correct hash, ledger, and decoded return value
  *
  * extractSimulationError parsing (private helper) is tested via the
  * simulation_failed path, which goes through it internally.
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SorobanRpc } from "@stellar/stellar-sdk";
-import { CircleUpClient } from "../client";
-import { isTxSuccess, isTxFailure, type CircleUpConfig } from "../types";
+import { SorobanRpc, xdr } from "@stellar/stellar-sdk";
+import { CircleUpClient, type PollConfig } from "../client";
+import { isTxSuccess, isTxFailure } from "../types";
+import {
+  CIRCLE_ADDR,
+  FAST_POLL,
+  MEMBER_A,
+  MOCK_ACCOUNT,
+  SDK_CONFIG,
+  simulationError,
+  simulationSuccess,
+} from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
-const SDK_CONFIG: CircleUpConfig = {
-  rpcUrl: "https://soroban-testnet.stellar.org",
-  networkPassphrase: "Test SDF Network ; September 2015",
-  contracts: {
-    circleFactory: "CFACTORY000000000000000000000000000000000000000000000000",
-    reputation: "CREP00000000000000000000000000000000000000000000000000000",
-    usdc: "CUSDC0000000000000000000000000000000000000000000000000000",
-  },
-};
-
-const CONTRACT_ID = "CCIRCLE00000000000000000000000000000000000000000000000000";
+const CONTRACT_ID = CIRCLE_ADDR;
 const METHOD = "join";
-
-// Minimal mock Keypair-like object that satisfies Stellar SDK usage
-const MOCK_KEYPAIR = {
-  publicKey: () => "GABC0000000000000000000000000000000000000000000000000000",
-  sign: () => Buffer.alloc(64),
-} as any;
-
-// A mock account object that TransactionBuilder accepts
-const MOCK_ACCOUNT = {
-  id: "GABC0000000000000000000000000000000000000000000000000000",
-  sequence: "100",
-  incrementSequenceNumber: () => {},
-} as any;
 
 // ─── Thin subclass exposing the protected method ──────────────────────────────
 
 class TestClient extends CircleUpClient {
   callBuildAndSend(method: string = METHOD) {
-    return this.buildAndSend(MOCK_KEYPAIR, CONTRACT_ID, method, []);
+    return this.buildAndSend(MEMBER_A, CONTRACT_ID, method, []);
   }
 }
 
-function makeClient() {
-  return new TestClient(SDK_CONFIG);
+function makeClient(poll: PollConfig = FAST_POLL) {
+  return new TestClient(SDK_CONFIG, poll);
 }
+
+/** Budget short enough that the polling loop runs out of time promptly. */
+const IMPATIENT_POLL: PollConfig = { ...FAST_POLL, timeoutMs: 50 };
 
 // ─── Helpers to build mock RPC return values ──────────────────────────────────
-
-function mockSimSuccess() {
-  return {
-    result: { retval: { toXDR: () => Buffer.alloc(0) } },
-    transactionData: {},
-    events: [],
-    minResourceFee: "100",
-    cost: {},
-    latestLedger: 1,
-    // Mimic the non-error simulation shape
-    _isSimulationSuccess: true,
-  } as any;
-}
-
-function mockSimError(error: string) {
-  return {
-    error,
-    events: [],
-    latestLedger: 1,
-    // Expose the flag isSimulationError checks
-  } as any;
-}
 
 function mockSendOk(hash = "TXHASH123") {
   return { status: "PENDING", hash } as any;
@@ -101,10 +71,11 @@ function mockSendError(hash = "TXHASH123") {
   } as any;
 }
 
-function mockGetTxSuccess(ledger = 42) {
+function mockGetTxSuccess(ledger = 42, returnValue?: xdr.ScVal) {
   return {
     status: SorobanRpc.Api.GetTransactionStatus.SUCCESS,
     ledger,
+    returnValue,
   } as any;
 }
 
@@ -114,9 +85,10 @@ function mockGetTxFailed() {
   } as any;
 }
 
-function mockGetTxNotFound() {
+function mockGetTxNotFound(latestLedger?: number) {
   return {
     status: SorobanRpc.Api.GetTransactionStatus.NOT_FOUND,
+    latestLedger,
   } as any;
 }
 
@@ -195,9 +167,8 @@ describe("buildAndSend — simulation", () => {
     const rawError =
       'HostError: Value(UnexpectedType)\n  contract log (debug): "already joined"\nError(Contract, #1)';
     vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
-      mockSimError(rawError),
+      simulationError(rawError),
     );
-    vi.spyOn(SorobanRpc.Api, "isSimulationError").mockReturnValue(true);
 
     const result = await makeClient().callBuildAndSend();
 
@@ -213,9 +184,8 @@ describe("buildAndSend — simulation", () => {
   it("falls back to contract error code when no debug log is present", async () => {
     const rawError = "HostError: Value(UnexpectedType)\nError(Contract, #3)";
     vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
-      mockSimError(rawError),
+      simulationError(rawError),
     );
-    vi.spyOn(SorobanRpc.Api, "isSimulationError").mockReturnValue(true);
 
     const result = await makeClient().callBuildAndSend();
 
@@ -231,12 +201,8 @@ describe("buildAndSend — submission", () => {
   beforeEach(() => {
     vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
     vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
-      mockSimSuccess(),
+      simulationSuccess(),
     );
-    vi.spyOn(SorobanRpc.Api, "isSimulationError").mockReturnValue(false);
-    vi.spyOn(SorobanRpc, "assembleTransaction" as any).mockReturnValue({
-      build: () => ({ sign: () => {}, toXDR: () => "" }),
-    });
   });
 
   it("returns errorCode 'network_error' when sendTransaction throws", async () => {
@@ -273,12 +239,8 @@ describe("buildAndSend — confirmation polling", () => {
   beforeEach(() => {
     vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
     vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
-      mockSimSuccess(),
+      simulationSuccess(),
     );
-    vi.spyOn(SorobanRpc.Api, "isSimulationError").mockReturnValue(false);
-    vi.spyOn(SorobanRpc, "assembleTransaction" as any).mockReturnValue({
-      build: () => ({ sign: () => {}, toXDR: () => "" }),
-    });
     vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockResolvedValue(
       mockSendOk("TX_POLLING"),
     );
@@ -335,9 +297,8 @@ describe("buildAndSend — error messages include contract/method context", () =
   it("includes contractId.method in simulation_failed message", async () => {
     vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
     vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
-      mockSimError("HostError: Error(Contract, #2)"),
+      simulationError("HostError: Error(Contract, #2)"),
     );
-    vi.spyOn(SorobanRpc.Api, "isSimulationError").mockReturnValue(true);
 
     const result = await makeClient().callBuildAndSend("contribute");
 
@@ -359,5 +320,243 @@ describe("buildAndSend — error messages include contract/method context", () =
     if (isTxFailure(result)) {
       expect(result.errorMessage).toContain("payout");
     }
+  });
+});
+
+// ─── Argument validation (no network I/O) ─────────────────────────────────────
+
+describe("buildAndSend — malformed invocations", () => {
+  /** Every network method throws, proving validation happened before any I/O. */
+  function failOnAnyRpcCall() {
+    const boom = () => {
+      throw new Error("the RPC should not have been contacted");
+    };
+    vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockImplementation(boom);
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockImplementation(boom);
+    vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockImplementation(boom);
+  }
+
+  class ArgTestClient extends CircleUpClient {
+    call(contractId: string, method: string, args: any) {
+      return this.buildAndSend(MEMBER_A, contractId, method, args);
+    }
+  }
+
+  const client = () => new ArgTestClient(SDK_CONFIG, FAST_POLL);
+
+  it("rejects a contract address that is not a C-address", async () => {
+    failOnAnyRpcCall();
+    const result = await client().call(MEMBER_A.publicKey(), "join", []);
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("invalid_argument");
+      expect(result.errorMessage).toContain("not a Soroban contract address");
+      expect(result.txHash).toBe("");
+    }
+  });
+
+  it("rejects a method name that is not a Soroban symbol", async () => {
+    failOnAnyRpcCall();
+    const result = await client().call(CONTRACT_ID, "join-circle", []);
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("invalid_argument");
+      expect(result.errorMessage).toContain("not a valid Soroban symbol");
+    }
+  });
+
+  it("rejects a method name longer than 32 characters", async () => {
+    failOnAnyRpcCall();
+    const result = await client().call(CONTRACT_ID, "a".repeat(33), []);
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) expect(result.errorCode).toBe("invalid_argument");
+  });
+
+  it("rejects arguments that were never encoded to ScVal, naming the index", async () => {
+    failOnAnyRpcCall();
+    const result = await client().call(CONTRACT_ID, "join", [
+      xdr.ScVal.scvU32(1),
+      MEMBER_A.publicKey(),
+    ]);
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("invalid_argument");
+      expect(result.errorMessage).toContain("args[1]");
+      expect(result.errorMessage).toContain("scAddress");
+    }
+  });
+
+  it("rejects an args value that is not an array", async () => {
+    failOnAnyRpcCall();
+    const result = await client().call(CONTRACT_ID, "join", undefined);
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("invalid_argument");
+      expect(result.errorMessage).toContain("must be an array");
+    }
+  });
+});
+
+// ─── Submission statuses beyond ERROR ─────────────────────────────────────────
+
+describe("buildAndSend — congestion and duplicate submission", () => {
+  beforeEach(() => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationSuccess(),
+    );
+  });
+
+  it("returns 'try_again_later' without polling when the RPC is congested", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockResolvedValue({
+      status: "TRY_AGAIN_LATER",
+      hash: "HASH_BUSY",
+    } as any);
+    const pollSpy = vi.spyOn(SorobanRpc.Server.prototype, "getTransaction");
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("try_again_later");
+      // The hash is still handed back so the caller can look it up first.
+      expect(result.txHash).toBe("HASH_BUSY");
+    }
+    // Polling a transaction the network never queued would burn the whole
+    // timeout budget and then report a misleading "timeout".
+    expect(pollSpy).not.toHaveBeenCalled();
+  });
+
+  it("polls to confirmation when the RPC reports DUPLICATE", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockResolvedValue({
+      status: "DUPLICATE",
+      hash: "HASH_DUP",
+    } as any);
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue(
+      mockGetTxSuccess(12),
+    );
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxSuccess(result)).toBe(true);
+    if (isTxSuccess(result)) {
+      expect(result.txHash).toBe("HASH_DUP");
+      expect(result.ledger).toBe(12);
+    }
+  });
+});
+
+// ─── Stale RPC detection ──────────────────────────────────────────────────────
+
+describe("buildAndSend — stale RPC state", () => {
+  beforeEach(() => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationSuccess(),
+    );
+    vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockResolvedValue({
+      status: "PENDING",
+      hash: "HASH_STALE",
+      latestLedger: 500,
+    } as any);
+  });
+
+  it("returns 'stale_rpc' when the reported ledger stops advancing", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue(
+      mockGetTxNotFound(500),
+    );
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorCode).toBe("stale_rpc");
+      expect(result.errorMessage).toContain("500");
+      expect(result.txHash).toBe("HASH_STALE");
+    }
+  });
+
+  it("keeps polling while the ledger advances, then reports success", async () => {
+    let ledger = 500;
+    let polls = 0;
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockImplementation(
+      async () => {
+        polls++;
+        ledger++;
+        return polls < 5 ? mockGetTxNotFound(ledger) : mockGetTxSuccess(ledger);
+      },
+    );
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxSuccess(result)).toBe(true);
+    expect(polls).toBe(5);
+  });
+
+  it("falls back to the timeout path when the RPC reports no ledger at all", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue(
+      mockGetTxNotFound(undefined),
+    );
+
+    const result = await makeClient(IMPATIENT_POLL).callBuildAndSend();
+
+    expect(isTxFailure(result)).toBe(true);
+    // Without a ledger height there is no evidence the endpoint is stuck, so
+    // claiming staleness would be a guess.
+    if (isTxFailure(result)) expect(result.errorCode).toBe("timeout");
+  });
+});
+
+// ─── Contract return values ───────────────────────────────────────────────────
+
+describe("buildAndSend — return value decoding", () => {
+  beforeEach(() => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getAccount").mockResolvedValue(MOCK_ACCOUNT);
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationSuccess(),
+    );
+    vi.spyOn(SorobanRpc.Server.prototype, "sendTransaction").mockResolvedValue(
+      mockSendOk("HASH_RETVAL"),
+    );
+  });
+
+  it("decodes the contract return value onto the success result", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue(
+      mockGetTxSuccess(3, xdr.ScVal.scvU32(7)),
+    );
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxSuccess(result)).toBe(true);
+    if (isTxSuccess(result)) expect(result.returnValue).toBe(7);
+  });
+
+  it("leaves returnValue undefined for a method that returns nothing", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue(
+      mockGetTxSuccess(3),
+    );
+
+    const result = await makeClient().callBuildAndSend();
+
+    expect(isTxSuccess(result)).toBe(true);
+    if (isTxSuccess(result)) expect(result.returnValue).toBeUndefined();
+  });
+
+  it("still reports success when the return value cannot be decoded", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "getTransaction").mockResolvedValue(
+      mockGetTxSuccess(3, { switch: () => ({ name: "nonsense" }) } as any),
+    );
+
+    const result = await makeClient().callBuildAndSend();
+
+    // The transaction is on-chain; an unreadable return value must not turn a
+    // confirmed payout into a reported failure.
+    expect(isTxSuccess(result)).toBe(true);
+    if (isTxSuccess(result)) expect(result.returnValue).toBeUndefined();
   });
 });

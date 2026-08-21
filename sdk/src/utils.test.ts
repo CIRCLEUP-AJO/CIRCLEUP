@@ -136,7 +136,7 @@ describe("daysToLedgers / ledgersToDays", () => {
 describe("shortAddress", () => {
   it("truncates a full Stellar address", () => {
     const addr = "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGGEWVPO75SVRBGZL";
-    expect(shortAddress(addr)).toBe("GCEZ…GZBL");
+    expect(shortAddress(addr)).toBe("GCEZ…BGZL");
   });
 
   it("returns short strings unchanged", () => {
