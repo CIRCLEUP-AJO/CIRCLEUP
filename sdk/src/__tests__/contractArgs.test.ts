@@ -17,15 +17,13 @@
 import { describe, it, expect } from "vitest";
 import { xdr, scValToNative, Address } from "@stellar/stellar-sdk";
 import { scAddress, scU32, scI128, scBool, scAddressVec } from "../client";
+import { CIRCLE_ADDR, MEMBER_A_ADDR, MEMBER_B_ADDR } from "./fixtures";
 
 // ─── Real Stellar addresses used across the suite ────────────────────────────
 
-// G-addresses (accounts) — 56 chars, start with G
-const G_ADDR_A = "GABC234567890123456789012345678901234567890123456789ABCD";
-const G_ADDR_B = "GXYZ234567890123456789012345678901234567890123456789EFGH";
-
-// C-address (contract) — 56 chars, start with C
-const C_ADDR = "CCIRCLE00000000000000000000000000000000000000000000000000";
+const G_ADDR_A = MEMBER_A_ADDR;
+const G_ADDR_B = MEMBER_B_ADDR;
+const C_ADDR = CIRCLE_ADDR;
 
 // ─── scAddress ────────────────────────────────────────────────────────────────
 
@@ -308,5 +306,74 @@ describe("contract arg helpers — combined usage", () => {
       const args: xdr.ScVal[] = [scAddress(G_ADDR_A)];
       expect(args).toHaveLength(1);
     }).not.toThrow();
+  });
+});
+
+// ─── Malformed input reporting ────────────────────────────────────────────────
+//
+// The Stellar SDK's own errors for these cases ("Unsupported address type",
+// a silently rounded bigint) do not say which value was wrong or what was
+// expected. These assertions pin the actionable messages the SDK adds.
+
+describe("scAddress — actionable errors", () => {
+  it("names the expected format rather than 'Unsupported address type'", () => {
+    expect(() => scAddress("not-a-stellar-address")).toThrow(TypeError);
+    expect(() => scAddress("not-a-stellar-address")).toThrow(/starting with "G"/);
+  });
+
+  it("rejects a well-shaped address with a broken checksum", () => {
+    // Same length and alphabet as a real strkey, last character altered.
+    const broken = `${G_ADDR_A.slice(0, 55)}${G_ADDR_A[55] === "A" ? "B" : "A"}`;
+    expect(() => scAddress(broken)).toThrow(/not a valid strkey/);
+  });
+
+  it("rejects a non-string value", () => {
+    expect(() => scAddress(undefined as any)).toThrow(TypeError);
+  });
+});
+
+describe("scI128 — precision and range guards", () => {
+  it("rejects a number above Number.MAX_SAFE_INTEGER", () => {
+    // BigInt(2 ** 53 + 1) silently rounds; on a stroops amount that is a
+    // payment for the wrong sum.
+    expect(() => scI128(Number.MAX_SAFE_INTEGER + 2)).toThrow(/precision/);
+  });
+
+  it("accepts Number.MAX_SAFE_INTEGER itself", () => {
+    expect(scValToNative(scI128(Number.MAX_SAFE_INTEGER))).toBe(
+      BigInt(Number.MAX_SAFE_INTEGER),
+    );
+  });
+
+  it("encodes the i128 boundary values", () => {
+    const max = (1n << 127n) - 1n;
+    const min = -(1n << 127n);
+    expect(scValToNative(scI128(max))).toBe(max);
+    expect(scValToNative(scI128(min))).toBe(min);
+  });
+
+  it("throws RangeError just outside the i128 range", () => {
+    expect(() => scI128(1n << 127n)).toThrow(RangeError);
+    expect(() => scI128(-(1n << 127n) - 1n)).toThrow(RangeError);
+  });
+
+  it("rejects a value that is neither bigint nor number", () => {
+    expect(() => scI128("100" as any)).toThrow(TypeError);
+  });
+});
+
+describe("scU32 — non-numeric input", () => {
+  it("says the value is not an integer rather than out of range", () => {
+    expect(() => scU32("5" as any)).toThrow(/not an integer/);
+  });
+});
+
+describe("scAddressVec — malformed lists", () => {
+  it("names the index of the offending entry", () => {
+    expect(() => scAddressVec([G_ADDR_A, G_ADDR_B, "oops"])).toThrow(/entry 2/);
+  });
+
+  it("rejects a value that is not an array", () => {
+    expect(() => scAddressVec(null as any)).toThrow(TypeError);
   });
 });

@@ -1,4 +1,5 @@
 import {
+  Account,
   Keypair,
   TransactionBuilder,
   BASE_FEE,
@@ -12,8 +13,6 @@ import {
 import type {
   CircleUpConfig,
   CircleConfig,
-  RawCircleConfig,
-  RawRoundState,
   RoundState,
   CircleStatus,
   TxResult,
@@ -33,9 +32,14 @@ import type {
 import {
   validateCircleUpConfig,
   isValidContractAddress,
+  isValidStellarAddress,
   mapRawConfig,
   mapRawRoundState,
   assertValidCircleStatus,
+  decodeU32,
+  decodeBigInt,
+  decodeBoolean,
+  decodeAddressList,
 } from "./types";
 import {
   buildSnapshot,
@@ -114,13 +118,104 @@ export interface PollConfig {
 }
 
 /** Resolved defaults used when the caller omits individual fields. */
-const DEFAULT_POLL_CONFIG = {
+export const DEFAULT_POLL_CONFIG = {
   initialIntervalMs: 2_000,
   maxIntervalMs: 10_000,
   backoffFactor: 1.5,
   timeoutMs: 60_000,
   maxConsecutiveErrors: 5,
 } as const satisfies Required<PollConfig>;
+
+/**
+ * How many consecutive polls may observe the same RPC ledger before the
+ * confirmation loop declares the endpoint stale.
+ *
+ * A healthy Stellar RPC advances its `latestLedger` roughly every 5 seconds.
+ * The polling interval starts at 2 s and backs off, so three consecutive
+ * responses reporting an unchanged ledger means the endpoint has stopped
+ * ingesting — the transaction will never be observed here no matter how long
+ * we wait, and continuing to poll would burn the caller's whole timeout budget
+ * on an endpoint that cannot answer.
+ */
+const STALE_LEDGER_POLLS = 3;
+
+/**
+ * Validate a caller-supplied {@link PollConfig}, reporting every problem at
+ * once rather than failing on the first one.
+ *
+ * Called from the `CircleUpClient` constructor so a bad schedule surfaces at
+ * setup time instead of producing a loop that spins hot, never retries, or
+ * gives up before the network could plausibly have confirmed anything.
+ *
+ * @throws `RangeError` listing every invalid field.
+ */
+function validatePollConfig(cfg: Required<PollConfig>): void {
+  const errors: string[] = [];
+
+  const positive = (
+    key: keyof PollConfig,
+    value: number,
+  ): void => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      errors.push(
+        `PollConfig.${key} must be a finite number greater than 0, got ${JSON.stringify(value)}.`,
+      );
+    }
+  };
+
+  positive("initialIntervalMs", cfg.initialIntervalMs);
+  positive("maxIntervalMs", cfg.maxIntervalMs);
+  positive("timeoutMs", cfg.timeoutMs);
+  positive("maxConsecutiveErrors", cfg.maxConsecutiveErrors);
+
+  if (
+    typeof cfg.maxConsecutiveErrors === "number" &&
+    Number.isFinite(cfg.maxConsecutiveErrors) &&
+    !Number.isInteger(cfg.maxConsecutiveErrors)
+  ) {
+    errors.push(
+      `PollConfig.maxConsecutiveErrors must be a whole number, got ${cfg.maxConsecutiveErrors}.`,
+    );
+  }
+
+  if (
+    typeof cfg.backoffFactor !== "number" ||
+    !Number.isFinite(cfg.backoffFactor) ||
+    cfg.backoffFactor < 1
+  ) {
+    errors.push(
+      `PollConfig.backoffFactor must be >= 1, got ${JSON.stringify(cfg.backoffFactor)}.`,
+    );
+  }
+
+  if (
+    Number.isFinite(cfg.initialIntervalMs) &&
+    Number.isFinite(cfg.maxIntervalMs) &&
+    cfg.maxIntervalMs < cfg.initialIntervalMs
+  ) {
+    errors.push(
+      `PollConfig.maxIntervalMs (${cfg.maxIntervalMs}) must be >= initialIntervalMs ` +
+        `(${cfg.initialIntervalMs}), otherwise the first wait already exceeds the cap.`,
+    );
+  }
+
+  if (
+    Number.isFinite(cfg.timeoutMs) &&
+    Number.isFinite(cfg.initialIntervalMs) &&
+    cfg.timeoutMs < cfg.initialIntervalMs
+  ) {
+    errors.push(
+      `PollConfig.timeoutMs (${cfg.timeoutMs}) must be >= initialIntervalMs ` +
+        `(${cfg.initialIntervalMs}), otherwise the loop times out before its first poll.`,
+    );
+  }
+
+  if (errors.length > 0) {
+    throw new RangeError(
+      `Invalid PollConfig:\n${errors.map((e) => `  • ${e}`).join("\n")}`,
+    );
+  }
+}
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -134,8 +229,103 @@ function txFailure(
 }
 
 /** Build a typed success result. */
-function txSuccess(txHash: string, ledger: number): TxSuccess {
-  return { success: true, txHash, ledger };
+function txSuccess(
+  txHash: string,
+  ledger: number,
+  returnValue?: unknown,
+): TxSuccess {
+  return { success: true, txHash, ledger, returnValue };
+}
+
+/**
+ * Source account used for read-only simulations.
+ *
+ * This is the strkey for the all-zero ed25519 public key. Simulations are
+ * never signed or submitted, so the account only needs to be a well-formed
+ * address; using a fixed one keeps reads free of the RPC round-trip that
+ * looking up a throwaway account would cost.
+ */
+const SIMULATION_SOURCE_ACCOUNT =
+  "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+/**
+ * Read the `latestLedger` field an RPC attaches to its responses.
+ *
+ * Returns `undefined` when the field is absent or not a number, in which case
+ * the caller cannot judge whether the endpoint is keeping up and must not
+ * treat it as stale.
+ */
+function readLatestLedger(response: unknown): number | undefined {
+  const value = (response as { latestLedger?: unknown } | null)?.latestLedger;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Decode the contract return value carried by a successful `getTransaction`
+ * response.
+ *
+ * A decode failure is deliberately swallowed: the transaction is already
+ * confirmed on-chain, and turning a successful contribution or payout into a
+ * reported failure because its return value could not be read would be worse
+ * than handing back `undefined`. Callers that need the value narrow it with a
+ * `decode*` helper and get a precise error there.
+ */
+function decodeReturnValue(status: unknown): unknown {
+  const retval = (status as { returnValue?: xdr.ScVal } | null)?.returnValue;
+  if (!retval) return undefined;
+  try {
+    return scValToNative(retval);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Soroban contract method names are `Symbol`s: up to 32 alphanumeric or
+ * underscore characters.
+ */
+const CONTRACT_METHOD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/;
+
+/**
+ * Validate the parts of a contract invocation that every code path shares —
+ * the target address, the method name, and the encoded arguments.
+ *
+ * Both `buildAndSend` and `simulateAndRead` run this before any network I/O so
+ * a malformed call is reported as a typed SDK error naming the offending
+ * argument, rather than as an opaque `Contract` constructor throw or a host
+ * error that only appears after a round-trip to the RPC.
+ *
+ * @returns `null` when the invocation is well-formed, otherwise a
+ *   human-readable description of the first problem found.
+ */
+function validateInvocation(
+  contractId: unknown,
+  method: unknown,
+  args: unknown,
+): string | null {
+  if (typeof contractId !== "string" || !isValidContractAddress(contractId)) {
+    return (
+      `contract address ${JSON.stringify(contractId)} is not a Soroban contract address ` +
+      `(expected a 56-character string starting with "C").`
+    );
+  }
+  if (typeof method !== "string" || !CONTRACT_METHOD_RE.test(method)) {
+    return (
+      `method name ${JSON.stringify(method)} is not a valid Soroban symbol ` +
+      `(1–32 letters, digits or underscores, not starting with a digit).`
+    );
+  }
+  if (!Array.isArray(args)) {
+    return `args must be an array of xdr.ScVal, got ${typeof args}.`;
+  }
+  const badIndex = args.findIndex((a) => !(a instanceof xdr.ScVal));
+  if (badIndex !== -1) {
+    return (
+      `args[${badIndex}] is not an xdr.ScVal. ` +
+      `Encode arguments with scAddress / scU32 / scI128 / scBool / scAddressVec first.`
+    );
+  }
+  return null;
 }
 
 /**
@@ -188,12 +378,35 @@ function extractSimulationError(raw: string): string {
  *
  * @param address A G-address (account) or C-address (contract).
  *
+ * @throws `TypeError` if `address` is not a well-formed strkey. The Stellar
+ *   SDK's own error for this is `"Unsupported address type"`, which does not
+ *   say which value was wrong or what was expected, so it is replaced here.
+ *
  * @example
  * scAddress("GABC…") // → xdr.ScVal (address variant)
  */
 export function scAddress(address: string): xdr.ScVal {
-  return new Address(address).toScVal();
+  if (!isValidStellarAddress(address)) {
+    throw new TypeError(
+      `scAddress: "${String(address)}" is not a Stellar address. ` +
+        `Expected a 56-character account key starting with "G" or contract address starting with "C".`,
+    );
+  }
+  try {
+    return new Address(address).toScVal();
+  } catch (err: any) {
+    // Correct shape but a bad strkey checksum — usually a truncated or
+    // hand-edited address.
+    throw new TypeError(
+      `scAddress: "${address}" has the right shape but is not a valid strkey ` +
+        `(${err?.message ?? "checksum failed"}). Check for a typo or a truncated copy-paste.`,
+    );
+  }
 }
+
+/** Inclusive bounds of a signed 128-bit integer, as enforced by `scI128`. */
+const I128_MAX = (1n << 127n) - 1n;
+const I128_MIN = -(1n << 127n);
 
 /**
  * Encode an unsigned 32-bit integer as an `ScVal` `u32`.
@@ -207,7 +420,12 @@ export function scAddress(address: string): xdr.ScVal {
  * scU32(0)       // round index
  */
 export function scU32(value: number): xdr.ScVal {
-  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new RangeError(
+      `scU32: value ${JSON.stringify(value)} is not an integer. u32 arguments must be whole numbers.`,
+    );
+  }
+  if (value < 0 || value > 0xffffffff) {
     throw new RangeError(
       `scU32: value ${value} is out of range for u32 (0–4294967295).`,
     );
@@ -220,7 +438,11 @@ export function scU32(value: number): xdr.ScVal {
  *
  * Accepts `bigint` (preferred — lossless) or `number` (converted to bigint).
  *
- * @throws `TypeError` if a non-integer `number` is passed.
+ * @throws `TypeError` if a non-integer `number` is passed, or if a `number`
+ *   exceeds `Number.MAX_SAFE_INTEGER` — past that point the conversion to
+ *   bigint silently rounds, which on a monetary amount is a correctness bug
+ *   that would only surface after the transaction was signed and submitted.
+ * @throws `RangeError` if the value does not fit in a signed 128-bit integer.
  *
  * @example
  * scI128(100_000_000n)        // round_amount in stroops
@@ -235,9 +457,24 @@ export function scI128(value: bigint | number): xdr.ScVal {
           `Pass a bigint instead.`,
       );
     }
+    if (!Number.isSafeInteger(value)) {
+      throw new TypeError(
+        `scI128: number ${value} exceeds Number.MAX_SAFE_INTEGER and would lose ` +
+          `precision on conversion. Pass a bigint instead.`,
+      );
+    }
     n = BigInt(value);
-  } else {
+  } else if (typeof value === "bigint") {
     n = value;
+  } else {
+    throw new TypeError(
+      `scI128: expected a bigint or integer number, got ${typeof value}.`,
+    );
+  }
+  if (n < I128_MIN || n > I128_MAX) {
+    throw new RangeError(
+      `scI128: value ${n} is out of range for i128 (${I128_MIN}–${I128_MAX}).`,
+    );
   }
   return nativeToScVal(n, { type: "i128" });
 }
@@ -261,19 +498,35 @@ export function scBool(value: boolean): xdr.ScVal {
  *
  * @param addresses Array of G-addresses (accounts) or C-addresses (contracts).
  *
+ * @throws `TypeError` if `addresses` is not an array, or if any entry is not a
+ *   valid address — the message names the offending index so a bad entry in a
+ *   long member list can be found without bisecting it.
  * @throws `Error` if `addresses` is empty — Soroban requires at least one member.
  *
  * @example
  * scAddressVec(["GABC…", "GDEF…"])
  */
 export function scAddressVec(addresses: string[]): xdr.ScVal {
+  if (!Array.isArray(addresses)) {
+    throw new TypeError(
+      `scAddressVec: expected an array of addresses, got ${typeof addresses}.`,
+    );
+  }
   if (addresses.length === 0) {
     throw new Error(
       "scAddressVec: addresses array must not be empty. " +
         "A circle requires at least one member address.",
     );
   }
-  return xdr.ScVal.scvVec(addresses.map((a) => new Address(a).toScVal()));
+  return xdr.ScVal.scvVec(
+    addresses.map((a, i) => {
+      try {
+        return scAddress(a);
+      } catch (err: any) {
+        throw new TypeError(`scAddressVec: entry ${i} is invalid — ${err?.message}`);
+      }
+    }),
+  );
 }
 
 // ─── Base client ─────────────────────────────────────────────────────────────
@@ -292,15 +545,19 @@ export class CircleUpClient {
     // Merge caller-supplied overrides onto the defaults so every field is
     // always present and the polling loop never has to deal with undefined.
     this.pollConfig = { ...DEFAULT_POLL_CONFIG, ...pollConfig };
-    if (this.pollConfig.backoffFactor < 1) {
-      throw new RangeError(
-        `PollConfig.backoffFactor must be >= 1, got ${this.pollConfig.backoffFactor}.`,
-      );
-    }
+    validatePollConfig(this.pollConfig);
   }
 
   // ── Tx helpers ──────────────────────────────────────────────────────────────
 
+  /**
+   * The canonical write path for every contract call in the SDK:
+   * validate → load account → simulate → assemble & sign → submit → confirm.
+   *
+   * Every failure mode returns a {@link TxFailure} carrying a
+   * {@link TxErrorCode}; this method never throws, so callers can branch on
+   * one result object instead of combining a try/catch with a status check.
+   */
   protected async buildAndSend(
     sourceKeypair: Keypair,
     contractId: string,
@@ -310,6 +567,12 @@ export class CircleUpClient {
     // Context string prepended to every error from this invocation so callers
     // can correlate an error back to the contract method without a stack trace.
     const ctx = `${contractId}.${method}`;
+
+    // Reject a malformed call before spending a network round-trip on it.
+    const invalid = validateInvocation(contractId, method, args);
+    if (invalid) {
+      return txFailure("", `Invalid call to ${ctx}: ${invalid}`, "invalid_argument");
+    }
 
     let account: Awaited<ReturnType<typeof this.rpc.getAccount>>;
     try {
@@ -331,16 +594,24 @@ export class CircleUpClient {
       );
     }
 
-    const contract = new Contract(contractId);
-
-    const txBuilder = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.config.networkPassphrase,
-    })
-      .addOperation(contract.call(method, ...args))
-      .setTimeout(30);
-
-    const tx = txBuilder.build();
+    // Building can throw on a malformed account object or an argument the
+    // Stellar SDK rejects at encode time; keep it inside the typed contract.
+    let tx: ReturnType<TransactionBuilder["build"]>;
+    try {
+      tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(new Contract(contractId).call(method, ...args))
+        .setTimeout(30)
+        .build();
+    } catch (err: any) {
+      return txFailure(
+        "",
+        `Failed to build the transaction for ${ctx}: ${err?.message ?? "unknown"}.`,
+        "invalid_argument",
+      );
+    }
 
     // Simulate first to get footprint + fee
     let simResult: Awaited<ReturnType<typeof this.rpc.simulateTransaction>>;
@@ -364,8 +635,18 @@ export class CircleUpClient {
       );
     }
 
-    const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
-    preparedTx.sign(sourceKeypair);
+    let preparedTx: ReturnType<TransactionBuilder["build"]>;
+    try {
+      preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+      preparedTx.sign(sourceKeypair);
+    } catch (err: any) {
+      return txFailure(
+        "",
+        `Failed to assemble or sign ${ctx}: ${err?.message ?? "unknown"}. ` +
+          `The simulation response may be incomplete, or the signing key may not match the source account.`,
+        "unknown",
+      );
+    }
 
     let sendResult: Awaited<ReturnType<typeof this.rpc.sendTransaction>>;
     try {
@@ -400,6 +681,23 @@ export class CircleUpClient {
       );
     }
 
+    if (sendResult.status === "TRY_AGAIN_LATER") {
+      // The RPC is congested and has *not* queued the transaction. Polling for
+      // a hash the network never accepted would burn the whole timeout budget
+      // and then report a misleading "timeout", so return immediately with the
+      // code that tells the caller to resubmit.
+      return txFailure(
+        sendResult.hash,
+        `The RPC asked us to try ${ctx} again later — it is congested and did not ` +
+          `queue the transaction. Wait a few seconds and resubmit.`,
+        "try_again_later",
+      );
+    }
+
+    // Remaining statuses are PENDING and DUPLICATE. DUPLICATE means this exact
+    // transaction is already in flight from an earlier submission, so the
+    // confirmation poll below is the correct next step for both.
+
     // Poll for confirmation with exponential backoff + full jitter
     const hash = sendResult.hash;
     const { timeoutMs, initialIntervalMs, maxIntervalMs, backoffFactor, maxConsecutiveErrors } =
@@ -407,6 +705,11 @@ export class CircleUpClient {
     const start = Date.now();
     let consecutiveErrors = 0;
     let currentInterval = initialIntervalMs;
+    // Highest ledger the RPC has reported so far. A healthy endpoint advances
+    // this every few seconds; one that does not is stale and will never
+    // observe our transaction.
+    let lastLedger: number | undefined = readLatestLedger(sendResult);
+    let unchangedLedgerPolls = 0;
 
     while (Date.now() - start < timeoutMs) {
       // Wait the current backoff interval before polling.
@@ -438,7 +741,7 @@ export class CircleUpClient {
       }
 
       if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-        return txSuccess(hash, status.ledger);
+        return txSuccess(hash, status.ledger, decodeReturnValue(status));
       }
       if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
         // Extract the result code from the transaction result XDR when
@@ -460,7 +763,31 @@ export class CircleUpClient {
         );
       }
 
-      // NOT_FOUND / still PENDING — advance the backoff interval for next poll
+      // NOT_FOUND — the transaction has not been included yet. Before waiting
+      // again, check that the RPC itself is still making progress: a stuck
+      // endpoint reports NOT_FOUND forever and is indistinguishable from a
+      // slow ledger unless the reported ledger height is compared across polls.
+      const latestLedger = readLatestLedger(status);
+      if (latestLedger !== undefined) {
+        if (latestLedger === lastLedger) {
+          unchangedLedgerPolls++;
+          if (unchangedLedgerPolls >= STALE_LEDGER_POLLS) {
+            return txFailure(
+              hash,
+              `The RPC at ${this.config.rpcUrl} has not advanced past ledger ${latestLedger} ` +
+                `across ${STALE_LEDGER_POLLS} consecutive polls while ${ctx} (tx: ${hash}) was pending. ` +
+                `Its view of the chain is stale, so this transaction cannot be confirmed here — ` +
+                `check the hash against another RPC or Stellar Expert before resubmitting.`,
+              "stale_rpc",
+            );
+          }
+        } else {
+          lastLedger = latestLedger;
+          unchangedLedgerPolls = 0;
+        }
+      }
+
+      // Advance the backoff interval for the next poll.
       currentInterval = Math.min(maxIntervalMs, currentInterval * backoffFactor);
     }
 
@@ -473,30 +800,75 @@ export class CircleUpClient {
     );
   }
 
+  /**
+   * Encode a call's arguments and run them through {@link buildAndSend}.
+   *
+   * The `scAddress` / `scU32` / `scI128` helpers throw on malformed input,
+   * which is the right behaviour for a standalone encoder but would break the
+   * promise that a mutation method always resolves to a `TxResult`. Routing
+   * every mutation through here converts an encoding error into the same
+   * typed failure shape as any other problem, with `errorCode:
+   * "invalid_argument"`.
+   *
+   * @param encodeArgs Builds the `ScVal` argument list; may throw.
+   */
+  protected async encodeAndSend(
+    sourceKeypair: Keypair,
+    contractId: string,
+    method: string,
+    encodeArgs: () => xdr.ScVal[],
+  ): Promise<TxResult> {
+    let args: xdr.ScVal[];
+    try {
+      args = encodeArgs();
+    } catch (err: any) {
+      return txFailure(
+        "",
+        `Invalid arguments for ${contractId}.${method}: ${err?.message ?? "unknown"}`,
+        "invalid_argument",
+      );
+    }
+    return this.buildAndSend(sourceKeypair, contractId, method, args);
+  }
+
+  /**
+   * The canonical read path: validate → build an unsigned transaction →
+   * simulate → decode the return value.
+   *
+   * Never throws — every failure is returned as a {@link SimulateFailure} whose
+   * `error` string has already been through {@link extractSimulationError}, so
+   * a contract panic reads the same here as it does on the write path.
+   */
   protected async simulateAndRead(
     contractId: string,
     method: string,
     args: xdr.ScVal[],
   ): Promise<SimulateResult> {
-    const dummyKeypair = Keypair.random();
-    const account = await this.rpc
-      .getAccount(dummyKeypair.publicKey())
-      .catch(() => {
-        return {
-          id: dummyKeypair.publicKey(),
-          sequence: "0",
-          incrementSequenceNumber: () => {},
-        } as any;
-      });
+    const invalid = validateInvocation(contractId, method, args);
+    if (invalid) {
+      return { ok: false, error: `Invalid call: ${invalid}` };
+    }
 
-    const contract = new Contract(contractId);
-    const tx = new TransactionBuilder(account, {
-      fee: BASE_FEE,
-      networkPassphrase: this.config.networkPassphrase,
-    })
-      .addOperation(contract.call(method, ...args))
-      .setTimeout(30)
-      .build();
+    // A read-only simulation is never signed or submitted, so the source
+    // account only has to be syntactically valid — it does not need to exist
+    // on the network, and asking the RPC about it would add a round-trip that
+    // always 404s for a throwaway key.
+    let tx: ReturnType<TransactionBuilder["build"]>;
+    try {
+      const source = new Account(SIMULATION_SOURCE_ACCOUNT, "0");
+      tx = new TransactionBuilder(source, {
+        fee: BASE_FEE,
+        networkPassphrase: this.config.networkPassphrase,
+      })
+        .addOperation(new Contract(contractId).call(method, ...args))
+        .setTimeout(30)
+        .build();
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: `Failed to build the simulation transaction: ${err?.message ?? "unknown"}`,
+      };
+    }
 
     let simResult: Awaited<ReturnType<typeof this.rpc.simulateTransaction>>;
     try {
@@ -509,14 +881,26 @@ export class CircleUpClient {
     }
 
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      return { ok: false, error: simResult.error };
+      return { ok: false, error: extractSimulationError(simResult.error) };
     }
 
     if (!("result" in simResult) || !simResult.result) {
-      return { ok: false, error: "no result from simulation" };
+      return {
+        ok: false,
+        error:
+          "the simulation returned no value. This method may not be a view function, " +
+          "or the RPC response was truncated.",
+      };
     }
 
-    return { ok: true, value: scValToNative(simResult.result.retval) };
+    try {
+      return { ok: true, value: scValToNative(simResult.result.retval) };
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: `Failed to decode the contract return value: ${err?.message ?? "unknown"}`,
+      };
+    }
   }
 
   /**
@@ -527,19 +911,25 @@ export class CircleUpClient {
    * Keeping the throw here (rather than in each call-site) means the error
    * message always includes the contract address and method name for easier
    * debugging.
+   *
+   * The return type is `unknown` on purpose: the decoded value comes straight
+   * off the wire and has not been checked against anything. Call-sites narrow
+   * it with `mapRawConfig`, `mapRawRoundState`, or one of the `decode*`
+   * helpers, so a contract whose return shape has drifted produces a named
+   * field error instead of an `undefined` that only fails three layers later.
    */
-  protected async simulateAndReadOrThrow<T>(
+  protected async simulateAndReadOrThrow(
     contractId: string,
     method: string,
     args: xdr.ScVal[],
-  ): Promise<T> {
+  ): Promise<unknown> {
     const result = await this.simulateAndRead(contractId, method, args);
     if (!result.ok) {
       throw new Error(
         `Contract call ${contractId}.${method} failed: ${result.error}`,
       );
     }
-    return result.value as T;
+    return result.value;
   }
 }
 
@@ -550,64 +940,59 @@ export class FactoryClient extends CircleUpClient {
     return this.config.contracts.circleFactory;
   }
 
-  /** Create a new circle. Returns the new circle's contract address. */
+  /**
+   * Create a new circle.
+   *
+   * `circleAddress` is read from the transaction's own return value, so it
+   * identifies the circle *this* call created. It is `undefined` when the
+   * transaction failed or when the confirming RPC response carried no readable
+   * address — never a guess based on the registry, which would name another
+   * caller's circle whenever two creations land in the same ledger.
+   *
+   * Never throws: a malformed member list or round amount comes back as
+   * `result.errorCode === "invalid_argument"`, like every other failure.
+   */
   async createCircle(params: {
     creator: Keypair;
     members: string[];
     roundAmountStroops: bigint;
     roundDeadlineLedgers: number;
   }): Promise<{ result: TxResult; circleAddress?: string }> {
-    const membersVal = scAddressVec(params.members);
-
-    const result = await this.buildAndSend(
+    const result = await this.encodeAndSend(
       params.creator,
       this.contractId,
       "create_circle",
-      [
+      () => [
         scAddress(params.creator.publicKey()),
-        membersVal,
+        scAddressVec(params.members),
         scI128(params.roundAmountStroops),
         scU32(params.roundDeadlineLedgers),
       ],
     );
 
-    if (!result.success) {
+    if (!result.success || !isValidStellarAddress(result.returnValue)) {
       return { result };
     }
 
-    // The factory `create_circle` entry-point returns the new circle's Address.
-    // Read it back via simulation so callers don't have to query get_circles()
-    // and guess which address is new.
-    let circleAddress: string | undefined;
-    try {
-      const circles = await this.getCircles();
-      // The last entry in the registry is always the one we just created
-      // because the factory appends and never reorders.
-      if (circles.length > 0) {
-        circleAddress = circles[circles.length - 1];
-      }
-    } catch {
-      // Non-fatal: the transaction succeeded; we just can't resolve the address
-      // right now.  Callers can fall back to getCircles() themselves.
-    }
-
-    return { result, circleAddress };
+    return { result, circleAddress: result.returnValue };
   }
 
   async getCircles(): Promise<string[]> {
-    return this.simulateAndReadOrThrow<string[]>(
+    const raw = await this.simulateAndReadOrThrow(
       this.contractId,
       "get_circles",
       [],
     );
+    return decodeAddressList(raw, "getCircles");
   }
 
   async getCircleCount(): Promise<number> {
-    return this.simulateAndReadOrThrow<number>(
+    const raw = await this.simulateAndReadOrThrow(
       this.contractId,
       "get_circle_count",
       [],
     );
+    return decodeU32(raw, "getCircleCount");
   }
 }
 
@@ -695,22 +1080,22 @@ export class CircleClient extends CircleUpClient {
   // ── Mutations ────────────────────────────────────────────────────────────────
 
   async join(member: Keypair): Promise<TxResult> {
-    const result = await this.buildAndSend(
+    const result = await this.encodeAndSend(
       member,
       this.circleAddress,
       "join",
-      [scAddress(member.publicKey())],
+      () => [scAddress(member.publicKey())],
     );
     if (result.success) this.invalidateCache();
     return result;
   }
 
   async contribute(member: Keypair): Promise<TxResult> {
-    const result = await this.buildAndSend(
+    const result = await this.encodeAndSend(
       member,
       this.circleAddress,
       "contribute",
-      [scAddress(member.publicKey())],
+      () => [scAddress(member.publicKey())],
     );
     if (result.success) this.invalidateCache();
     return result;
@@ -723,20 +1108,23 @@ export class CircleClient extends CircleUpClient {
   }
 
   async markDefault(caller: Keypair, member: string): Promise<TxResult> {
-    const result = await this.buildAndSend(
+    const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
       "mark_default",
-      [scAddress(member)],
+      () => [scAddress(member)],
     );
     if (result.success) this.invalidateCache();
     return result;
   }
 
   async close(caller: Keypair): Promise<TxResult> {
-    const result = await this.buildAndSend(caller, this.circleAddress, "close", [
-      scAddress(caller.publicKey()),
-    ]);
+    const result = await this.encodeAndSend(
+      caller,
+      this.circleAddress,
+      "close",
+      () => [scAddress(caller.publicKey())],
+    );
     if (result.success) this.invalidateCache();
     return result;
   }
@@ -751,7 +1139,7 @@ export class CircleClient extends CircleUpClient {
    * of throwing, use {@link getConfigResult}.
    */
   async getConfig(): Promise<CircleConfig> {
-    const raw = await this.simulateAndReadOrThrow<RawCircleConfig>(
+    const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "get_config",
       [],
@@ -793,7 +1181,7 @@ export class CircleClient extends CircleUpClient {
    * For a non-throwing alternative use {@link getStatusResult}.
    */
   async getStatus(): Promise<CircleStatus> {
-    const raw = await this.simulateAndReadOrThrow<string>(
+    const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "get_status",
       [],
@@ -830,7 +1218,7 @@ export class CircleClient extends CircleUpClient {
    * **Throws** on simulation failure or when the circle is not Active/Pending.
    */
   async getCurrentRound(): Promise<RoundState> {
-    const raw = await this.simulateAndReadOrThrow<RawRoundState>(
+    const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "get_current_round",
       [],
@@ -865,19 +1253,21 @@ export class CircleClient extends CircleUpClient {
   }
 
   async getCollateral(member: string): Promise<bigint> {
-    return this.simulateAndReadOrThrow<bigint>(
+    const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "get_collateral",
       [scAddress(member)],
     );
+    return decodeBigInt(raw, "getCollateral");
   }
 
   async getDefaults(member: string): Promise<number> {
-    return this.simulateAndReadOrThrow<number>(
+    const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "get_defaults",
       [scAddress(member)],
     );
+    return decodeU32(raw, "getDefaults");
   }
 
   /**
@@ -896,7 +1286,7 @@ export class CircleClient extends CircleUpClient {
    * @param roundIndex Zero-based round index to query.
    */
   async hasContributed(member: string, roundIndex: number): Promise<boolean> {
-    return this.simulateAndReadOrThrow<boolean>(
+    const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "has_contributed",
       [
@@ -904,6 +1294,7 @@ export class CircleClient extends CircleUpClient {
         scU32(roundIndex),
       ],
     );
+    return decodeBoolean(raw, "hasContributed");
   }
 
   /**
@@ -1125,11 +1516,12 @@ export class ReputationClient extends CircleUpClient {
   }
 
   async getScore(member: string): Promise<number> {
-    return this.simulateAndReadOrThrow<number>(
+    const raw = await this.simulateAndReadOrThrow(
       this.contractId,
       "score",
       [scAddress(member)],
     );
+    return decodeU32(raw, "getScore");
   }
 }
 
