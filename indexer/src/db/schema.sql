@@ -84,6 +84,15 @@ CREATE TABLE IF NOT EXISTS indexer_state (
 INSERT INTO indexer_state (id, last_ledger) VALUES (1, 0)
 ON CONFLICT (id) DO NOTHING;
 
+-- Per-ledger checkpoint written atomically with each ledger's event batch.
+-- Enables crash recovery at ledger boundaries and gap/stall visibility.
+CREATE TABLE IF NOT EXISTS ledger_checkpoints (
+    ledger          BIGINT PRIMARY KEY,
+    events_count    INTEGER NOT NULL DEFAULT 0,
+    failed_count    INTEGER NOT NULL DEFAULT 0,
+    processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- Tracks which files under src/db/migrations/ have been applied, so
 -- migrate.ts can report schema version/status and skip re-applying files.
 -- Defined here (rather than only in migrate.ts) so the schema's version
@@ -102,6 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_defaults_member ON defaults(member_address);
 -- Supports the GROUP BY event_type aggregate used by the indexer state audit
 -- query (GET /indexer/state in api.ts).
 CREATE INDEX IF NOT EXISTS idx_ingested_events_event_type ON ingested_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_ledger_checkpoints_ledger ON ledger_checkpoints(ledger DESC);
 
 -- circles.created_ledger: GET /circles orders the full circle list by this
 -- column (see api.ts). circle_members(circle_address, payout_order) and
