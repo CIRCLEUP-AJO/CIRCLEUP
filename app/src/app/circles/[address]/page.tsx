@@ -109,9 +109,9 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
   try {
     roundsData = roundsRes.ok
       ? ((await roundsRes.json()) as Record<string, unknown>)
-      : { rounds: [], pendingDefaults: [], currentRound: null };
+      : { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
   } catch {
-    roundsData = { rounds: [], pendingDefaults: [], currentRound: null };
+    roundsData = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
   }
 
   // Validate the shape we depend on to avoid runtime errors in the render tree
@@ -136,6 +136,12 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
       members,
       rounds: Array.isArray(roundsData.rounds)
         ? (roundsData.rounds as CircleRound[])
+        : [],
+      // openRounds: unpaid rounds with activity that are not the current round.
+      // Previously invisible to the client because the old /rounds endpoint
+      // only iterated payouts (issue #170).
+      openRounds: Array.isArray(roundsData.openRounds)
+        ? (roundsData.openRounds as CircleRound[])
         : [],
       pendingDefaults: Array.isArray(roundsData.pendingDefaults)
         ? (roundsData.pendingDefaults as CirclePendingDefault[])
