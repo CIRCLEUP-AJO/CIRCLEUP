@@ -46,9 +46,20 @@ export interface DefaultRecord {
 /** @see ApiRoundRow in sdk/src/types.ts */
 export interface CircleRound {
   roundIndex: number;
-  recipient: string;
-  amount: string;
-  txHash: string;
+  /**
+   * "completed" — payout row exists for this round.
+   * "current"   — the active in-progress round (no payout yet).
+   * "cancelled" — the current round of a Cancelled circle.
+   * "open"      — unpaid round with activity that is not the current round
+   *               (reorg / partial-ingest edge case; was previously invisible).
+   */
+  status: "completed" | "current" | "cancelled" | "open";
+  /** null when the round has not been paid out yet. */
+  recipient: string | null;
+  /** null when the round has not been paid out yet. */
+  amount: string | null;
+  /** null when the round has not been paid out yet. */
+  txHash: string | null;
   contributions: ContributionRecord[];
   defaults: DefaultRecord[];
 }
@@ -77,7 +88,17 @@ export interface CircleState {
 export interface CircleDetailData {
   circle: CircleState;
   members: CircleMember[];
+  /**
+   * Completed rounds only (status === "completed"), sorted by roundIndex.
+   * Returned by the indexer's /rounds endpoint as the `rounds` field.
+   */
   rounds: CircleRound[];
+  /**
+   * Unpaid rounds that have contributions and/or defaults recorded but are
+   * not the circle's current round — previously dropped silently (issue #170).
+   * Returned by the indexer's /rounds endpoint as the `openRounds` field.
+   */
+  openRounds: CircleRound[];
   pendingDefaults: CirclePendingDefault[];
   /** Latest ledger the indexer has processed (used for countdown math) */
   latestLedger?: number | null;
@@ -735,7 +756,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             const isPaid = i < currentRound;
             const isNext =
               i === currentRound && data.circle.status === "Active";
-            const roundForMember = data.rounds.find((r) => r.roundIndex === i);
+            const roundForMember = data.rounds.find(
+              (r) => r.roundIndex === i && r.status === "completed",
+            );
 
             // Contribution status for the current active round
             const contribStatus = getMemberContributionStatus(
@@ -813,47 +836,35 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )}
       </div>
 
-      {/* Round history */}
+      {/* Round history — completed rounds only (have a payout). */}
       {data.rounds.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 p-5">
           <h2 className="font-semibold text-slate-800 mb-4">📋 Round History</h2>
           <div className="space-y-4">
             {data.rounds.map((round) => (
-              <div
-                key={round.roundIndex}
-                className="border border-slate-100 rounded-lg p-4"
-              >
-                <div className="flex items-center justify-between mb-2">
-                  <h3 className="font-medium text-slate-800">
-                    Round {round.roundIndex}
-                  </h3>
-                  <a
-                    href={`https://stellar.expert/explorer/testnet/tx/${round.txHash}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-brand-600 hover:underline font-mono"
-                    title={round.txHash}
-                  >
-                    {shortAddress(round.txHash)}
-                  </a>
-                </div>
-                <p className="text-sm text-slate-600">
-                  🎯 ${formatUsdc(round.amount)} paid to{" "}
-                  <span className="font-mono">
-                    {shortAddress(round.recipient)}
-                  </span>
-                </p>
-                <p className="text-xs text-slate-400 mt-1">
-                  {round.contributions.length} contribution
-                  {round.contributions.length !== 1 ? "s" : ""}
-                  {round.defaults.length > 0 && (
-                    <span className="text-red-500 ml-2">
-                      · {round.defaults.length} default
-                      {round.defaults.length > 1 ? "s" : ""}
-                    </span>
-                  )}
-                </p>
-              </div>
+              <RoundCard key={round.roundIndex} round={round} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Open rounds — rounds with recorded activity (contributions / defaults)
+          but no payout yet and not the circle's current round.
+          These were previously silently dropped (issue #170). */}
+      {data.openRounds.length > 0 && (
+        <div className="bg-amber-50 border border-amber-200 rounded-xl p-5">
+          <h2 className="font-semibold text-amber-800 mb-1">
+            ⏳ Open Rounds
+          </h2>
+          <p className="text-xs text-amber-700 mb-3">
+            These rounds have recorded contributions or defaults but have not
+            been paid out yet and are not the current round. They may be the
+            result of a partial ingest or a reorg; they will move to Round
+            History once a payout is confirmed on-chain.
+          </p>
+          <div className="space-y-3">
+            {data.openRounds.map((round) => (
+              <RoundCard key={round.roundIndex} round={round} />
             ))}
           </div>
         </div>
@@ -897,6 +908,92 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           placeholder="Loading invite link…"
         />
       </div>
+    </div>
+  );
+}
+
+// ─── RoundCard ────────────────────────────────────────────────────────────────
+//
+// Renders a single round row in both the "Round History" (completed) and
+// "Open Rounds" (unpaid-with-activity) sections.  All payout fields are
+// nullable — this component guards every access so the page never crashes on
+// an in-progress or open round.
+
+interface RoundCardProps {
+  round: CircleRound;
+}
+
+function RoundCard({ round }: RoundCardProps) {
+  const statusLabel: Record<CircleRound["status"], string> = {
+    completed: "",
+    current:   "in progress",
+    cancelled: "cancelled",
+    open:      "open",
+  };
+
+  const statusColor: Record<CircleRound["status"], string> = {
+    completed: "",
+    current:   "text-amber-700 bg-amber-50 border-amber-200",
+    cancelled: "text-slate-600 bg-slate-100 border-slate-300",
+    open:      "text-amber-700 bg-amber-50 border-amber-200",
+  };
+
+  return (
+    <div className="border border-slate-100 rounded-lg p-4">
+      {/* Header row: round number + status badge (left) / tx link (right) */}
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <h3 className="font-medium text-slate-800">
+            Round {round.roundIndex}
+          </h3>
+          {round.status !== "completed" && (
+            <span
+              className={`text-xs font-medium border rounded-full px-2 py-0.5 ${statusColor[round.status]}`}
+            >
+              {statusLabel[round.status]}
+            </span>
+          )}
+        </div>
+
+        {round.txHash ? (
+          <a
+            href={`https://stellar.expert/explorer/testnet/tx/${round.txHash}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-brand-600 hover:underline font-mono"
+            title={round.txHash}
+          >
+            {shortAddress(round.txHash)}
+          </a>
+        ) : (
+          <span className="text-xs text-slate-400 italic">awaiting payout</span>
+        )}
+      </div>
+
+      {/* Payout summary — only shown when a payout exists */}
+      {round.status === "completed" &&
+        round.amount != null &&
+        round.recipient != null ? (
+        <p className="text-sm text-slate-600">
+          <span aria-hidden="true">🎯 </span>
+          ${formatUsdc(round.amount)} paid to{" "}
+          <span className="font-mono">{shortAddress(round.recipient)}</span>
+        </p>
+      ) : (
+        <p className="text-sm text-slate-500 italic">Payout not yet triggered</p>
+      )}
+
+      {/* Contribution / default counts */}
+      <p className="text-xs text-slate-400 mt-1">
+        {round.contributions.length} contribution
+        {round.contributions.length !== 1 ? "s" : ""}
+        {round.defaults.length > 0 && (
+          <span className="text-red-500 ml-2">
+            · {round.defaults.length} default
+            {round.defaults.length > 1 ? "s" : ""}
+          </span>
+        )}
+      </p>
     </div>
   );
 }

@@ -18,6 +18,8 @@ import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
 import { rpc, USDC } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
+import { runAllHealthChecks } from "./health";
+import type { MigrationHealth } from "./db/migrate";
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
@@ -107,8 +109,7 @@ const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const
 type CircleStatus = (typeof CIRCLE_STATUSES)[number];
 
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
-
-// ── Query-param parsing helpers ───────────────────────────────────────────────
+void HEALTH_CHECK_TIMEOUT_MS; // retained for reference; checks now live in health.ts
 
 type ParseResult<T> = T | { error: string };
 
@@ -300,7 +301,7 @@ function nonBlankParam(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
-export function createApp() {
+export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
   app.use(cors(buildCorsOptions()));
   app.use(apiRateLimiter);
@@ -320,24 +321,26 @@ export function createApp() {
   );
 
   // ── Health ───────────────────────────────────────────────────────────────────
+  //
+  // Runs all operational health checks in parallel:
+  //   • Postgres connectivity
+  //   • Soroban RPC connectivity
+  //   • Indexer ledger lag (DB last_ledger vs RPC latest_ledger)
+  //   • Schema migration health (surfaced from startup check or live query)
+  //   • Contract state drift (DB current_round vs on-chain value for a sampled
+  //     Active circle — skipped when RPC is unavailable)
+  //
+  // Returns HTTP 200 when all checks pass, 503 when any component is degraded
+  // or errored, so load-balancers and uptime monitors can act on the status
+  // code without parsing the body.
 
   app.get("/health", async (_req: Request, res: Response) => {
-    const [db, rpcHealth] = await Promise.all([
-      checkComponentHealth(() => query("SELECT 1")),
-      checkComponentHealth(() => rpc.getLatestLedger()),
-    ]);
-
-    const healthy = db.status === "ok" && rpcHealth.status === "ok";
-    res.status(healthy ? 200 : 503).json({
-      status: healthy ? "ok" : "degraded",
-      timestamp: new Date().toISOString(),
-      db,
-      rpc: rpcHealth,
-      // Surfaces the configured USDC token address so operators can confirm
-      // the indexer and app (NEXT_PUBLIC_USDC_ADDRESS) are tracking the same
-      // token without cross-referencing separate .env files.
-      config: { usdcAddress: USDC },
+    const report = await runAllHealthChecks({
+      rpc,
+      usdcAddress: USDC,
+      cachedMigrationHealth: options.cachedMigrationHealth ?? null,
     });
+    res.status(report.status === "ok" ? 200 : 503).json(report);
   });
 
   // ── Circles ──────────────────────────────────────────────────────────────────
