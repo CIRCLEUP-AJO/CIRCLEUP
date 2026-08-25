@@ -14,7 +14,8 @@
     "replay": "ts-node src/db/replay.ts",
     "replay:dry-run": "ts-node src/db/replay.ts --dry-run --from=0",
     "explain": "ts-node src/db/explain.ts",
-    "test": "node --require ts-node/register --test src/indexer.test.ts src/api.test.ts src/config.test.ts src/db/migrate.test.ts src/db/pool.test.ts src/db/replay.test.ts src/groupRounds.test.ts src/health.test.ts"
+    "test": "node --require ts-node/register --test src/indexer.test.ts src/api.test.ts src/config.test.ts src/db/migrate.test.ts src/db/pool.test.ts src/db/replay.test.ts src/groupRounds.test.ts src/health.test.ts src/fixtures/incident.test.ts",
+    "test:incidents": "node --require ts-node/register --test src/fixtures/incident.test.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^12.3.0",
