@@ -52,6 +52,19 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Round Lifecycle](#round-lifecycle)
   - [Reputation Authorization Flow](#reputation-authorization-flow)
 - [Security Notes](#security-notes)
+- [Incident Fixtures and Offline Reproduction](#incident-fixtures-and-offline-reproduction)
+  - [Fixture Overview](#fixture-overview)
+  - [Running the Incident Tests](#running-the-incident-tests)
+  - [StaleIndexerData fixture](#staleindexerdata-fixture)
+  - [DuplicateEvents fixture](#duplicateevents-fixture)
+  - [WalletRejection fixture](#walletrejection-fixture)
+  - [RpcTimeout fixture](#rpctimeout-fixture)
+  - [SchemaDrift fixture](#schemadrift-fixture)
+- [Mutation Testing and Guard Verification](#mutation-testing-and-guard-verification)
+  - [Why Mutation Testing](#why-mutation-testing)
+  - [Contract Mutation Guards (Rust)](#contract-mutation-guards-rust)
+  - [App Gating Mutation Tests (TypeScript)](#app-gating-mutation-tests-typescript)
+  - [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations)
 - [Development Best Practices](#development-best-practices)
 
 ---
@@ -817,6 +830,227 @@ A revoked circle can never call `increment` again, even if the factory re-deploy
 
 ---
 
+## Incident Fixtures and Offline Reproduction
+
+The fixtures in `indexer/src/fixtures/incident-fixtures.ts` encode sanitized, deterministic state snapshots for each likely incident class.  They contain no real private keys, no production transaction hashes, and no live RPC responses.  Every address is a synthetic all-zero strkey; every ledger number is chosen so relative ordering is obvious at a glance.
+
+Use the fixtures to reproduce an incident class locally without needing a live network, a funded wallet, or a running Postgres instance.
+
+### Fixture Overview
+
+| Fixture namespace | Incident class | Runbook section |
+|---|---|---|
+| `StaleIndexerData` | Indexer cursor freezes; DB status/round lag behind chain | [Circle list is empty but circles exist on-chain](#circle-list-is-empty-but-circles-exist-on-chain) |
+| `DuplicateEvents` | Same Soroban event delivered twice; dedup guard verified | [Circle list is empty but circles exist on-chain](#circle-list-is-empty-but-circles-exist-on-chain) |
+| `WalletRejection` | Freighter not installed / permission denied / unknown error | [Freighter not detected](#freighter-not-detected) · [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed) |
+| `RpcTimeout` | simulate / send / poll timeout; health endpoint 503 | [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed) · [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner) |
+| `SchemaDrift` | Migration file renamed after apply; ghost entry in `schema_migrations` | [Indexer boot: "SCHEMA WARNING"](#indexer-boot-schema-warning) |
+
+### Running the Incident Tests
+
+```bash
+# Run all incident reproduction tests (offline — no DB or RPC required):
+npm run test:incidents --workspace=indexer
+
+# Run the full indexer test suite (includes incidents + integration tests):
+npm test --workspace=indexer
+```
+
+The `test:incidents` script targets only `src/fixtures/incident.test.ts` so it passes in any offline environment — CI runners without Postgres, developer laptops without a running indexer, or during an active incident when the network is degraded.
+
+### StaleIndexerData fixture
+
+**File:** `indexer/src/fixtures/incident-fixtures.ts` — `StaleIndexerData` namespace
+
+**Encodes:**
+- `seedIndexerState()` — indexer `last_ledger = 1_220_000` while chain tip is `1_280_000` (60 000 ledger lag ≈ 83 hours)
+- `seedCircle()` — circle row frozen at `status = "Active"`, `current_round = 0` while on-chain the circle is `Completed`
+- `seedOnChainState()` — the actual on-chain truth for cross-checking lag
+
+**Reproduction steps:**
+1. Insert `seedIndexerState()` into `indexer_state` and `seedCircle()` into `circles`.
+2. Query `GET /circles/:address` — response shows stale `status` and `current_round`.
+3. Query `GET /indexer/state` — `lastLedger` is behind by `lagLedgers`.
+4. Compare against `seedOnChainState()` to verify the delta matches `expectedBehaviour.lagLedgers`.
+
+**Resolution:** set `START_LEDGER` to `LEDGER.STALE` and replay: `npm run replay -- --from=1220000`
+
+### DuplicateEvents fixture
+
+**File:** `indexer/src/fixtures/incident-fixtures.ts` — `DuplicateEvents` namespace
+
+**Encodes:**
+- `seedIngestedEvent()` / `seedDuplicateIngestedEvent()` — two rows with the same `event_key` (`tx_hash:event_index`)
+- `seedContribution()` / `seedPayout()` — the corresponding derived rows
+
+**Reproduction steps:**
+1. Insert `seedIngestedEvent()` into `ingested_events` — succeeds.
+2. Attempt to insert `seedDuplicateIngestedEvent()` — `event_key` PRIMARY KEY conflict rejects it.
+3. Confirm `ingested_events` contains exactly one row for this event (`expectedBehaviour.ingestedEventsRows = 1`).
+4. Confirm the `contributions` and `payouts` tables each contain exactly one row per UNIQUE constraint.
+
+**What to check if duplicate rows appear:** the dedup `INSERT … ON CONFLICT DO NOTHING` in `indexer.ts` was bypassed (e.g. a direct SQL insert during a failed replay).  Re-run `npm run replay -- --from=<ledger>` to reconcile.
+
+### WalletRejection fixture
+
+**File:** `indexer/src/fixtures/incident-fixtures.ts` — `WalletRejection` namespace
+
+**Encodes three sub-cases:**
+
+| Sub-case | Trigger | Expected `invokeContract` result |
+|---|---|---|
+| `notInstalled` | `isFreighterInstalled()` returns `false` | `{ success: false, txHash: "", error: "Freighter wallet extension is not installed." }` |
+| `permissionDenied` | User dismisses the Freighter prompt | `{ success: false, txHash: "", error: "You cancelled the transaction in Freighter. No funds were moved." }` |
+| `unknownError` | Extension throws `"Extension context invalidated."` | `{ success: false, txHash: "", error: "Extension context invalidated." }` |
+
+**Reproduction steps:**
+1. In a browser test environment, mock `isFreighterInstalled` to return `false` and call `connectWallet()` — should throw `WalletError` with `reason = "not_installed"`.
+2. Mock `signTransaction` to throw one of `permissionDenied.rawErrorVariants` — `invokeContract` must return `expectedResult`.
+3. Mock `signTransaction` to throw `unknownError.rawError` — formatted error must equal `unknownError.expectedResult.error`.
+
+**Runbook resolution:** see [Freighter not detected](#freighter-not-detected) for install and permission steps.
+
+### RpcTimeout fixture
+
+**File:** `indexer/src/fixtures/incident-fixtures.ts` — `RpcTimeout` namespace
+
+**Encodes four sub-cases:**
+
+| Sub-case | Phase | Expected result |
+|---|---|---|
+| `simulateTimeout` | `simulateTransaction` throws `"Request timeout"` | `success: false`, network error message |
+| `sendTimeout` | `sendTransaction` throws `"Failed to fetch"` | `success: false`, network error message |
+| `pollExhausted` | 30 polls all return `NOT_FOUND` | `success: false`, `txHash` preserved, timeout message |
+| `healthCheckTimeout` | DB + RPC both exceed 5 000 ms | HTTP 503, `status: "degraded"` |
+
+**Reproduction steps:**
+1. Inject `RpcTimeout.seedMockRpcThatTimesOut(10)` as the RPC client and call `invokeContract` — should return `success: false` within ~10 ms (not after the full 60 s poll budget).
+2. For `pollExhausted`: stub `getTransaction` to always return `{ status: "NOT_FOUND" }` — after 30 attempts `invokeContract` returns the timeout message with the `txHash` preserved.
+3. For health timeout: stub `pool.query` and RPC latency checks to resolve after 6 000 ms — `GET /health` must return 503 with `"status": "degraded"`.
+
+**Runbook resolution:** see [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner) and [Transaction fails with "USDC transfer failed"](#transaction-fails-with-usdc-transfer-failed).
+
+### SchemaDrift fixture
+
+**File:** `indexer/src/fixtures/incident-fixtures.ts` — `SchemaDrift` namespace
+
+**Encodes:**
+- `seedAppliedInDb()` — `["001_add_round_deadline_ledgers.sql"]` (original name, still in `schema_migrations`)
+- `seedFilesOnDisk()` — `["001_add_round_deadline_ledgers_renamed.sql", "002_ledger_checkpoints.sql"]` (original gone, renamed version present)
+- `seedAppliedRow()` — the `schema_migrations` row with the original filename
+
+**Reproduction steps:**
+1. Insert `seedAppliedRow()` into `schema_migrations`.
+2. Temporarily rename `indexer/src/db/migrations/001_add_round_deadline_ledgers.sql` to the `RENAMED_FILENAME`.
+3. Run `npm run migrate:check --workspace=indexer` — output must show `Health state: drifted`.
+4. Restore the original filename; re-run the check — output must show `Health state: pending` (renamed file now pending).
+
+**Runbook resolution:** see [Indexer boot: "SCHEMA WARNING"](#indexer-boot-schema-warning) for drift recovery steps.
+
+---
+
+## Mutation Testing and Guard Verification
+
+### Why Mutation Testing
+
+A test that passes when a critical guard is removed is not testing that guard — it is testing something else.  Mutation testing detects this by explicitly removing each guard and verifying that at least one test fails.
+
+CircleUp uses an **explicit guard-removal** strategy rather than a fully automated mutation framework (e.g. `cargo-mutants`):
+
+- Each critical guard has a named test that proves removal would be detected.
+- The strategy is transparent: the guard under test and the risk if removed are documented in the test file header.
+- CI budget is predictable: the tests run as part of the standard `cargo test` / `npm test` invocations without a separate mutation runner.
+
+### Contract Mutation Guards (Rust)
+
+**File:** `contracts/circle/src/mutation_guards.rs`
+
+Run with:
+
+```bash
+cd contracts && cargo test -p circle mutation_guard
+```
+
+Fifteen guards are tested across the `circle` and `reputation` contracts:
+
+| Guard | Risk if removed | Test |
+|---|---|---|
+| `already joined` (`has` check, not balance) | Double-collateral pull | `guard_join_double_collateral_pull` · `guard_join_has_check_not_balance_check` |
+| `not all members have contributed yet` | Payout before all deposits | `guard_payout_requires_full_contribution_counter` · `guard_payout_one_missing_contribution_blocks` |
+| `round contribution tally mismatch` | Forged counter bypasses payout | `guard_payout_tally_mismatch_forged_counter` · `guard_payout_forged_keys_without_counter_blocked` |
+| `round deadline not yet passed` (strict `>`) | Premature default; collateral stolen early | `guard_mark_default_deadline_strict_boundary` · `guard_mark_default_one_before_deadline_blocked` |
+| `member did contribute` | Contributor penalised despite fulfilling obligation | `guard_mark_default_contributor_cannot_be_penalised` · `guard_contribution_key_persists_after_deadline_for_guard_correctness` |
+| `already marked default this round` | Double penalty (36% instead of 20%) | `guard_mark_default_idempotency` · `guard_mark_default_single_penalty_amount_is_correct` |
+| `circle already closed` (Closed flag) | Double-release of collateral | `guard_close_double_release_prevention` · `guard_close_collateral_zeroed_before_transfer_cei` |
+| `overflows penalty calculation` | Silent i128 wrap; penalty becomes 0 | `guard_initialize_overflow_penalty_arithmetic` |
+| `overflows pot calculation` | Silent i128 wrap; recipient receives wrong amount | `guard_initialize_overflow_pot_arithmetic` |
+| `already initialized` | Member list overwrite mid-lifecycle | `guard_reinitialize_blocked` · `guard_reinitialize_blocked_with_different_params` |
+| Reputation unauthorized caller | Self-awarded reputation points | `guard_reputation_unauthorized_caller_blocked` |
+| Reputation revocation permanent | Revived circle awards points | `guard_reputation_revocation_is_permanent` |
+| `duplicate members` | One wallet gets two rotation slots | `guard_duplicate_members_rejected` |
+| Non-member cannot close | Outsider triggers collateral settlement | `guard_close_non_member_rejected` |
+| Status gate for contribute/close | Contributions/closes on wrong lifecycle phase | `guard_contribute_blocked_while_pending` · `guard_contribute_blocked_while_completed` · `guard_contribute_rejected_one_past_deadline` |
+
+Each guard test follows one of two forms:
+
+- **Form A** (`#[should_panic]`): the contract is put into the state the guard is meant to block, and the test asserts the call panics with the exact guard message. Removing the guard makes the call succeed, breaking the `#[should_panic]` assertion.
+- **Form B** (positive assertion): the test verifies the call _succeeds_ at the boundary where the guard allows it, and separately verifies the guard fires one step earlier. Weakening the boundary (e.g. changing `>` to `>=`) would break one of the two assertions.
+
+### App Gating Mutation Tests (TypeScript)
+
+**File:** `app/src/lib/gating.mutation.test.ts`
+
+Run with:
+
+```bash
+node --require ts-node/register --test app/src/lib/gating.mutation.test.ts
+```
+
+Eight guards are tested in `computeActionEligibility`:
+
+| Guard | Action | Risk if removed | Mutant proof |
+|---|---|---|---|
+| `stale_snapshot` (age ≥ maxAge) | all | Stale UI state submits on-chain write | `mutantNoStalenessCheck` allows stale snapshots |
+| `wrong_status` (Pending for join) | join | `join` on Active/Completed circle | `mutantNoStatusCheckJoin` allows join on Active |
+| `wrong_status` (Active for contribute) | contribute | `contribute` on Pending/Completed circle | `mutantNoStatusCheckContribute` allows on Pending |
+| `deadline_passed` (latestLedger > deadlineLedger) | contribute | Late contribution submitted after deadline | `mutantNoDeadlineCheckContribute` allows late contributions |
+| `already_joined` (hasLockedCollateral) | join | Double-join from browser triggers double-collateral | `mutantNoAlreadyJoinedCheck` allows when already joined |
+| `already_contributed` | contribute | Double-contribute from browser | `mutantNoAlreadyContributedCheck` allows when already contributed |
+| `round_not_complete` (contributions < memberCount) | payout | Premature payout triggered from UI | `mutantNoRoundCompleteCheckPayout` allows with partial contributions |
+| `wrong_status` (terminal for close) | close | Close on Active/Pending circle | `mutantNoStatusCheckClose` allows on Active |
+
+Each test follows the **production vs. mutant** pattern:
+1. Assert the production function **blocks** the action for the given input.
+2. Call the local mutant (guard removed) with the same input.
+3. Assert the mutant **allows** it — proving the production guard is the discriminating factor.
+
+Guard ordering invariants are also tested: `stale_snapshot` is checked before `wrong_status` which is checked before action-specific guards, for all four actions.
+
+### CI Budget and Excluded Mutations
+
+**Budget:** All mutation guard tests run as part of the existing CI commands — no separate mutation runner or additional CI step is required.
+
+```
+cargo test -p circle          # includes mutation_guards.rs — ~5 s
+npm test --workspace=indexer  # includes incident.test.ts — ~1 s (offline)
+npx tsc --noEmit              # type-checks gating.mutation.test.ts — ~3 s
+```
+
+Total added CI time: < 10 seconds.
+
+**Excluded mutations (with rationale):**
+
+| Excluded guard | Rationale |
+|---|---|
+| `MIN/MAX_ROUND_DEADLINE_LEDGERS` bounds | Removal creates an unusable circle (zero or multi-year window) but no direct financial theft path. Covered by boundary tests B3/B4 in `prop_tests.rs`. |
+| `MAX_MEMBERS` bound | Removal allows expensive initialization but no financial shortcut. Covered by boundary test B5 in `prop_tests.rs`. |
+| Status forward-only (no revert) | Tested exhaustively as invariant 4 in `prop_tests.rs` across random member counts and amounts. Duplicating it here would add CI time without new coverage. |
+| `round_deadline_ledgers` stored as u64 (not truncated) | A u32 truncation would silently set a wrong deadline but is already caught by boundary tests B6a/B6b in `prop_tests.rs`. |
+
+Any future change to a guard listed in either test file requires updating the corresponding mutation test or explicitly documenting why the guard is excluded. Guards not in the mutation test catalogue are considered lower-risk or already covered by property-based tests.
+
+---
+
 ## Development Best Practices
 
 **Contract changes**
@@ -837,9 +1071,12 @@ A revoked circle can never call `increment` again, even if the factory re-deploy
 - The `app/src/lib/gating.ts` action-eligibility logic is the single source of truth for which wallet actions are allowed given the current circle state. Update it — not ad-hoc UI conditions — when adding new state transitions.
 
 **Testing**
-- Rust: `cd contracts && cargo test` runs all unit and property-based tests.
-- TypeScript: `npm test --workspace=indexer` runs all indexer unit and integration tests.
+- Rust: `cd contracts && cargo test` runs all unit, property-based, and mutation guard tests.
+- TypeScript: `npm test --workspace=indexer` runs all indexer unit, integration, and incident reproduction tests.
+- App gating mutation tests: `node --require ts-node/register --test app/src/lib/gating.mutation.test.ts`
+- Incident reproduction (offline): `npm run test:incidents --workspace=indexer`
 - Integration tests gated on `DATABASE_URL` are skipped automatically in CI environments without Postgres — run them locally before landing schema changes.
+- When modifying a financial guard in `contracts/circle/src/lib.rs` or `app/src/lib/gating.ts`, update the corresponding mutation guard test in `mutation_guards.rs` or `gating.mutation.test.ts`. If the guard is intentionally excluded from mutation testing, add a rationale to the [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations) table.
 
 **Branching and commits**
 - Follow [Conventional Commits](https://www.conventionalcommits.org/): `feat(scope): description`, `fix(scope): description`, etc.
