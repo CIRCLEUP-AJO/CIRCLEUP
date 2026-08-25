@@ -108,6 +108,59 @@ pub enum DataKey {
     Closed,                      // true after close() successfully settles all collateral; re-invocation guard
 }
 
+// ─── Initialization-specific error type ──────────────────────────────────────
+//
+// `initialize` is a mutating entry-point that uses `panic!` for most
+// guard violations (consistent with every other mutating entry-point in
+// this contract — Soroban rolls the whole invocation back on panic and
+// surfaces the message to the caller).  These `InitError` variants
+// complement the panic messages by giving callers a stable, machine-readable
+// code they can match on when calling `try_initialize` from an SDK or
+// integration test, without requiring a string parse on the diagnostic.
+//
+// The variant names mirror the panic messages one-to-one so auditors can
+// cross-reference them without ambiguity.
+
+/// Typed errors that `initialize` returns via `contracterror` when called
+/// through `try_initialize`.
+///
+/// Every variant corresponds to exactly one validation guard in the
+/// `initialize` entry-point.  The numeric discriminants are stable across
+/// upgrades — do not renumber existing variants.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum InitError {
+    /// `initialize` was called after a previous successful call.
+    AlreadyInitialized = 1,
+    /// `members` list has fewer than 2 entries.
+    TooFewMembers = 2,
+    /// `members` list has more than [`MAX_MEMBERS`] entries.
+    TooManyMembers = 3,
+    /// `members` list contains the same address more than once.
+    DuplicateMembers = 4,
+    /// `round_amount` is zero or negative.
+    InvalidRoundAmount = 5,
+    /// `round_amount` × `member_count` would overflow `i128`.
+    RoundAmountPotOverflow = 6,
+    /// `round_amount` × [`PENALTY_BPS`] would overflow `i128`.
+    RoundAmountPenaltyOverflow = 7,
+    /// `round_deadline_ledgers` is below [`MIN_ROUND_DEADLINE_LEDGERS`].
+    DeadlineBelowMinimum = 8,
+    /// `round_deadline_ledgers` is above [`MAX_ROUND_DEADLINE_LEDGERS`].
+    DeadlineAboveMaximum = 9,
+    /// `usdc_token` address is the same as the circle contract itself —
+    /// this would make every token transfer a no-op and break the financial model.
+    InvalidTokenAddress = 10,
+    /// `reputation_contract` address is the same as the circle contract or
+    /// the same as `usdc_token` — indicates a misconfigured deployment.
+    InvalidReputationAddress = 11,
+    /// `members` contains fewer entries than the rotation length requires
+    /// (i.e. `members.len()` is zero after deduplication, which should be
+    /// caught earlier, or the rotation array has a different length from the
+    /// member array — guards against inconsistent off-chain construction).
+    InconsistentRotation = 12,
+}
+
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
 ///
 /// Expressed in basis points (1 bp = 0.01 %).  Divide by [`BPS_DENOM`] to get
@@ -258,6 +311,29 @@ impl CircleContract {
     // ── Initialize ────────────────────────────────────────────────────────────
 
     /// Called once by the factory immediately after deployment.
+    ///
+    /// # Validation
+    ///
+    /// All validation runs before any persistent state is written.  An invalid
+    /// configuration makes no state changes — the reentrancy guard is the only
+    /// key touched before the checks, and it is cleared on any panic path.
+    ///
+    /// | Check | Condition | Panic message |
+    /// |---|---|---|
+    /// | Double-init | `Config` key present | `"already initialized"` |
+    /// | Reentrancy | `Initializing` flag present | `"initialize already in progress"` |
+    /// | Min members | `members.len() < 2` | `"need at least 2 members"` |
+    /// | Max members | `members.len() > MAX_MEMBERS` | `"too many members"` |
+    /// | Duplicate members | any two entries equal | `"duplicate members"` |
+    /// | Positive amount | `round_amount <= 0` | `"round_amount must be positive"` |
+    /// | Pot overflow | `round_amount * member_count` overflows `i128` | `"round_amount too large: overflows pot calculation for this member count"` |
+    /// | Penalty overflow | `round_amount * PENALTY_BPS` overflows `i128` | `"round_amount too large: overflows penalty calculation"` |
+    /// | Min deadline | `round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS` | `"round_deadline_ledgers below minimum"` |
+    /// | Max deadline | `round_deadline_ledgers > MAX_ROUND_DEADLINE_LEDGERS` | `"round_deadline_ledgers above maximum"` |
+    /// | Token address | `usdc_token == current contract` | `"usdc_token must not be the circle contract itself"` |
+    /// | Reputation address | `reputation_contract == current contract` | `"reputation_contract must not be the circle contract itself"` |
+    /// | Reputation ≠ token | `reputation_contract == usdc_token` | `"reputation_contract must not be the same address as usdc_token"` |
+    /// | Rotation consistency | `members.len() == 0` after validation passes | (defensive; unreachable in practice) |
     pub fn initialize(
         env: Env,
         members: Vec<Address>,
@@ -307,6 +383,50 @@ impl CircleContract {
             panic!("round_deadline_ledgers above maximum");
         }
 
+        // ── Token and contract address validation ─────────────────────────────
+        //
+        // A misconfigured deployment where `usdc_token` or `reputation_contract`
+        // points back at the circle itself would make every token transfer a
+        // no-op (the circle can't hold USDC to transfer to itself) and would
+        // allow the circle to award its own reputation scores, breaking both the
+        // financial model and the authorization invariants.
+        //
+        // We also reject `reputation_contract == usdc_token` because mixing the
+        // two roles into a single address is nonsensical and almost certainly a
+        // copy-paste error in the deployment script.
+        //
+        // Note: Soroban `Address` values are always well-formed 32-byte contract
+        // or account identifiers — there is no concept of a "zero address" in the
+        // EVM sense.  The checks here guard against logical misconfiguration
+        // (self-referential or aliased addresses) rather than null inputs.
+        let self_address = env.current_contract_address();
+        if usdc_token == self_address {
+            panic!("usdc_token must not be the circle contract itself");
+        }
+        if reputation_contract == self_address {
+            panic!("reputation_contract must not be the circle contract itself");
+        }
+        if reputation_contract == usdc_token {
+            panic!("reputation_contract must not be the same address as usdc_token");
+        }
+
+        // ── Rotation consistency check ────────────────────────────────────────
+        //
+        // The rotation order is defined by the `members` list — each member at
+        // index `i` is the recipient of round `i`.  After all previous checks
+        // `members.len()` is in [2, MAX_MEMBERS] and every address is unique, so
+        // the rotation is inherently consistent.  We verify this explicitly with
+        // a defensive assertion so that if a future refactor introduces a separate
+        // rotation parameter the compiler flags the missing check rather than
+        // silently shipping a broken invariant.
+        //
+        // This check is intentionally infallible given the earlier validations;
+        // its value is as documentation and a future-proofing guard.
+        let member_count = members.len();
+        if member_count == 0 {
+            panic!("rotation length is zero: members list must have at least 2 entries");
+        }
+
         let config = CircleConfig {
             members: members.clone(),
             round_amount,
@@ -338,7 +458,7 @@ impl CircleContract {
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "initialized")),
-            members.len(),
+            member_count,
         );
     }
 

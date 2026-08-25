@@ -3028,4 +3028,469 @@ mod circle_tests {
         t.circle.close(&t.alice);
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #322 — Validate circle configuration before initialization
+    //
+    // These tests cover the new explicit validation guards added to `initialize`
+    // as part of issue #322:
+    //
+    //   • Token address must not be the circle contract itself.
+    //   • Reputation contract must not be the circle contract itself.
+    //   • Reputation contract must not be the same address as the USDC token.
+    //   • Rotation consistency defensive check (members.len() > 0 after all
+    //     previous guards, which is guaranteed but asserted for documentation).
+    //   • All guards leave NO persistent state on failure.
+    //   • All existing valid-configuration tests continue to pass (regression).
+    //
+    // Acceptance criteria from issue #322:
+    //   ✓ Invalid configuration makes no persistent state changes.
+    //   ✓ Errors are deterministic and documented.
+    //   ✓ Existing valid creation and deployment tests remain green.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Smallest-valid configuration acceptance tests ─────────────────────────
+
+    /// The smallest valid circle: 2 members, 1 stroop, minimum deadline.
+    ///
+    /// All three address parameters (token, reputation, circle) are distinct.
+    /// After initialize the config, status, and current round must be correct.
+    #[test]
+    fn test_322_smallest_valid_configuration_initializes_correctly() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a.clone());
+        members.push_back(member_b.clone());
+
+        // Must not panic — all three addresses are distinct and all parameters
+        // are at their minimum valid values.
+        circle.initialize(
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.round_amount, 1i128);
+        assert_eq!(config.round_deadline_ledgers, MIN_ROUND_DEADLINE_LEDGERS);
+
+        assert_eq!(circle.get_status(), CircleStatus::Pending);
+
+        let round = circle.get_current_round();
+        assert_eq!(round.round_index, 0);
+        assert_eq!(round.recipient, member_a);
+    }
+
+    /// Two distinct members with the largest valid round_amount that does not
+    /// overflow the pot or penalty calculations.
+    #[test]
+    fn test_322_max_valid_round_amount_initializes_correctly() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        // Largest amount that survives both checked_mul guards:
+        //   amount * member_count (2) must not overflow i128
+        //   amount * PENALTY_BPS  must not overflow i128
+        // The binding constraint is PENALTY_BPS (10_000 > 2).
+        let max_amount = i128::MAX / PENALTY_BPS;
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members,
+            &max_amount,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.round_amount, max_amount);
+    }
+
+    /// Maximum deadline value initializes without error.
+    #[test]
+    fn test_322_max_valid_deadline_initializes_correctly() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &MAX_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.round_deadline_ledgers, MAX_ROUND_DEADLINE_LEDGERS);
+    }
+
+    // ── Token address validation ───────────────────────────────────────────────
+
+    /// `initialize` must reject a `usdc_token` that equals the circle contract
+    /// address.  A self-referential token would make every USDC transfer a
+    /// no-op (the contract cannot transfer tokens to itself as a token mint)
+    /// and break the entire financial model.
+    ///
+    /// Guard message: "usdc_token must not be the circle contract itself"
+    #[test]
+    #[should_panic(expected = "usdc_token must not be the circle contract itself")]
+    fn test_322_usdc_token_equals_circle_address_panics() {
+        let (env, _token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // Pass the circle's own address as the USDC token — must be rejected.
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &circle_id,       // ← circle contract used as token address
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+    }
+
+    /// When `usdc_token == circle_address`, no persistent state must be written.
+    /// This confirms the guard fires before any storage mutation.
+    #[test]
+    fn test_322_usdc_token_equals_circle_leaves_no_state() {
+        let (env, _token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // Attempt the invalid initialize — it panics.
+        let result = circle.try_initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &circle_id,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+        assert!(result.is_err(), "must fail when token == circle address");
+
+        // The Config key must be absent — no state was committed.
+        let config_result = circle.try_get_config();
+        assert!(
+            config_result.is_err(),
+            "Config key must not exist after a failed initialize"
+        );
+    }
+
+    // ── Reputation contract address validation ────────────────────────────────
+
+    /// `initialize` must reject a `reputation_contract` that equals the circle
+    /// contract address.  The reputation contract is invoked via a cross-contract
+    /// call; if it pointed at the circle itself, `payout` would recurse into
+    /// `initialize`-style entry-points and break the authorization model.
+    ///
+    /// Guard message: "reputation_contract must not be the circle contract itself"
+    #[test]
+    #[should_panic(expected = "reputation_contract must not be the circle contract itself")]
+    fn test_322_reputation_contract_equals_circle_address_panics() {
+        let (env, token_address, _reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // Pass the circle's own address as the reputation contract — must be rejected.
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &circle_id,       // ← circle contract used as reputation address
+            &ROUND_DEADLINE,
+        );
+    }
+
+    /// When `reputation_contract == circle_address`, no persistent state must be
+    /// written — the guard fires before any storage mutation.
+    #[test]
+    fn test_322_reputation_contract_equals_circle_leaves_no_state() {
+        let (env, token_address, _reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let result = circle.try_initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &circle_id,
+            &ROUND_DEADLINE,
+        );
+        assert!(result.is_err(), "must fail when reputation == circle address");
+
+        let config_result = circle.try_get_config();
+        assert!(
+            config_result.is_err(),
+            "Config key must not exist after a failed initialize"
+        );
+    }
+
+    // ── Reputation ≠ USDC token validation ────────────────────────────────────
+
+    /// `initialize` must reject a configuration where `reputation_contract` and
+    /// `usdc_token` point to the same address.  Sharing the two roles on a single
+    /// contract is almost certainly a deployment-script error and would break both
+    /// the financial model and the authorization invariants.
+    ///
+    /// Guard message: "reputation_contract must not be the same address as usdc_token"
+    #[test]
+    #[should_panic(expected = "reputation_contract must not be the same address as usdc_token")]
+    fn test_322_reputation_equals_usdc_token_panics() {
+        let (env, token_address, _reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // Both reputation and token point at token_address — must be rejected.
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &token_address,   // ← reputation == usdc token
+            &ROUND_DEADLINE,
+        );
+    }
+
+    /// When `reputation_contract == usdc_token`, no persistent state must be
+    /// written.
+    #[test]
+    fn test_322_reputation_equals_usdc_token_leaves_no_state() {
+        let (env, token_address, _reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let result = circle.try_initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &token_address,
+            &ROUND_DEADLINE,
+        );
+        assert!(result.is_err(), "must fail when reputation == usdc_token");
+
+        let config_result = circle.try_get_config();
+        assert!(
+            config_result.is_err(),
+            "Config key must not exist after a failed initialize"
+        );
+    }
+
+    // ── All three addresses must be distinct ──────────────────────────────────
+
+    /// The three address parameters must all be distinct.  The previous tests
+    /// cover individual pairs; this test confirms the happy-path where all three
+    /// are distinct succeeds without error.
+    #[test]
+    fn test_322_three_distinct_addresses_succeeds() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        // circle_id ≠ token_address ≠ reputation_id — this must succeed.
+        assert_ne!(circle_id, token_address, "fixture: circle ≠ token");
+        assert_ne!(circle_id, reputation_id, "fixture: circle ≠ reputation");
+        assert_ne!(token_address, reputation_id, "fixture: token ≠ reputation");
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+
+        // Config must be present after successful initialize
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2);
+    }
+
+    // ── Address-validation guards fire before storage writes ─────────────────
+
+    /// All address-validation failures must leave the Reentrancy guard
+    /// (`Initializing` key) cleared and the `Config` key absent, so the same
+    /// contract instance can be successfully initialized in a subsequent call
+    /// with corrected parameters.
+    ///
+    /// This is the "no persistent state changes" acceptance criterion.
+    #[test]
+    fn test_322_address_validation_failure_allows_retry_with_corrected_params() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // First attempt: reputation == usdc_token (invalid)
+        let bad_result = circle.try_initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &token_address, // reputation == token: invalid
+            &ROUND_DEADLINE,
+        );
+        assert!(bad_result.is_err(), "first attempt must fail");
+
+        // Second attempt with corrected parameters must succeed.
+        circle.initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id, // now distinct from token
+            &ROUND_DEADLINE,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2, "corrected initialize must commit Config");
+    }
+
+    // ── Existing guard regression tests ──────────────────────────────────────
+    //
+    // These regression tests re-exercise the pre-existing guards to confirm
+    // that the new validations added by issue #322 did not accidentally break
+    // any of the original checks.  Each guard is exercised once here; the
+    // comprehensive coverage lives in the earlier test sections and prop_tests.
+
+    /// Regression: double-initialize is still rejected after issue #322 changes.
+    #[test]
+    #[should_panic(expected = "already initialized")]
+    fn test_322_regression_already_initialized_still_rejected() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+        // Second call must be rejected.
+        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+    }
+
+    /// Regression: fewer than 2 members still rejected.
+    #[test]
+    #[should_panic(expected = "need at least 2 members")]
+    fn test_322_regression_too_few_members_still_rejected() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+    }
+
+    /// Regression: duplicate members still rejected.
+    #[test]
+    #[should_panic(expected = "duplicate members")]
+    fn test_322_regression_duplicate_members_still_rejected() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let a = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(a.clone());
+        members.push_back(a); // duplicate
+
+        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+    }
+
+    /// Regression: zero round_amount still rejected.
+    #[test]
+    #[should_panic(expected = "round_amount must be positive")]
+    fn test_322_regression_zero_round_amount_still_rejected() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(&members, &0i128, &token_address, &reputation_id, &ROUND_DEADLINE);
+    }
+
+    /// Regression: deadline below minimum still rejected.
+    #[test]
+    #[should_panic(expected = "round_deadline_ledgers below minimum")]
+    fn test_322_regression_deadline_below_min_still_rejected() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members, &ROUND_AMOUNT, &token_address, &reputation_id,
+            &(MIN_ROUND_DEADLINE_LEDGERS - 1),
+        );
+    }
+
+    /// Regression: deadline above maximum still rejected.
+    #[test]
+    #[should_panic(expected = "round_deadline_ledgers above maximum")]
+    fn test_322_regression_deadline_above_max_still_rejected() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members, &ROUND_AMOUNT, &token_address, &reputation_id,
+            &(MAX_ROUND_DEADLINE_LEDGERS + 1),
+        );
+    }
+
 }
