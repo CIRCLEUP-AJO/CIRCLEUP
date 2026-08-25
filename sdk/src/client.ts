@@ -40,6 +40,7 @@ import {
   decodeBigInt,
   decodeBoolean,
   decodeAddressList,
+  validateContractArgs,
 } from "./types";
 import {
   buildSnapshot,
@@ -335,30 +336,118 @@ function validateInvocation(
  * contains the contract panic message, e.g.:
  *   "HostError: Value(UnexpectedType)\n  ... contract backtrace ...\nError(Contract, #1)"
  *
- * We try to surface the most actionable part:
- * 1. A quoted contract message (text between "contract backtrace" or panic string)
- * 2. The last `Error(...)` segment which encodes the contract error code
- * 3. Fall back to the full string if neither pattern matches
+ * We try to surface the most actionable part in priority order:
+ * 1. Quoted contract debug log (most specific — the contract author's message)
+ * 2. Panic message embedded in the host error
+ * 3. The last `Error(...)` segment which encodes the contract error code
+ * 4. Known host-error patterns translated to plain English
+ * 5. Fall back to the full string trimmed to 300 chars
  */
 function extractSimulationError(raw: string): string {
-  // Soroban contract panics embed the message as a quoted string, e.g.:
-  //   Event contract log (debug): "already joined"
+  // Priority 1: Contract debug log — e.g. Event contract log (debug): "already joined"
   const logMatch = raw.match(/contract\s+log\s+\(debug\):\s+"([^"]+)"/i);
   if (logMatch) return logMatch[1];
 
-  // Panic messages appear as: panic called with: "message"
+  // Priority 2: Panic messages — e.g. panic called with: "message"
   const panicMatch = raw.match(/panic called with:\s+"([^"]+)"/i);
   if (panicMatch) return panicMatch[1];
 
-  // ContractError enum variant: Error(Contract, #N) — extract code number
+  // Priority 3: ContractError enum variant — Error(Contract, #N)
   const errCodeMatch = raw.match(/Error\(Contract,\s*#(\d+)\)/);
   if (errCodeMatch) {
     return `Contract error code ${errCodeMatch[1]}. Check that the operation is valid for the current circle state.`;
   }
 
-  // If the raw string is short enough to be user-visible, pass it through;
-  // otherwise trim it to avoid dumping a multi-KB XDR blob into a UI toast.
+  // Priority 4: Known Soroban host errors translated to plain English
+  if (raw.includes("Value(UnexpectedType)")) {
+    return (
+      "The contract received an argument of the wrong type. " +
+      "Check that all arguments are encoded with the correct scAddress/scU32/scI128 helper."
+    );
+  }
+  if (raw.includes("Value(MissingValue)")) {
+    return (
+      "The contract tried to read a value that does not exist. " +
+      "The circle may not be initialised, or you may be targeting the wrong contract address."
+    );
+  }
+  if (raw.includes("Value(ExistingValue)")) {
+    return "The contract tried to create a value that already exists (possible duplicate operation).";
+  }
+  if (raw.includes("Auth(NotAuthorized)") || raw.includes("Auth(InvalidAction)")) {
+    return (
+      "The transaction was not authorised. " +
+      "Ensure the signing keypair matches the account that should perform this action."
+    );
+  }
+  if (raw.includes("Budget(CpuLimitExceeded)") || raw.includes("Budget(MemLimitExceeded)")) {
+    return (
+      "The contract ran out of CPU or memory resources during simulation. " +
+      "The operation may be too complex or the circle may have too many members."
+    );
+  }
+  if (raw.includes("Storage(MissingValue)")) {
+    return (
+      "A required storage entry was not found. " +
+      "The circle contract may not be deployed at this address, or the state has not been initialised."
+    );
+  }
+
+  // Priority 5: Short enough to show as-is; otherwise truncate
   return raw.length <= 300 ? raw : raw.slice(0, 297) + "...";
+}
+
+/**
+ * Normalise a raw RPC or network error into a short, actionable string.
+ *
+ * Node's `fetch` and the Stellar SDK surface many different error shapes —
+ * `ECONNREFUSED`, `ENOTFOUND`, `FetchError`, HTTP timeouts, etc.  This helper
+ * maps the most common ones to sentences that tell the developer what to try
+ * next, while keeping the raw message for anything unusual so it is not lost.
+ */
+function formatRpcError(raw: string, rpcUrl: string): string {
+  const lower = raw.toLowerCase();
+
+  if (
+    lower.includes("econnrefused") ||
+    lower.includes("connection refused")
+  ) {
+    return (
+      `Could not connect to the RPC at ${rpcUrl} (connection refused). ` +
+      `Check that the endpoint is running and that config.rpcUrl is correct.`
+    );
+  }
+  if (lower.includes("enotfound") || lower.includes("name or service not known")) {
+    return (
+      `DNS resolution failed for the RPC at ${rpcUrl}. ` +
+      `Check the hostname in config.rpcUrl.`
+    );
+  }
+  if (
+    lower.includes("etimedout") ||
+    lower.includes("network timeout") ||
+    lower.includes("socket hang up")
+  ) {
+    return (
+      `The RPC at ${rpcUrl} did not respond in time. ` +
+      `The node may be overloaded — wait a moment and retry.`
+    );
+  }
+  if (lower.includes("fetch failed") || lower.includes("failed to fetch")) {
+    return (
+      `Network fetch to ${rpcUrl} failed. ` +
+      `Check your internet connection and that config.rpcUrl is reachable.`
+    );
+  }
+  if (lower.includes("ssl") || lower.includes("certificate")) {
+    return (
+      `TLS/SSL error connecting to ${rpcUrl}. ` +
+      `Check the certificate or use an HTTP URL for local development.`
+    );
+  }
+
+  // For short messages pass them through; otherwise trim to avoid log spam
+  return raw.length <= 200 ? raw : raw.slice(0, 197) + "...";
 }
 
 // ─── Contract argument helpers ────────────────────────────────────────────────
@@ -589,7 +678,7 @@ export class CircleUpClient {
         isNotFound
           ? `Account ${sourceKeypair.publicKey()} not found on the network. ` +
             `Fund it with Friendbot (testnet) or a real XLM transfer before calling ${ctx}.`
-          : `Failed to load account for ${ctx}: ${msg}`,
+          : `Failed to load account for ${ctx}: ${formatRpcError(msg, this.config.rpcUrl)}`,
         isNotFound ? "account_not_found" : "network_error",
       );
     }
@@ -620,8 +709,7 @@ export class CircleUpClient {
     } catch (err: any) {
       return txFailure(
         "",
-        `Network error while simulating ${ctx}: ${err?.message ?? "unknown"}. ` +
-          `Check your RPC endpoint (${this.config.rpcUrl}).`,
+        `Network error while simulating ${ctx}: ${formatRpcError(err?.message ?? "unknown", this.config.rpcUrl)}`,
         "network_error",
       );
     }
@@ -654,8 +742,7 @@ export class CircleUpClient {
     } catch (err: any) {
       return txFailure(
         "",
-        `Network error while submitting ${ctx}: ${err?.message ?? "unknown"}. ` +
-          `Check your RPC endpoint (${this.config.rpcUrl}).`,
+        `Network error while submitting ${ctx}: ${formatRpcError(err?.message ?? "unknown", this.config.rpcUrl)}`,
         "network_error",
       );
     }
@@ -730,7 +817,7 @@ export class CircleUpClient {
           return txFailure(
             hash,
             `Lost RPC connectivity while waiting for ${ctx} (tx: ${hash}). ` +
-              `Last error: ${(err as any)?.message ?? "unknown"}. ` +
+              `Last error: ${formatRpcError((err as any)?.message ?? "unknown", this.config.rpcUrl)}. ` +
               `The transaction may still confirm — check Stellar Expert before retrying.`,
             "network_error",
           );
@@ -876,7 +963,7 @@ export class CircleUpClient {
     } catch (err: any) {
       return {
         ok: false,
-        error: `Simulation network error: ${err?.message ?? "unknown"}`,
+        error: `Simulation network error: ${formatRpcError(err?.message ?? "unknown", this.config.rpcUrl)}`,
       };
     }
 
@@ -958,6 +1045,23 @@ export class FactoryClient extends CircleUpClient {
     roundAmountStroops: bigint;
     roundDeadlineLedgers: number;
   }): Promise<{ result: TxResult; circleAddress?: string }> {
+    // Validate all parameters upfront so the error message names the exact
+    // field that is wrong, rather than surfacing as an opaque encoding throw.
+    const argError = validateContractArgs([
+      { name: "members", value: params.members, type: "addressVec" },
+      { name: "roundAmountStroops", value: params.roundAmountStroops, type: "i128" },
+      { name: "roundDeadlineLedgers", value: params.roundDeadlineLedgers, type: "u32" },
+    ]);
+    if (argError) {
+      const result: TxResult = {
+        success: false,
+        txHash: "",
+        errorMessage: `Invalid arguments for create_circle: ${argError}`,
+        errorCode: "invalid_argument",
+      };
+      return { result };
+    }
+
     const result = await this.encodeAndSend(
       params.creator,
       this.contractId,
@@ -1108,6 +1212,19 @@ export class CircleClient extends CircleUpClient {
   }
 
   async markDefault(caller: Keypair, member: string): Promise<TxResult> {
+    // Validate the member address early so callers get a clear error that names
+    // the field rather than an opaque scAddress throw wrapped in encodeAndSend.
+    const argError = validateContractArgs([
+      { name: "member", value: member, type: "address" },
+    ]);
+    if (argError) {
+      return {
+        success: false,
+        txHash: "",
+        errorMessage: `Invalid arguments for mark_default: ${argError}`,
+        errorCode: "invalid_argument",
+      };
+    }
     const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
