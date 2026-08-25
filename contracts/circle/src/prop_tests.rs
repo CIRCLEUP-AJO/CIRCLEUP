@@ -987,4 +987,250 @@ mod prop_tests {
             prev = after;
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #322 — Property and boundary tests for initialize config validation
+    //
+    // These tests verify the new address-validation guards introduced in #322:
+    //
+    //   B322-1  usdc_token == circle → always rejected, no state written
+    //   B322-2  reputation_contract == circle → always rejected, no state written
+    //   B322-3  reputation_contract == usdc_token → always rejected, no state written
+    //   B322-4  all three distinct addresses + valid params → always accepted
+    //   B322-5  Property: initialize with valid params always succeeds and
+    //           leaves Config readable
+    //   B322-6  Property: any invalid address configuration always leaves
+    //           Config absent (no state written)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Helpers for #322 tests ────────────────────────────────────────────────
+
+    /// Build a bare env with a USDC token and reputation contract registered.
+    /// Returns `(env, token_address, reputation_address)`.
+    fn make_env_with_token_and_rep() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_reg = env.register_stellar_asset_contract_v2(token_admin);
+
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        let rep_admin = Address::generate(&env);
+        rep_client.initialize(&rep_admin);
+
+        (env, token_reg.address(), rep_id)
+    }
+
+    // ── B322-1: usdc_token == circle always rejected ──────────────────────────
+
+    /// The self-referential token guard fires regardless of member count or
+    /// round_amount, as long as all other parameters are valid.
+    #[test]
+    fn b322_1_usdc_token_equals_circle_always_rejected() {
+        let (env, _token_address, reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // Pass the circle itself as the token — must panic
+        let result = circle.try_initialize(
+            &members,
+            &1_000_000i128,
+            &circle_id,      // ← usdc_token == circle
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "usdc_token == circle must always be rejected"
+        );
+
+        // Config must not exist — no persistent state written
+        assert!(
+            circle.try_get_config().is_err(),
+            "Config must be absent after rejected initialize"
+        );
+    }
+
+    // ── B322-2: reputation_contract == circle always rejected ─────────────────
+
+    #[test]
+    fn b322_2_reputation_equals_circle_always_rejected() {
+        let (env, token_address, _reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let result = circle.try_initialize(
+            &members,
+            &1_000_000i128,
+            &token_address,
+            &circle_id,      // ← reputation == circle
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "reputation_contract == circle must always be rejected"
+        );
+
+        assert!(
+            circle.try_get_config().is_err(),
+            "Config must be absent after rejected initialize"
+        );
+    }
+
+    // ── B322-3: reputation_contract == usdc_token always rejected ────────────
+
+    #[test]
+    fn b322_3_reputation_equals_usdc_token_always_rejected() {
+        let (env, token_address, _reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let result = circle.try_initialize(
+            &members,
+            &1_000_000i128,
+            &token_address,
+            &token_address,  // ← reputation == usdc_token
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "reputation_contract == usdc_token must always be rejected"
+        );
+
+        assert!(
+            circle.try_get_config().is_err(),
+            "Config must be absent after rejected initialize"
+        );
+    }
+
+    // ── B322-4: all three distinct → accepted ─────────────────────────────────
+
+    /// When circle_id, token_address, and reputation_id are all distinct and
+    /// all other parameters are valid, initialize must always succeed and write
+    /// a Config key readable via get_config.
+    #[test]
+    fn b322_4_three_distinct_addresses_always_accepted() {
+        let (env, token_address, reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        // Paranoia: the fixture must generate distinct addresses
+        assert_ne!(circle_id, token_address);
+        assert_ne!(circle_id, reputation_id);
+        assert_ne!(token_address, reputation_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members,
+            &1_000_000i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.round_amount, 1_000_000i128);
+    }
+
+    // ── B322-5: Property — valid params always produce readable Config ─────────
+
+    /// For any member count in [2, 8] and round_amount in [1, MAX_VALID],
+    /// initialize with distinct addresses must always write a Config that
+    /// get_config returns correctly.
+    proptest! {
+        #[test]
+        fn prop_322_valid_params_always_initializes(
+            member_count in 2usize..=8usize,
+            round_amount in 1i128..=MAX_VALID_ROUND_AMOUNT,
+            deadline in MIN_ROUND_DEADLINE_LEDGERS..=MAX_ROUND_DEADLINE_LEDGERS,
+        ) {
+            let (env, token_address, reputation_id) = make_env_with_token_and_rep();
+            let circle_id = env.register_contract(None, crate::CircleContract);
+            let circle = CircleContractClient::new(&env, &circle_id);
+
+            let mut members = SdkVec::new(&env);
+            for _ in 0..member_count {
+                members.push_back(Address::generate(&env));
+            }
+
+            circle.initialize(
+                &members,
+                &round_amount,
+                &token_address,
+                &reputation_id,
+                &deadline,
+            );
+
+            let config = circle.get_config();
+            prop_assert_eq!(config.members.len() as usize, member_count);
+            prop_assert_eq!(config.round_amount, round_amount);
+            prop_assert_eq!(config.round_deadline_ledgers, deadline);
+        }
+    }
+
+    // ── B322-6: Property — invalid address configs always leave Config absent ──
+
+    /// For any invalid address combination (self-referential or aliased),
+    /// the initialize attempt must fail and leave the Config key absent.
+    ///
+    /// The three invalid patterns are tried in sequence:
+    ///   (a) token == circle
+    ///   (b) reputation == circle
+    ///   (c) reputation == token
+    proptest! {
+        #[test]
+        fn prop_322_invalid_address_config_leaves_no_state(
+            member_count in 2usize..=6usize,
+            round_amount in 1i128..=1_000_000i128,
+            // 0 = token==circle, 1 = rep==circle, 2 = rep==token
+            bad_pattern in 0u8..=2u8,
+        ) {
+            let (env, token_address, reputation_id) = make_env_with_token_and_rep();
+            let circle_id = env.register_contract(None, crate::CircleContract);
+            let circle = CircleContractClient::new(&env, &circle_id);
+
+            let mut members = SdkVec::new(&env);
+            for _ in 0..member_count {
+                members.push_back(Address::generate(&env));
+            }
+
+            let (bad_token, bad_rep) = match bad_pattern {
+                0 => (circle_id.clone(), reputation_id.clone()),  // token == circle
+                1 => (token_address.clone(), circle_id.clone()),  // rep == circle
+                _ => (token_address.clone(), token_address.clone()), // rep == token
+            };
+
+            let result = circle.try_initialize(
+                &members,
+                &round_amount,
+                &bad_token,
+                &bad_rep,
+                &MIN_ROUND_DEADLINE_LEDGERS,
+            );
+            prop_assert!(result.is_err(), "invalid address config must be rejected");
+
+            // No Config key must exist after the failed attempt
+            prop_assert!(
+                circle.try_get_config().is_err(),
+                "Config must be absent after any failed initialize"
+            );
+        }
+    }
 }
