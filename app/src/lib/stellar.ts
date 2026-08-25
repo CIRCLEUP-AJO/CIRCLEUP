@@ -21,6 +21,7 @@ import {
   requestAccess,
 } from "@stellar/freighter-api";
 import { STELLAR_RPC_URL, NETWORK_PASSPHRASE, REPUTATION_ADDRESS } from "./config";
+import { startTx, emit, categorizeError } from "./telemetry";
 
 // ─── Freighter detection & error types ───────────────────────────────────────
 
@@ -207,12 +208,22 @@ export async function invokeContract(
 ): Promise<{ txHash: string; success: boolean; error?: string }> {
   const rpc = getRpc();
 
+  // ── Telemetry: started ───────────────────────────────────────────────────
+  // startTx emits the "started" stage and returns a context handle that
+  // tracks the per-invocation start time.  Only the method name is recorded —
+  // contractId, walletAddress, and args are never passed to telemetry.
+  const txCtx = startTx(method);
+
+  // ── Account fetch ────────────────────────────────────────────────────────
   let account: Awaited<ReturnType<typeof rpc.getAccount>>;
   try {
     account = await rpc.getAccount(walletAddress);
   } catch (err: any) {
     const msg: string = err?.message ?? "";
-    if (msg.toLowerCase().includes("network") || msg.toLowerCase().includes("fetch")) {
+    const isNetwork =
+      msg.toLowerCase().includes("network") || msg.toLowerCase().includes("fetch");
+    emit(txCtx, "failed", categorizeError(isNetwork ? "network" : msg));
+    if (isNetwork) {
       return {
         txHash: "",
         success: false,
@@ -232,15 +243,26 @@ export async function invokeContract(
     .setTimeout(30);
 
   const tx = txBuilder.build();
+
+  // ── Simulation ───────────────────────────────────────────────────────────
   const simResult = await rpc.simulateTransaction(tx);
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
+    // Emit simulate_failed with a category derived from the error type, but
+    // never forward the raw simResult.error string (may contain contract
+    // panic messages that echo argument values).
+    emit(txCtx, "simulate_failed", categorizeError(simResult.error));
     return { txHash: "", success: false, error: formatContractError(simResult.error) };
   }
 
+  // ── Telemetry: simulated ─────────────────────────────────────────────────
+  emit(txCtx, "simulated");
+
   const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
 
-  // signTransaction v2 returns the signed XDR string directly
+  // ── Wallet signing ───────────────────────────────────────────────────────
+  // signTransaction v2 returns the signed XDR string directly.
+  // The XDR is never forwarded to telemetry.
   let signedXdr: string;
   try {
     signedXdr = await signTransaction(preparedTx.toXDR(), {
@@ -255,25 +277,31 @@ export async function invokeContract(
       lower.includes("cancelled") ||
       lower.includes("canceled")
     ) {
+      // ── Telemetry: wallet_rejected ───────────────────────────────────────
+      emit(txCtx, "wallet_rejected", "wallet_denied");
       return {
         txHash: "",
         success: false,
         error: "You cancelled the transaction in Freighter. No funds were moved.",
       };
     }
+    emit(txCtx, "failed", categorizeError(msg || "User rejected"));
     return { txHash: "", success: false, error: formatContractError(msg || "User rejected") };
   }
 
   if (!signedXdr) {
+    emit(txCtx, "failed", "unknown");
     return { txHash: "", success: false, error: "Freighter did not return a signed transaction." };
   }
 
+  // ── Submission ───────────────────────────────────────────────────────────
   let sendResult: Awaited<ReturnType<typeof rpc.sendTransaction>>;
   try {
     sendResult = await rpc.sendTransaction(
       TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
     );
   } catch (err: any) {
+    emit(txCtx, "failed", categorizeError(err?.message ?? "network error"));
     return {
       txHash: "",
       success: false,
@@ -282,6 +310,10 @@ export async function invokeContract(
   }
 
   if (sendResult.status === "ERROR") {
+    // ── Telemetry: submission_failed ─────────────────────────────────────
+    // The hash is available at this point; it is included in the return value
+    // for the user but never forwarded to telemetry.
+    emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
       success: false,
@@ -289,8 +321,14 @@ export async function invokeContract(
     };
   }
 
+  // ── Telemetry: submitted ─────────────────────────────────────────────────
+  // Hash is now known.  It is returned to the caller and visible in the
+  // browser UI, but is not included in the telemetry event.
+  emit(txCtx, "submitted");
+
   const hash = sendResult.hash;
 
+  // ── Polling loop ─────────────────────────────────────────────────────────
   let attempts = TX_POLL_ATTEMPTS;
   while (attempts-- > 0) {
     await new Promise((r) => setTimeout(r, TX_POLL_INTERVAL_MS));
@@ -298,14 +336,18 @@ export async function invokeContract(
     try {
       status = await rpc.getTransaction(hash);
     } catch {
-      // Transient polling error — keep trying
+      // Transient polling error — keep trying; no telemetry for transient errors
       continue;
     }
 
     if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      // ── Telemetry: confirmed ───────────────────────────────────────────
+      emit(txCtx, "confirmed");
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+      // ── Telemetry: failed ──────────────────────────────────────────────
+      emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
         success: false,
@@ -314,6 +356,8 @@ export async function invokeContract(
     }
   }
 
+  // ── Telemetry: timed_out ─────────────────────────────────────────────────
+  emit(txCtx, "timed_out", "timeout");
   return { txHash: hash, success: false, error: formatContractError("timeout") };
 }
 
