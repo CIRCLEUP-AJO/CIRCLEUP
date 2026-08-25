@@ -40,7 +40,7 @@
 //! | `contribute` (per member) | Contributed(member, round) | Persistent | 1 persistent entry per contribution; also updates CurrentRound (instance) |
 //! | `payout` | — | — | Updates CurrentRound + RoundsCompleted (instance); no new persistent entries |
 //! | `mark_default` | Defaulted(member, round) + Defaults(member) | Persistent | 2 persistent entries; also updates Collateral(member) |
-//! | `close` | Closed | Instance | Boolean flag set after all collateral is released; guards against re-invocation |
+//! | `close` | Closed | Instance | Boolean flag set after all collateral is released; guards against re-invocation. Also reads all Collateral(member) keys in a pre-release scan pass and zeroes them during settlement. |
 //!
 //! Use `stellar-cli contract invoke --cost` to get instruction-count and
 //! read/write-byte estimates before broadcasting.  The `simulate_transaction`
@@ -811,6 +811,14 @@ impl CircleContract {
     ///
     /// # Settlement semantics
     ///
+    /// Before the release loop the contract pre-computes `pre_release_total` —
+    /// the sum of every member's current `Collateral` balance read from storage.
+    /// This value is used after the loop for an arithmetic assertion:
+    ///   `total_released == pre_release_total`
+    /// If any member's balance was skipped or counted twice the assertion fires,
+    /// rolling back the entire transaction and preventing inconsistent state from
+    /// being committed.
+    ///
     /// For each member the contract reads their `Collateral(member)` balance and,
     /// if positive, zeroes the key in storage *before* performing the transfer
     /// (checks-effects-interactions per member).  The `Closed` flag is set
@@ -897,6 +905,23 @@ impl CircleContract {
             .checked_mul(config.members.len() as i128)
             .unwrap_or_else(|| panic!("total expected collateral overflow"));
 
+        // Pre-compute the total collateral held in storage before any transfer.
+        // This snapshot is compared against total_released after the loop as an
+        // arithmetic assertion: released == stored_before_release.  Any mismatch
+        // (double-count, silent skip, or storage inconsistency) causes the whole
+        // transaction to roll back, leaving no partial state on-chain.
+        let mut pre_release_total: i128 = 0;
+        for member in config.members.iter() {
+            let balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Collateral(member.clone()))
+                .unwrap_or(0);
+            pre_release_total = pre_release_total
+                .checked_add(balance)
+                .unwrap_or_else(|| panic!("pre_release_total overflow during collateral scan"));
+        }
+
         // Set the Closed flag before any transfers (checks-effects-interactions).
         // A reentrant call to close() — e.g. through a hostile token contract —
         // will hit this guard immediately and panic, preventing double-releases.
@@ -944,6 +969,19 @@ impl CircleContract {
                     (member, collateral),
                 );
             }
+        }
+
+        // Arithmetic assertion: every stroop that was in storage must have been
+        // released.  If total_released diverges from the pre-release snapshot the
+        // entire transaction panics and rolls back, guaranteeing no partial release
+        // state is ever committed.  This fires if a member's balance was silently
+        // skipped, counted twice, or mutated by a reentrant path that slipped past
+        // the Closed guard.
+        if total_released != pre_release_total {
+            panic!(
+                "circle: settlement arithmetic mismatch — released {} but pre-release total was {}",
+                total_released, pre_release_total
+            );
         }
 
         let reason = if matches!(status, CircleStatus::Completed) {
