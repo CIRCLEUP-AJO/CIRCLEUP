@@ -53,6 +53,8 @@
 mod tests; // tests are in tests.rs
 #[cfg(test)]
 mod prop_tests; // property-based / fuzz-style harness (issue #167)
+#[cfg(test)]
+mod mutation_guards; // explicit guard-removal / mutation tests
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
