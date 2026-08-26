@@ -44,8 +44,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
+- `sdk/src/utils.ts` — `usdcToStroops` now routes both `string` and `number`
+  input through one exact string-parsing path that expands JavaScript exponent
+  notation (`1e-7`, `1e+21`) losslessly and counts only *significant* decimals.
+  Valid small/large numeric amounts such as `0.0000001` now convert exactly
+  instead of throwing, while `> 7`-decimal precision, negatives, non-finite
+  numbers, and malformed exponents are rejected with specific messages. Also
+  documented USDC units/precision and that `formatUsdc` truncates (never rounds
+  up) so a displayed amount can never overstate the true balance
 
 ### Fixed
+- `app/src/lib/config.ts` — `usdcToStroops` silently discarded any digits beyond
+  7 decimal places (`frac.padEnd(7, "0").slice(0, 7)`), so an over-precise amount
+  was signed for a *different* value than the user entered. It now rejects excess
+  precision (and handles exponent notation) identically to the SDK. Realigned the
+  other money helpers with `sdk/src/utils.ts` too: added the missing negative /
+  `NaN` guards to `stroopsToUsdc` and `formatUsdc`, and the non-integer / negative
+  member-count guard to `formatPot` (a fractional count previously made
+  `BigInt(memberCount)` throw)
 - SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with
   `this.source.sequenceNumber is not a function`. The read path built its
   transaction from an account stub that was missing that method, and it always
