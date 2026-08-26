@@ -838,4 +838,172 @@ mod tests {
         assert_eq!(s.client.get_circle_count(), 0);
         assert!(s.client.get_circles().is_empty());
     }
+
+    // ── Adversarial authorization tests (Issue #87) ───────────────────────────
+
+    /// Re-initializing an already-initialized factory is rejected and leaves
+    /// the original admin and circle count unchanged.
+    #[test]
+    fn adv_factory_double_initialize_rejected_state_unchanged() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+
+        let attacker = Address::generate(&env);
+        let bad_hash: BytesN<32> = BytesN::from_array(&env, &[0xffu8; 32]);
+
+        let result = s.client.try_initialize(
+            &attacker,
+            &bad_hash,
+            &Address::generate(&env),
+            &Address::generate(&env),
+        );
+        assert!(result.is_err(), "second factory initialize must be rejected");
+
+        // Admin must still be the original admin
+        assert_eq!(
+            s.client.get_admin(),
+            s.admin,
+            "admin must be unchanged after rejected re-initialization"
+        );
+
+        // Circle count must still be 0 (no state written)
+        assert_eq!(
+            s.client.get_circle_count(),
+            0,
+            "circle count must be unchanged after rejected re-initialization"
+        );
+        assert!(s.client.get_circles().is_empty());
+    }
+
+    /// A create_circle call with fewer than 2 members is rejected and the
+    /// factory circle count stays at its pre-call value.
+    #[test]
+    fn adv_factory_create_circle_single_member_count_unchanged() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+
+        let count_before = s.client.get_circle_count();
+        let mut m = Vec::new(&env);
+        m.push_back(Address::generate(&env));
+
+        let result = s.client.try_create_circle(
+            &Address::generate(&env),
+            &m,
+            &1_000_000i128,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(result.is_err(), "single-member create must be rejected");
+        assert_eq!(
+            s.client.get_circle_count(),
+            count_before,
+            "circle count must be unchanged after rejected create"
+        );
+        assert!(s.client.get_circles().is_empty());
+    }
+
+    /// A create_circle call with a negative round_amount is rejected; the
+    /// factory registry stays empty.
+    #[test]
+    fn adv_factory_create_circle_negative_amount_registry_unchanged() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+
+        let m = make_members(&env, 3);
+        let result = s.client.try_create_circle(
+            &Address::generate(&env),
+            &m,
+            &(-1i128),
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(result.is_err(), "negative round_amount create must be rejected");
+        assert_eq!(s.client.get_circle_count(), 0);
+        assert!(s.client.get_circles().is_empty());
+    }
+
+    /// A batch of five different adversarial create_circle calls (each with a
+    /// distinct invalid parameter) must all be rejected without incrementing
+    /// the factory counter.
+    #[test]
+    fn adv_factory_batch_adversarial_creates_all_rejected() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+
+        let adversarial_calls: &[(&dyn Fn() -> bool)] = &[
+            // 1. empty member list
+            &|| {
+                let m = Vec::new(&env);
+                s.client
+                    .try_create_circle(
+                        &Address::generate(&env),
+                        &m,
+                        &1_000_000i128,
+                        &MIN_ROUND_DEADLINE_LEDGERS,
+                    )
+                    .is_err()
+            },
+            // 2. single member
+            &|| {
+                let mut m = Vec::new(&env);
+                m.push_back(Address::generate(&env));
+                s.client
+                    .try_create_circle(
+                        &Address::generate(&env),
+                        &m,
+                        &1_000_000i128,
+                        &MIN_ROUND_DEADLINE_LEDGERS,
+                    )
+                    .is_err()
+            },
+            // 3. zero amount
+            &|| {
+                let m = make_members(&env, 2);
+                s.client
+                    .try_create_circle(
+                        &Address::generate(&env),
+                        &m,
+                        &0i128,
+                        &MIN_ROUND_DEADLINE_LEDGERS,
+                    )
+                    .is_err()
+            },
+            // 4. deadline below minimum
+            &|| {
+                let m = make_members(&env, 2);
+                s.client
+                    .try_create_circle(
+                        &Address::generate(&env),
+                        &m,
+                        &1_000_000i128,
+                        &(MIN_ROUND_DEADLINE_LEDGERS - 1),
+                    )
+                    .is_err()
+            },
+            // 5. deadline above maximum
+            &|| {
+                let m = make_members(&env, 2);
+                s.client
+                    .try_create_circle(
+                        &Address::generate(&env),
+                        &m,
+                        &1_000_000i128,
+                        &(MAX_ROUND_DEADLINE_LEDGERS + 1),
+                    )
+                    .is_err()
+            },
+        ];
+
+        for (i, call) in adversarial_calls.iter().enumerate() {
+            assert!(call(), "adversarial call {} must be rejected", i + 1);
+        }
+
+        assert_eq!(
+            s.client.get_circle_count(),
+            0,
+            "factory circle count must be 0 after all adversarial create attempts"
+        );
+        assert!(
+            s.client.get_circles().is_empty(),
+            "circles list must be empty after all adversarial create attempts"
+        );
+    }
 }
