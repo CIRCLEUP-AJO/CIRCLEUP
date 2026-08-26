@@ -744,6 +744,24 @@ export function isTxSuccess(result: TxResult): result is TxSuccess {
 }
 
 /**
+ * Returns true when a failed transaction is safe to retry without risk of
+ * duplication or wasted funds.
+ *
+ * Conservative classification:
+ * - Retryable: transient network/RPC issues where the tx was never confirmed.
+ * - NOT retryable: validation failures, user rejection, and confirmed on-chain
+ *   failures — retrying these wastes fees or duplicates state changes.
+ *
+ * For `"timeout"` and `"stale_rpc"` the transaction may still be in flight;
+ * callers should check the hash on Stellar Expert before resubmitting.
+ *
+ * @example
+ * const result = await client.contribute(keypair);
+ * if (isTxFailure(result) && isRetryable(result)) {
+ *   // safe to resubmit
+ * }
+ */
+/**
  * Type-guard — narrows `TxResult` to `TxFailure`.
  *
  * @example
@@ -755,6 +773,27 @@ export function isTxSuccess(result: TxResult): result is TxSuccess {
 export function isTxFailure(result: TxResult): result is TxFailure {
   return result.success === false;
 }
+
+export function isRetryable(result: TxFailure): boolean {
+  switch (result.errorCode) {
+    case "network_error":
+    case "try_again_later":
+    case "tx_rejected":
+      return true;
+    // timeout / stale_rpc: tx may be in flight — check the hash first.
+    // Classified as NOT automatically retryable to prevent blind duplication.
+    case "timeout":
+    case "stale_rpc":
+    case "invalid_argument":
+    case "account_not_found":
+    case "simulation_failed":
+    case "tx_failed":
+    case "unknown":
+    default:
+      return false;
+  }
+}
+
 
 // ─── Indexer REST API models ───────────────────────────────────────────────────
 //
