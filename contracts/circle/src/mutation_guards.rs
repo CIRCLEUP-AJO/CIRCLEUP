@@ -37,6 +37,12 @@
 //! | reputation revocation permanent | revived circle awards points | `guard_reputation_revocation_is_permanent` |
 //! | `duplicate members` | one wallet gets two rotation slots | `guard_duplicate_members_rejected` |
 //! | `not authorized to close: caller is not a circle member` | outsider drains collateral | `guard_close_non_member_rejected` |
+//! | `circle is not active` on contribute while Pending/Completed | tokens locked with no payout path | `guard_contribute_blocked_while_pending`, `guard_contribute_blocked_while_completed` |
+//! | `round deadline passed` on contribute | late contribution accepted | `guard_contribute_rejected_one_past_deadline` |
+//! | `already paid out` (CEI single-use guard) | double-payout transfers pot twice | `guard_payout_single_use_settled_marker` |
+//! | `stored recipient does not match rotation order` | pot transferred to wrong address | `guard_payout_recipient_must_match_rotation` |
+//! | collateral zeroed before transfer (CEI) | second withdrawal after close | `guard_collateral_zeroed_after_close_prevents_second_withdrawal` |
+//! | penalty deducted once and counted in release | penalty counted twice or refunded | `guard_collateral_penalty_and_release_counted_once` |
 //!
 //! # CI budget
 //!
@@ -792,4 +798,129 @@ mod mutation_guard_tests {
             "mark_default must succeed at deadline+1 for non-contributor"
         );
     }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GUARD 16: Payout CEI — paid_out written before external interactions
+    //
+    // Guard: `round.paid_out = true` is set BEFORE token transfer and
+    //   reputation increment.
+    // Risk if removed / reordered: a reentrant payout call could succeed
+    //   before paid_out is flipped, allowing the pot to be transferred twice.
+    //
+    // Note: full reentrancy requires a hostile token contract; in the Soroban
+    //   test environment we simulate by calling payout() again directly after
+    //   the first succeeds — the second call must be rejected immediately.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// A round can only be paid out once: the second call must panic.
+    #[test]
+    #[should_panic(expected = "already paid out")]
+    fn guard_payout_single_use_settled_marker() {
+        let t = make_setup();
+        t.activate();
+        t.contribute_all();
+        t.circle.payout(); // succeeds — paid_out = true
+        t.circle.payout(); // must be rejected
+    }
+
+    /// After payout, RoundsCompleted increments exactly once.
+    /// Over-counting would only happen if payout ran more than once.
+    #[test]
+    fn guard_payout_rounds_completed_increments_exactly_once() {
+        let t = make_setup();
+        t.activate();
+        t.contribute_all();
+        t.circle.payout();
+
+        let completed: u32 = t.env.as_contract(&t.circle_id, || {
+            t.env.storage().instance()
+                .get(&crate::DataKey::RoundsCompleted)
+                .unwrap_or(0)
+        });
+        assert_eq!(completed, 1, "RoundsCompleted must be 1 after one payout");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GUARD 17: Payout recipient derived from rotation — caller cannot inject
+    //
+    // Guard: recipient cross-check `round.recipient == members[round.round_index]`
+    // Risk if removed: a storage corruption that changes the stored recipient
+    //   without updating the rotation would silently transfer the pot to the
+    //   wrong address.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// Injecting a non-rotation recipient into CurrentRound.recipient causes payout to panic.
+    #[test]
+    #[should_panic(expected = "stored recipient does not match rotation order")]
+    fn guard_payout_recipient_must_match_rotation() {
+        let t = make_setup();
+        t.activate();
+        t.contribute_all();
+
+        // Corrupt stored recipient
+        let outsider = Address::generate(&t.env);
+        t.env.as_contract(&t.circle_id, || {
+            let mut round: crate::RoundState = t.env.storage().instance()
+                .get(&crate::DataKey::CurrentRound).unwrap();
+            round.recipient = outsider;
+            t.env.storage().instance().set(&crate::DataKey::CurrentRound, &round);
+        });
+
+        t.circle.payout(); // must panic
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GUARD 18: Collateral conservation — no member can withdraw twice
+    //
+    // Guard: `env.storage().persistent().set(&collateral_key, &0i128)`
+    //   before transfer in close(), plus the Closed flag.
+    // Risk if removed: a member whose key was not zeroed could somehow trigger
+    //   a second release; the arithmetic assertion in close() would also catch
+    //   a double-count.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// After close, every collateral storage key is zero — no second withdrawal possible.
+    #[test]
+    fn guard_collateral_zeroed_after_close_prevents_second_withdrawal() {
+        let t = make_setup();
+        t.activate();
+        t.force_status(CircleStatus::Completed);
+        t.circle.close(&t.alice);
+
+        for member in [&t.alice, &t.bob, &t.carol, &t.dave] {
+            assert_eq!(
+                t.circle.get_collateral(member), 0,
+                "collateral must be zero after close — prevents second withdrawal"
+            );
+        }
+    }
+
+    /// Penalized collateral is counted once: penalty reduces stored balance,
+    /// close releases only the reduced balance.
+    #[test]
+    fn guard_collateral_penalty_and_release_counted_once() {
+        let t = make_setup();
+        t.activate();
+
+        let initial = t.circle.get_collateral(&t.dave);
+        let penalty = initial * PENALTY_BPS / BPS_DENOM;
+        let remaining = initial - penalty;
+
+        t.advance_past_deadline();
+        t.circle.mark_default(&t.dave);
+
+        // Stored value must be exactly initial - penalty (deducted once)
+        assert_eq!(t.circle.get_collateral(&t.dave), remaining);
+
+        t.force_status(CircleStatus::Completed);
+        let bal_before = t.token.balance(&t.dave);
+        t.circle.close(&t.dave);
+        let released = t.token.balance(&t.dave) - bal_before;
+
+        // Released must equal remaining (not initial, not 0)
+        assert_eq!(released, remaining,
+            "released collateral must equal penalty-reduced balance, counted exactly once");
+        assert_eq!(t.circle.get_collateral(&t.dave), 0);
+    }
 }
+
