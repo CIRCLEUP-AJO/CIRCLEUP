@@ -655,9 +655,9 @@ impl CircleContract {
 
         // Reject late contributions even when payout has not run yet (e.g. the
         // pot is incomplete and callers are waiting on mark_default / payout).
-        // Must stay consistent with mark_default, which becomes available once
-        // sequence > deadline_ledger.
-        if (env.ledger().sequence() as u64) > round.deadline_ledger {
+        // Uses the centralized deadline_passed predicate so the boundary
+        // semantics are identical to mark_default (strict greater-than).
+        if Self::deadline_passed(&env, &round) {
             panic!("round deadline passed; cannot contribute before payout");
         }
 
@@ -692,9 +692,65 @@ impl CircleContract {
         );
     }
 
+    // ── Deadline predicate ────────────────────────────────────────────────────
+
+    /// Returns `true` when the round deadline has **strictly** passed.
+    ///
+    /// # Boundary rule
+    ///
+    /// Uses `sequence > deadline_ledger` (strict greater-than).  The member
+    /// whose contribution arrives in the very ledger that *equals*
+    /// `deadline_ledger` is still considered on time; the deadline is only
+    /// exceeded on the **next** ledger.  This is the single authoritative
+    /// definition used by both `contribute` and `mark_default` so the two
+    /// entry-points can never have inconsistent boundary semantics.
+    ///
+    /// # Source of time
+    ///
+    /// Reads `env.ledger().sequence()` — the current ledger sequence number
+    /// committed by the Stellar consensus protocol.  This value is determined
+    /// by the network, not by the caller, so no client timestamp can influence
+    /// whether a default is allowed.
+    ///
+    /// # Per-round isolation
+    ///
+    /// Each round stores its own `deadline_ledger` in `CurrentRound`.  The
+    /// deadline is refreshed every time a new round starts (in `payout`) so
+    /// stale deadlines from a prior round can never bleed into a later one.
+    #[inline]
+    fn deadline_passed(env: &Env, round: &RoundState) -> bool {
+        (env.ledger().sequence() as u64) > round.deadline_ledger
+    }
+
     // ── Payout ────────────────────────────────────────────────────────────────
 
     /// Transfer the pot to this round's recipient once all members have contributed.
+    ///
+    /// # Recipient derivation
+    ///
+    /// The recipient is **always** `members[round_index]` — the value stored in
+    /// `CurrentRound.recipient` at round-start time.  No caller argument can
+    /// override this.  An index-out-of-bounds state (which should be
+    /// unreachable given the initialization checks) is treated as a storage
+    /// inconsistency and panics rather than silently transferring to a wrong
+    /// address.
+    ///
+    /// # Checks-Effects-Interactions ordering
+    ///
+    /// 1. All precondition checks run first (status, paid_out, contribution counts,
+    ///    tally cross-check, recipient bounds).
+    /// 2. `round.paid_out = true` and `RoundsCompleted` are written to storage
+    ///    **before** any external call (token transfer or reputation increment).
+    ///    If a downstream call re-enters `payout`, the `paid_out` guard fires
+    ///    immediately, preventing a second transfer.
+    /// 3. The token transfer runs next.
+    /// 4. The reputation increment runs last.  If it fails, the transaction
+    ///    rolls back — this reverts the `paid_out` flag too, leaving the round
+    ///    payable again once the reputation contract issue is resolved.
+    ///    This is the documented policy: **reputation failure rolls back settlement**.
+    ///    Callers who want fire-and-forget reputation should wrap the call in an
+    ///    SDK retry pattern rather than expecting the contract to skip it.
+    ///
     /// Anyone may call this.
     pub fn payout(env: Env) {
         let config: CircleConfig = env
@@ -718,6 +774,9 @@ impl CircleContract {
             .get(&DataKey::CurrentRound)
             .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
+        // Single-use guard: a round may be paid out exactly once.
+        // This flag is written to storage BEFORE any external call (CEI) so
+        // that a reentrant payout attempt hits this guard immediately.
         if round.paid_out {
             panic!("already paid out");
         }
@@ -728,6 +787,7 @@ impl CircleContract {
         }
 
         // Strong invariant: contribution counter must match persisted records.
+        // A forged counter that passes the previous check is caught here.
         let mut persisted_contributors: u32 = 0;
         for member in config.members.iter() {
             if env.storage().persistent().has(&DataKey::Contributed(member, round.round_index)) {
@@ -738,24 +798,48 @@ impl CircleContract {
             panic!("round contribution tally mismatch");
         }
 
-        // Transfer pot (member_count × round_amount) to this round's recipient
+        // Bounds guard: round_index must be a valid position in the rotation.
+        // This is defensive — initialize already ensures member_count >= 2 and
+        // payout advances round_index by 1 after checking < member_count, so
+        // an out-of-bounds index indicates a storage inconsistency.
+        if round.round_index >= member_count as u32 {
+            panic!("circle: round_index out of bounds — storage inconsistency");
+        }
+
+        // Verify stored recipient matches the canonical rotation position.
+        // The recipient is never supplied by the caller; it is always derived
+        // from members[round_index] and stored at round-start time.  This
+        // cross-check catches any divergence between the stored recipient and
+        // the rotation order (e.g. from a hypothetical storage corruption).
+        let canonical_recipient = config
+            .members
+            .get(round.round_index)
+            .unwrap_or_else(|| panic!("circle: canonical recipient at index {} missing — storage inconsistency", round.round_index));
+        if round.recipient != canonical_recipient {
+            panic!("circle: stored recipient does not match rotation order — storage inconsistency");
+        }
+
         let pot: i128 = config
             .round_amount
             .checked_mul(member_count as i128)
             .unwrap_or_else(|| panic!("pot amount overflow"));
-        let token_client = token::Client::new(&env, &config.usdc_token);
-        Self::safe_transfer(
-            &token_client,
-            &env.current_contract_address(),
-            &round.recipient,
-            &pot,
-            "round payout",
-        );
 
+        // ── CHECKS-EFFECTS-INTERACTIONS ───────────────────────────────────────
+        //
+        // All state mutations happen before any external calls so a reentrant
+        // call to payout() sees paid_out=true and panics before it can
+        // transfer the pot a second time.
+        //
+        // If either external call (token transfer or reputation increment)
+        // fails, the Soroban transaction rolls back atomically — this resets
+        // paid_out to false and leaves the round payable once the downstream
+        // issue is resolved.
+
+        // Effect: mark this round as settled before touching external contracts.
         round.paid_out = true;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
-        // Bump completed counter
+        // Effect: bump the completed-round counter.
         let completed: u32 = env
             .storage()
             .instance()
@@ -765,13 +849,30 @@ impl CircleContract {
             .instance()
             .set(&DataKey::RoundsCompleted, &(completed + 1));
 
-        // Increment on-chain reputation for the recipient.
-        // Pass the circle's own address as the `circle` argument — Soroban's
-        // Contract Invoker rule auto-grants require_auth for the calling
-        // contract's own address, so no external signature is needed.
-        // try_increment surfaces any reputation contract error (e.g. circle
-        // not yet registered as authorized caller) as a clear panic instead of
-        // a silent trap from the callee.
+        // Interaction 1: transfer pot to the canonical recipient.
+        let token_client = token::Client::new(&env, &config.usdc_token);
+        Self::safe_transfer(
+            &token_client,
+            &env.current_contract_address(),
+            &round.recipient,
+            &pot,
+            "round payout",
+        );
+
+        // Interaction 2: increment on-chain reputation for the recipient.
+        //
+        // Reputation failure policy (documented):
+        //   If try_increment returns an error the whole transaction rolls back.
+        //   This reverts paid_out=true, RoundsCompleted, and the token transfer.
+        //   The round remains payable and the operator must resolve the
+        //   reputation contract issue (e.g. re-register the circle as an
+        //   authorized caller) before retrying payout.
+        //
+        // Rationale: a successful token transfer with a failed reputation
+        //   update would leave the recipient richer but unrecognized, which is
+        //   harder to recover from than a clean rollback.  Rollback is the
+        //   safe default; operators who prefer fire-and-forget reputation
+        //   should wrap the retry at the SDK layer.
         let rep_client =
             reputation::ReputationContractClient::new(&env, &config.reputation_contract);
         let _ = rep_client
@@ -802,6 +903,9 @@ impl CircleContract {
                 round_index: next_round_index,
                 recipient: next_recipient.clone(),
                 contributions_received: 0,
+                // Use the centralized deadline helper: new deadline = current
+                // ledger + round_deadline_ledgers, sourced from the contract's
+                // own ledger sequence — not from any caller-supplied timestamp.
                 deadline_ledger: env.ledger().sequence() as u64
                     + config.round_deadline_ledgers as u64,
                 paid_out: false,
@@ -859,7 +963,11 @@ impl CircleContract {
             panic!("round already paid out");
         }
 
-        if (env.ledger().sequence() as u64) <= round.deadline_ledger {
+        // Uses the centralized deadline_passed predicate — strict greater-than
+        // so the deadline ledger itself is the last moment to contribute, not
+        // the first moment to default.  This is the same boundary used by
+        // contribute() so the two entry-points are always consistent.
+        if !Self::deadline_passed(&env, &round) {
             panic!("round deadline not yet passed");
         }
 
