@@ -9,6 +9,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `app/src/lib/walletCapabilities.ts` — wallet capability adapter around the
+  Freighter provider: `detectWalletCapabilities()` returns a typed
+  `WalletCapabilities` result (connect / sign / network / change-listener), and
+  `explainUnsupportedAction()` produces a user-facing reason *before* an action
+  is attempted. SSR-safe (returns all-unsupported when `window` is absent, never
+  throws) and reads only the provider's method shape, so results carry no
+  sensitive data
+- `app/src/lib/walletCapabilities.test.ts` — mocked-provider tests for each
+  capability state (SSR, absent, full, signing-only, network-only, listener-only,
+  denied/partial) and the pre-signing explanation helper
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
