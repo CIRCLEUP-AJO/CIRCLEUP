@@ -9,6 +9,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `sdk/src/types.ts` — typed indexer read models `CircleSummary`, `CircleDetail`,
+  `MemberStatus`, `RoundStatus`, and `PayoutHistory` (plus `RoundPhase`,
+  `RoundContribution`, `RoundDefault`, `PayoutRecord`). Every monetary field is
+  documented as **stroops** and typed `string`; every value the indexer can omit
+  is explicitly `T | null`. No new `any`
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
