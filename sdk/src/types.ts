@@ -683,6 +683,7 @@ export interface TxSuccess {
  * | `"tx_rejected"` | The transaction was submitted but immediately rejected (`status === "ERROR"`). | Yes, after rebuilding. |
  * | `"tx_failed"` | The transaction was included in a ledger but its status is FAILED. | No — it ran and failed on-chain. |
  * | `"stale_rpc"` | The RPC stopped advancing its ledger while the transaction was pending. | Yes — against a healthy RPC. |
+ * | `"stale_state"` | An opt-in write preflight found the on-chain state had moved past the caller's expected state, so the submission would predictably fail. | No — refresh state and rebuild. |
  * | `"timeout"` | Confirmation polling exceeded the timeout window. | Check the hash before retrying. |
  * | `"unknown"` | An unclassified error (should not normally occur). | Unknown. |
  *
@@ -704,8 +705,32 @@ export type TxErrorCode =
   | "tx_rejected"
   | "tx_failed"
   | "stale_rpc"
+  | "stale_state"
   | "timeout"
   | "unknown";
+
+/**
+ * One field of on-chain state that has diverged from the value a caller
+ * expected, as detected by the opt-in write preflight (issue #347).
+ *
+ * `expected` is what the caller's UI/decision was based on; `actual` is the
+ * freshly-read chain value.  A non-empty list of these is what makes a stale
+ * submission *predictable* — e.g. `{ field: "roundIndex", expected: 2,
+ * actual: 3 }` means the round advanced after the caller loaded the page.
+ */
+export interface StateMismatch {
+  /** Which comparable state field diverged. */
+  readonly field:
+    | "status"
+    | "roundIndex"
+    | "contributionsReceived"
+    | "hasContributed"
+    | "paidOut";
+  /** The value the caller expected (from their snapshot). */
+  readonly expected: string | number | boolean;
+  /** The value freshly read from the chain at preflight time. */
+  readonly actual: string | number | boolean;
+}
 
 /** A transaction that failed to submit, was rejected, or timed out. */
 export interface TxFailure {
@@ -725,6 +750,13 @@ export interface TxFailure {
    * @see {@link TxErrorCode} for the full list of codes and their meanings.
    */
   readonly errorCode: TxErrorCode;
+  /**
+   * The specific state divergences that caused a preflight to abort the
+   * submission.  Present only when `errorCode === "stale_state"`; a caller can
+   * use it to tell the user exactly what changed (which round, whose
+   * contribution) instead of a generic "try again". See {@link StateMismatch}.
+   */
+  readonly mismatches?: readonly StateMismatch[];
 }
 
 /** Discriminated union of all possible transaction outcomes. */
