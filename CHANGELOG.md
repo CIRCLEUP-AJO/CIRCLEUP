@@ -34,6 +34,16 @@ Versions follow [Semantic Versioning](https://semver.org/).
   partial replay semantics and preflight non-mutation guarantee
 - `indexer` boot sequence now logs a prominent `SCHEMA WARNING` for `drifted` or
   `partial` states after migrations run, surfacing drift before the poller starts
+- `sdk/src/constants.ts` — `getExplorerLink(network, type, identifier)`: builds a
+  network-aware Stellar Expert URL for a transaction, account, or contract.
+  Mainnet correctly maps to the explorer's `public` segment, identifiers are
+  URL-encoded so a value with slashes or other path characters cannot break out
+  of the path, and unsupported/custom networks or empty identifiers return `null`
+  (a safe non-link the caller renders as plain text); also exports the
+  `ExplorerEntityType` type and `EXPLORER_BASE_URL` constant
+- `sdk/src/constants.test.ts` — tests for `getExplorerLink` covering testnet,
+  mainnet (→ `public`), account/contract entity types, custom/unsupported
+  networks, and malformed identifiers (path injection, whitespace, empty)
 
 ### Changed
 - `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
@@ -44,6 +54,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
+- `app/src/lib/config.ts` — mirrored the SDK explorer helper as `getExplorerLink`
+  and added `resolveNetworkName` / `ACTIVE_NETWORK` (resolved once from
+  `NEXT_PUBLIC_NETWORK_PASSPHRASE`). The create and circle-detail views now build
+  transaction links from the active network instead of a hardcoded testnet URL,
+  and omit the link — rendering the hash as plain text — on unsupported networks
 
 ### Fixed
 - SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with

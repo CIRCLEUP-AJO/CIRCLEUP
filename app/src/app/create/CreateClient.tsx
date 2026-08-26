@@ -5,14 +5,13 @@ import {
   CIRCLE_FACTORY_ADDRESS,
   usdcToStroops,
   shortAddress,
+  getExplorerLink,
+  ACTIVE_NETWORK,
 } from "@/lib/config";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
-
-/** Stellar Expert base URL for testnet transactions. */
-const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
 
 /** Minimum and maximum number of members allowed by the contract. */
 const MIN_MEMBERS = 2;
@@ -199,6 +198,10 @@ export default function CreateClient() {
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
+  // Network-aware explorer link for the created transaction. Resolves to null
+  // on unsupported/custom networks, in which case the link is omitted entirely.
+  const explorerTxUrl = txHash ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash) : null;
+
   return (
     <div className="max-w-xl mx-auto">
       <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
@@ -358,14 +361,16 @@ export default function CreateClient() {
               </div>
             </div>
 
-            <a
-              href={`${EXPLORER_BASE}/${txHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
-            >
-              View on Stellar Expert ↗
-            </a>
+            {explorerTxUrl && (
+              <a
+                href={explorerTxUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
+              >
+                View on Stellar Expert ↗
+              </a>
+            )}
 
             <p className="text-xs text-slate-500">
               Redirecting to circles list in a few seconds…
