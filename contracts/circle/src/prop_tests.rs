@@ -126,7 +126,7 @@ mod prop_tests {
             sdk_members.push_back(m);
         }
 
-        circle.initialize(&sdk_members, &round_amount, &token_id, &rep_id, &deadline);
+        circle.initialize(&Address::generate(&env), &sdk_members, &round_amount, &token_id, &rep_id, &deadline);
 
         PropSetup {
             env,
@@ -732,6 +732,7 @@ mod prop_tests {
 
         // MAX_VALID_ROUND_AMOUNT + 1 overflows the penalty check
         circle.initialize(
+            &Address::generate(&env),
             &members,
             &(MAX_VALID_ROUND_AMOUNT + 1),
             &token_id,
@@ -806,6 +807,7 @@ mod prop_tests {
         // and amount * member_count (256) ≤ i128::MAX.
         let round_amount = 1_000_000i128;
         circle.initialize(
+            &Address::generate(&env),
             &members,
             &round_amount,
             &token_id,
@@ -1137,6 +1139,7 @@ mod prop_tests {
         members.push_back(Address::generate(&env));
 
         circle.initialize(
+            &Address::generate(&env),
             &members,
             &1_000_000i128,
             &token_address,
@@ -1171,6 +1174,7 @@ mod prop_tests {
             }
 
             circle.initialize(
+                &Address::generate(&env),
                 &members,
                 &round_amount,
                 &token_address,

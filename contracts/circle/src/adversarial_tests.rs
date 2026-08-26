@@ -60,6 +60,8 @@ mod adversarial_tests {
         dave: Address,    // members[3]
         /// NOT in config.members — the canonical "forged member".
         stranger: Address,
+        /// Address with pause/resume authority over this circle.
+        circle_admin: Address,
     }
 
     impl<'a> AdvSetup<'a> {
@@ -133,6 +135,8 @@ mod adversarial_tests {
         rep.initialize(&rep_admin);
         rep.add_authorized_caller(&rep_admin, &circle_id);
 
+        let circle_admin = Address::generate(&env);
+
         let mut members = Vec::new(&env);
         members.push_back(alice.clone());
         members.push_back(bob.clone());
@@ -140,6 +144,7 @@ mod adversarial_tests {
         members.push_back(dave.clone());
 
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_reg.address(),
@@ -161,6 +166,7 @@ mod adversarial_tests {
             carol,
             dave,
             stranger,
+            circle_admin,
         }
     }
 

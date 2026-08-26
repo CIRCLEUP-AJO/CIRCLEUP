@@ -92,6 +92,7 @@ mod mutation_guard_tests {
         bob: Address,
         carol: Address,
         dave: Address,
+        circle_admin: Address,
     }
 
     impl<'a> MutSetup<'a> {
@@ -176,6 +177,8 @@ mod mutation_guard_tests {
         rep_client.initialize(&rep_admin);
         rep_client.add_authorized_caller(&rep_admin, &circle_id);
 
+        let circle_admin = Address::generate(&env);
+
         let mut members = Vec::new(&env);
         members.push_back(alice.clone());
         members.push_back(bob.clone());
@@ -183,6 +186,7 @@ mod mutation_guard_tests {
         members.push_back(dave.clone());
 
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_reg.address(),
@@ -202,6 +206,7 @@ mod mutation_guard_tests {
             bob,
             carol,
             dave,
+            circle_admin,
         }
     }
 
@@ -508,7 +513,9 @@ mod mutation_guard_tests {
 
         // i128::MAX / PENALTY_BPS + 1 overflows `round_amount * PENALTY_BPS`
         let overflow_amount = i128::MAX / crate::PENALTY_BPS + 1;
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &overflow_amount,
             &token_reg.address(),
@@ -549,7 +556,9 @@ mod mutation_guard_tests {
 
         // i128::MAX / 255 + 1 overflows when multiplied by member_count (255)
         let overflow_amount = i128::MAX / member_count as i128 + 1;
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &overflow_amount,
             &token_reg.address(),
@@ -689,7 +698,9 @@ mod mutation_guard_tests {
         members.push_back(bob.clone());
         members.push_back(alice.clone()); // duplicate
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_reg.address(),
