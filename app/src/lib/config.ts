@@ -171,3 +171,31 @@ export function shortAddress(addr: string): string {
   if (!addr || addr.length < 8) return addr;
   return `${addr.slice(0, 4)}…${addr.slice(-4)}`;
 }
+
+// ─── Ledger / time helpers ────────────────────────────────────────────────────
+//
+// Mirrors sdk/src/utils.ts (the canonical source of truth). The app package
+// does not depend on @circleup/sdk, so these helpers are re-declared here and
+// must be kept in sync with the SDK.
+//
+// UTC / rounding policy:
+//   • A "day" is always a fixed 86_400-second UTC day, never a local calendar
+//     day, so midnight, leap days, and daylight-saving transitions never shift
+//     the result — the conversion is pure arithmetic and independent of the
+//     host timezone.
+//   • Stellar produces one ledger approximately every 5 seconds, so a day is
+//     86_400 / 5 = 17_280 ledgers.
+//   • Fractional ledgers are rounded to the nearest whole ledger, so identical
+//     inputs always yield identical, deterministic ledger deadlines.
+
+/** Approximate ledgers for a given number of days (Stellar: ~5 s/ledger). */
+export function daysToLedgers(days: number): number {
+  if (days < 0) throw new RangeError(`daysToLedgers: days must be >= 0, got ${days}`);
+  return Math.round((days * 24 * 60 * 60) / 5);
+}
+
+/** Approximate days for a given number of ledgers. */
+export function ledgersToDays(ledgers: number): number {
+  if (ledgers < 0) throw new RangeError(`ledgersToDays: ledgers must be >= 0, got ${ledgers}`);
+  return Math.round((ledgers * 5) / (24 * 60 * 60));
+}
