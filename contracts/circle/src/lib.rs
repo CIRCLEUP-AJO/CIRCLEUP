@@ -563,9 +563,14 @@ impl CircleContract {
 
         env.storage().instance().remove(&DataKey::Initializing);
 
+        // Event: circle/initialized
+        // Data: (circle_address, member_count, round_amount)
+        //   circle_address — identifies this circle in multi-circle indexer queries
+        //   member_count   — number of members configured (equals total rounds)
+        //   round_amount   — USDC stroops each member contributes per round
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "initialized")),
-            member_count,
+            (env.current_contract_address(), member_count, round_amount),
         );
     }
 
@@ -673,16 +678,31 @@ impl CircleContract {
                 + config.round_deadline_ledgers as u64;
             env.storage().instance().set(&DataKey::CurrentRound, &round);
 
+            // Event: circle/active
+            // Data: (circle_address, deadline_ledger)
+            //   circle_address  — identifies this circle for multi-circle indexer queries
+            //   deadline_ledger — round-0 deadline set at activation; consumers can start
+            //                     countdown timers without polling get_current_round
             env.events()
-                .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "active")), ());
+                .publish(
+                    (Symbol::new(&env, "circle"), Symbol::new(&env, "active")),
+                    (env.current_contract_address(), round.deadline_ledger),
+                );
         }
 
-        // Emit (member, join_order) so indexers and front-ends can show a live
-        // join-progress indicator ("2 of 4 members joined") and record who
-        // claimed which position in the queue without secondary lookups.
+        // Event: circle/joined
+        // Data: (circle_address, member, join_order, collateral_amount)
+        //   circle_address   — identifies this circle for multi-circle indexer queries
+        //   member           — the address that just joined
+        //   join_order       — 1-based position in the join queue (N triggers Active)
+        //   collateral_amount — USDC stroops locked by this member
+        let collateral_amount = config
+            .round_amount
+            .checked_mul(COLLATERAL_MULTIPLIER)
+            .unwrap_or(0);
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "joined")),
-            (member, join_order),
+            (env.current_contract_address(), member, join_order, collateral_amount),
         );
     }
 
@@ -723,9 +743,14 @@ impl CircleContract {
             .instance()
             .set(&DataKey::Status, &CircleStatus::Cancelled);
 
+        // Event: circle/cancelled
+        // Data: (circle_address, caller, ledger)
+        //   circle_address — identifies this circle for replay
+        //   caller         — member who triggered cancellation
+        //   ledger         — ledger sequence at cancellation time
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "cancelled")),
-            (caller, env.ledger().sequence()),
+            (env.current_contract_address(), caller, env.ledger().sequence()),
         );
     }
 
@@ -799,9 +824,15 @@ impl CircleContract {
         round.contributions_received += 1;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
+        // Event: circle/contributed
+        // Data: (circle_address, member, round_index, amount)
+        //   circle_address — identifies this circle for replay
+        //   member         — contributor's address
+        //   round_index    — which round this contribution belongs to
+        //   amount         — USDC stroops transferred (= round_amount)
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "contributed")),
-            (member, round.round_index),
+            (env.current_contract_address(), member, round.round_index, config.round_amount),
         );
     }
 
@@ -993,9 +1024,15 @@ impl CircleContract {
             .try_increment(&env.current_contract_address(), &round.recipient)
             .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
 
+        // Event: circle/payout
+        // Data: (circle_address, recipient, amount, round_index)
+        //   circle_address — identifies this circle for replay
+        //   recipient      — address that received the pot
+        //   amount         — total USDC stroops paid out (= round_amount × member_count)
+        //   round_index    — which round was settled
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
-            (round.recipient.clone(), pot, round.round_index),
+            (env.current_contract_address(), round.recipient.clone(), pot, round.round_index),
         );
 
         // Advance to next round or mark the circle as completed
@@ -1004,9 +1041,13 @@ impl CircleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Status, &CircleStatus::Completed);
+            // Event: circle/completed
+            // Data: (circle_address, rounds_completed)
+            //   circle_address   — identifies this circle for replay
+            //   rounds_completed — total rounds that ran (equals member_count)
             env.events().publish(
                 (Symbol::new(&env, "circle"), Symbol::new(&env, "completed")),
-                (),
+                (env.current_contract_address(), member_count),
             );
         } else {
             let next_recipient = config
@@ -1029,9 +1070,15 @@ impl CircleContract {
             // Notify indexers and front-ends that a new contribution window has
             // opened.  Consumers can use this event to reset contribution status
             // displays and restart deadline countdowns without polling get_current_round.
+            // Event: circle/round_started
+            // Data: (circle_address, round_index, recipient, deadline_ledger)
+            //   circle_address  — identifies this circle for replay
+            //   round_index     — the new round that just opened
+            //   recipient       — address scheduled to receive the pot this round
+            //   deadline_ledger — ledger after which contributions are rejected
             env.events().publish(
                 (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
-                (next_round_index, next_recipient, next_round.deadline_ledger),
+                (env.current_contract_address(), next_round_index, next_recipient, next_round.deadline_ledger),
             );
         }
     }
@@ -1132,9 +1179,16 @@ impl CircleContract {
             .persistent()
             .set(&DataKey::Defaults(member.clone()), &(defaults + 1));
 
+        // Event: circle/default
+        // Data: (circle_address, member, penalty, round_index, new_collateral)
+        //   circle_address  — identifies this circle for replay
+        //   member          — the member who was penalised
+        //   penalty         — USDC stroops deducted from collateral
+        //   round_index     — round in which the default occurred
+        //   new_collateral  — member's collateral balance after penalty
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
-            (member, penalty, round.round_index, new_collateral),
+            (env.current_contract_address(), member, penalty, round.round_index, new_collateral),
         );
     }
 
@@ -1306,14 +1360,17 @@ impl CircleContract {
                     .unwrap_or_else(|| panic!("total released overflow"));
                 members_released += 1;
 
-                // Per-member audit trail: indexers sum these to reconcile
-                // with total_released in the closed event.
+                // Event: circle/collateral_released (per member with positive balance)
+                // Data: (circle_address, member, amount)
+                //   circle_address — identifies this circle for replay
+                //   member         — recipient of the released collateral
+                //   amount         — USDC stroops returned to this member
                 env.events().publish(
                     (
                         Symbol::new(&env, "circle"),
                         Symbol::new(&env, "collateral_released"),
                     ),
-                    (member, collateral),
+                    (env.current_contract_address(), member, collateral),
                 );
             }
         }
@@ -1337,12 +1394,17 @@ impl CircleContract {
             Symbol::new(&env, "cancelled")
         };
 
-        // Aggregate settlement event.
-        // Data: (closer, total_released, total_expected_collateral, reason)
-        //   total_expected_collateral - total_released = total penalties forfeited
+        // Event: circle/closed
+        // Data: (circle_address, closer, total_released, total_expected_collateral, reason)
+        //   circle_address           — identifies this circle for replay
+        //   closer                   — member who triggered settlement
+        //   total_released           — total USDC stroops returned across all members
+        //   total_expected_collateral — what would have been released with zero penalties
+        //   reason                   — Symbol "completed" or "cancelled"
+        //   total_expected − total_released = total penalties forfeited (auditable)
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
-            (closer, total_released, total_expected_collateral, reason),
+            (env.current_contract_address(), closer, total_released, total_expected_collateral, reason),
         );
     }
 
@@ -1405,9 +1467,14 @@ impl CircleContract {
 
         env.storage().instance().set(&DataKey::Paused, &true);
 
+        // Event: circle/paused
+        // Data: (circle_address, admin, ledger)
+        //   circle_address — identifies this circle for replay
+        //   admin          — address that triggered the pause
+        //   ledger         — ledger sequence at pause time
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "paused")),
-            (admin, env.ledger().sequence()),
+            (env.current_contract_address(), admin, env.ledger().sequence()),
         );
 
         Ok(())
@@ -1456,9 +1523,14 @@ impl CircleContract {
         // `is_paused` can use a simple `has` check and the storage is clean.
         env.storage().instance().remove(&DataKey::Paused);
 
+        // Event: circle/resumed
+        // Data: (circle_address, admin, ledger)
+        //   circle_address — identifies this circle for replay
+        //   admin          — address that triggered the resume
+        //   ledger         — ledger sequence at resume time
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "resumed")),
-            (admin, env.ledger().sequence()),
+            (env.current_contract_address(), admin, env.ledger().sequence()),
         );
 
         Ok(())
