@@ -34,6 +34,27 @@ Versions follow [Semantic Versioning](https://semver.org/).
   partial replay semantics and preflight non-mutation guarantee
 - `indexer` boot sequence now logs a prominent `SCHEMA WARNING` for `drifted` or
   `partial` states after migrations run, surfacing drift before the poller starts
+- SDK: caller correlation metadata on every write. Mutation methods (`join`,
+  `contribute`, `payout`, `markDefault`, `close`, `createCircle`) accept an
+  optional `{ metadata }` (a flat bag of scalar identifiers, e.g.
+  `{ operation: "join-circle", uiRequestId: "req_8a1f" }`) that is echoed back on
+  the resulting `TxResult` — present on failures too, so a UI action ties to a tx
+  hash whether it confirmed or failed
+- SDK: `sanitizeTxMetadata` security boundary strips secrets before metadata is
+  ever echoed or logged — drops keys named like secrets (`secret`, `seed`,
+  `signed`, `xdr`, `apiKey`, …), Stellar secret-seed values under any key,
+  over-long strings (signed XDR), and all non-scalars; caps at 32 keys
+- SDK: opt-in structured tx logging via `CircleUpClient.setTxLogger`. A registered
+  `TxLogger` receives log-safe `TxLogEvent`s across the write lifecycle
+  (`simulated` → `submitted` → `confirmed` | `failed`) carrying the contract,
+  method, tx hash, ledger/error code, and sanitised correlation metadata — never
+  the signing key, its secret, the signed XDR, or the raw arguments. A throwing
+  logger can never change a transaction's outcome
+- `sdk/src/__tests__/txMetadata.test.ts` — unit tests for `sanitizeTxMetadata`
+  (secret/payload/non-scalar stripping, key cap, no-mutation/frozen output) and
+  the write path (metadata echoed on success and failure results, log lifecycle
+  ordering and log-safe fields, correlation preserved across retried attempts,
+  end-to-end threading through `CircleClient.join`)
 
 ### Changed
 - `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
