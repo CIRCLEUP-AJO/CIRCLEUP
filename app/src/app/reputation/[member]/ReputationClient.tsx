@@ -151,7 +151,7 @@ export default function ReputationClient({ member }: { member: string }) {
           </p>
         </div>
 
-        {/* Deliberate refresh button — #12 */}
+        {/* Refresh button */}
         <div className="shrink-0 text-right">
           <button
             onClick={() => load(true)}
@@ -264,7 +264,7 @@ export default function ReputationClient({ member }: { member: string }) {
         </div>
       )}
 
-      {/* Badge legend — #10 */}
+      {/* Reputation badge legend */}
       <ReputationLegend />
     </div>
   );

@@ -86,8 +86,10 @@ async function main() {
     console.log(`[circleup-indexer] Schema health: ${health.summary}`);
   }
 
-  // Start REST API
-  const app = createApp();
+  // Start REST API — pass the migration health result so the /health endpoint
+  // can surface schema drift without re-running the migration scan on every
+  // health poll request.
+  const app = createApp({ cachedMigrationHealth: health });
   const server = app.listen(PORT, () => {
     console.log(`[circleup-indexer] API listening on http://localhost:${PORT}`);
   });

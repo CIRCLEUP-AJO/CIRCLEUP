@@ -13,6 +13,23 @@
  *   circle/default           → inserts defaults row
  *   circle/completed         → updates circles.status = 'Completed'
  *   reputation/increment     → upserts reputation row
+ *
+ * Ordering model
+ * ──────────────
+ * Events are fetched for a ledger range [fromLedger, toLedger], sorted by
+ * (ledger ASC, event-id ASC) for canonical on-chain ordering, and processed
+ * one ledger at a time.  Each ledger's batch is wrapped in a single Postgres
+ * transaction that also advances the indexer_state cursor and writes a
+ * ledger_checkpoints record, so either the full ledger commits or nothing
+ * does.  Individual event failures use savepoints — a bad event handler rolls
+ * back only its own writes and lets the rest of the ledger proceed.
+ *
+ * Recovery
+ * ────────
+ * On crash/restart the cursor is read from DB (never from memory), so the
+ * indexer resumes exactly from the last durable ledger boundary.  Events
+ * already recorded in ingested_events are skipped by the dedup check inside
+ * ingestEventInTx, giving exactly-once semantics across restarts.
  */
 
 import { SorobanRpc, xdr, scValToNative } from "@stellar/stellar-sdk";
@@ -27,6 +44,7 @@ import {
   POLL_INTERVAL_MS,
   EVENTS_LIMIT,
 } from "./config";
+import { redactAddress, redactTxHash, formatAmount } from "./redact";
 
 export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
   allowHttp: true,
@@ -34,18 +52,9 @@ export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
 
 const FACTORY = CIRCLE_FACTORY_ADDRESS;
 const REPUTATION = REPUTATION_ADDRESS;
-// Not consumed by any on-chain call today — the indexer doesn't need to
-// distinguish contribution assets — but validated at startup and surfaced via
-// GET /health so operators can confirm the indexer and app agree on which
-// USDC token they're tracking.
 export const USDC = USDC_ADDRESS;
 
 // ─── Soroban RPC retry ───────────────────────────────────────────────────────
-//
-// getEvents / getLatestLedger fail transiently under RPC rate limits, brief
-// network blips, and 5xx responses. Without an in-cycle retry the poll loop
-// would skip the whole ledger range until the next interval, delaying ingest
-// and flooding logs with one-shot errors.
 
 const RPC_RETRY_MAX_ATTEMPTS = parseInt(
   process.env.RPC_RETRY_MAX_ATTEMPTS || "4",
@@ -160,14 +169,23 @@ export async function withRpcRetry<T>(
       describeRpcError(lastErr),
   );
 }
+
 // The SDK's getEvents returns EventResponse; extract the string contractId safely.
 type SdkEvent = SorobanRpc.Api.EventResponse;
+
+/**
+ * A resolved (event, handler) pair ready for per-ledger processing.
+ * The handler must be called inside an existing Postgres transaction.
+ */
+export interface EventHandler {
+  event: SdkEvent;
+  handler: (client: PoolClient) => Promise<void>;
+}
 
 function getContractIdStr(event: SdkEvent): string | null {
   const c = event.contractId;
   if (!c) return null;
   if (typeof c === "string") return c;
-  // Contract object — call toString() which returns the strkey
   if (typeof (c as { toString?: () => string }).toString === "function") {
     return (c as { toString: () => string }).toString();
   }
@@ -175,13 +193,11 @@ function getContractIdStr(event: SdkEvent): string | null {
 }
 
 function getTopicStr(event: SdkEvent, idx: number): string {
-  // In EventResponse, topic entries are already xdr.ScVal objects
   const val = event.topic[idx];
   return scValToNative(val as xdr.ScVal) as string;
 }
 
 function getValueNative(event: SdkEvent): unknown {
-  // In EventResponse, value is already an xdr.ScVal object
   return scValToNative(event.value as xdr.ScVal);
 }
 
@@ -211,39 +227,155 @@ export function createEventKey(event: SdkEvent): string {
   ].join(":");
 }
 
-async function queryClient<T = any>(client: PoolClient, text: string, params?: any[]): Promise<T[]> {
-  const res = await client.query(text, params);
-  return res.rows as T[];
+// ─── Ledger ordering utilities ────────────────────────────────────────────────
+
+/**
+ * Groups events by their ledger number, returning a Map sorted by ledger ASC.
+ * Events within each ledger retain their original insertion order; callers
+ * should sort by event.id before calling to get canonical on-chain ordering.
+ */
+export function groupEventsByLedger(events: SdkEvent[]): Map<number, SdkEvent[]> {
+  const map = new Map<number, SdkEvent[]>();
+  for (const event of events) {
+    const ledger = event.ledger ?? 0;
+    const bucket = map.get(ledger);
+    if (bucket) {
+      bucket.push(event);
+    } else {
+      map.set(ledger, [event]);
+    }
+  }
+  return new Map([...map.entries()].sort(([a], [b]) => a - b));
 }
 
-async function ingestEvent<T>(event: SdkEvent, handleEvent: (client: PoolClient) => Promise<T>): Promise<boolean> {
+/**
+ * Returns ledger numbers in [fromLedger, toLedger] absent from seenLedgers.
+ * Useful for identifying ranges where no contract events were emitted and for
+ * detecting cases where an RPC call silently dropped an expected ledger.
+ */
+export function detectLedgerGaps(
+  seenLedgers: number[],
+  fromLedger: number,
+  toLedger: number,
+): number[] {
+  const seen = new Set(seenLedgers);
+  const gaps: number[] = [];
+  for (let l = fromLedger; l <= toLedger; l++) {
+    if (!seen.has(l)) gaps.push(l);
+  }
+  return gaps;
+}
+
+// ─── Dedup-aware event ingestor (caller owns the transaction) ─────────────────
+
+/**
+ * Ingest one event inside the caller's open transaction.
+ *
+ * Checks ingested_events for the event_key; if already present, returns false
+ * without running the handler (idempotent replay path).  Otherwise records
+ * the key and runs handleEvent inside the same transaction.
+ *
+ * Callers should wrap this in a SAVEPOINT so a throwing handler rolls back
+ * only that event's writes and not the entire ledger batch.
+ */
+export async function ingestEventInTx(
+  client: PoolClient,
+  event: SdkEvent,
+  handleEvent: (client: PoolClient) => Promise<void>,
+): Promise<boolean> {
   const eventKey = createEventKey(event);
 
-  return withTransaction(async (client) => {
-    const existing = await queryClient<{ event_key: string }>(
-      client,
-      "SELECT event_key FROM ingested_events WHERE event_key = $1",
-      [eventKey],
-    );
+  const existing = await client.query<{ event_key: string }>(
+    "SELECT event_key FROM ingested_events WHERE event_key = $1",
+    [eventKey],
+  );
+  if (existing.rows.length > 0) return false;
 
-    if (existing.length > 0) {
-      return false;
+  const contractId = getContractIdStr(event) ?? "";
+  const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
+  const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
+  const eventType = topic0 && topic1 ? `${topic0}:${topic1}` : topic0;
+
+  await client.query(
+    `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (event_key) DO NOTHING`,
+    [eventKey, contractId, event.ledger, event.txHash, eventType],
+  );
+
+  await handleEvent(client);
+  return true;
+}
+
+// ─── Per-ledger atomic processor ─────────────────────────────────────────────
+
+/**
+ * Process all events for one ledger inside a single Postgres transaction.
+ *
+ * Each event is wrapped in a savepoint: a throwing handler rolls back only its
+ * own writes and does not abort the rest of the ledger.  After all events are
+ * attempted the indexer_state cursor is advanced to `ledger` and a
+ * ledger_checkpoints record is written — both inside the same transaction, so
+ * a crash before COMMIT leaves the DB at the previous ledger boundary with no
+ * partial state.
+ *
+ * items must be pre-sorted in canonical ledger order (ledger ASC, event id ASC)
+ * by the caller.
+ */
+export async function processLedger(
+  ledger: number,
+  items: EventHandler[],
+): Promise<{ processed: number; failed: number }> {
+  return withTransaction(async (client) => {
+    let processed = 0;
+    let failed = 0;
+
+    for (const { event, handler } of items) {
+      const contractId = getContractIdStr(event);
+      const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
+      const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
+
+      await client.query("SAVEPOINT sp_event");
+      try {
+        const ingested = await ingestEventInTx(client, event, handler);
+        await client.query("RELEASE SAVEPOINT sp_event");
+        if (ingested) {
+          processed++;
+          totalEventsProcessed++;
+        }
+      } catch (err) {
+        await client.query("ROLLBACK TO SAVEPOINT sp_event");
+        failed++;
+        totalEventsFailed++;
+        console.error(
+          `[indexer] Failed to process ${topic0}/${topic1} event ` +
+            `(contract=${redactAddress(contractId ?? "unknown")}, ledger=${ledger}` +
+            (event.txHash ? `, tx=${redactTxHash(event.txHash)}` : "") +
+            "):",
+          err,
+        );
+      }
     }
 
-    const contractId = getContractIdStr(event) ?? "";
-    const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
-    const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
-    const eventType = topic0 && topic1 ? `${topic0}:${topic1}` : topic0;
-
+    // Advance the durable ledger cursor atomically with the event writes.
+    // If this transaction rolls back (e.g. DB OOM), the cursor stays at the
+    // previous ledger so the next poll retries this ledger from scratch.
     await client.query(
-      `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (event_key) DO NOTHING`,
-      [eventKey, contractId, event.ledger, event.txHash, eventType],
+      "UPDATE indexer_state SET last_ledger = $1, updated_at = NOW() WHERE id = 1",
+      [ledger],
     );
 
-    await handleEvent(client);
-    return true;
+    await client.query(
+      `INSERT INTO ledger_checkpoints (ledger, events_count, failed_count)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (ledger) DO UPDATE
+         SET events_count  = EXCLUDED.events_count,
+             failed_count  = EXCLUDED.failed_count,
+             processed_at  = NOW()`,
+      [ledger, processed, failed],
+    );
+
+    return { processed, failed };
   });
 }
 
@@ -254,9 +386,6 @@ async function ingestEvent<T>(event: SdkEvent, handleEvent: (client: PoolClient)
  *
  * Contract data tuple (contracts/circle_factory/src/lib.rs):
  *   (circle_address: Address, creator: Address, circle_index: u32)
- *
- * Returns a typed object so callers never have to remember positional order,
- * and so tests can assert on field names rather than array indices.
  */
 export function parseCircleCreatedEvent(value: unknown): {
   circleAddress: string;
@@ -288,7 +417,7 @@ export function parseCircleCreatedEvent(value: unknown): {
   return { circleAddress, creator, circleIndex };
 }
 
-
+// ─── Cursor helpers ───────────────────────────────────────────────────────────
 
 async function getLastLedger(): Promise<number> {
   const rows = await query<{ last_ledger: string }>(
@@ -307,15 +436,11 @@ async function setLastLedger(ledger: number) {
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
 async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
-  // Delegate data extraction to the pure parser so the shape is validated
-  // before any DB writes are attempted.  See parseCircleCreatedEvent for the
-  // full field documentation.
   const { circleAddress, creator, circleIndex } = parseCircleCreatedEvent(
     getValueNative(event),
   );
 
-  await queryClient(
-    client,
+  await client.query(
     `INSERT INTO circles
        (address, creator, round_amount, member_count, total_rounds, status,
         current_round, created_ledger)
@@ -324,117 +449,104 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
     [circleAddress, creator, event.ledger],
   );
   console.log(
-    `[indexer] New circle created: ${circleAddress} by ${creator} (factory index: ${circleIndex})`,
+    `[indexer] New circle created: ${redactAddress(circleAddress)} by ${redactAddress(creator)} (factory index: ${circleIndex})`,
   );
 }
 
 async function handleCircleJoined(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const memberAddr = getValueNative(event) as string;
 
-  await queryClient(
-    client,
+  await client.query(
     `UPDATE circle_members SET joined_at = NOW()
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Member joined: ${memberAddr} → ${circleAddr}`);
+  console.log(`[indexer] Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleActive(client: PoolClient, circleAddr: string) {
-  await queryClient(
-    client,
+  await client.query(
     "UPDATE circles SET status = 'Active', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle active: ${circleAddr}`);
+  console.log(`[indexer] Circle active: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleContributed(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const [memberAddr, roundIndex] = getValueNative(event) as [string, number];
 
-  const rows = await queryClient<{ round_amount: string }>(
-    client,
+  const rows = await client.query<{ round_amount: string }>(
     "SELECT round_amount FROM circles WHERE address = $1",
     [circleAddr],
   );
-  const amount = rows.length > 0 ? rows[0].round_amount : "0";
+  const amount = rows.rows.length > 0 ? rows.rows[0].round_amount : "0";
 
-  await queryClient(
-    client,
+  await client.query(
     `INSERT INTO contributions (circle_address, member_address, round_index, amount, tx_hash, ledger)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (circle_address, member_address, round_index) DO NOTHING`,
     [circleAddr, memberAddr, roundIndex, amount, event.txHash, event.ledger],
   );
-  console.log(`[indexer] Contribution: ${memberAddr} round ${roundIndex} → ${circleAddr}`);
+  console.log(`[indexer] Contribution: ${redactAddress(memberAddr)} round ${roundIndex} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCirclePayout(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const [recipient, pot, roundIndex] = getValueNative(event) as [string, bigint, number];
 
-  await queryClient(
-    client,
+  await client.query(
     `INSERT INTO payouts (circle_address, recipient, round_index, amount, tx_hash, ledger)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (circle_address, round_index) DO NOTHING`,
     [circleAddr, recipient, roundIndex, pot.toString(), event.txHash, event.ledger],
   );
 
-  await queryClient(
-    client,
+  await client.query(
     `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
     [roundIndex + 1, circleAddr],
   );
-  console.log(`[indexer] Payout: ${recipient} received ${pot} round ${roundIndex} from ${circleAddr}`);
+  console.log(`[indexer] Payout: ${redactAddress(recipient)} ${formatAmount(pot)} round ${roundIndex} from ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleDefault(client: PoolClient, circleAddr: string, event: SdkEvent) {
   const [memberAddr, penalty, roundIndex] = getValueNative(event) as [string, bigint, number];
 
-  await queryClient(
-    client,
+  await client.query(
     `INSERT INTO defaults (circle_address, member_address, round_index, penalty, tx_hash, ledger)
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [circleAddr, memberAddr, roundIndex, penalty.toString(), event.txHash, event.ledger],
   );
 
-  await queryClient(
-    client,
+  await client.query(
     `UPDATE circle_members SET defaults = defaults + 1
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Default: ${memberAddr} penalty ${penalty} round ${roundIndex} in ${circleAddr}`);
+  console.log(`[indexer] Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
-  await queryClient(
-    client,
+  await client.query(
     "UPDATE circles SET status = 'Completed', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle completed: ${circleAddr}`);
+  console.log(`[indexer] Circle completed: ${redactAddress(circleAddr)}`);
 }
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   const score = getValueNative(event) as number;
-  // The member address is the second topic emitted by the reputation contract
   const memberAddr = scValToNative(event.topic[1] as xdr.ScVal) as string;
 
-  await queryClient(
-    client,
+  await client.query(
     `INSERT INTO reputation (member_address, score, updated_at)
      VALUES ($1, $2, NOW())
      ON CONFLICT (member_address) DO UPDATE SET score = $2, updated_at = NOW()`,
     [memberAddr, score],
   );
-  console.log(`[indexer] Reputation: ${memberAddr} → score ${score}`);
+  console.log(`[indexer] Reputation: ${redactAddress(memberAddr)} → score ${score}`);
 }
 
-// ─── Metrics ───────────────────────────────────────────────────────────────
+// ─── Metrics ─────────────────────────────────────────────────────────────────
 
-// Cumulative counters surfaced in each cycle's summary log line so a spike in
-// errors is visible without cross-referencing individual error entries.
 let totalEventsProcessed = 0;
 let totalEventsFailed = 0;
 
@@ -445,10 +557,11 @@ interface EventLogContext {
   txHash?: string;
 }
 
-// Runs a single event's handler in isolation so a malformed or unexpected
-// event (e.g. a contract upgrade adding/removing a topic field) can't abort
-// the rest of the batch — without this, one bad event in a 100-event page
-// would silently drop every event after it for that poll cycle.
+/**
+ * Runs a single event's handler in isolation, updating cumulative metrics.
+ * Exported for use in one-off testing and health utilities; the main ingest
+ * pipeline uses processLedger which manages isolation via savepoints.
+ */
 export async function runEventHandler(
   handler: () => Promise<void>,
   ctx: EventLogContext,
@@ -461,8 +574,8 @@ export async function runEventHandler(
     totalEventsFailed++;
     console.error(
       `[indexer] Failed to process ${ctx.topic} event ` +
-        `(contract=${ctx.contractId ?? "unknown"}, ledger=${ctx.ledger}` +
-        (ctx.txHash ? `, tx=${ctx.txHash}` : "") +
+        `(contract=${redactAddress(ctx.contractId ?? "unknown")}, ledger=${ctx.ledger}` +
+        (ctx.txHash ? `, tx=${redactTxHash(ctx.txHash)}` : "") +
         "):",
       err,
     );
@@ -470,14 +583,25 @@ export async function runEventHandler(
   }
 }
 
-// ─── Main poll loop ───────────────────────────────────────────────────────────
+// ─── Main poll cycle ──────────────────────────────────────────────────────────
 
+/**
+ * Fetch all relevant events for [fromLedger, toLedger], build canonical
+ * (event, handler) pairs sorted by ledger then event id, and process each
+ * ledger's batch atomically via processLedger.
+ *
+ * New circles discovered within the range are included in the circle-event
+ * query without a DB round-trip, so joined/active/etc. events in the same
+ * ledger as circle_created are not missed.
+ *
+ * The cursor in indexer_state is advanced per ledger inside processLedger.
+ * After all event-carrying ledgers are done, setLastLedger advances the
+ * cursor to toLedger to cover any trailing empty ledgers.
+ */
 async function processEvents(fromLedger: number, toLedger: number) {
   const startedAt = Date.now();
-  let eventsSeen = 0;
-  let eventsFailed = 0;
 
-  // Factory + reputation events
+  // ── 1. Fetch factory + reputation events ────────────────────────────────
   const factoryResponse = await withRpcRetry("getEvents(factory+reputation)", () =>
     rpc.getEvents({
       startLedger: fromLedger,
@@ -491,93 +615,142 @@ async function processEvents(fromLedger: number, toLedger: number) {
     }),
   );
 
+  // ── 2. Pre-extract new circle addresses from factory events ──────────────
+  // Doing this before any DB writes lets us include newly-created circles in
+  // the circle-event query even before their circle_created event is committed.
+  const newCircleAddrs: string[] = [];
   for (const event of factoryResponse.events) {
     if (!event.topic || event.topic.length < 2) continue;
-    const topic0 = getTopicStr(event, 0);
-    const topic1 = getTopicStr(event, 1);
-
-    let handler: (() => Promise<void>) | null = null;
-    if (topic0 === "factory" && topic1 === "circle_created") {
-      handler = () => ingestEvent(event, (client) => handleFactoryCircleCreated(client, event)).then(() => {});
-    } else if (topic0 === "reputation" && topic1 === "increment") {
-      handler = () => ingestEvent(event, (client) => handleReputationIncrement(client, event)).then(() => {});
+    if (getTopicStr(event, 0) === "factory" && getTopicStr(event, 1) === "circle_created") {
+      try {
+        const { circleAddress } = parseCircleCreatedEvent(getValueNative(event));
+        newCircleAddrs.push(circleAddress);
+      } catch {
+        // parse errors surface again at ingest time with full context
+      }
     }
-    if (!handler) continue;
-
-    eventsSeen++;
-    const ok = await runEventHandler(handler, {
-      contractId: getContractIdStr(event),
-      topic: `${topic0}/${topic1}`,
-      ledger: event.ledger,
-      txHash: event.txHash,
-    });
-    if (!ok) eventsFailed++;
   }
 
-  // Circle contract events — query all known circles
-  const circles = await query<{ address: string }>("SELECT address FROM circles");
+  // ── 3. Merge known + newly-discovered circle addresses ───────────────────
+  const existingCircles = await query<{ address: string }>("SELECT address FROM circles");
+  const allCircleAddrs = [
+    ...new Set([...existingCircles.map((c) => c.address), ...newCircleAddrs]),
+  ];
 
-  if (circles.length > 0) {
-    const circleAddresses = circles.map((c) => c.address);
+  // ── 4. Fetch circle contract events ──────────────────────────────────────
+  const circleEvents: SdkEvent[] = [];
+  if (allCircleAddrs.length > 0) {
     const circleResponse = await withRpcRetry("getEvents(circles)", () =>
       rpc.getEvents({
         startLedger: fromLedger,
-        filters: [{ type: "contract", contractIds: circleAddresses }],
+        filters: [{ type: "contract", contractIds: allCircleAddrs }],
         limit: EVENTS_LIMIT,
       }),
     );
+    circleEvents.push(...circleResponse.events);
+  }
 
-    for (const event of circleResponse.events) {
-      if (!event.topic || event.topic.length < 2) continue;
+  // ── 5. Build (event, handler) pairs ──────────────────────────────────────
+  const items: EventHandler[] = [];
 
-      const contractId = getContractIdStr(event);
-      if (!contractId) continue;
-
-      const topic0 = getTopicStr(event, 0);
-      const topic1 = getTopicStr(event, 1);
-
-      if (topic0 !== "circle") continue;
-
-      let handler: (() => Promise<void>) | null = null;
-      switch (topic1) {
-        case "joined":
-          handler = () => ingestEvent(event, (client) => handleCircleJoined(client, contractId, event)).then(() => {});
-          break;
-        case "active":
-          handler = () => ingestEvent(event, (client) => handleCircleActive(client, contractId)).then(() => {});
-          break;
-        case "contributed":
-          handler = () => ingestEvent(event, (client) => handleCircleContributed(client, contractId, event)).then(() => {});
-          break;
-        case "payout":
-          handler = () => ingestEvent(event, (client) => handleCirclePayout(client, contractId, event)).then(() => {});
-          break;
-        case "default":
-          handler = () => ingestEvent(event, (client) => handleCircleDefault(client, contractId, event)).then(() => {});
-          break;
-        case "completed":
-          handler = () => ingestEvent(event, (client) => handleCircleCompleted(client, contractId)).then(() => {});
-          break;
-      }
-      if (!handler) continue;
-
-      eventsSeen++;
-      const ok = await runEventHandler(handler, {
-        contractId,
-        topic: `circle/${topic1}`,
-        ledger: event.ledger,
-        txHash: event.txHash,
-      });
-      if (!ok) eventsFailed++;
+  for (const event of factoryResponse.events) {
+    if (!event.topic || event.topic.length < 2) continue;
+    const t0 = getTopicStr(event, 0);
+    const t1 = getTopicStr(event, 1);
+    if (t0 === "factory" && t1 === "circle_created") {
+      items.push({ event, handler: (c) => handleFactoryCircleCreated(c, event) });
+    } else if (t0 === "reputation" && t1 === "increment") {
+      items.push({ event, handler: (c) => handleReputationIncrement(c, event) });
     }
+  }
+
+  for (const event of circleEvents) {
+    if (!event.topic || event.topic.length < 2) continue;
+    const t0 = getTopicStr(event, 0);
+    const t1 = getTopicStr(event, 1);
+    if (t0 !== "circle") continue;
+    const contractId = getContractIdStr(event);
+    if (!contractId) continue;
+
+    let handler: ((client: PoolClient) => Promise<void>) | null = null;
+    switch (t1) {
+      case "joined":      handler = (c) => handleCircleJoined(c, contractId, event); break;
+      case "active":      handler = (c) => handleCircleActive(c, contractId); break;
+      case "contributed": handler = (c) => handleCircleContributed(c, contractId, event); break;
+      case "payout":      handler = (c) => handleCirclePayout(c, contractId, event); break;
+      case "default":     handler = (c) => handleCircleDefault(c, contractId, event); break;
+      case "completed":   handler = (c) => handleCircleCompleted(c, contractId); break;
+    }
+    if (handler) items.push({ event, handler });
+  }
+
+  // ── 6. Sort by (ledger ASC, event id ASC) — canonical on-chain order ────
+  // event.id encodes (ledger, txIndex, eventIndex), so string comparison is
+  // sufficient for within-ledger ordering.
+  items.sort((a, b) => {
+    if (a.event.ledger !== b.event.ledger) return a.event.ledger - b.event.ledger;
+    return (a.event.id ?? "").localeCompare(b.event.id ?? "");
+  });
+
+  // ── 7. Group by ledger ───────────────────────────────────────────────────
+  const byLedger = new Map<number, EventHandler[]>();
+  for (const item of items) {
+    const l = item.event.ledger;
+    const bucket = byLedger.get(l);
+    if (bucket) bucket.push(item);
+    else byLedger.set(l, [item]);
+  }
+  const sortedLedgers = [...byLedger.keys()].sort((a, b) => a - b);
+
+  // ── 8. Process each ledger atomically, checkpointing per ledger ──────────
+  let totalSeen = 0;
+  let totalFailed = 0;
+
+  for (const ledger of sortedLedgers) {
+    const { processed, failed } = await processLedger(ledger, byLedger.get(ledger)!);
+    totalSeen += processed;
+    totalFailed += failed;
+  }
+
+  // ── 9. Advance cursor to cover any empty trailing ledgers ────────────────
+  // processLedger sets the cursor to the highest event-carrying ledger.
+  // Ledgers between that and toLedger had no relevant events; advance past them
+  // so the next poll doesn't re-fetch a known-empty range.
+  const lastEventLedger = sortedLedgers.length > 0
+    ? sortedLedgers[sortedLedgers.length - 1]
+    : 0;
+  if (lastEventLedger < toLedger) {
+    await setLastLedger(toLedger);
   }
 
   const durationMs = Date.now() - startedAt;
   console.log(
     `[indexer] Processed ledgers ${fromLedger}-${toLedger}: ` +
-      `${eventsSeen} event(s), ${eventsFailed} failed, ${durationMs}ms` +
+      `${totalSeen} event(s), ${totalFailed} failed, ${durationMs}ms` +
       (totalEventsFailed > 0 ? ` (${totalEventsFailed} failed since start)` : ""),
   );
+}
+
+// ─── Poll cycle ───────────────────────────────────────────────────────────────
+
+/**
+ * One poll iteration: read the durable cursor from DB, fetch the latest
+ * ledger from RPC, and process any new ledgers.
+ *
+ * The cursor is always read from the DB (not from an in-memory variable) so
+ * that any per-ledger progress made before a crash is reflected on restart
+ * without any special recovery logic.
+ */
+async function runPollCycle(): Promise<void> {
+  let lastLedger = await getLastLedger();
+  if (lastLedger === 0) lastLedger = START_LEDGER;
+
+  const latestLedger = await withRpcRetry("getLatestLedger", () => rpc.getLatestLedger());
+  const toLedger = latestLedger.sequence;
+
+  if (toLedger > lastLedger) {
+    await processEvents(lastLedger + 1, toLedger);
+  }
 }
 
 // ─── Poller lifecycle (graceful shutdown) ─────────────────────────────────────
@@ -586,27 +759,6 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 let pollInFlight: Promise<void> | null = null;
 let shuttingDown = false;
 let indexerStarted = false;
-
-/**
- * Run one poll cycle: fetch latest ledger and ingest events in (lastLedger, to].
- * Returns the ledger cursor to persist (unchanged when there is nothing new or
- * when the batch fails — so the next tick retries the same range).
- */
-async function runPollCycle(lastLedger: number): Promise<number> {
-  const latestLedger = await rpc.getLatestLedger();
-  const toLedger = latestLedger.sequence;
-
-  if (toLedger > lastLedger) {
-    // processEvents isolates per-event failures internally; if it throws,
-    // the failure is at the batch level (RPC/DB unreachable) so we must
-    // NOT advance lastLedger — retry the same range next tick instead of
-    // silently skipping the ledgers we failed to fetch.
-    await processEvents(lastLedger + 1, toLedger);
-    await setLastLedger(toLedger);
-    return toLedger;
-  }
-  return lastLedger;
-}
 
 export async function startIndexer() {
   if (indexerStarted) {
@@ -618,41 +770,29 @@ export async function startIndexer() {
       `(poll interval: ${POLL_INTERVAL_MS}ms, events per page: ${EVENTS_LIMIT})...`,
   );
 
-  let lastLedger = await getLastLedger();
-  if (lastLedger === 0) {
-    lastLedger = START_LEDGER;
-  }
-
-  console.log(`[indexer] Starting from ledger ${lastLedger}`);
-
   shuttingDown = false;
   indexerStarted = true;
 
   const tick = () => {
-    if (shuttingDown) {
-      return;
-    }
+    if (shuttingDown) return;
     if (pollInFlight) {
-      console.warn(
-        "[indexer] Previous poll still in flight — skipping overlapping tick",
-      );
+      console.warn("[indexer] Previous poll still in flight — skipping overlapping tick");
       return;
     }
 
     pollInFlight = (async () => {
       try {
-        lastLedger = await runPollCycle(lastLedger);
+        await runPollCycle();
       } catch (err) {
-        console.error(
-          `[indexer] Poll error (will retry from ledger ${lastLedger + 1}):`,
-          err,
-        );
+        console.error("[indexer] Poll error (will retry on next tick):", err);
       }
     })().finally(() => {
       pollInFlight = null;
     });
   };
 
+  // Run an immediate tick so we don't wait a full interval on startup.
+  tick();
   pollTimer = setInterval(tick, POLL_INTERVAL_MS);
 }
 
@@ -675,9 +815,7 @@ export async function stopIndexer(): Promise<void> {
   }
 
   shuttingDown = true;
-  console.log(
-    "[indexer] Graceful shutdown requested — stopping event poller...",
-  );
+  console.log("[indexer] Graceful shutdown requested — stopping event poller...");
 
   if (pollTimer) {
     clearInterval(pollTimer);
@@ -698,7 +836,6 @@ export function isIndexerRunning(): boolean {
   return indexerStarted && !shuttingDown;
 }
 
-// Exposed for tests and potential future health/metrics endpoints.
 export function getIndexerMetrics() {
   return { totalEventsProcessed, totalEventsFailed };
 }
