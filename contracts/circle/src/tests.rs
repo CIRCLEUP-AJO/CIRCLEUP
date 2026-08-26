@@ -2423,8 +2423,7 @@ mod circle_tests {
         let closed_events = events_named(&t.env, "closed");
         assert_eq!(closed_events.len(), 1, "expected exactly one closed event");
         let closed_data = closed_events[0].clone();
-        let (_closer, total_released, _total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, _total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         assert_eq!(
@@ -2465,8 +2464,7 @@ mod circle_tests {
             .map(|(_c, _t, d)| d.clone())
             .expect("expected a closed event");
 
-        let (_closer, _total_released, total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, _total_released, total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         let expected = ROUND_AMOUNT * COLLATERAL_MULTIPLIER * (t.members.len() as i128);
@@ -2501,8 +2499,7 @@ mod circle_tests {
             .map(|(_c, _t, d)| d.clone())
             .expect("expected a closed event");
 
-        let (_closer, total_released, total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         assert_eq!(
@@ -2540,8 +2537,7 @@ mod circle_tests {
             .map(|(_c, _t, d)| d.clone())
             .expect("expected a closed event");
 
-        let (_closer, total_released, _total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, _total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         assert_eq!(
@@ -2885,8 +2881,7 @@ mod circle_tests {
         // Decode the aggregate closed event
         let closed_events = events_named(&t.env, "closed");
         assert_eq!(closed_events.len(), 1, "expected exactly one closed event");
-        let (_closer, total_released, _total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, _total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_events[0]);
 
         // 1. total_released must equal the pre-close storage sum
@@ -2900,7 +2895,7 @@ mod circle_tests {
         let events_sum: i128 = released_events
             .iter()
             .map(|v| {
-                let (_member, amount): (Address, i128) =
+                let (_circle, _member, amount): (Address, Address, i128) =
                     soroban_sdk::FromVal::from_val(&t.env, v);
                 amount
             })
@@ -2930,8 +2925,7 @@ mod circle_tests {
             t.circle.close(&t.alice);
 
             let closed = events_named(&t.env, "closed");
-            let (_closer, _released, _expected, reason):
-                (Address, i128, i128, soroban_sdk::Symbol) =
+            let (_circle, _closer, _released, _expected, reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
                 soroban_sdk::FromVal::from_val(&t.env, &closed[0]);
             assert_eq!(
                 reason,
@@ -2949,8 +2943,7 @@ mod circle_tests {
             t.circle.close(&t.alice);
 
             let closed = events_named(&t.env, "closed");
-            let (_closer, _released, _expected, reason):
-                (Address, i128, i128, soroban_sdk::Symbol) =
+            let (_circle, _closer, _released, _expected, reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
                 soroban_sdk::FromVal::from_val(&t.env, &closed[0]);
             assert_eq!(
                 reason,
@@ -2979,8 +2972,7 @@ mod circle_tests {
         t.circle.close(&t.alice);
 
         let closed = events_named(&t.env, "closed");
-        let (_closer, total_released, total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed[0]);
 
         let full_expected = ROUND_AMOUNT * COLLATERAL_MULTIPLIER * 4; // 4 members

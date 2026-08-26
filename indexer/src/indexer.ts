@@ -6,12 +6,17 @@
  *
  * Events consumed:
  *   factory/circle_created  → inserts circles + circle_members rows
+ *   circle/initialized      → (no DB write; creation handled by factory event)
  *   circle/joined            → updates circle_members.joined_at
  *   circle/active            → updates circles.status = 'Active'
  *   circle/contributed       → inserts contributions row
  *   circle/payout            → inserts payouts row, updates circles.current_round
  *   circle/default           → inserts defaults row
  *   circle/completed         → updates circles.status = 'Completed'
+ *   circle/cancelled         → updates circles.status = 'Cancelled'
+ *   circle/closed            → updates circles status/total_released/close_reason
+ *   circle/paused            → updates circles.paused = TRUE
+ *   circle/resumed           → updates circles.paused = FALSE
  *   reputation/increment     → upserts reputation row
  *
  * Ordering model
@@ -454,7 +459,10 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
 }
 
 async function handleCircleJoined(client: PoolClient, circleAddr: string, event: SdkEvent) {
-  const memberAddr = getValueNative(event) as string;
+  // Event data: (circle_address, member, join_order, collateral_amount)
+  // circle_address is topic-level but also first data element; member is at index [1]
+  const value = getValueNative(event);
+  const memberAddr = Array.isArray(value) ? String(value[1]) : String(value);
 
   await client.query(
     `UPDATE circle_members SET joined_at = NOW()
@@ -473,13 +481,11 @@ async function handleCircleActive(client: PoolClient, circleAddr: string) {
 }
 
 async function handleCircleContributed(client: PoolClient, circleAddr: string, event: SdkEvent) {
-  const [memberAddr, roundIndex] = getValueNative(event) as [string, number];
-
-  const rows = await client.query<{ round_amount: string }>(
-    "SELECT round_amount FROM circles WHERE address = $1",
-    [circleAddr],
-  );
-  const amount = rows.rows.length > 0 ? rows.rows[0].round_amount : "0";
+  // Event data: (circle_address, member, round_index, amount)
+  const value = getValueNative(event) as unknown[];
+  const memberAddr = String(value[1]);
+  const roundIndex = Number(value[2]);
+  const amount = value[3] !== undefined ? String(value[3]) : "0";
 
   await client.query(
     `INSERT INTO contributions (circle_address, member_address, round_index, amount, tx_hash, ledger)
@@ -491,7 +497,11 @@ async function handleCircleContributed(client: PoolClient, circleAddr: string, e
 }
 
 async function handleCirclePayout(client: PoolClient, circleAddr: string, event: SdkEvent) {
-  const [recipient, pot, roundIndex] = getValueNative(event) as [string, bigint, number];
+  // Event data: (circle_address, recipient, amount, round_index)
+  const value = getValueNative(event) as unknown[];
+  const recipient = String(value[1]);
+  const pot = value[2] as bigint;
+  const roundIndex = Number(value[3]);
 
   await client.query(
     `INSERT INTO payouts (circle_address, recipient, round_index, amount, tx_hash, ledger)
@@ -508,7 +518,11 @@ async function handleCirclePayout(client: PoolClient, circleAddr: string, event:
 }
 
 async function handleCircleDefault(client: PoolClient, circleAddr: string, event: SdkEvent) {
-  const [memberAddr, penalty, roundIndex] = getValueNative(event) as [string, bigint, number];
+  // Event data: (circle_address, member, penalty, round_index, new_collateral)
+  const value = getValueNative(event) as unknown[];
+  const memberAddr = String(value[1]);
+  const penalty = value[2] as bigint;
+  const roundIndex = Number(value[3]);
 
   await client.query(
     `INSERT INTO defaults (circle_address, member_address, round_index, penalty, tx_hash, ledger)
@@ -530,6 +544,48 @@ async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
     [circleAddr],
   );
   console.log(`[indexer] Circle completed: ${redactAddress(circleAddr)}`);
+}
+
+async function handleCircleCancelled(client: PoolClient, circleAddr: string) {
+  // Event data: (circle_address, caller, ledger) — we only need the status update
+  await client.query(
+    "UPDATE circles SET status = 'Cancelled', updated_at = NOW() WHERE address = $1",
+    [circleAddr],
+  );
+  console.log(`[indexer] Circle cancelled: ${redactAddress(circleAddr)}`);
+}
+
+async function handleCircleClosed(client: PoolClient, circleAddr: string, event: SdkEvent) {
+  // Event data: (circle_address, closer, total_released, total_expected_collateral, reason)
+  const value = getValueNative(event) as unknown[];
+  const totalReleased = value[2] !== undefined ? String(value[2]) : "0";
+  const reason = value[4] !== undefined ? String(value[4]) : "unknown";
+  await client.query(
+    `UPDATE circles
+       SET status = 'Closed', updated_at = NOW(),
+           total_released = $2, close_reason = $3
+     WHERE address = $1`,
+    [circleAddr, totalReleased, reason],
+  );
+  console.log(`[indexer] Circle closed: ${redactAddress(circleAddr)} reason=${reason} released=${totalReleased}`);
+}
+
+async function handleCirclePaused(client: PoolClient, circleAddr: string) {
+  // Event data: (circle_address, admin, ledger) — record paused flag
+  await client.query(
+    "UPDATE circles SET paused = TRUE, updated_at = NOW() WHERE address = $1",
+    [circleAddr],
+  );
+  console.log(`[indexer] Circle paused: ${redactAddress(circleAddr)}`);
+}
+
+async function handleCircleResumed(client: PoolClient, circleAddr: string) {
+  // Event data: (circle_address, admin, ledger) — clear paused flag
+  await client.query(
+    "UPDATE circles SET paused = FALSE, updated_at = NOW() WHERE address = $1",
+    [circleAddr],
+  );
+  console.log(`[indexer] Circle resumed: ${redactAddress(circleAddr)}`);
 }
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
@@ -680,6 +736,10 @@ async function processEvents(fromLedger: number, toLedger: number) {
       case "payout":      handler = (c) => handleCirclePayout(c, contractId, event); break;
       case "default":     handler = (c) => handleCircleDefault(c, contractId, event); break;
       case "completed":   handler = (c) => handleCircleCompleted(c, contractId); break;
+      case "cancelled":   handler = (c) => handleCircleCancelled(c, contractId); break;
+      case "closed":      handler = (c) => handleCircleClosed(c, contractId, event); break;
+      case "paused":      handler = (c) => handleCirclePaused(c, contractId); break;
+      case "resumed":     handler = (c) => handleCircleResumed(c, contractId); break;
     }
     if (handler) items.push({ event, handler });
   }
