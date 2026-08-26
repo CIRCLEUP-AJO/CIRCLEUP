@@ -108,6 +108,11 @@ pub enum DataKey {
     RoundsCompleted,
     Initializing,                // reentrancy guard held for the duration of `initialize`
     Closed,                      // true after close() successfully settles all collateral; re-invocation guard
+    /// Canonical USDC token address locked at initialization time.
+    /// Stored separately from Config so `get_usdc_token` can be called
+    /// without deserializing the full CircleConfig, and to make the
+    /// immutability of the token selection explicit in storage layout.
+    UsdcToken,
 }
 
 // ─── Initialization-specific error type ──────────────────────────────────────
@@ -161,6 +166,11 @@ pub enum InitError {
     /// caught earlier, or the rotation array has a different length from the
     /// member array — guards against inconsistent off-chain construction).
     InconsistentRotation = 12,
+    /// `usdc_token` does not respond to the standard token interface
+    /// (`balance` call failed) — the address is not a usable token contract.
+    /// Accepting an unusable token would strand all member deposits with no
+    /// recovery path.
+    UnusableTokenContract = 13,
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
@@ -412,6 +422,32 @@ impl CircleContract {
             panic!("reputation_contract must not be the same address as usdc_token");
         }
 
+        // ── Token identity / usability probe ──────────────────────────────────
+        //
+        // Verify that `usdc_token` is a live, callable token contract by probing
+        // its standard `balance` entry-point with a try_ call.  A successful
+        // probe (even returning 0) confirms the address hosts a contract that
+        // implements the token interface; a failure means the address is either
+        // not a contract, not deployed, or implements a different interface —
+        // any of which would silently strand all member deposits.
+        //
+        // Why probe at initialization rather than at first transfer:
+        //   A misconfigured token cannot be corrected after initialization
+        //   (the stored address is immutable).  Catching it here gives the
+        //   deployer an immediate, clear failure message and leaves the circle
+        //   un-initialized so it can be redeployed with the correct token.
+        //
+        // The probe uses the circle's own address as the balance query target —
+        // this is always a valid address (the contract itself) so the call will
+        // not fail due to an invalid argument.
+        let token_probe = token::Client::new(&env, &usdc_token);
+        if token_probe
+            .try_balance(&env.current_contract_address())
+            .is_err()
+        {
+            panic!("usdc_token does not implement the standard token interface; verify the token contract address");
+        }
+
         // ── Rotation consistency check ────────────────────────────────────────
         //
         // The rotation order is defined by the `members` list — each member at
@@ -432,7 +468,7 @@ impl CircleContract {
         let config = CircleConfig {
             members: members.clone(),
             round_amount,
-            usdc_token,
+            usdc_token: usdc_token.clone(),
             reputation_contract,
             round_deadline_ledgers,
         };
@@ -440,6 +476,12 @@ impl CircleContract {
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::Status, &CircleStatus::Pending);
         env.storage().instance().set(&DataKey::RoundsCompleted, &0u32);
+
+        // Store the token address under its own key so `get_usdc_token` can
+        // return it without deserializing the full CircleConfig, and to make
+        // the immutability of the token selection explicit and independently
+        // observable.  Once written here it is never overwritten.
+        env.storage().instance().set(&DataKey::UsdcToken, &usdc_token);
 
         // Round 0 is prepared at init; the live deadline is refreshed when the
         // circle becomes Active (all members joined), not at initialize time.
@@ -1238,6 +1280,22 @@ impl CircleContract {
     /// replaying the event log.
     pub fn is_closed(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Closed)
+    }
+
+    /// Returns the canonical USDC token address that was locked at initialization.
+    ///
+    /// This view exposes the immutable token selection so SDKs and indexers can
+    /// verify which token a circle uses without deserializing the full
+    /// [`CircleConfig`].  The address cannot change after initialization — it is
+    /// written once under [`DataKey::UsdcToken`] and never overwritten.
+    ///
+    /// Returns `Err(ContractError::NotInitialized)` when called before
+    /// `initialize`.
+    pub fn get_usdc_token(env: Env) -> Result<Address, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(ContractError::NotInitialized)
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────
