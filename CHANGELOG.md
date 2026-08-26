@@ -9,6 +9,34 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Issue 30**: Contract argument compatibility fixtures (`sdk/src/__tests__/contractFixtures.test.ts`)
+  — Base64-encoded XDR fixtures for every public contract method (factory, circle,
+  reputation) that verify SDK argument encoding remains compatible with contract
+  signatures across releases. Covers valid arguments and boundary cases for all
+  22 contract methods. See `sdk/CONTRACT_FIXTURES.md` for maintenance guide
+- **Issue 28**: Canonical event identity constraints (`indexer/src/db/migrations/003_event_dedup_constraints.sql`)
+  — Added `event_index` column and unique index on `(ledger, tx_hash, event_index)`
+  to enforce idempotency at the database layer rather than relying on application
+  memory. Makes duplicate event delivery (from at-least-once polling) a silent
+  no-op via `ON CONFLICT DO NOTHING`
+- **Issue 29**: Exponential backoff for RPC polling (`indexer/src/indexer.ts`)
+  — Temporary RPC failures (connection refused, timeout, rate limit) now trigger
+  capped exponential backoff (1s → 2s → 4s → ... → 60s) with full jitter instead
+  of hot-looping or immediate exit. Backoff resets after successful poll. Structured
+  warnings at exponentially-spaced thresholds (3, 4, 8, 16, 32 failures) prevent
+  log spam
+- `docs/INDEXER_RELIABILITY.md` — Comprehensive design document covering atomic
+  ledger checkpointing, event idempotency model, backoff policy, graceful shutdown,
+  and monitoring recommendations
+- `sdk/CONTRACT_FIXTURES.md` — Documentation for maintaining contract fixtures,
+  debugging failed tests, and integrating with CI
+- `indexer/src/backoff.test.ts` — 12 unit tests verifying backoff progression,
+  jitter bounds, reset-after-success, warning thresholds, and cap enforcement
+- `indexer/src/eventIdentity.test.ts` — 13 unit tests verifying `parseEventIndex`
+  extraction, `createEventKey` stability, canonical identity properties, and
+  duplicate detection across ledgers and transactions
+- `indexer/src/indexer.ts` — `parseEventIndex()` function extracts event index
+  from Soroban RPC event.id format (`ledger-txIndex-eventIndex`)
 - `sdk/src/index.ts` — documented the public API surface at the package entry
   point: a grouped map (clients, errors, config & types, gating, utilities,
   constants, low-level encoders) states that the package root is the only
@@ -45,6 +73,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
   `partial` states after migrations run, surfacing drift before the poller starts
 
 ### Changed
+- **Issue 31**: Event ingestion is now fully restart-safe — the indexer cursor and
+  all event projections (circles, contributions, payouts, etc.) are written in a
+  single database transaction per ledger. On crash before commit, the transaction
+  rolls back and restart processes the same ledger again (idempotent via dedup
+  constraints). On crash after commit, restart resumes from the next ledger. The
+  cursor is always read from the database (never from memory) on startup
+- **Issue 29**: Poll error handling now applies jittered backoff wait inside the
+  error catch block before allowing the next tick, preventing hot loops during
+  sustained RPC outages
+- `indexer/src/indexer.ts` — `ingestEventInTx()` now inserts `event_index` column
+  for canonical identity-based deduplication alongside the legacy `event_key` column
+- `indexer/src/db/schema.sql` — `ingested_events` table now includes `event_index`
+  column and unique index on `(ledger, tx_hash, event_index)` for database-enforced
+  idempotency
 - `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
   health check on every boot; non-clean states emit a `SCHEMA WARNING` log line
   rather than aborting so the indexer keeps serving data in ambiguous situations

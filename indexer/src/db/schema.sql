@@ -71,8 +71,17 @@ CREATE TABLE IF NOT EXISTS ingested_events (
     ledger          BIGINT NOT NULL,
     tx_hash         TEXT,
     event_type      TEXT,
+    event_index     INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Issue 28: Canonical event identity constraint for at-least-once idempotency.
+-- The unique index on (ledger, tx_hash, event_index) makes duplicate delivery
+-- a silent no-op via ON CONFLICT DO NOTHING, removing the need for application-
+-- layer dedup checks.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ingested_events_identity
+    ON ingested_events(ledger, tx_hash, event_index)
+    WHERE event_index IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS indexer_state (
     id              INTEGER PRIMARY KEY DEFAULT 1,
