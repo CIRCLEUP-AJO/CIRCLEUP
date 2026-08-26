@@ -987,4 +987,531 @@ mod prop_tests {
             prev = after;
         }
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #322 — Property and boundary tests for initialize config validation
+    //
+    // These tests verify the new address-validation guards introduced in #322:
+    //
+    //   B322-1  usdc_token == circle → always rejected, no state written
+    //   B322-2  reputation_contract == circle → always rejected, no state written
+    //   B322-3  reputation_contract == usdc_token → always rejected, no state written
+    //   B322-4  all three distinct addresses + valid params → always accepted
+    //   B322-5  Property: initialize with valid params always succeeds and
+    //           leaves Config readable
+    //   B322-6  Property: any invalid address configuration always leaves
+    //           Config absent (no state written)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Helpers for #322 tests ────────────────────────────────────────────────
+
+    /// Build a bare env with a USDC token and reputation contract registered.
+    /// Returns `(env, token_address, reputation_address)`.
+    fn make_env_with_token_and_rep() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_reg = env.register_stellar_asset_contract_v2(token_admin);
+
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        let rep_admin = Address::generate(&env);
+        rep_client.initialize(&rep_admin);
+
+        (env, token_reg.address(), rep_id)
+    }
+
+    // ── B322-1: usdc_token == circle always rejected ──────────────────────────
+
+    /// The self-referential token guard fires regardless of member count or
+    /// round_amount, as long as all other parameters are valid.
+    #[test]
+    fn b322_1_usdc_token_equals_circle_always_rejected() {
+        let (env, _token_address, reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // Pass the circle itself as the token — must panic
+        let result = circle.try_initialize(
+            &members,
+            &1_000_000i128,
+            &circle_id,      // ← usdc_token == circle
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "usdc_token == circle must always be rejected"
+        );
+
+        // Config must not exist — no persistent state written
+        assert!(
+            circle.try_get_config().is_err(),
+            "Config must be absent after rejected initialize"
+        );
+    }
+
+    // ── B322-2: reputation_contract == circle always rejected ─────────────────
+
+    #[test]
+    fn b322_2_reputation_equals_circle_always_rejected() {
+        let (env, token_address, _reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let result = circle.try_initialize(
+            &members,
+            &1_000_000i128,
+            &token_address,
+            &circle_id,      // ← reputation == circle
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "reputation_contract == circle must always be rejected"
+        );
+
+        assert!(
+            circle.try_get_config().is_err(),
+            "Config must be absent after rejected initialize"
+        );
+    }
+
+    // ── B322-3: reputation_contract == usdc_token always rejected ────────────
+
+    #[test]
+    fn b322_3_reputation_equals_usdc_token_always_rejected() {
+        let (env, token_address, _reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let result = circle.try_initialize(
+            &members,
+            &1_000_000i128,
+            &token_address,
+            &token_address,  // ← reputation == usdc_token
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(
+            result.is_err(),
+            "reputation_contract == usdc_token must always be rejected"
+        );
+
+        assert!(
+            circle.try_get_config().is_err(),
+            "Config must be absent after rejected initialize"
+        );
+    }
+
+    // ── B322-4: all three distinct → accepted ─────────────────────────────────
+
+    /// When circle_id, token_address, and reputation_id are all distinct and
+    /// all other parameters are valid, initialize must always succeed and write
+    /// a Config key readable via get_config.
+    #[test]
+    fn b322_4_three_distinct_addresses_always_accepted() {
+        let (env, token_address, reputation_id) = make_env_with_token_and_rep();
+        let circle_id = env.register_contract(None, crate::CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        // Paranoia: the fixture must generate distinct addresses
+        assert_ne!(circle_id, token_address);
+        assert_ne!(circle_id, reputation_id);
+        assert_ne!(token_address, reputation_id);
+
+        let mut members = SdkVec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        circle.initialize(
+            &members,
+            &1_000_000i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2);
+        assert_eq!(config.round_amount, 1_000_000i128);
+    }
+
+    // ── B322-5: Property — valid params always produce readable Config ─────────
+
+    /// For any member count in [2, 8] and round_amount in [1, MAX_VALID],
+    /// initialize with distinct addresses must always write a Config that
+    /// get_config returns correctly.
+    proptest! {
+        #[test]
+        fn prop_322_valid_params_always_initializes(
+            member_count in 2usize..=8usize,
+            round_amount in 1i128..=MAX_VALID_ROUND_AMOUNT,
+            deadline in MIN_ROUND_DEADLINE_LEDGERS..=MAX_ROUND_DEADLINE_LEDGERS,
+        ) {
+            let (env, token_address, reputation_id) = make_env_with_token_and_rep();
+            let circle_id = env.register_contract(None, crate::CircleContract);
+            let circle = CircleContractClient::new(&env, &circle_id);
+
+            let mut members = SdkVec::new(&env);
+            for _ in 0..member_count {
+                members.push_back(Address::generate(&env));
+            }
+
+            circle.initialize(
+                &members,
+                &round_amount,
+                &token_address,
+                &reputation_id,
+                &deadline,
+            );
+
+            let config = circle.get_config();
+            prop_assert_eq!(config.members.len() as usize, member_count);
+            prop_assert_eq!(config.round_amount, round_amount);
+            prop_assert_eq!(config.round_deadline_ledgers, deadline);
+        }
+    }
+
+    // ── B322-6: Property — invalid address configs always leave Config absent ──
+
+    /// For any invalid address combination (self-referential or aliased),
+    /// the initialize attempt must fail and leave the Config key absent.
+    ///
+    /// The three invalid patterns are tried in sequence:
+    ///   (a) token == circle
+    ///   (b) reputation == circle
+    ///   (c) reputation == token
+    proptest! {
+        #[test]
+        fn prop_322_invalid_address_config_leaves_no_state(
+            member_count in 2usize..=6usize,
+            round_amount in 1i128..=1_000_000i128,
+            // 0 = token==circle, 1 = rep==circle, 2 = rep==token
+            bad_pattern in 0u8..=2u8,
+        ) {
+            let (env, token_address, reputation_id) = make_env_with_token_and_rep();
+            let circle_id = env.register_contract(None, crate::CircleContract);
+            let circle = CircleContractClient::new(&env, &circle_id);
+
+            let mut members = SdkVec::new(&env);
+            for _ in 0..member_count {
+                members.push_back(Address::generate(&env));
+            }
+
+            let (bad_token, bad_rep) = match bad_pattern {
+                0 => (circle_id.clone(), reputation_id.clone()),  // token == circle
+                1 => (token_address.clone(), circle_id.clone()),  // rep == circle
+                _ => (token_address.clone(), token_address.clone()), // rep == token
+            };
+
+            let result = circle.try_initialize(
+                &members,
+                &round_amount,
+                &bad_token,
+                &bad_rep,
+                &MIN_ROUND_DEADLINE_LEDGERS,
+            );
+            prop_assert!(result.is_err(), "invalid address config must be rejected");
+
+            // No Config key must exist after the failed attempt
+            prop_assert!(
+                circle.try_get_config().is_err(),
+                "Config must be absent after any failed initialize"
+            );
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #86 — Generated action-sequence properties
+    //
+    // The properties below extend the suite from single-operation invariants to
+    // *sequences* of operations generated by proptest.  Invalid steps (wrong
+    // state, deadline mismatch, etc.) are silently skipped via `try_*` so the
+    // generator explores the full reachable state space without needing a
+    // perfect model of what is currently valid.
+    //
+    // Three invariant families are covered:
+    //   S1 — Collateral never goes negative under any generated step sequence.
+    //   S2 — Token conservation holds for any generated contribution ordering.
+    //   S3 — Each member receives the pot exactly once per full lifecycle.
+    //   S4 — Status only advances (never regresses) under any step sequence.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// One step in a generated lifecycle sequence.
+    ///
+    /// Indices are taken modulo `member_count` so the strategy works for any
+    /// circle size — proptest generates arbitrary `usize` values and the
+    /// driver clamps them.
+    #[derive(Debug, Clone)]
+    enum LifecycleStep {
+        /// Attempt `contribute` as `members[idx % n]`.
+        Contribute(usize),
+        /// Advance the ledger past the current deadline then attempt
+        /// `mark_default` on `members[idx % n]`.
+        MarkDefault(usize),
+        /// Attempt `payout`.
+        Payout,
+    }
+
+    fn lifecycle_step_strategy() -> impl Strategy<Value = LifecycleStep> {
+        prop_oneof![
+            (0usize..16).prop_map(LifecycleStep::Contribute),
+            (0usize..16).prop_map(LifecycleStep::MarkDefault),
+            Just(LifecycleStep::Payout),
+        ]
+    }
+
+    /// Translate a `CircleStatus` to a monotone rank for forward-only assertions.
+    fn status_rank(s: &CircleStatus) -> u8 {
+        match s {
+            CircleStatus::Pending    => 0,
+            CircleStatus::Active     => 1,
+            CircleStatus::Completed  => 2,
+            CircleStatus::Cancelled  => 3,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        // ── Invariant S1: Collateral never negative under generated sequences ──
+        //
+        // A circle is activated with all members joining.  proptest then
+        // generates up to 24 lifecycle steps.  Invalid steps (deadline already
+        // passed, already contributed, etc.) are silently dropped via `try_*`.
+        // The only invariant asserted is that every member's collateral is >= 0
+        // after every step — i.e., the penalty formula never produces a negative
+        // value regardless of how many times it is applied.
+
+        #[test]
+        fn prop_action_sequence_collateral_invariant(
+            member_count in 2usize..=4,
+            round_amount in 1i128..=100_000_000i128,
+            steps in prop::collection::vec(lifecycle_step_strategy(), 0..=24),
+        ) {
+            let mc = member_count;
+            let setup = make_circle_n(mc, round_amount, MIN_ROUND_DEADLINE_LEDGERS);
+            join_in_order(&setup, &(0..mc).collect::<Vec<_>>());
+
+            for step in &steps {
+                if setup.circle.get_status() != CircleStatus::Active {
+                    break;
+                }
+
+                match step {
+                    LifecycleStep::Contribute(idx) => {
+                        let m = setup.members[idx % mc].clone();
+                        let _ = setup.circle.try_contribute(&m);
+                    }
+                    LifecycleStep::MarkDefault(idx) => {
+                        // Advance ledger to deadline+1 only when the circle is
+                        // still active (get_current_round panics otherwise).
+                        if setup.circle.get_status() == CircleStatus::Active {
+                            let round = setup.circle.get_current_round();
+                            let dl = round.deadline_ledger as u32;
+                            setup.env.ledger().with_mut(|l| {
+                                if l.sequence_number <= dl {
+                                    l.sequence_number = dl + 1;
+                                }
+                            });
+                        }
+                        let m = setup.members[idx % mc].clone();
+                        let _ = setup.circle.try_mark_default(&m);
+                    }
+                    LifecycleStep::Payout => {
+                        let _ = setup.circle.try_payout();
+                    }
+                }
+
+                // Invariant: collateral must be non-negative after every step
+                for m in &setup.members {
+                    let c = setup.circle.get_collateral(m);
+                    prop_assert!(
+                        c >= 0,
+                        "collateral must never be negative; member has {} after a lifecycle step",
+                        c
+                    );
+                }
+            }
+        }
+
+        // ── Invariant S2: Token conservation under generated contribution order ─
+        //
+        // Over a complete clean lifecycle (all members contribute every round,
+        // no defaults) the net token change per member is exactly 0, regardless
+        // of the *order* in which members contribute within each round.
+        //
+        // Each round receives an independently generated shuffle seed so proptest
+        // explores the full cartesian product of per-round orderings.
+
+        #[test]
+        fn prop_conservation_generated_contribution_order(
+            member_count in 2usize..=4,
+            round_amount in 1i128..=100_000_000i128,
+            per_round_seeds in prop::collection::vec(any::<u64>(), 1..=4),
+        ) {
+            let mc = member_count;
+            let setup = make_circle_n(mc, round_amount, MIN_ROUND_DEADLINE_LEDGERS);
+
+            let balances_before: Vec<i128> = setup.members.iter()
+                .map(|m| setup.token.balance(m))
+                .collect();
+
+            // Canonical join order for determinism
+            join_in_order(&setup, &(0..mc).collect::<Vec<_>>());
+
+            // Execute each round with a generated contribution order
+            for round_idx in 0..mc {
+                let seed = per_round_seeds[round_idx % per_round_seeds.len()];
+                let order = permute(mc, seed);
+                for &member_idx in &order {
+                    setup.circle.contribute(&setup.members[member_idx]);
+                }
+                setup.circle.payout();
+            }
+
+            prop_assert_eq!(
+                setup.circle.get_status(), CircleStatus::Completed,
+                "circle must be Completed after all rounds"
+            );
+
+            setup.circle.close(&setup.members[0]);
+
+            for (i, m) in setup.members.iter().enumerate() {
+                let bal_after = setup.token.balance(m);
+                prop_assert_eq!(
+                    bal_after, balances_before[i],
+                    "member[{}] net token change must be 0 for any contribution order; \
+                     before={} after={}", i, balances_before[i], bal_after
+                );
+            }
+        }
+
+        // ── Invariant S3: Each member receives exactly one payout ─────────────
+        //
+        // Over a full lifecycle each member appears as round recipient exactly
+        // once.  The property is parameterised on join order (which does not
+        // affect rotation — rotation is always members[0..n] in index order)
+        // to verify that the recipient derivation is independent of the order
+        // in which members joined.
+
+        #[test]
+        fn prop_single_payout_per_member(
+            member_count in 2usize..=4,
+            round_amount in 1i128..=100_000_000i128,
+            join_seed in any::<u64>(),
+        ) {
+            let mc = member_count;
+            let setup = make_circle_n(mc, round_amount, MIN_ROUND_DEADLINE_LEDGERS);
+
+            // Join in the generated order (rotation is not affected)
+            join_in_order(&setup, &permute(mc, join_seed));
+
+            let pot = round_amount * mc as i128;
+            let mut payout_recipients: Vec<soroban_sdk::Address> = Vec::with_capacity(mc);
+
+            for _ in 0..mc {
+                let round = setup.circle.get_current_round();
+                let recipient = round.recipient.clone();
+                payout_recipients.push(recipient.clone());
+
+                let bal_before = setup.token.balance(&recipient);
+                contribute_all(&setup);
+                setup.circle.payout();
+                let bal_after = setup.token.balance(&recipient);
+
+                // Recipient's net gain in this round: received pot, paid one contribution
+                let net = bal_after - bal_before;
+                prop_assert_eq!(
+                    net,
+                    pot - round_amount,
+                    "round recipient must net pot − own contribution = {} in round {}; \
+                     got {}", pot - round_amount, round.round_index, net
+                );
+            }
+
+            prop_assert_eq!(
+                setup.circle.get_status(), CircleStatus::Completed,
+                "circle must be Completed after all rounds"
+            );
+
+            // Every member appears as recipient exactly once
+            for (i, m) in setup.members.iter().enumerate() {
+                let count = payout_recipients.iter().filter(|r| *r == m).count();
+                prop_assert_eq!(
+                    count, 1,
+                    "member[{}] must appear as recipient exactly once; got {} times", i, count
+                );
+            }
+        }
+
+        // ── Invariant S4: Status only advances under generated step sequences ──
+        //
+        // For any generated sequence of lifecycle steps the status must follow
+        // the DAG ordering: Pending < Active < Completed.  Invalid steps are
+        // dropped via `try_*`; the rank of the observed status must be
+        // monotone-non-decreasing across every step.
+
+        #[test]
+        fn prop_generated_sequence_status_advances(
+            member_count in 2usize..=4,
+            round_amount in 1i128..=50_000_000i128,
+            steps in prop::collection::vec(lifecycle_step_strategy(), 0..=20),
+        ) {
+            let mc = member_count;
+            let setup = make_circle_n(mc, round_amount, MIN_ROUND_DEADLINE_LEDGERS);
+            join_in_order(&setup, &(0..mc).collect::<Vec<_>>());
+
+            let mut prev_rank = status_rank(&setup.circle.get_status());
+
+            for step in &steps {
+                if setup.circle.get_status() != CircleStatus::Active {
+                    break;
+                }
+
+                match step {
+                    LifecycleStep::Contribute(idx) => {
+                        let m = setup.members[idx % mc].clone();
+                        let _ = setup.circle.try_contribute(&m);
+                    }
+                    LifecycleStep::MarkDefault(idx) => {
+                        if setup.circle.get_status() == CircleStatus::Active {
+                            let round = setup.circle.get_current_round();
+                            let dl = round.deadline_ledger as u32;
+                            setup.env.ledger().with_mut(|l| {
+                                if l.sequence_number <= dl {
+                                    l.sequence_number = dl + 1;
+                                }
+                            });
+                        }
+                        let m = setup.members[idx % mc].clone();
+                        let _ = setup.circle.try_mark_default(&m);
+                    }
+                    LifecycleStep::Payout => {
+                        let _ = setup.circle.try_payout();
+                    }
+                }
+
+                let new_rank = status_rank(&setup.circle.get_status());
+                prop_assert!(
+                    new_rank >= prev_rank,
+                    "status rank must never decrease: prev={} new={}", prev_rank, new_rank
+                );
+                prev_rank = new_rank;
+            }
+        }
+    }
 }

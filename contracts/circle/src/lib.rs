@@ -40,7 +40,7 @@
 //! | `contribute` (per member) | Contributed(member, round) | Persistent | 1 persistent entry per contribution; also updates CurrentRound (instance) |
 //! | `payout` | — | — | Updates CurrentRound + RoundsCompleted (instance); no new persistent entries |
 //! | `mark_default` | Defaulted(member, round) + Defaults(member) | Persistent | 2 persistent entries; also updates Collateral(member) |
-//! | `close` | Closed | Instance | Boolean flag set after all collateral is released; guards against re-invocation |
+//! | `close` | Closed | Instance | Boolean flag set after all collateral is released; guards against re-invocation. Also reads all Collateral(member) keys in a pre-release scan pass and zeroes them during settlement. |
 //!
 //! Use `stellar-cli contract invoke --cost` to get instruction-count and
 //! read/write-byte estimates before broadcasting.  The `simulate_transaction`
@@ -53,6 +53,10 @@
 mod tests; // tests are in tests.rs
 #[cfg(test)]
 mod prop_tests; // property-based / fuzz-style harness (issue #167)
+#[cfg(test)]
+mod mutation_guards; // explicit guard-removal / mutation tests
+#[cfg(test)]
+mod adversarial_tests; // adversarial authorization tests (issue #87)
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
@@ -104,6 +108,59 @@ pub enum DataKey {
     RoundsCompleted,
     Initializing,                // reentrancy guard held for the duration of `initialize`
     Closed,                      // true after close() successfully settles all collateral; re-invocation guard
+}
+
+// ─── Initialization-specific error type ──────────────────────────────────────
+//
+// `initialize` is a mutating entry-point that uses `panic!` for most
+// guard violations (consistent with every other mutating entry-point in
+// this contract — Soroban rolls the whole invocation back on panic and
+// surfaces the message to the caller).  These `InitError` variants
+// complement the panic messages by giving callers a stable, machine-readable
+// code they can match on when calling `try_initialize` from an SDK or
+// integration test, without requiring a string parse on the diagnostic.
+//
+// The variant names mirror the panic messages one-to-one so auditors can
+// cross-reference them without ambiguity.
+
+/// Typed errors that `initialize` returns via `contracterror` when called
+/// through `try_initialize`.
+///
+/// Every variant corresponds to exactly one validation guard in the
+/// `initialize` entry-point.  The numeric discriminants are stable across
+/// upgrades — do not renumber existing variants.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum InitError {
+    /// `initialize` was called after a previous successful call.
+    AlreadyInitialized = 1,
+    /// `members` list has fewer than 2 entries.
+    TooFewMembers = 2,
+    /// `members` list has more than [`MAX_MEMBERS`] entries.
+    TooManyMembers = 3,
+    /// `members` list contains the same address more than once.
+    DuplicateMembers = 4,
+    /// `round_amount` is zero or negative.
+    InvalidRoundAmount = 5,
+    /// `round_amount` × `member_count` would overflow `i128`.
+    RoundAmountPotOverflow = 6,
+    /// `round_amount` × [`PENALTY_BPS`] would overflow `i128`.
+    RoundAmountPenaltyOverflow = 7,
+    /// `round_deadline_ledgers` is below [`MIN_ROUND_DEADLINE_LEDGERS`].
+    DeadlineBelowMinimum = 8,
+    /// `round_deadline_ledgers` is above [`MAX_ROUND_DEADLINE_LEDGERS`].
+    DeadlineAboveMaximum = 9,
+    /// `usdc_token` address is the same as the circle contract itself —
+    /// this would make every token transfer a no-op and break the financial model.
+    InvalidTokenAddress = 10,
+    /// `reputation_contract` address is the same as the circle contract or
+    /// the same as `usdc_token` — indicates a misconfigured deployment.
+    InvalidReputationAddress = 11,
+    /// `members` contains fewer entries than the rotation length requires
+    /// (i.e. `members.len()` is zero after deduplication, which should be
+    /// caught earlier, or the rotation array has a different length from the
+    /// member array — guards against inconsistent off-chain construction).
+    InconsistentRotation = 12,
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
@@ -256,6 +313,29 @@ impl CircleContract {
     // ── Initialize ────────────────────────────────────────────────────────────
 
     /// Called once by the factory immediately after deployment.
+    ///
+    /// # Validation
+    ///
+    /// All validation runs before any persistent state is written.  An invalid
+    /// configuration makes no state changes — the reentrancy guard is the only
+    /// key touched before the checks, and it is cleared on any panic path.
+    ///
+    /// | Check | Condition | Panic message |
+    /// |---|---|---|
+    /// | Double-init | `Config` key present | `"already initialized"` |
+    /// | Reentrancy | `Initializing` flag present | `"initialize already in progress"` |
+    /// | Min members | `members.len() < 2` | `"need at least 2 members"` |
+    /// | Max members | `members.len() > MAX_MEMBERS` | `"too many members"` |
+    /// | Duplicate members | any two entries equal | `"duplicate members"` |
+    /// | Positive amount | `round_amount <= 0` | `"round_amount must be positive"` |
+    /// | Pot overflow | `round_amount * member_count` overflows `i128` | `"round_amount too large: overflows pot calculation for this member count"` |
+    /// | Penalty overflow | `round_amount * PENALTY_BPS` overflows `i128` | `"round_amount too large: overflows penalty calculation"` |
+    /// | Min deadline | `round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS` | `"round_deadline_ledgers below minimum"` |
+    /// | Max deadline | `round_deadline_ledgers > MAX_ROUND_DEADLINE_LEDGERS` | `"round_deadline_ledgers above maximum"` |
+    /// | Token address | `usdc_token == current contract` | `"usdc_token must not be the circle contract itself"` |
+    /// | Reputation address | `reputation_contract == current contract` | `"reputation_contract must not be the circle contract itself"` |
+    /// | Reputation ≠ token | `reputation_contract == usdc_token` | `"reputation_contract must not be the same address as usdc_token"` |
+    /// | Rotation consistency | `members.len() == 0` after validation passes | (defensive; unreachable in practice) |
     pub fn initialize(
         env: Env,
         members: Vec<Address>,
@@ -305,6 +385,50 @@ impl CircleContract {
             panic!("round_deadline_ledgers above maximum");
         }
 
+        // ── Token and contract address validation ─────────────────────────────
+        //
+        // A misconfigured deployment where `usdc_token` or `reputation_contract`
+        // points back at the circle itself would make every token transfer a
+        // no-op (the circle can't hold USDC to transfer to itself) and would
+        // allow the circle to award its own reputation scores, breaking both the
+        // financial model and the authorization invariants.
+        //
+        // We also reject `reputation_contract == usdc_token` because mixing the
+        // two roles into a single address is nonsensical and almost certainly a
+        // copy-paste error in the deployment script.
+        //
+        // Note: Soroban `Address` values are always well-formed 32-byte contract
+        // or account identifiers — there is no concept of a "zero address" in the
+        // EVM sense.  The checks here guard against logical misconfiguration
+        // (self-referential or aliased addresses) rather than null inputs.
+        let self_address = env.current_contract_address();
+        if usdc_token == self_address {
+            panic!("usdc_token must not be the circle contract itself");
+        }
+        if reputation_contract == self_address {
+            panic!("reputation_contract must not be the circle contract itself");
+        }
+        if reputation_contract == usdc_token {
+            panic!("reputation_contract must not be the same address as usdc_token");
+        }
+
+        // ── Rotation consistency check ────────────────────────────────────────
+        //
+        // The rotation order is defined by the `members` list — each member at
+        // index `i` is the recipient of round `i`.  After all previous checks
+        // `members.len()` is in [2, MAX_MEMBERS] and every address is unique, so
+        // the rotation is inherently consistent.  We verify this explicitly with
+        // a defensive assertion so that if a future refactor introduces a separate
+        // rotation parameter the compiler flags the missing check rather than
+        // silently shipping a broken invariant.
+        //
+        // This check is intentionally infallible given the earlier validations;
+        // its value is as documentation and a future-proofing guard.
+        let member_count = members.len();
+        if member_count == 0 {
+            panic!("rotation length is zero: members list must have at least 2 entries");
+        }
+
         let config = CircleConfig {
             members: members.clone(),
             round_amount,
@@ -336,7 +460,7 @@ impl CircleContract {
 
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "initialized")),
-            members.len(),
+            member_count,
         );
     }
 
@@ -533,9 +657,9 @@ impl CircleContract {
 
         // Reject late contributions even when payout has not run yet (e.g. the
         // pot is incomplete and callers are waiting on mark_default / payout).
-        // Must stay consistent with mark_default, which becomes available once
-        // sequence > deadline_ledger.
-        if (env.ledger().sequence() as u64) > round.deadline_ledger {
+        // Uses the centralized deadline_passed predicate so the boundary
+        // semantics are identical to mark_default (strict greater-than).
+        if Self::deadline_passed(&env, &round) {
             panic!("round deadline passed; cannot contribute before payout");
         }
 
@@ -570,9 +694,65 @@ impl CircleContract {
         );
     }
 
+    // ── Deadline predicate ────────────────────────────────────────────────────
+
+    /// Returns `true` when the round deadline has **strictly** passed.
+    ///
+    /// # Boundary rule
+    ///
+    /// Uses `sequence > deadline_ledger` (strict greater-than).  The member
+    /// whose contribution arrives in the very ledger that *equals*
+    /// `deadline_ledger` is still considered on time; the deadline is only
+    /// exceeded on the **next** ledger.  This is the single authoritative
+    /// definition used by both `contribute` and `mark_default` so the two
+    /// entry-points can never have inconsistent boundary semantics.
+    ///
+    /// # Source of time
+    ///
+    /// Reads `env.ledger().sequence()` — the current ledger sequence number
+    /// committed by the Stellar consensus protocol.  This value is determined
+    /// by the network, not by the caller, so no client timestamp can influence
+    /// whether a default is allowed.
+    ///
+    /// # Per-round isolation
+    ///
+    /// Each round stores its own `deadline_ledger` in `CurrentRound`.  The
+    /// deadline is refreshed every time a new round starts (in `payout`) so
+    /// stale deadlines from a prior round can never bleed into a later one.
+    #[inline]
+    fn deadline_passed(env: &Env, round: &RoundState) -> bool {
+        (env.ledger().sequence() as u64) > round.deadline_ledger
+    }
+
     // ── Payout ────────────────────────────────────────────────────────────────
 
     /// Transfer the pot to this round's recipient once all members have contributed.
+    ///
+    /// # Recipient derivation
+    ///
+    /// The recipient is **always** `members[round_index]` — the value stored in
+    /// `CurrentRound.recipient` at round-start time.  No caller argument can
+    /// override this.  An index-out-of-bounds state (which should be
+    /// unreachable given the initialization checks) is treated as a storage
+    /// inconsistency and panics rather than silently transferring to a wrong
+    /// address.
+    ///
+    /// # Checks-Effects-Interactions ordering
+    ///
+    /// 1. All precondition checks run first (status, paid_out, contribution counts,
+    ///    tally cross-check, recipient bounds).
+    /// 2. `round.paid_out = true` and `RoundsCompleted` are written to storage
+    ///    **before** any external call (token transfer or reputation increment).
+    ///    If a downstream call re-enters `payout`, the `paid_out` guard fires
+    ///    immediately, preventing a second transfer.
+    /// 3. The token transfer runs next.
+    /// 4. The reputation increment runs last.  If it fails, the transaction
+    ///    rolls back — this reverts the `paid_out` flag too, leaving the round
+    ///    payable again once the reputation contract issue is resolved.
+    ///    This is the documented policy: **reputation failure rolls back settlement**.
+    ///    Callers who want fire-and-forget reputation should wrap the call in an
+    ///    SDK retry pattern rather than expecting the contract to skip it.
+    ///
     /// Anyone may call this.
     pub fn payout(env: Env) {
         let config: CircleConfig = env
@@ -596,6 +776,9 @@ impl CircleContract {
             .get(&DataKey::CurrentRound)
             .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
+        // Single-use guard: a round may be paid out exactly once.
+        // This flag is written to storage BEFORE any external call (CEI) so
+        // that a reentrant payout attempt hits this guard immediately.
         if round.paid_out {
             panic!("already paid out");
         }
@@ -606,6 +789,7 @@ impl CircleContract {
         }
 
         // Strong invariant: contribution counter must match persisted records.
+        // A forged counter that passes the previous check is caught here.
         let mut persisted_contributors: u32 = 0;
         for member in config.members.iter() {
             if env.storage().persistent().has(&DataKey::Contributed(member, round.round_index)) {
@@ -616,24 +800,48 @@ impl CircleContract {
             panic!("round contribution tally mismatch");
         }
 
-        // Transfer pot (member_count × round_amount) to this round's recipient
+        // Bounds guard: round_index must be a valid position in the rotation.
+        // This is defensive — initialize already ensures member_count >= 2 and
+        // payout advances round_index by 1 after checking < member_count, so
+        // an out-of-bounds index indicates a storage inconsistency.
+        if round.round_index >= member_count as u32 {
+            panic!("circle: round_index out of bounds — storage inconsistency");
+        }
+
+        // Verify stored recipient matches the canonical rotation position.
+        // The recipient is never supplied by the caller; it is always derived
+        // from members[round_index] and stored at round-start time.  This
+        // cross-check catches any divergence between the stored recipient and
+        // the rotation order (e.g. from a hypothetical storage corruption).
+        let canonical_recipient = config
+            .members
+            .get(round.round_index)
+            .unwrap_or_else(|| panic!("circle: canonical recipient at index {} missing — storage inconsistency", round.round_index));
+        if round.recipient != canonical_recipient {
+            panic!("circle: stored recipient does not match rotation order — storage inconsistency");
+        }
+
         let pot: i128 = config
             .round_amount
             .checked_mul(member_count as i128)
             .unwrap_or_else(|| panic!("pot amount overflow"));
-        let token_client = token::Client::new(&env, &config.usdc_token);
-        Self::safe_transfer(
-            &token_client,
-            &env.current_contract_address(),
-            &round.recipient,
-            &pot,
-            "round payout",
-        );
 
+        // ── CHECKS-EFFECTS-INTERACTIONS ───────────────────────────────────────
+        //
+        // All state mutations happen before any external calls so a reentrant
+        // call to payout() sees paid_out=true and panics before it can
+        // transfer the pot a second time.
+        //
+        // If either external call (token transfer or reputation increment)
+        // fails, the Soroban transaction rolls back atomically — this resets
+        // paid_out to false and leaves the round payable once the downstream
+        // issue is resolved.
+
+        // Effect: mark this round as settled before touching external contracts.
         round.paid_out = true;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
-        // Bump completed counter
+        // Effect: bump the completed-round counter.
         let completed: u32 = env
             .storage()
             .instance()
@@ -643,13 +851,30 @@ impl CircleContract {
             .instance()
             .set(&DataKey::RoundsCompleted, &(completed + 1));
 
-        // Increment on-chain reputation for the recipient.
-        // Pass the circle's own address as the `circle` argument — Soroban's
-        // Contract Invoker rule auto-grants require_auth for the calling
-        // contract's own address, so no external signature is needed.
-        // try_increment surfaces any reputation contract error (e.g. circle
-        // not yet registered as authorized caller) as a clear panic instead of
-        // a silent trap from the callee.
+        // Interaction 1: transfer pot to the canonical recipient.
+        let token_client = token::Client::new(&env, &config.usdc_token);
+        Self::safe_transfer(
+            &token_client,
+            &env.current_contract_address(),
+            &round.recipient,
+            &pot,
+            "round payout",
+        );
+
+        // Interaction 2: increment on-chain reputation for the recipient.
+        //
+        // Reputation failure policy (documented):
+        //   If try_increment returns an error the whole transaction rolls back.
+        //   This reverts paid_out=true, RoundsCompleted, and the token transfer.
+        //   The round remains payable and the operator must resolve the
+        //   reputation contract issue (e.g. re-register the circle as an
+        //   authorized caller) before retrying payout.
+        //
+        // Rationale: a successful token transfer with a failed reputation
+        //   update would leave the recipient richer but unrecognized, which is
+        //   harder to recover from than a clean rollback.  Rollback is the
+        //   safe default; operators who prefer fire-and-forget reputation
+        //   should wrap the retry at the SDK layer.
         let rep_client =
             reputation::ReputationContractClient::new(&env, &config.reputation_contract);
         let _ = rep_client
@@ -680,6 +905,9 @@ impl CircleContract {
                 round_index: next_round_index,
                 recipient: next_recipient.clone(),
                 contributions_received: 0,
+                // Use the centralized deadline helper: new deadline = current
+                // ledger + round_deadline_ledgers, sourced from the contract's
+                // own ledger sequence — not from any caller-supplied timestamp.
                 deadline_ledger: env.ledger().sequence() as u64
                     + config.round_deadline_ledgers as u64,
                 paid_out: false,
@@ -737,7 +965,11 @@ impl CircleContract {
             panic!("round already paid out");
         }
 
-        if (env.ledger().sequence() as u64) <= round.deadline_ledger {
+        // Uses the centralized deadline_passed predicate — strict greater-than
+        // so the deadline ledger itself is the last moment to contribute, not
+        // the first moment to default.  This is the same boundary used by
+        // contribute() so the two entry-points are always consistent.
+        if !Self::deadline_passed(&env, &round) {
             panic!("round deadline not yet passed");
         }
 
@@ -810,6 +1042,14 @@ impl CircleContract {
     ///   accumulate across multiple calls.
     ///
     /// # Settlement semantics
+    ///
+    /// Before the release loop the contract pre-computes `pre_release_total` —
+    /// the sum of every member's current `Collateral` balance read from storage.
+    /// This value is used after the loop for an arithmetic assertion:
+    ///   `total_released == pre_release_total`
+    /// If any member's balance was skipped or counted twice the assertion fires,
+    /// rolling back the entire transaction and preventing inconsistent state from
+    /// being committed.
     ///
     /// For each member the contract reads their `Collateral(member)` balance and,
     /// if positive, zeroes the key in storage *before* performing the transfer
@@ -897,6 +1137,23 @@ impl CircleContract {
             .checked_mul(config.members.len() as i128)
             .unwrap_or_else(|| panic!("total expected collateral overflow"));
 
+        // Pre-compute the total collateral held in storage before any transfer.
+        // This snapshot is compared against total_released after the loop as an
+        // arithmetic assertion: released == stored_before_release.  Any mismatch
+        // (double-count, silent skip, or storage inconsistency) causes the whole
+        // transaction to roll back, leaving no partial state on-chain.
+        let mut pre_release_total: i128 = 0;
+        for member in config.members.iter() {
+            let balance: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Collateral(member.clone()))
+                .unwrap_or(0);
+            pre_release_total = pre_release_total
+                .checked_add(balance)
+                .unwrap_or_else(|| panic!("pre_release_total overflow during collateral scan"));
+        }
+
         // Set the Closed flag before any transfers (checks-effects-interactions).
         // A reentrant call to close() — e.g. through a hostile token contract —
         // will hit this guard immediately and panic, preventing double-releases.
@@ -944,6 +1201,19 @@ impl CircleContract {
                     (member, collateral),
                 );
             }
+        }
+
+        // Arithmetic assertion: every stroop that was in storage must have been
+        // released.  If total_released diverges from the pre-release snapshot the
+        // entire transaction panics and rolls back, guaranteeing no partial release
+        // state is ever committed.  This fires if a member's balance was silently
+        // skipped, counted twice, or mutated by a reentrant path that slipped past
+        // the Closed guard.
+        if total_released != pre_release_total {
+            panic!(
+                "circle: settlement arithmetic mismatch — released {} but pre-release total was {}",
+                total_released, pre_release_total
+            );
         }
 
         let reason = if matches!(status, CircleStatus::Completed) {

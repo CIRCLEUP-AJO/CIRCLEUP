@@ -106,11 +106,126 @@ export function validateCircleUpConfig(config: unknown): asserts config is Circl
     }
   }
 
+  // indexerUrl — optional, but when present must look like an HTTP(S) URL
+  if (cfg.indexerUrl !== undefined && cfg.indexerUrl !== null) {
+    if (typeof cfg.indexerUrl !== "string") {
+      errors.push(
+        `config.indexerUrl must be a string URL (e.g. "http://localhost:3001"), got ${typeof cfg.indexerUrl}.`,
+      );
+    } else if (cfg.indexerUrl.trim() !== "" && !/^https?:\/\/.+/.test(cfg.indexerUrl.trim())) {
+      errors.push(
+        `config.indexerUrl "${cfg.indexerUrl}" does not look like a valid HTTP(S) URL.`,
+      );
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error(
       `Invalid CircleUpConfig:\n${errors.map((e) => `  • ${e}`).join("\n")}`,
     );
   }
+}
+
+// ─── Contract argument validation ─────────────────────────────────────────────
+
+/**
+ * Validate a set of contract call parameters before any encoding is attempted.
+ *
+ * Called by high-level mutation methods (e.g. `createCircle`, `markDefault`)
+ * to catch bad inputs — wrong types, out-of-range numbers, malformed addresses
+ * — at the earliest possible point.  Returning a string rather than throwing
+ * lets callers convert the problem into the appropriate error shape (`TxFailure`
+ * for mutations, a thrown `TypeError` for pure encoders).
+ *
+ * @param params Named parameters to validate, checked in order.
+ * @returns `null` when every parameter is valid; otherwise a human-readable
+ *   description of the first problem found.
+ */
+export function validateContractArgs(
+  params: Array<{ name: string; value: unknown; type: "address" | "u32" | "i128" | "bool" | "addressVec" }>,
+): string | null {
+  for (const { name, value, type } of params) {
+    switch (type) {
+      case "address": {
+        if (!isValidStellarAddress(value)) {
+          return (
+            `"${name}" must be a Stellar account (G…) or contract (C…) address, ` +
+            `got ${describeArgValue(value)}.`
+          );
+        }
+        break;
+      }
+      case "u32": {
+        if (
+          typeof value !== "number" ||
+          !Number.isInteger(value) ||
+          value < 0 ||
+          value > 0xffffffff
+        ) {
+          return (
+            `"${name}" must be a u32 integer (0–4294967295), ` +
+            `got ${describeArgValue(value)}.`
+          );
+        }
+        break;
+      }
+      case "i128": {
+        const I128_MAX = (1n << 127n) - 1n;
+        const I128_MIN = -(1n << 127n);
+        if (typeof value === "number") {
+          if (!Number.isInteger(value)) {
+            return `"${name}" must be a whole number for i128 encoding, got ${value} (use a bigint).`;
+          }
+          if (!Number.isSafeInteger(value)) {
+            return (
+              `"${name}" (${value}) exceeds Number.MAX_SAFE_INTEGER and would lose ` +
+              `precision when converted to i128. Pass a bigint instead.`
+            );
+          }
+        } else if (typeof value === "bigint") {
+          if (value < I128_MIN || value > I128_MAX) {
+            return `"${name}" (${value}) is out of range for i128 (${I128_MIN}–${I128_MAX}).`;
+          }
+        } else {
+          return `"${name}" must be a bigint or integer number for i128 encoding, got ${describeArgValue(value)}.`;
+        }
+        break;
+      }
+      case "bool": {
+        if (typeof value !== "boolean") {
+          return `"${name}" must be a boolean, got ${describeArgValue(value)}.`;
+        }
+        break;
+      }
+      case "addressVec": {
+        if (!Array.isArray(value)) {
+          return `"${name}" must be an array of Stellar addresses, got ${describeArgValue(value)}.`;
+        }
+        if (value.length === 0) {
+          return `"${name}" must not be empty — at least one address is required.`;
+        }
+        for (let i = 0; i < value.length; i++) {
+          if (!isValidStellarAddress(value[i])) {
+            return (
+              `"${name}[${i}]" is not a valid Stellar address, got ${describeArgValue(value[i])}.`
+            );
+          }
+        }
+        break;
+      }
+    }
+  }
+  return null;
+}
+
+/** Render an argument value concisely for an error message. */
+function describeArgValue(value: unknown): string {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "bigint") return `bigint ${value}`;
+  if (typeof value === "string") return `string "${value.slice(0, 40)}${value.length > 40 ? "…" : ""}"`;
+  if (typeof value === "object") return `object (${Object.prototype.toString.call(value)})`;
+  return `${typeof value} ${JSON.stringify(value)}`;
 }
 
 // ── Raw wire types returned by scValToNative from Soroban simulation ──────────
@@ -291,12 +406,14 @@ function describeValue(value: unknown): string {
  * @throws `TypeError` when the value is not an in-range u32.
  */
 export function decodeU32(value: unknown, label: string): number {
-  if (
-    typeof value !== "number" ||
-    !Number.isInteger(value) ||
-    value < 0 ||
-    value > 0xffffffff
-  ) {
+  if (typeof value !== "number") {
+    throw new TypeError(
+      `${label}: expected a u32 (number) but the contract returned ${describeValue(value)} ` +
+        `(type: ${typeof value}). This usually means the contract's return type has changed ` +
+        `or the wrong field was decoded.`,
+    );
+  }
+  if (!Number.isInteger(value) || value < 0 || value > 0xffffffff) {
     throw new TypeError(
       `${label}: expected a u32 (0–4294967295) but the contract returned ${describeValue(value)}.`,
     );
@@ -327,7 +444,9 @@ export function decodeBigInt(value: unknown, label: string): bigint {
     return BigInt(value);
   }
   throw new TypeError(
-    `${label}: expected a bigint amount but the contract returned ${describeValue(value)}.`,
+    `${label}: expected a bigint or number for an i128/u64 field but the contract returned ` +
+      `${describeValue(value)} (type: ${typeof value}). ` +
+      `This usually means the contract's return type has changed or the wrong field was decoded.`,
   );
 }
 
@@ -343,7 +462,8 @@ export function decodeBigInt(value: unknown, label: string): bigint {
 export function decodeBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") {
     throw new TypeError(
-      `${label}: expected a boolean but the contract returned ${describeValue(value)}.`,
+      `${label}: expected a boolean but the contract returned ${describeValue(value)} ` +
+        `(type: ${typeof value}).`,
     );
   }
   return value;
@@ -357,8 +477,12 @@ export function decodeBoolean(value: unknown, label: string): boolean {
  */
 export function decodeAddress(value: unknown, label: string): string {
   if (!isValidStellarAddress(value)) {
+    const typeTag = value === null ? "null"
+      : value === undefined ? "undefined"
+      : typeof value;
     throw new TypeError(
-      `${label}: expected a Stellar address (G… or C…) but the contract returned ${describeValue(value)}.`,
+      `${label}: expected a Stellar address (G… or C…) but the contract returned ` +
+        `${describeValue(value)} (type: ${typeTag}).`,
     );
   }
   return value;

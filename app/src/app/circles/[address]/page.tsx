@@ -1,4 +1,3 @@
-import React from "react";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { INDEXER_URL, formatUsdc, formatPot } from "@/lib/config";
@@ -15,6 +14,27 @@ export async function generateMetadata({
 }: {
   params: { address: string };
 }): Promise<Metadata> {
+  // Attempt to enrich the metadata with live circle data.  A failure here must
+  // never 500 the page — fall back to the address-only title gracefully.
+  try {
+    const result = await getCircleDetail(params.address);
+    if (result.ok) {
+      const { circle } = result.data;
+      const pot = `$${formatPot(circle.round_amount, circle.member_count)}`;
+      const roundAmount = `$${formatUsdc(circle.round_amount)}`;
+      return {
+        title: `${roundAmount}/round Circle (${circle.status}) — CircleUp`,
+        description:
+          `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}. ` +
+          `Savings circle at ${params.address} on CircleUp. Track rotation order, round progress, and contribution history.`,
+      };
+    }
+  } catch {
+    // Silently fall through to the default below
+  }
+
+  // Default: address-only fallback when the indexer is unreachable or the
+  // circle is not found (404 will be served by the page render, not here).
   return {
     title: `Circle ${params.address.slice(0, 8)}… — CircleUp`,
     description: `Savings circle at ${params.address} on CircleUp. Track rotation order, round progress, and contribution history.`,
@@ -23,11 +43,13 @@ export async function generateMetadata({
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type FetchError = "network" | "not_found" | "server" | "parse" | "misconfigured";
+type FetchError = "network" | "server" | "parse" | "misconfigured";
 
+// not_found is handled separately: the page calls notFound() which triggers
+// Next.js's built-in 404 route — CircleErrorBody is never rendered for it.
 type FetchResult =
   | { ok: true; data: CircleDetailData }
-  | { ok: false; error: FetchError };
+  | { ok: false; error: "not_found" | FetchError };
 
 // ─── URL validation ───────────────────────────────────────────────────────────
 
@@ -87,9 +109,9 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
   try {
     roundsData = roundsRes.ok
       ? ((await roundsRes.json()) as Record<string, unknown>)
-      : { rounds: [], pendingDefaults: [], currentRound: null };
+      : { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
   } catch {
-    roundsData = { rounds: [], pendingDefaults: [], currentRound: null };
+    roundsData = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
   }
 
   // Validate the shape we depend on to avoid runtime errors in the render tree
@@ -114,6 +136,12 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
       members,
       rounds: Array.isArray(roundsData.rounds)
         ? (roundsData.rounds as CircleRound[])
+        : [],
+      // openRounds: unpaid rounds with activity that are not the current round.
+      // Previously invisible to the client because the old /rounds endpoint
+      // only iterated payouts (issue #170).
+      openRounds: Array.isArray(roundsData.openRounds)
+        ? (roundsData.openRounds as CircleRound[])
         : [],
       pendingDefaults: Array.isArray(roundsData.pendingDefaults)
         ? (roundsData.pendingDefaults as CirclePendingDefault[])
@@ -219,18 +247,6 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
 // always visible.
 
 function CircleErrorBody({ error }: { error: FetchError }) {
-  if (error === "not_found") {
-    return (
-      <div className="text-center py-12 text-slate-500" role="main">
-        <div className="text-4xl mb-3">🔍</div>
-        <p className="font-medium text-slate-800">Circle not found.</p>
-        <p className="text-sm mt-1 text-slate-500">
-          It may not be indexed yet — try refreshing in a moment.
-        </p>
-      </div>
-    );
-  }
-
   const messages: Record<string, string> = {
     misconfigured:
       "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
@@ -270,6 +286,7 @@ export default async function CircleDetailPage({
     if (result.error === "not_found") {
       notFound();
     }
+    // At this point result.error is narrowed to FetchError (never "not_found")
     return (
       <div>
         <CircleHeader address={params.address} circle={null} />

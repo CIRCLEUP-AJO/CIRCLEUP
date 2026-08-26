@@ -127,14 +127,30 @@ export function formatPot(
 }
 
 // ─── Ledger / time helpers ────────────────────────────────────────────────────
+//
+// UTC / rounding policy (single source of truth for schedule → ledger math):
+//
+//   • A "day" is always a fixed 86_400-second UTC day. It is NOT a local
+//     calendar day, so midnight, leap days, and daylight-saving transitions
+//     never shift the result — the conversion is pure arithmetic and is
+//     therefore independent of the host timezone.
+//   • Stellar produces one ledger approximately every 5 seconds, so a day is
+//     86_400 / 5 = 17_280 ledgers.
+//   • Fractional ledgers are rounded to the nearest whole ledger
+//     (`Math.round`), so identical inputs always yield identical, deterministic
+//     ledger deadlines.
+//   • The minimum meaningful interval is 1 ledger (~5 s). A sub-ledger input
+//     (e.g. 0.00001 days) rounds to 0 ledgers, which is treated as "no
+//     deadline" by callers; use `daysToLedgers` with a value of at least
+//     `1 / 17_280` to request a non-zero window.
 
-/** Approximate ledgers for a given number of days (Stellar: ~5 s/ledger) */
+/** Approximate ledgers for a given number of days (Stellar: ~5 s/ledger). */
 export function daysToLedgers(days: number): number {
   if (days < 0) throw new RangeError(`daysToLedgers: days must be >= 0, got ${days}`);
   return Math.round((days * 24 * 60 * 60) / 5);
 }
 
-/** Approximate days for a given number of ledgers */
+/** Approximate days for a given number of ledgers. */
 export function ledgersToDays(ledgers: number): number {
   if (ledgers < 0) throw new RangeError(`ledgersToDays: ledgers must be >= 0, got ${ledgers}`);
   return Math.round((ledgers * 5) / (24 * 60 * 60));

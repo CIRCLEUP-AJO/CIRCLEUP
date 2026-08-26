@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { WalletButton } from "@/components/WalletButton";
+import { WalletRepLink } from "@/components/WalletRepLink";
 
 export const metadata: Metadata = {
   title: "CircleUp — On-Chain Savings Circles",
@@ -29,9 +30,7 @@ export default function RootLayout({
             <a href="/create" className="text-slate-600 hover:text-brand-600 transition-colors">
               Create
             </a>
-            <a href="#" className="text-slate-600 hover:text-brand-600 transition-colors">
-              My Reputation
-            </a>
+            <WalletRepLink />
             <WalletButton />
           </div>
         </nav>
