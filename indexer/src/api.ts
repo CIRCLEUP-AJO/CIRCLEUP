@@ -19,6 +19,7 @@ import { query } from "./db/pool";
 import { rpc, USDC } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
+import { redactAddress } from "./redact";
 import type { MigrationHealth } from "./db/migrate";
 
 // ── CORS ─────────────────────────────────────────────────────────────────────
@@ -506,7 +507,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         latestLedger,
       });
     } catch (err) {
-      console.error(`[api] Failed to load circle ${address}`, err);
+      console.error(`[api] Failed to load circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle", getErrorMessage(err));
     }
   });
@@ -571,7 +572,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         },
       });
     } catch (err) {
-      console.error(`[api] Failed to load members for circle ${address}`, err);
+      console.error(`[api] Failed to load members for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle members", getErrorMessage(err));
     }
   });
@@ -624,7 +625,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         pendingDefaults,
       });
     } catch (err) {
-      console.error(`[api] Failed to load rounds for circle ${address}`, err);
+      console.error(`[api] Failed to load rounds for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle rounds", getErrorMessage(err));
     }
   });
@@ -717,7 +718,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       });
     } catch (err) {
       console.error(
-        `[api] Failed to load contributions for member ${member}`,
+        `[api] Failed to load contributions for member ${redactAddress(member)}`,
         err,
       );
       sendError(
@@ -795,7 +796,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         updatedAt: row?.updated_at ?? null,
       });
     } catch (err) {
-      console.error(`[api] Failed to load reputation for member ${member}`, err);
+      console.error(`[api] Failed to load reputation for member ${redactAddress(member)}`, err);
       sendError(res, 500, "Failed to load reputation", getErrorMessage(err));
     }
   });

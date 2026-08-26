@@ -44,6 +44,7 @@ import {
   POLL_INTERVAL_MS,
   EVENTS_LIMIT,
 } from "./config";
+import { redactAddress, redactTxHash, formatAmount } from "./redact";
 
 export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
   allowHttp: true,
@@ -348,8 +349,8 @@ export async function processLedger(
         totalEventsFailed++;
         console.error(
           `[indexer] Failed to process ${topic0}/${topic1} event ` +
-            `(contract=${contractId ?? "unknown"}, ledger=${ledger}` +
-            (event.txHash ? `, tx=${event.txHash}` : "") +
+            `(contract=${redactAddress(contractId ?? "unknown")}, ledger=${ledger}` +
+            (event.txHash ? `, tx=${redactTxHash(event.txHash)}` : "") +
             "):",
           err,
         );
@@ -448,7 +449,7 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
     [circleAddress, creator, event.ledger],
   );
   console.log(
-    `[indexer] New circle created: ${circleAddress} by ${creator} (factory index: ${circleIndex})`,
+    `[indexer] New circle created: ${redactAddress(circleAddress)} by ${redactAddress(creator)} (factory index: ${circleIndex})`,
   );
 }
 
@@ -460,7 +461,7 @@ async function handleCircleJoined(client: PoolClient, circleAddr: string, event:
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Member joined: ${memberAddr} → ${circleAddr}`);
+  console.log(`[indexer] Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleActive(client: PoolClient, circleAddr: string) {
@@ -468,7 +469,7 @@ async function handleCircleActive(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET status = 'Active', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle active: ${circleAddr}`);
+  console.log(`[indexer] Circle active: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleContributed(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -486,7 +487,7 @@ async function handleCircleContributed(client: PoolClient, circleAddr: string, e
      ON CONFLICT (circle_address, member_address, round_index) DO NOTHING`,
     [circleAddr, memberAddr, roundIndex, amount, event.txHash, event.ledger],
   );
-  console.log(`[indexer] Contribution: ${memberAddr} round ${roundIndex} → ${circleAddr}`);
+  console.log(`[indexer] Contribution: ${redactAddress(memberAddr)} round ${roundIndex} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCirclePayout(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -503,7 +504,7 @@ async function handleCirclePayout(client: PoolClient, circleAddr: string, event:
     `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
     [roundIndex + 1, circleAddr],
   );
-  console.log(`[indexer] Payout: ${recipient} received ${pot} round ${roundIndex} from ${circleAddr}`);
+  console.log(`[indexer] Payout: ${redactAddress(recipient)} ${formatAmount(pot)} round ${roundIndex} from ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleDefault(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -520,7 +521,7 @@ async function handleCircleDefault(client: PoolClient, circleAddr: string, event
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Default: ${memberAddr} penalty ${penalty} round ${roundIndex} in ${circleAddr}`);
+  console.log(`[indexer] Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
@@ -528,7 +529,7 @@ async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET status = 'Completed', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle completed: ${circleAddr}`);
+  console.log(`[indexer] Circle completed: ${redactAddress(circleAddr)}`);
 }
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
@@ -541,7 +542,7 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
      ON CONFLICT (member_address) DO UPDATE SET score = $2, updated_at = NOW()`,
     [memberAddr, score],
   );
-  console.log(`[indexer] Reputation: ${memberAddr} → score ${score}`);
+  console.log(`[indexer] Reputation: ${redactAddress(memberAddr)} → score ${score}`);
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────
@@ -573,8 +574,8 @@ export async function runEventHandler(
     totalEventsFailed++;
     console.error(
       `[indexer] Failed to process ${ctx.topic} event ` +
-        `(contract=${ctx.contractId ?? "unknown"}, ledger=${ctx.ledger}` +
-        (ctx.txHash ? `, tx=${ctx.txHash}` : "") +
+        `(contract=${redactAddress(ctx.contractId ?? "unknown")}, ledger=${ctx.ledger}` +
+        (ctx.txHash ? `, tx=${redactTxHash(ctx.txHash)}` : "") +
         "):",
       err,
     );
