@@ -1,0 +1,23 @@
+{
+  // Type-checks the examples against the package's public entry point.
+  //
+  // The `paths` mapping resolves "@circleup/sdk" to the package root so the
+  // fixture imports exactly as an external consumer would — no deep paths —
+  // without needing the package to be built and linked into node_modules.
+  //
+  // Run:  npx tsc -p examples/tsconfig.json
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "rootDir": "..",
+    "baseUrl": ".",
+    "paths": {
+      "@circleup/sdk": ["../src/index.ts"]
+    }
+  },
+  "include": ["./**/*.ts", "../src/**/*.ts"],
+  "exclude": ["../node_modules", "../dist", "../src/__tests__"]
+}
