@@ -113,6 +113,15 @@ pub enum DataKey {
     /// without deserializing the full CircleConfig, and to make the
     /// immutability of the token selection explicit in storage layout.
     UsdcToken,
+    /// Admin address — the only account that may pause or resume this circle.
+    /// Set once at `initialize` time; typically the factory contract or deployer.
+    /// Immutable after initialization.
+    Admin,
+    /// Pause flag — present and `true` when the circle is paused.
+    /// Absent (or `false`) when the circle is operating normally.
+    /// When present, all fund-moving entry-points (join, contribute, payout,
+    /// mark_default, close) are blocked.  Read-only views remain available.
+    Paused,
 }
 
 // ─── Initialization-specific error type ──────────────────────────────────────
@@ -171,6 +180,30 @@ pub enum InitError {
     /// Accepting an unusable token would strand all member deposits with no
     /// recovery path.
     UnusableTokenContract = 13,
+}
+
+// ─── Pause / emergency-recovery error type ───────────────────────────────────
+//
+// Returned by `pause` and `resume` so callers receive a typed, inspectable
+// error code rather than an opaque panic when authorization or state guards
+// fire.  Using `contracterror` keeps the error model consistent with the rest
+// of the contract's typed-error approach and lets SDK consumers branch on
+// stable codes rather than message strings.
+
+/// Typed errors returned by `pause` and `resume`.
+///
+/// The numeric discriminants are stable — do not renumber existing variants.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PauseError {
+    /// Caller is not the stored admin address.
+    Unauthorized = 1,
+    /// `pause` was called when the circle is already paused.
+    AlreadyPaused = 2,
+    /// `resume` was called when the circle is not paused.
+    NotPaused = 3,
+    /// `pause` or `resume` was called before `initialize`.
+    NotInitialized = 4,
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
@@ -299,6 +332,27 @@ impl CircleContract {
         }
     }
 
+    /// Panics with a clear message if the circle is currently paused.
+    ///
+    /// Called at the top of every fund-moving entry-point (join, contribute,
+    /// payout, mark_default, close) so the pause check is applied uniformly
+    /// without duplicating the storage read at each call site.
+    ///
+    /// Read-only views intentionally do NOT call this — reads remain available
+    /// while paused so indexers and front-ends can still inspect circle state
+    /// and display the pause reason to members.
+    #[inline]
+    fn assert_not_paused(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic!("circle is paused: no fund-moving operations are allowed until an admin resumes it");
+        }
+    }
+
     fn assert_unique_members(members: &Vec<Address>) {
         let len = members.len();
         let mut i: u32 = 0;
@@ -345,9 +399,11 @@ impl CircleContract {
     /// | Token address | `usdc_token == current contract` | `"usdc_token must not be the circle contract itself"` |
     /// | Reputation address | `reputation_contract == current contract` | `"reputation_contract must not be the circle contract itself"` |
     /// | Reputation ≠ token | `reputation_contract == usdc_token` | `"reputation_contract must not be the same address as usdc_token"` |
+    /// | Token usability | `token.try_balance` fails | `"usdc_token does not implement the standard token interface"` |
     /// | Rotation consistency | `members.len() == 0` after validation passes | (defensive; unreachable in practice) |
     pub fn initialize(
         env: Env,
+        admin: Address,
         members: Vec<Address>,
         round_amount: i128,
         usdc_token: Address,
@@ -367,6 +423,13 @@ impl CircleContract {
             panic!("initialize already in progress");
         }
         env.storage().instance().set(&DataKey::Initializing, &true);
+
+        // Admin authorization: the admin must sign this invocation.
+        // The admin is the only account permitted to pause/resume this circle.
+        // Typically the factory contract (Contract Invoker rule) or a governance
+        // multisig in direct deployments.
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
 
         if members.len() < 2 {
             panic!("need at least 2 members");
@@ -528,6 +591,8 @@ impl CircleContract {
     pub fn join(env: Env, member: Address) {
         member.require_auth();
 
+        Self::assert_not_paused(&env);
+
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -633,6 +698,8 @@ impl CircleContract {
     pub fn cancel(env: Env, caller: Address) {
         caller.require_auth();
 
+        Self::assert_not_paused(&env);
+
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -671,6 +738,8 @@ impl CircleContract {
     /// updates one instance entry (`CurrentRound`).
     pub fn contribute(env: Env, member: Address) {
         member.require_auth();
+
+        Self::assert_not_paused(&env);
 
         let config: CircleConfig = env
             .storage()
@@ -797,6 +866,7 @@ impl CircleContract {
     ///
     /// Anyone may call this.
     pub fn payout(env: Env) {
+        Self::assert_not_paused(&env);
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -982,6 +1052,7 @@ impl CircleContract {
     /// `Defaults(member)`) and updates one persistent entry
     /// (`Collateral(member)`).
     pub fn mark_default(env: Env, member: Address) {
+        Self::assert_not_paused(&env);
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -1120,6 +1191,8 @@ impl CircleContract {
     /// entry (`Collateral(member)`) per member that held a non-zero balance.
     pub fn close(env: Env, closer: Address) {
         closer.require_auth();
+
+        Self::assert_not_paused(&env);
 
         let config: CircleConfig = env
             .storage()
@@ -1280,6 +1353,141 @@ impl CircleContract {
     /// replaying the event log.
     pub fn is_closed(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Closed)
+    }
+
+    // ── Pause / emergency recovery ────────────────────────────────────────────
+
+    /// Pause the circle, blocking all fund-moving operations.
+    ///
+    /// Only the stored `admin` address (set at initialization) may call this.
+    /// A paused circle accepts no `join`, `contribute`, `payout`, `mark_default`,
+    /// or `close` calls.  All read-only views remain available so indexers and
+    /// front-ends can display the current state and the pause reason to members.
+    ///
+    /// # Authorization
+    /// `admin.require_auth()` is called inside this function; the admin must sign
+    /// the transaction that invokes `pause`.
+    ///
+    /// # Errors (via `try_pause`)
+    /// - `PauseError::NotInitialized` — called before `initialize`.
+    /// - `PauseError::Unauthorized` — caller is not the stored admin.
+    /// - `PauseError::AlreadyPaused` — circle is already paused.
+    ///
+    /// # Events
+    /// Emits `circle` / `paused` with data `(admin: Address, ledger: u32)`.
+    pub fn pause(env: Env, admin: Address) -> Result<(), PauseError> {
+        // Must be initialized before pause is meaningful.
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PauseError::NotInitialized)?;
+
+        // Require the admin's signature before any state check so authorization
+        // is always the first gate — consistent with Soroban auth best practices.
+        admin.require_auth();
+
+        if admin != stored_admin {
+            return Err(PauseError::Unauthorized);
+        }
+
+        // Idempotency guard: pausing an already-paused circle is an error so
+        // callers get clear feedback rather than a silent no-op that might mask
+        // a double-invocation bug.
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(PauseError::AlreadyPaused);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &true);
+
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "paused")),
+            (admin, env.ledger().sequence()),
+        );
+
+        Ok(())
+    }
+
+    /// Resume a paused circle, restoring normal operations.
+    ///
+    /// Only the stored `admin` address may call this.  After a successful
+    /// `resume` all entry-points are available again with the round and member
+    /// data intact — no state is lost during a pause/resume cycle.
+    ///
+    /// # Authorization
+    /// `admin.require_auth()` is called inside this function.
+    ///
+    /// # Errors (via `try_resume`)
+    /// - `PauseError::NotInitialized` — called before `initialize`.
+    /// - `PauseError::Unauthorized` — caller is not the stored admin.
+    /// - `PauseError::NotPaused` — circle is not currently paused.
+    ///
+    /// # Events
+    /// Emits `circle` / `resumed` with data `(admin: Address, ledger: u32)`.
+    pub fn resume(env: Env, admin: Address) -> Result<(), PauseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PauseError::NotInitialized)?;
+
+        admin.require_auth();
+
+        if admin != stored_admin {
+            return Err(PauseError::Unauthorized);
+        }
+
+        // Cannot resume a circle that is not paused.
+        if !env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(PauseError::NotPaused);
+        }
+
+        // Remove the flag entirely rather than setting it to `false` so
+        // `is_paused` can use a simple `has` check and the storage is clean.
+        env.storage().instance().remove(&DataKey::Paused);
+
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "resumed")),
+            (admin, env.ledger().sequence()),
+        );
+
+        Ok(())
+    }
+
+    /// Returns `true` when the circle is currently paused.
+    ///
+    /// This view is always available — it does not require the circle to be
+    /// initialized and does not check the pause state before returning.
+    /// Front-ends should call this before showing action buttons so users see
+    /// a clear "circle is paused" message rather than a cryptic transaction
+    /// failure.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Returns the admin address stored at initialization.
+    ///
+    /// Returns `Err(ContractError::NotInitialized)` when called before
+    /// `initialize`.  SDKs can use this to verify which address has pause/resume
+    /// authority without hard-coding it.
+    pub fn get_admin(env: Env) -> Result<Address, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)
     }
 
     /// Returns the canonical USDC token address that was locked at initialization.
