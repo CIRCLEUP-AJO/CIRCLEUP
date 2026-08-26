@@ -937,3 +937,172 @@ export interface ApiHealthResponse {
   status: "ok";
   timestamp: string;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Indexer read models (issue #342)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Shared, typed views of the indexer REST responses. RPC values and indexer
+// responses diverge in field names, numeric representation, and optionality;
+// these models give consumers one shape per resource that makes explicit the
+// two things raw JSON does not encode:
+//
+//   • Units — every monetary field is in **stroops**, the canonical integer
+//     unit (1 USDC = 10,000,000 stroops = STROOPS_PER_USDC). Amounts are typed
+//     `string` because a pot can exceed Number.MAX_SAFE_INTEGER. Convert to
+//     display units only at render time. No field below is a display-unit number.
+//   • Missing data — every value the indexer can omit or leave unresolved is
+//     explicitly `T | null`, never an implicit `undefined` or a silent `0`.
+//
+// Numeric representation rules applied throughout:
+//   • Monetary amounts (stroops) and on-chain u64 ledger sequences → `string`.
+//   • Counts, round indices and order positions (bounded, small) → `number`.
+//   • Timestamps → ISO-8601 `string`.
+
+/** Lifecycle phase of a single round, as reconciled by the indexer. */
+export type RoundPhase = "completed" | "current" | "cancelled" | "open";
+
+/**
+ * Compact per-circle model for list views (`GET /circles`).
+ */
+export interface CircleSummary {
+  /** Circle contract address (C…). */
+  address: string;
+  /** Address that created the circle. */
+  creator: string;
+  /** Per-round contribution amount, in **stroops** (string). */
+  roundAmount: string;
+  /** Number of member slots configured in the circle. */
+  memberCount: number;
+  /** Circle lifecycle status. */
+  status: CircleStatus;
+  /** 0-based index of the round currently in progress. */
+  currentRound: number;
+  /** Total number of rounds the circle runs (one payout per member). */
+  totalRounds: number;
+  /** Ledger sequence at which the circle was created (u64 → string). */
+  createdLedger: string;
+  /** ISO-8601 timestamp of the most recent indexer update to this circle. */
+  updatedAt: string;
+}
+
+/**
+ * Per-member status within a circle (`GET /circles/:address/members`, and the
+ * `members` array of the circle-detail response).
+ */
+export interface MemberStatus {
+  /** Member account address (G…). */
+  memberAddress: string;
+  /** Member's position in the payout rotation, as recorded by the indexer. */
+  payoutOrder: number;
+  /** Collateral locked by this member, in **stroops** (string). */
+  collateral: string;
+  /** Number of rounds in which this member has defaulted. */
+  defaults: number;
+  /** On-chain reputation score; `null` when the member has no reputation record yet. */
+  reputationScore: number | null;
+  /**
+   * Total contributions this member has made across the circle (string).
+   * `null` when the source view omits it — the circle-detail endpoint does not
+   * include per-member contribution totals.
+   */
+  totalContributions: string | null;
+}
+
+/**
+ * Full per-circle model for detail views (`GET /circles/:address`).
+ * Extends {@link CircleSummary} with the roster, deadline data, and the
+ * indexer's latest processed ledger for staleness checks.
+ */
+export interface CircleDetail extends CircleSummary {
+  /**
+   * Number of ledgers a round stays open for contributions (the deadline
+   * window), u64 → string. `null` for circles indexed before this field was
+   * tracked.
+   */
+  roundDeadlineLedgers: string | null;
+  /**
+   * Absolute ledger sequence by which the current round must be funded.
+   * `null` when there is no active round or the indexer cannot resolve it.
+   */
+  deadlineLedger: number | null;
+  /** Full member roster with per-member status. */
+  members: MemberStatus[];
+  /**
+   * Latest ledger height the indexer has processed, enabling staleness checks.
+   * `null` when the indexer has not recorded any ledger yet.
+   */
+  latestLedger: number | null;
+}
+
+/** A single contribution row nested inside a {@link RoundStatus}. */
+export interface RoundContribution {
+  /** Contributing member (G…). */
+  memberAddress: string;
+  /** Contribution amount, in **stroops** (string). */
+  amount: string;
+  /** Contribution transaction hash. */
+  txHash: string;
+  /** Ledger sequence of the contribution (u64 → string). */
+  ledger: string;
+}
+
+/** A single default row nested inside a {@link RoundStatus}. */
+export interface RoundDefault {
+  /** Defaulting member (G…). */
+  memberAddress: string;
+  /** Penalty applied for the default, in **stroops** (string). */
+  penalty: string;
+  /** Default-record transaction hash. */
+  txHash: string;
+  /** Ledger sequence of the default record (u64 → string). */
+  ledger: string;
+}
+
+/**
+ * Reconciled status of a single round (`GET /circles/:address/rounds`).
+ * The payout fields are all populated together once the round completes and
+ * are `null` beforehand.
+ */
+export interface RoundStatus {
+  /** 0-based round index. */
+  roundIndex: number;
+  /** Lifecycle phase of this round. */
+  status: RoundPhase;
+  /** Payout recipient (G…); `null` until the round is paid out. */
+  recipient: string | null;
+  /** Payout amount, in **stroops** (string); `null` until the round is paid out. */
+  amount: string | null;
+  /** Payout transaction hash; `null` until the round is paid out. */
+  txHash: string | null;
+  /** Ledger sequence of the payout (u64 → string); `null` until paid out. */
+  ledger: string | null;
+  /** Contributions recorded for this round. */
+  contributions: RoundContribution[];
+  /** Defaults recorded for this round. */
+  defaults: RoundDefault[];
+}
+
+/** A single settled payout inside a {@link PayoutHistory}. */
+export interface PayoutRecord {
+  /** 0-based index of the round this payout settled. */
+  roundIndex: number;
+  /** Payout recipient (G…). */
+  recipient: string;
+  /** Payout amount, in **stroops** (string). */
+  amount: string;
+  /** Payout transaction hash. */
+  txHash: string;
+  /** Ledger sequence of the payout (u64 → string). */
+  ledger: string;
+  /** ISO-8601 timestamp of the payout. */
+  settledAt: string;
+}
+
+/** Chronological payout history for a circle, one entry per completed round. */
+export interface PayoutHistory {
+  /** Circle these payouts belong to (C…). */
+  circleAddress: string;
+  /** Payout records, oldest-first by round index. */
+  payouts: PayoutRecord[];
+}
