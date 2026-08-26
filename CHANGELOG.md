@@ -9,6 +9,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `sdk/src/index.ts` — documented the public API surface at the package entry
+  point: a grouped map (clients, errors, config & types, gating, utilities,
+  constants, low-level encoders) states that the package root is the only
+  supported import path and that deep paths / test modules carry no stability
+  guarantee. Re-export order is annotated so each symbol has one canonical source
+- `sdk/examples/public-api.ts` — side-effect-free fixture that imports every
+  documented symbol from the package root (no deep or `../src` paths) and is
+  type-checked by `sdk/examples/tsconfig.json`, so the public contract stays
+  reachable-from-root and cannot silently regress
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
