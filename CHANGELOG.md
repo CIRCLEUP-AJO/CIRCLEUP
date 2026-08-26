@@ -34,6 +34,26 @@ Versions follow [Semantic Versioning](https://semver.org/).
   partial replay semantics and preflight non-mutation guarantee
 - `indexer` boot sequence now logs a prominent `SCHEMA WARNING` for `drifted` or
   `partial` states after migrations run, surfacing drift before the poller starts
+- `sdk/src/gating.ts` — `detectStateMismatches()`: a pure, content-based comparator
+  that reports exactly which state fields (`status`, `roundIndex`,
+  `contributionsReceived`, `hasContributed`, `paidOut`) diverged between a caller's
+  declared `ExpectedState` and freshly-read `ActualState`; complements the existing
+  age-based gating by catching *predictable* stale submissions even when the caller
+  believes their data is fresh
+- `sdk/src/client.ts` — `CircleClient.preflight()`: an opt-in, read-only check that
+  force-refreshes on-chain state and returns typed `PreflightResult` mismatches
+  without submitting a transaction; every mutation (`join`, `contribute`, `payout`,
+  `markDefault`, `close`) now accepts an optional `PreflightOptions` that aborts a
+  stale write with `errorCode: "stale_state"` before submission. Omitting it
+  preserves the zero-extra-RPC fast path, and a preflight *read* failure never
+  blocks the write — the contract remains the final authority
+- `sdk/src/types.ts` — `StateMismatch` type, the `"stale_state"` `TxErrorCode`, and
+  an optional `mismatches` field on `TxFailure` so callers can tell the user exactly
+  what changed instead of a generic retry prompt
+- `sdk/src/__tests__/preflight.test.ts` — unit tests for `detectStateMismatches`
+  (field-by-field divergence, stable ordering, null/unknown skipping) and
+  integration tests for `preflight()` and the per-mutation guard (stale block,
+  passing pass-through, fast path, read-failure proceed, args-unchanged guarantee)
 
 ### Changed
 - `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
