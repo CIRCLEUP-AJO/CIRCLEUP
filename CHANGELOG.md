@@ -9,6 +9,22 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `sdk/src/gating.ts` — new `default` action in `computeActionEligibility`,
+  gating the `mark_default` write. It layers a fresh-snapshot check, `Active`
+  status, active-round, membership, and not-already-contributed guards on top of
+  a **fail-closed** deadline check: unlike `contribute` (which fails *open* on
+  unknown ledger data so an honest member is never blocked), `default` requires
+  positive proof the round deadline has passed before allowing the punitive
+  write. Adds the `deadline_not_passed` block reason
+- `app/src/lib/gating.ts` — mirrors the SDK `default` action for the app gating
+  layer, adapted to `AppStateSnapshot` (kept in sync manually; the app does not
+  depend on `@circleup/sdk`)
+- `sdk/src/__tests__/actionGating.test.ts` — coverage for the `default` action:
+  deadline boundary (blocked at exactly `deadlineLedger`), fail-closed on unknown
+  ledger, membership, status, already-contributed, and stale-snapshot cases
+- `app/src/lib/gating.mutation.test.ts` — mutation-guard coverage for the app
+  `default` action, including the contribute-vs-default deadline asymmetry
+  (at exactly the deadline: `contribute` allowed, `default` blocked)
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and

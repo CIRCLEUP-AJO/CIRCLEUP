@@ -398,6 +398,115 @@ describe("computeActionEligibility — payout", () => {
   });
 });
 
+// ─── default (mark_default) ─────────────────────────────────────────────────
+
+describe("computeActionEligibility — default", () => {
+  it("allows default once the deadline has passed and the target has not contributed", () => {
+    // latestLedger = 10_001 > deadlineLedger = 10_000
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, { latestLedger: 10_001 });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      hasContributedCurrentRound: false,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(true);
+  });
+
+  it("blocks default before the deadline (deadline_not_passed)", () => {
+    // latestLedger = 5_000 < deadlineLedger = 10_000 — window still open
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, { latestLedger: 5_000 });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      hasContributedCurrentRound: false,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("deadline_not_passed");
+  });
+
+  it("blocks default at exactly the deadline ledger (boundary — not yet passed)", () => {
+    // Mirror image of contribute's inclusive boundary: at deadlineLedger the
+    // window is still open, so a default is premature.
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, { latestLedger: 10_000 });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      hasContributedCurrentRound: false,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("deadline_not_passed");
+  });
+
+  it("fails closed when latestLedger is null (unknown ledger disables default)", () => {
+    // Unlike contribute (which fails open on null ledger), default must refuse.
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, { latestLedger: null });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      hasContributedCurrentRound: false,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("deadline_not_passed");
+  });
+
+  it("blocks default on a Pending circle (wrong_status)", () => {
+    const snap = makeSnapshot("Pending");
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("wrong_status");
+  });
+
+  it("blocks default when there is no active round (no_active_round)", () => {
+    const snap = makeSnapshot("Active", null);
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("no_active_round");
+  });
+
+  it("blocks default for a target that is not a member (not_a_member)", () => {
+    const outsider = "GZZZ0000000000000000000000000000000000000000000000000000";
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, { latestLedger: 10_001 });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: outsider,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("not_a_member");
+  });
+
+  it("blocks default when the target already contributed (already_contributed)", () => {
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, { latestLedger: 10_001 });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      hasContributedCurrentRound: true,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("already_contributed");
+  });
+
+  it("blocks default on a stale snapshot (stale_snapshot)", () => {
+    const staleAt = NOW_MS - 45_000;
+    const snap = makeSnapshot("Active", ACTIVE_ROUND, {
+      fetchedAtMs: staleAt,
+      latestLedger: 10_001,
+    });
+    const r = computeActionEligibility("default", snap, {
+      memberAddress: BOB,
+      maxSnapshotAgeMs: 30_000,
+      nowMs: NOW_MS,
+    });
+    expect(r.allowed).toBe(false);
+    if (!r.allowed) expect(r.reason).toBe("stale_snapshot");
+  });
+});
+
 // ─── close ────────────────────────────────────────────────────────────────────
 
 describe("computeActionEligibility — close", () => {
@@ -474,6 +583,7 @@ describe("stale_snapshot blocks every action when TTL has expired", () => {
     ["join",       "Pending",   ACTIVE_ROUND,                            { memberAddress: ALICE }],
     ["contribute", "Active",    ACTIVE_ROUND,                            { memberAddress: BOB }],
     ["payout",     "Active",    { ...ACTIVE_ROUND, contributionsReceived: 3 }, { contributionsReceived: 3 }],
+    ["default",    "Active",    ACTIVE_ROUND,                            { memberAddress: BOB }],
     ["close",      "Completed", null,                                    { memberAddress: CAROL }],
   ];
 
