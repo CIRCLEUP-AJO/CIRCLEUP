@@ -198,6 +198,10 @@ export default function CreateClient() {
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
+  // Network-aware explorer link for the created transaction. Resolves to null
+  // on unsupported/custom networks, in which case the link is omitted entirely.
+  const explorerTxUrl = txHash ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash) : null;
+
   return (
     <div className="max-w-xl mx-auto">
       <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
@@ -357,14 +361,16 @@ export default function CreateClient() {
               </div>
             </div>
 
-            <a
-              href={`${EXPLORER_BASE}/${txHash}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
-            >
-              View on Stellar Expert ↗
-            </a>
+            {explorerTxUrl && (
+              <a
+                href={explorerTxUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
+              >
+                View on Stellar Expert ↗
+              </a>
+            )}
 
             <p className="text-xs text-slate-500">
               Redirecting to circles list in a few seconds…

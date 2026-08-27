@@ -194,12 +194,34 @@ function parseStatus(value: unknown): ParseResult<CircleStatus | undefined> {
   return { error: `status must be one of: ${CIRCLE_STATUSES.join(", ")}` };
 }
 
+// Stellar address: G-address (account) or C-address (contract), 56 base32 chars.
+const STELLAR_ADDRESS_RE = /^[GC][A-Z2-7]{55}$/;
+
+function isStellarAddress(value: string): boolean {
+  return STELLAR_ADDRESS_RE.test(value);
+}
+
+function parseAddress(value: string | undefined, label: string): ParseResult<string> {
+  if (!value || value.trim() === "") {
+    return { error: `${label} is required` };
+  }
+  const trimmed = value.trim();
+  if (!isStellarAddress(trimmed)) {
+    return { error: `${label} must be a valid Stellar address (G… or C…, 56 characters)` };
+  }
+  return trimmed;
+}
+
 function parseCircleFilter(value: unknown): ParseResult<string | undefined> {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.trim() === "") {
     return { error: "circle must be a non-empty string" };
   }
-  return value.trim();
+  const trimmed = value.trim();
+  if (!isStellarAddress(trimmed)) {
+    return { error: "circle must be a valid Stellar address (G… or C…, 56 characters)" };
+  }
+  return trimmed;
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -324,41 +346,6 @@ interface IndexerStateAuditRow {
 interface EventTypeCountRow {
   event_type: string | null;
   count: string;
-}
-
-/** Returns a trimmed, non-empty version of a route param, or null if it's missing/blank. */
-function nonBlankParam(value: string | undefined): string | null {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : null;
-}
-
-/**
- * Validates and returns a canonical Stellar address from a route parameter.
- *
- * Returns `{ value }` on success, or `{ error }` with a 400-ready message when
- * the param is missing, blank, or not a valid G-key / C-contract ID.  Using a
- * discriminated union keeps call-sites explicit about which branch they are in.
- *
- * Circle addresses are always C-prefixed contract IDs; member / wallet
- * addresses are always G-prefixed public keys.  Both pass this check so the
- * API remains forward-compatible with contract-based multisig members.
- */
-function stellarAddressParam(
-  value: string | undefined,
-  label: string,
-): { value: string } | { error: string } {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    return { error: `${label} is required` };
-  }
-  if (!isCanonicalStellarAddress(trimmed)) {
-    return {
-      error:
-        `${label} must be a valid Stellar address ` +
-        `(G-prefixed public key or C-prefixed contract ID, 56 base32 characters each)`,
-    };
-  }
-  return { value: trimmed };
 }
 
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
@@ -506,12 +493,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address", async (req: Request, res: Response) => {
-    const addrResult = stellarAddressParam(req.params.address, "Circle address");
-    if ("error" in addrResult) {
-      res.status(400).json({ error: addrResult.error });
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
       return;
     }
-    const address = addrResult.value;
+    const address = addressResult;
     try {
       const [circle] = await query<CircleRow>(
         `SELECT * FROM circles WHERE address = $1`,
@@ -573,12 +560,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address/members", async (req: Request, res: Response) => {
-    const addrResult = stellarAddressParam(req.params.address, "Circle address");
-    if ("error" in addrResult) {
-      res.status(400).json({ error: addrResult.error });
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
       return;
     }
-    const address = addrResult.value;
+    const address = addressResult;
     try {
       const [circle] = await query<Pick<CircleRow, "address">>(
         `SELECT address FROM circles WHERE address = $1`,
@@ -639,12 +626,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address/rounds", async (req: Request, res: Response) => {
-    const addrResult = stellarAddressParam(req.params.address, "Circle address");
-    if ("error" in addrResult) {
-      res.status(400).json({ error: addrResult.error });
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
       return;
     }
-    const address = addrResult.value;
+    const address = addressResult;
     try {
       const [circle] = await query<
         Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status">
@@ -706,12 +693,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // the filter itself is invalid rather than a silently empty result.
 
   app.get("/members/:member/contributions", async (req: Request, res: Response) => {
-    const memberResult = stellarAddressParam(req.params.member, "Member address");
-    if ("error" in memberResult) {
+    const memberResult = parseAddress(req.params.member, "Member address");
+    if (isParseError(memberResult)) {
       res.status(400).json({ error: memberResult.error });
       return;
     }
-    const member = memberResult.value;
+    const member = memberResult;
 
     const pageResult = parsePage(req.query.page);
     const limitResult = parseLimit(req.query.limit);
@@ -796,12 +783,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // ── Reputation ───────────────────────────────────────────────────────────────
 
   app.get("/reputation/:member", async (req: Request, res: Response) => {
-    const memberResult = stellarAddressParam(req.params.member, "Member address");
-    if ("error" in memberResult) {
+    const memberResult = parseAddress(req.params.member, "Member address");
+    if (isParseError(memberResult)) {
       res.status(400).json({ error: memberResult.error });
       return;
     }
-    const member = memberResult.value;
+    const member = memberResult;
 
     // Optional ?circle=<address> narrows the contributions/defaults
     // breakdown to a single circle, e.g. for a member-in-circle detail view
