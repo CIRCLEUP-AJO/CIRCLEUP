@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS ledger_checkpoints (
 -- history lives next to the rest of the schema definition.
 CREATE TABLE IF NOT EXISTS schema_migrations (
     filename        TEXT PRIMARY KEY,
-    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    applied_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    content_hash    TEXT
 );
 
 -- Indexes

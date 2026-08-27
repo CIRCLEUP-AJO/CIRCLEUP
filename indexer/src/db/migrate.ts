@@ -1,8 +1,14 @@
 import * as fs from "fs";
 import * as path from "path";
+import * as crypto from "crypto";
 import { pool } from "./pool";
 
 const migrationsDir = path.join(__dirname, "migrations");
+
+function sha256File(filePath: string): string {
+  const content = fs.readFileSync(filePath, "utf-8");
+  return crypto.createHash("sha256").update(content, "utf8").digest("hex");
+}
 
 function migrationFilesOnDisk(): string[] {
   if (!fs.existsSync(migrationsDir)) return [];
@@ -18,6 +24,9 @@ export interface MigrationStatus {
   // Filenames recorded as applied in schema_migrations but missing on disk —
   // signals someone deleted/renamed a migration that already ran elsewhere.
   missingOnDisk: string[];
+  // Filenames whose on-disk content no longer matches the stored hash —
+  // signals an edit to an already-applied migration file.
+  modified: string[];
   // The most recently applied migration, or null if none have run yet. This
   // doubles as the schema's version identifier since migrations are ordered
   // and cumulative.
@@ -38,6 +47,9 @@ export interface MigrationStatus {
  *   drifted    — one or more filenames recorded as applied in
  *                schema_migrations have no corresponding file on disk; this
  *                usually means a migration was renamed or deleted after it ran.
+ *   modified   — one or more applied migration files have been edited since
+ *                they were applied (content hash mismatch); this indicates
+ *                environment drift that could silently alter future behaviour.
  *   partial    — both pending migrations AND missingOnDisk entries exist at the
  *                same time; the DB is neither fully up-to-date nor clean.
  *   uninitialized — schema_migrations table itself doesn't exist yet; no base
@@ -47,6 +59,7 @@ export type SchemaHealthState =
   | "clean"
   | "pending"
   | "drifted"
+  | "modified"
   | "partial"
   | "uninitialized";
 
@@ -74,32 +87,44 @@ export async function getMigrationStatus(
 ): Promise<MigrationStatus> {
   const filesOnDisk = migrationFilesOnDisk();
 
-  let appliedSet: Set<string>;
+  let appliedRows: Array<{ filename: string; content_hash: string | null }>;
   try {
     const queryFn = existingClient
-      ? (text: string) => existingClient.query<{ filename: string }>(text)
-      : (text: string) => pool.query<{ filename: string }>(text);
+      ? (text: string) => existingClient.query<{ filename: string; content_hash: string | null }>(text)
+      : (text: string) => pool.query<{ filename: string; content_hash: string | null }>(text);
     const { rows } = await queryFn(
-      "SELECT filename FROM schema_migrations ORDER BY filename",
+      "SELECT filename, content_hash FROM schema_migrations ORDER BY filename",
     );
-    appliedSet = new Set(rows.map((r) => r.filename));
+    appliedRows = rows;
   } catch (err) {
     // undefined_table — schema.sql hasn't been applied yet, so nothing has run.
     if ((err as { code?: string }).code === "42P01") {
-      appliedSet = new Set();
+      appliedRows = [];
     } else {
       throw err;
     }
   }
 
+  const appliedSet = new Set(appliedRows.map((r) => r.filename));
+  const hashMap = new Map(appliedRows.map((r) => [r.filename, r.content_hash]));
+
   const applied = filesOnDisk.filter((f) => appliedSet.has(f));
   const pending = filesOnDisk.filter((f) => !appliedSet.has(f));
   const missingOnDisk = [...appliedSet].filter((f) => !filesOnDisk.includes(f));
+
+  // Detect files that exist on disk AND are applied but whose content has changed.
+  const modified = applied.filter((f) => {
+    const storedHash = hashMap.get(f);
+    if (!storedHash) return false; // no hash stored yet — skip (backwards compat)
+    const diskHash = sha256File(path.join(migrationsDir, f));
+    return diskHash !== storedHash;
+  });
 
   return {
     applied,
     pending,
     missingOnDisk,
+    modified,
     currentVersion: applied.length > 0 ? applied[applied.length - 1] : null,
   };
 }
@@ -157,7 +182,7 @@ export async function checkMigrationHealth(
   }
 
   const status = await getMigrationStatus(existingClient);
-  const { pending, missingOnDisk } = status;
+  const { pending, missingOnDisk, modified } = status;
 
   let state: SchemaHealthState;
   let summary: string;
@@ -176,6 +201,13 @@ export async function checkMigrationHealth(
       `Schema has drifted: ${missingOnDisk.length} migration(s) recorded as applied in ` +
       `schema_migrations but no longer present on disk: ${missingOnDisk.join(", ")}. ` +
       `This usually means a migration file was renamed or deleted after it ran.`;
+  } else if (modified.length > 0) {
+    state = "modified";
+    summary =
+      `${modified.length} applied migration file(s) have been edited since they were applied: ` +
+      `${modified.join(", ")}. ` +
+      `Editing applied migrations causes environment drift and may silently alter future behaviour. ` +
+      `Restore the original file(s) or create a new migration to make the change.`;
   } else if (pending.length > 0) {
     state = "pending";
     summary =
@@ -235,7 +267,7 @@ export async function runMigrations(): Promise<MigrationStatus> {
     // exist for the health query.  Pass the existing client so we reuse the
     // open connection rather than acquiring a second one from the pool.
     const health = await checkMigrationHealth(client);
-    if (health.state === "drifted" || health.state === "partial") {
+    if (health.state === "drifted" || health.state === "partial" || health.state === "modified") {
       console.warn(`[migrate] WARNING — ${health.summary}`);
     } else if (health.state === "pending") {
       console.log(`[migrate] ${health.summary}`);
@@ -258,12 +290,13 @@ export async function runMigrations(): Promise<MigrationStatus> {
       }
 
       const sql = fs.readFileSync(path.join(migrationsDir, file), "utf-8");
+      const contentHash = crypto.createHash("sha256").update(sql, "utf8").digest("hex");
       await client.query("BEGIN");
       try {
         await client.query(sql);
         await client.query(
-          "INSERT INTO schema_migrations (filename) VALUES ($1)",
-          [file],
+          "INSERT INTO schema_migrations (filename, content_hash) VALUES ($1, $2)",
+          [file, contentHash],
         );
         await client.query("COMMIT");
         console.log(`[migrate] Applied: ${file}`);
