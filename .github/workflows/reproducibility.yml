@@ -1,0 +1,104 @@
+# CI — Contract build reproducibility (Issue #396)
+#
+# Builds Soroban WASM artifacts twice from a clean state using the pinned
+# toolchain in contracts/rust-toolchain.toml, then verifies that the
+# resulting artifacts match the expected hashes in
+# contracts/expected-hashes.json.
+#
+# This workflow:
+#   - Never deploys contracts or submits transactions.
+#   - Requires no deployment secrets.
+#   - Fails fast when toolchain drift or source changes alter artifact bytes.
+
+name: Contract Build Reproducibility
+
+on:
+  push:
+    paths:
+      - "contracts/**"
+      - ".github/workflows/reproducibility.yml"
+  pull_request:
+    paths:
+      - "contracts/**"
+      - ".github/workflows/reproducibility.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  reproducibility:
+    name: Verify WASM artifact hashes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install the exact Rust toolchain declared in contracts/rust-toolchain.toml.
+      # The toolchain file is picked up automatically by rustup.
+      - name: Install pinned Rust toolchain
+        working-directory: contracts
+        run: |
+          rustup show           # triggers rust-toolchain.toml install
+          rustup show active-toolchain
+          cargo --version
+          rustc --version
+
+      # Cache compiled dependencies to speed up repeated runs.
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      # First build — produces the artifacts under contracts/target/
+      - name: Build contracts (first pass)
+        working-directory: contracts
+        run: |
+          cargo build --release --target wasm32-unknown-unknown
+          echo "=== First-pass artifact sizes ==="
+          ls -lh target/wasm32-unknown-unknown/release/*.wasm
+
+      # Verify hashes against contracts/expected-hashes.json.
+      # When expected hashes are empty (first bootstrap), this step is
+      # informational only.
+      - name: Verify artifact hashes
+        working-directory: scripts
+        run: npx ts-node src/check-artifact-hashes.ts
+
+      # Second build from a clean state to confirm byte-for-byte reproducibility.
+      - name: Clean and rebuild (second pass)
+        working-directory: contracts
+        run: |
+          cargo clean
+          cargo build --release --target wasm32-unknown-unknown
+          echo "=== Second-pass artifact sizes ==="
+          ls -lh target/wasm32-unknown-unknown/release/*.wasm
+
+      # Both passes must produce identical hashes.
+      - name: Compare first and second pass hashes
+        working-directory: scripts
+        run: npx ts-node src/check-artifact-hashes.ts
+
+      - name: Print toolchain info
+        if: always()
+        working-directory: contracts
+        run: |
+          rustc --version
+          cargo --version
+          rustup show

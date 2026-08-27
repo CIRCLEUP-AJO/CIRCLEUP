@@ -30,6 +30,11 @@ import {
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
+import {
+  runFundingDiagnostics,
+  printFundingDiagnostics,
+  checkRpcReachability,
+} from "./funding-diagnostics";
 
 // Load from scripts/.env if present, otherwise fall back to root .env
 dotenv.config({ path: path.join(__dirname, "../.env") });
@@ -153,6 +158,17 @@ async function main() {
   console.log(`USDC: ${deployed.usdc}`);
   console.log("");
 
+  // ── Funding diagnostics (#399) — fail early before any write ─────────────
+
+  console.log("[seed] Checking RPC reachability and account funding...");
+  const rpcOk = await checkRpcReachability(RPC_URL);
+  if (!rpcOk) {
+    throw new Error(
+      `[seed] RPC endpoint is unreachable: ${RPC_URL}\n` +
+      "  Check your internet connection or set RPC_URL to an available testnet endpoint.",
+    );
+  }
+
   // Generate 4 member keypairs
   const alice = Keypair.random();
   const bob = Keypair.random();
@@ -174,11 +190,29 @@ async function main() {
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  // Mint USDC to each member (requires token admin)
-  // In a real demo you'd use the actual USDC faucet
-  // Here we use the factory deployer as token admin
+  // Run funding diagnostics after friendbot funding to verify sufficiency
+  console.log("\n[seed] Running post-funding balance checks...");
+  const fundingResult = await runFundingDiagnostics({
+    rpcUrl:            RPC_URL,
+    deployerPublicKey: alice.publicKey(), // alice acts as circle creator
+    memberPublicKeys:  members.map((kp) => kp.publicKey()),
+    usdcContractId:    deployed.usdc,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  });
+
+  printFundingDiagnostics(fundingResult);
+
+  // Check only XLM balances here (USDC may not be funded yet — that's expected)
+  const xlmFailures = fundingResult.failures.filter((f) => f.checkType === "xlm");
+  if (xlmFailures.length > 0) {
+    throw new Error(
+      "[seed] Insufficient XLM balance — aborting before any contract calls.\n" +
+      xlmFailures.map((f) => `  • ${f.label}: ${f.guidance ?? "insufficient"}`).join("\n"),
+    );
+  }
+
   console.log("\n💵 Note: In a real demo, fund each account with testnet USDC.");
-  console.log("   Skipping mint step — use stellar-cli to mint test USDC.");
+  console.log("   Skipping USDC mint step — use stellar-cli to mint test USDC.");
 
   // Create circle via factory
   console.log("\n🏗️  Creating 4-member $100/round circle...");
