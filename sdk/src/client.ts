@@ -47,11 +47,14 @@ import {
 import {
   buildSnapshot,
   computeActionEligibility,
+  detectStateMismatches,
   isGateBlocked,
   isSnapshotFresh,
 } from "./gating";
 import type {
+  ActualState,
   CircleAction,
+  ExpectedState,
   GateBlockReason,
   GateOptions,
   GateResult,
@@ -1340,6 +1343,58 @@ export class GateError extends Error {
   }
 }
 
+// ─── Stale-write preflight (issue #347) ─────────────────────────────────────────
+
+/**
+ * Options for the opt-in stale-write preflight.
+ *
+ * Attach this to any {@link CircleClient} mutation — or pass it to
+ * {@link CircleClient.preflight} directly — to force a fresh on-chain read and
+ * compare it against the state the caller's decision was based on.  If anything
+ * the caller pinned has moved, the mutation returns a {@link TxFailure} with
+ * `errorCode: "stale_state"` instead of submitting a transaction that would
+ * predictably revert.
+ *
+ * Omitting the preflight entirely preserves the fast path: a caller with
+ * trusted-fresh data submits directly with no extra RPC round-trip.
+ */
+export interface PreflightOptions {
+  /**
+   * The state the caller expected when they decided to act.  Only the fields
+   * that were actually part of the decision need be supplied; unspecified
+   * fields are never compared.  See {@link ExpectedState}.
+   */
+  expected: ExpectedState;
+
+  /**
+   * The member address whose contribution status should be verified.  Required
+   * only when `expected.hasContributed` is set, because resolving that flag
+   * needs an extra `has_contributed` read keyed by member.  Ignored otherwise.
+   */
+  memberAddress?: string;
+}
+
+/**
+ * Result of a {@link CircleClient.preflight} check — a discriminated union so
+ * callers pattern-match on `stale` rather than probing optional fields.
+ */
+export type PreflightResult = PreflightFresh | PreflightStale;
+
+/** The declared expectations still match on-chain state; safe to proceed. */
+export interface PreflightFresh {
+  readonly stale: false;
+}
+
+/**
+ * The on-chain state has diverged from what the caller expected.  `mismatches`
+ * lists exactly which fields moved; `message` is a ready-to-display summary.
+ */
+export interface PreflightStale {
+  readonly stale: true;
+  readonly mismatches: readonly StateMismatch[];
+  readonly message: string;
+}
+
 // ─── Circle client ────────────────────────────────────────────────────────────
 
 export class CircleClient extends CircleUpClient {
@@ -1437,6 +1492,8 @@ export class CircleClient extends CircleUpClient {
         sanitizeTxMetadata(options?.metadata),
       );
     }
+    const stale = await this.preflightGuard(preflight);
+    if (stale) return stale;
     const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
@@ -1458,6 +1515,114 @@ export class CircleClient extends CircleUpClient {
     );
     if (result.success) this.invalidateCache();
     return result;
+  }
+
+  // ── Stale-write preflight (issue #347) ───────────────────────────────────────
+
+  /**
+   * Actively check whether a write would be submitted against stale state.
+   *
+   * Force-refreshes the full on-chain state, resolves the fields the caller
+   * pinned in `options.expected`, and reports any divergence as a list of typed
+   * {@link StateMismatch} values.  This lets a caller detect a *predictable*
+   * stale submission — one that would revert because another member acted after
+   * the caller's view was rendered — without having to submit and watch it fail.
+   *
+   * This is a read-only operation: it never submits a transaction and never
+   * alters any subsequent transaction's arguments.  A `stale: false` result
+   * means nothing the caller pinned has changed — **not** that the write is
+   * guaranteed to succeed.  The contract remains the final authority.
+   *
+   * @example
+   * const pre = await client.preflight({ expected: { roundIndex: 2 } });
+   * if (pre.stale) { showError(pre.message); return; }
+   * await client.contribute(keypair);
+   *
+   * @param options  The expected state to compare against, plus an optional
+   *                 member address for `hasContributed` resolution.
+   */
+  async preflight(options: PreflightOptions): Promise<PreflightResult> {
+    const fresh = await this.getFullState({ forceRefresh: true });
+    const actual = await this.resolveActualState(fresh, options);
+    const mismatches = detectStateMismatches(options.expected, actual);
+    if (mismatches.length === 0) {
+      return { stale: false };
+    }
+    return { stale: true, mismatches, message: formatMismatchMessage(mismatches) };
+  }
+
+  /**
+   * Resolve the concrete {@link ActualState} to compare a preflight expectation
+   * against, from a freshly-fetched {@link CircleFullState}.
+   *
+   * Round-derived fields are `null` when the circle has no current round.  The
+   * per-member `hasContributed` flag costs an extra `has_contributed` read, so
+   * it is resolved only when the caller both pinned an expectation for it and
+   * supplied `memberAddress`; otherwise it stays `null` and the comparator
+   * skips it.
+   */
+  private async resolveActualState(
+    fresh: CircleFullState,
+    options: PreflightOptions,
+  ): Promise<ActualState> {
+    const round = fresh.currentRound;
+
+    let hasContributed: boolean | null = null;
+    if (
+      options.expected.hasContributed !== undefined &&
+      options.memberAddress &&
+      round
+    ) {
+      hasContributed = await this.hasContributed(
+        options.memberAddress,
+        round.roundIndex,
+      );
+    }
+
+    return {
+      status: fresh.status,
+      roundIndex: round ? round.roundIndex : null,
+      contributionsReceived: round ? round.contributionsReceived : null,
+      hasContributed,
+      paidOut: round ? round.paidOut : null,
+    };
+  }
+
+  /**
+   * Shared guard run at the top of every mutation.  Returns a `stale_state`
+   * {@link TxFailure} when an opted-in preflight detects divergence, or `null`
+   * to let the mutation proceed.
+   *
+   * Two paths return `null` (proceed):
+   *   1. **Fast path** — no `preflight` supplied, so no extra RPC is spent and
+   *      a caller with trusted-fresh data submits immediately.
+   *   2. **Read failure** — the preflight read itself threw (e.g. a transient
+   *      RPC error).  A preflight is an *optimisation*, not the source of
+   *      truth: failing it must not block a write the contract would accept, so
+   *      the guard swallows the error and proceeds, leaving the contract as the
+   *      final authority and preserving the mutation's non-throwing contract.
+   */
+  private async preflightGuard(
+    preflight: PreflightOptions | undefined,
+  ): Promise<TxFailure | null> {
+    if (!preflight) return null;
+
+    let result: PreflightResult;
+    try {
+      result = await this.preflight(preflight);
+    } catch {
+      return null;
+    }
+
+    if (!result.stale) return null;
+
+    return {
+      success: false,
+      txHash: "",
+      errorMessage: result.message,
+      errorCode: "stale_state",
+      mismatches: result.mismatches,
+    };
   }
 
   // ── Queries ──────────────────────────────────────────────────────────────────
