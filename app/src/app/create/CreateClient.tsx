@@ -1,17 +1,16 @@
 "use client";
-import { useState } from "react";
+import { useState, useId, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import {
   CIRCLE_FACTORY_ADDRESS,
   usdcToStroops,
   shortAddress,
   daysToLedgers,
+  getExplorerLink,
+  ACTIVE_NETWORK,
 } from "@/lib/config";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
-
-/** Stellar Expert base URL for testnet transactions. */
-const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";
 
 /** Minimum and maximum number of members allowed by the contract. */
 const MIN_MEMBERS = 2;
@@ -45,12 +44,29 @@ export default function CreateClient() {
   const [txHash, setTxHash] = useState("");
   const [copied, setCopied] = useState(false);
 
+  // Stable IDs for aria-describedby associations
+  const errorId = useId();
+  const successId = useId();
+  const amountHintId = useId();
+  const membersHintId = useId();
+
+  // Focus management: move focus to the error region when a submission error appears
+  const errorRef = useRef<HTMLDivElement>(null);
+  const successRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (error && errorRef.current) {
+      errorRef.current.focus();
+    }
+  }, [error]);
+
+  useEffect(() => {
+    if (txHash && successRef.current) {
+      successRef.current.focus();
+    }
+  }, [txHash]);
+
   // ── Derived summary values ───────────────────────────────────────────────────
-  //
-  // Both the round-amount hint and the summary card derive from the same
-  // filledCount so they are always consistent. Previously the hint used
-  // members.length (counting blank rows) while the summary card used
-  // members.filter(m=>m.trim()).length (correct) — now both use filledCount.
 
   const filledCount = getFilledMembers(members).length;
   const roundAmountNum = parseFloat(roundUSDC || "0");
@@ -125,9 +141,6 @@ export default function CreateClient() {
       return;
     }
 
-    // Duplicate-address check — the contract will reject duplicates on-chain,
-    // but surfacing it here gives the user a clear, actionable message instead
-    // of a cryptic contract error.
     const duplicate = findDuplicateAddress(validMembers);
     if (duplicate) {
       setError(
@@ -174,7 +187,7 @@ export default function CreateClient() {
           new Address(walletAddress).toScVal(),
           membersVal,
           nativeToScVal(usdcToStroops(amount), { type: "i128" }),
-          nativeToScVal(DAYS_TO_LEDGERS(days), { type: "u32" }),
+          nativeToScVal(daysToLedgers(days), { type: "u32" }),
         ],
         walletAddress,
       );
@@ -184,53 +197,71 @@ export default function CreateClient() {
         return;
       }
 
-      // Show the transaction hash before redirecting so the user can save it
       setTxHash(result.txHash);
-      // Give the user 5 seconds to see and copy the hash before redirecting
       setTimeout(() => router.push("/"), 5000);
     } catch (err: unknown) {
-      // err typed as unknown — extract message safely instead of casting to any
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
     }
   }
 
-  // ── Render ───────────────────────────────────────────────────────────────────
-
-  // Network-aware explorer link for the created transaction. Resolves to null
-  // on unsupported/custom networks, in which case the link is omitted entirely.
   const explorerTxUrl = txHash ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash) : null;
 
+  // Determine which aria-describedby tokens apply to the submit button
+  const submitDescribedBy = [
+    error ? errorId : null,
+    txHash ? successId : null,
+  ]
+    .filter(Boolean)
+    .join(" ") || undefined;
+
   return (
-    <div className="max-w-xl mx-auto">
+    <div className="max-w-xl mx-auto px-2 sm:px-0">
       <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
       <p className="text-slate-500 text-sm mb-8">
         Set up the members, contribution amount, and schedule. The rotation order
         is the same as the member list.
       </p>
 
-      <form onSubmit={handleSubmit} className="space-y-6">
+      {/*
+        Live region: always present in the DOM from first render so screen
+        readers register it before content changes.  Errors use role="alert"
+        (assertive) so they interrupt immediately; the success panel uses
+        aria-live="polite" so it doesn't cut off ongoing announcements.
+      */}
+
+      <form
+        onSubmit={handleSubmit}
+        className="space-y-6"
+        aria-describedby={submitDescribedBy}
+        noValidate
+      >
         {/* Round amount */}
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">
+          <label
+            htmlFor="round-usdc"
+            className="block text-sm font-medium text-slate-700 mb-1"
+          >
             Contribution per member / round (USDC)
           </label>
           <div className="flex items-center gap-2">
-            <span className="text-slate-400 text-lg">$</span>
+            <span className="text-slate-400 text-lg" aria-hidden="true">$</span>
             <input
+              id="round-usdc"
               type="number"
               min="1"
               step="1"
               value={roundUSDC}
               onChange={(e) => setRoundUSDC(e.target.value)}
-              className="flex-1 border border-slate-300 rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
+              className="flex-1 min-w-0 border border-slate-300 rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
               required
+              aria-describedby={amountHintId}
+              aria-label="Contribution amount in USDC"
             />
-            <span className="text-slate-500 text-sm">USDC</span>
+            <span className="text-slate-500 text-sm shrink-0">USDC</span>
           </div>
-          {/* Hint uses filledCount so blank rows are not counted */}
-          <p className="text-xs text-slate-400 mt-1">
+          <p id={amountHintId} className="text-xs text-slate-400 mt-1">
             The full pot per round = ${roundUSDC || 0} ×{" "}
             {filledCount > 0 ? filledCount : "…"} members
           </p>
@@ -238,85 +269,104 @@ export default function CreateClient() {
 
         {/* Round duration */}
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">
+          <label
+            htmlFor="round-days"
+            className="block text-sm font-medium text-slate-700 mb-1"
+          >
             Round duration (days)
           </label>
           <input
+            id="round-days"
             type="number"
             min="1"
             value={roundDays}
             onChange={(e) => setRoundDays(e.target.value)}
             className="w-full border border-slate-300 rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
             required
+            aria-label="Round duration in days"
           />
         </div>
 
         {/* Members */}
-        <div>
+        <fieldset>
           <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 mb-2">
-            <label className="block text-sm font-medium text-slate-700">
+            <legend className="text-sm font-medium text-slate-700">
               Members (Stellar addresses) — payout order top → bottom
-            </label>
+            </legend>
             <span
               className={`text-xs font-medium ${
                 members.length >= MAX_MEMBERS
                   ? "text-amber-600"
                   : "text-slate-400"
               }`}
+              aria-live="polite"
+              aria-atomic="true"
             >
               {members.length} / {MAX_MEMBERS}
             </span>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2" aria-describedby={membersHintId}>
             {members.map((m, i) => (
               <div key={i} className="flex items-center gap-2">
-                <span className="text-xs text-slate-400 w-5 text-right">{i + 1}.</span>
+                <span className="text-xs text-slate-400 w-5 shrink-0 text-right" aria-hidden="true">
+                  {i + 1}.
+                </span>
                 <input
+                  id={`member-${i}`}
                   type="text"
-                  placeholder={`G... (member ${i + 1})`}
+                  placeholder={`G… (member ${i + 1})`}
                   value={m}
                   onChange={(e) => updateMember(i, e.target.value)}
                   className="flex-1 min-w-0 border border-slate-300 rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  aria-label={`Member ${i + 1} Stellar address`}
+                  autoComplete="off"
+                  spellCheck={false}
                 />
                 {members.length > MIN_MEMBERS && (
                   <button
                     type="button"
                     onClick={() => removeMember(i)}
-                    className="p-1 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none"
+                    className="p-2 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
                     aria-label={`Remove member ${i + 1}`}
                   >
-                    ×
+                    <span aria-hidden="true">×</span>
                   </button>
                 )}
               </div>
             ))}
           </div>
-          <div className="mt-2 flex items-center gap-3">
+          <div className="mt-2 flex flex-wrap items-center gap-3">
             <button
               type="button"
               onClick={addMember}
               disabled={members.length >= MAX_MEMBERS}
               className="text-sm text-brand-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline"
+              aria-disabled={members.length >= MAX_MEMBERS}
             >
               + Add member
             </button>
             {members.length >= MAX_MEMBERS && (
-              <span className="text-xs text-amber-600">
+              <span
+                className="text-xs text-amber-600"
+                role="status"
+                aria-live="polite"
+              >
                 Maximum of {MAX_MEMBERS} members reached.
               </span>
             )}
           </div>
-          <p className="text-xs text-slate-400 mt-1">
+          <p id={membersHintId} className="text-xs text-slate-400 mt-1">
             Minimum {MIN_MEMBERS} members · maximum {MAX_MEMBERS} members.
           </p>
-        </div>
+        </fieldset>
 
-        {/* Summary card ─────────────────────────────────────────────────────── */}
-        {/* All values derived from filledCount / potPerRound so blank rows     */}
-        {/* are never included in any count or calculation shown here.           */}
-        <div className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-slate-700">
+        {/* Summary card */}
+        <div
+          className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-slate-700"
+          aria-label="Circle summary"
+        >
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
-          <ul className="space-y-0.5 text-slate-600">
+          <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
             <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
             <li>💰 ${roundUSDC} USDC / member / round</li>
             <li>🎯 Pot per round: ${potPerRound.toFixed(0)}</li>
@@ -325,36 +375,59 @@ export default function CreateClient() {
           </ul>
         </div>
 
+        {/*
+          Error region — role="alert" for immediate announcement.
+          tabIndex={-1} allows programmatic focus via errorRef.current.focus()
+          so keyboard users are moved to the message after submission failure.
+        */}
         {error && (
           <div
-            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700"
+            id={errorId}
+            ref={errorRef}
             role="alert"
+            tabIndex={-1}
+            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 focus:outline-none focus:ring-2 focus:ring-red-400"
           >
             {error}
           </div>
         )}
 
+        {/*
+          Success region — aria-live="polite" so it announces once without
+          interrupting.  tabIndex={-1} allows programmatic focus after the
+          action completes so keyboard users land on the confirmation.
+        */}
         {txHash && (
           <div
-            className="bg-brand-50 border border-brand-200 rounded-lg p-4 text-sm text-brand-700 space-y-3"
+            id={successId}
+            ref={successRef}
+            className="bg-brand-50 border border-brand-200 rounded-lg p-4 text-sm text-brand-700 space-y-3 focus:outline-none"
             role="status"
             aria-live="polite"
+            aria-atomic="true"
+            tabIndex={-1}
           >
             <p className="font-semibold text-brand-800 flex items-center gap-1.5">
-              ✅ Circle created successfully!
+              <span aria-hidden="true">✅</span> Circle created successfully!
             </p>
 
             <div>
-              <p className="text-xs text-brand-600 mb-1 font-medium">Transaction hash</p>
+              <p className="text-xs text-brand-600 mb-1 font-medium" id={`${successId}-hash-label`}>
+                Transaction hash
+              </p>
               <div className="flex items-center gap-2 bg-white border border-brand-200 rounded-lg px-3 py-2">
-                <span className="font-mono text-xs text-slate-700 flex-1 break-all select-all">
+                <span
+                  className="font-mono text-xs text-slate-700 flex-1 break-all select-all min-w-0"
+                  aria-labelledby={`${successId}-hash-label`}
+                >
                   {txHash}
                 </span>
                 <button
                   type="button"
                   onClick={copyTxHash}
-                  className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0"
-                  aria-label="Copy transaction hash"
+                  className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
+                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
+                  aria-pressed={copied}
                 >
                   {copied ? "✓ Copied" : "Copy"}
                 </button>
@@ -378,10 +451,26 @@ export default function CreateClient() {
           </div>
         )}
 
+        {/*
+          Pending state announcement — always in the DOM so the live region is
+          registered before the state changes.  When loading=true, the message
+          is set; otherwise it is an empty string so nothing is announced.
+        */}
+        <p
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          className="sr-only"
+        >
+          {loading ? "Creating circle, please wait and approve the transaction in Freighter." : ""}
+        </p>
+
         <button
           type="submit"
           disabled={loading || !!txHash}
-          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 text-lg"
+          aria-busy={loading}
+          aria-describedby={submitDescribedBy}
+          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 text-lg min-h-[48px]"
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>

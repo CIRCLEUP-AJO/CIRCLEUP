@@ -76,6 +76,7 @@ import { WalletButton } from "@/components/WalletButton";
 import { CircleCard, type Circle } from "@/components/CircleCard";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
 
+
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 const activeCircle: Circle = {
@@ -133,6 +134,24 @@ describe("a11y: ReputationBadge", () => {
     ["lg", 10],
   ] as const)("size=%s score=%i has no violations", async (size, score) => {
     const { container } = render(<ReputationBadge score={score} size={size} />);
+    const violations = await checkA11y(container);
+    expect(violations, formatViolations(violations)).toHaveLength(0);
+  });
+
+  it("null score (unknown) has no violations", async () => {
+    const { container } = render(<ReputationBadge score={null} />);
+    const violations = await checkA11y(container);
+    expect(violations, formatViolations(violations)).toHaveLength(0);
+  });
+
+  it("negative score has no violations", async () => {
+    const { container } = render(<ReputationBadge score={-1} />);
+    const violations = await checkA11y(container);
+    expect(violations, formatViolations(violations)).toHaveLength(0);
+  });
+
+  it("large score (999) has no violations", async () => {
+    const { container } = render(<ReputationBadge score={999} />);
     const violations = await checkA11y(container);
     expect(violations, formatViolations(violations)).toHaveLength(0);
   });
