@@ -784,3 +784,437 @@ PR Checklist
 [ ] No accidental mutation path
 
 [ ] Acceptance criteria verified
+TODO — Stable API Numeric/Wire-Type Contract
+
+Description: JavaScript clients can lose precision when API amounts and ledger values are serialized as numbers. Responses need explicit units and stable wire types.
+
+1. Inventory Existing Serialization
+
+[ ] Search API serializers for financial/ledger fields.
+
+[ ] Search DTOs and response schemas.
+
+[ ] Search SDK response types.
+
+[ ] Search frontend/app models consuming API responses.
+
+[ ] Identify all amount fields.
+
+[ ] Identify all stroop fields.
+
+[ ] Identify all ledger sequence fields.
+
+[ ] Identify timestamp fields.
+
+[ ] Identify token/asset quantity fields.
+
+[ ] Identify pagination/cursor fields.
+
+[ ] Identify database BigInt values.
+
+[ ] Identify JavaScript number conversions.
+
+[ ] Identify Number(...) usage on large integers.
+
+[ ] Identify parseInt(...) usage on API values.
+
+[ ] Identify implicit JSON serialization.
+
+[ ] Identify fields currently returned as JSON numbers.
+
+[ ] Identify SDK assumptions about numeric fields.
+
+[ ] Identify app assumptions about numeric fields.
+
+[ ] Record potentially unsafe fields in an inventory.
+
+
+2. Define Wire-Type Rules
+
+[ ] Treat financial quantities as exact values.
+
+[ ] Return large integer amounts as strings.
+
+[ ] Return stroop values as decimal integer strings.
+
+[ ] Return ledger sequence values as strings where precision may exceed JS safe integers.
+
+[ ] Keep ordinary small counts as numbers where appropriate.
+
+[ ] Define timestamp representation explicitly.
+
+[ ] Define timestamp units explicitly.
+
+[ ] Define whether timestamps are ISO-8601 strings or integer epochs.
+
+[ ] Avoid ambiguous numeric fields.
+
+[ ] Never serialize financial values through floating-point arithmetic.
+
+[ ] Never use Number() for exact financial quantities.
+
+[ ] Avoid parseFloat() for monetary amounts.
+
+[ ] Define decimal/token precision explicitly.
+
+[ ] Define nullable numeric fields.
+
+[ ] Define optional numeric fields.
+
+[ ] Define empty-value behavior.
+
+[ ] Ensure every numeric field has a documented unit.
+
+
+3. Version the Contract
+
+[ ] Review the current API response versioning strategy.
+
+[ ] Define the new response contract version.
+
+[ ] Choose a compatibility strategy.
+
+[ ] Avoid silently changing existing field types without documentation.
+
+[ ] Determine whether a versioned endpoint is required.
+
+[ ] Determine whether a response-version header is sufficient.
+
+[ ] Document the selected strategy.
+
+[ ] Define migration behavior for existing clients.
+
+[ ] Define deprecation behavior for old numeric fields.
+
+[ ] Define removal timeline if applicable.
+
+[ ] Ensure SDK can identify the contract version.
+
+[ ] Ensure app can consume the selected version.
+
+[ ] Add contract fixtures representing the new wire format.
+
+
+4. API Serializers
+
+[ ] Update amount serializers.
+
+[ ] Update stroop serializers.
+
+[ ] Update ledger serializers.
+
+[ ] Update token quantity serializers.
+
+[ ] Update database BigInt serialization.
+
+[ ] Prevent implicit BigInt conversion to number.
+
+[ ] Ensure exact integers are converted directly to strings.
+
+[ ] Preserve negative values where the domain permits them.
+
+[ ] Preserve zero exactly.
+
+[ ] Preserve leading/sign conventions consistently.
+
+[ ] Ensure serializers never emit NaN.
+
+[ ] Ensure serializers never emit Infinity.
+
+[ ] Ensure serializers never emit scientific notation for exact integers.
+
+[ ] Ensure nullability remains consistent.
+
+[ ] Review error responses containing numeric fields.
+
+
+5. Financial Amounts
+
+[ ] Identify all currency/token amount fields.
+
+[ ] Document their smallest unit.
+
+[ ] Document decimal precision.
+
+[ ] Return exact amounts as strings.
+
+[ ] Ensure 0 becomes "0" where the field is string-based.
+
+[ ] Test maximum supported amount.
+
+[ ] Test minimum supported amount.
+
+[ ] Test values around Number.MAX_SAFE_INTEGER.
+
+[ ] Test values above Number.MAX_SAFE_INTEGER.
+
+[ ] Test values with many digits.
+
+[ ] Test negative values where supported.
+
+[ ] Test serialization/deserialization round trips.
+
+[ ] Verify no precision changes occur.
+
+
+6. Ledger Values
+
+[ ] Inventory all ledger sequence fields.
+
+[ ] Define ledger units explicitly.
+
+[ ] Define ledger wire type.
+
+[ ] Return unsafe ledger integers as strings.
+
+[ ] Test values below the JS safe-integer boundary.
+
+[ ] Test Number.MAX_SAFE_INTEGER.
+
+[ ] Test Number.MAX_SAFE_INTEGER + 1.
+
+[ ] Test realistic large ledger values.
+
+[ ] Verify SDK does not coerce them into numbers.
+
+[ ] Verify frontend does not coerce them into numbers.
+
+[ ] Ensure sorting logic remains correct.
+
+[ ] Ensure comparisons use appropriate string/bigint handling.
+
+
+7. Timestamps
+
+[ ] Inventory every timestamp field.
+
+[ ] Identify timestamp units.
+
+[ ] Identify whether values represent seconds, milliseconds, or another unit.
+
+[ ] Document timestamp units.
+
+[ ] Define timestamp wire type.
+
+[ ] Prefer an unambiguous representation.
+
+[ ] Ensure consumers do not guess timestamp units.
+
+[ ] Test epoch boundary values.
+
+[ ] Test current timestamps.
+
+[ ] Test large epoch values.
+
+[ ] Test timestamp round trips.
+
+[ ] Document timezone expectations.
+
+[ ] Ensure timestamps remain backwards compatible where required.
+
+
+8. SDK Changes
+
+[ ] Update SDK response interfaces/types.
+
+[ ] Change unsafe numeric fields to strings.
+
+[ ] Add explicit unit/type documentation to SDK types.
+
+[ ] Remove unsafe numeric coercion.
+
+[ ] Update SDK parsing logic.
+
+[ ] Preserve exact wire values.
+
+[ ] Add helpers for converting values when explicitly requested.
+
+[ ] Ensure helpers use BigInt or decimal-safe libraries.
+
+[ ] Avoid automatic conversion to JavaScript number.
+
+[ ] Update SDK fixtures.
+
+[ ] Update SDK tests.
+
+[ ] Check generated types if applicable.
+
+[ ] Check API client code generation assumptions.
+
+
+9. Application Changes
+
+[ ] Search for consumers of changed fields.
+
+[ ] Remove direct arithmetic on string amounts.
+
+[ ] Replace unsafe Number(value) conversions.
+
+[ ] Replace unsafe parseInt(value) conversions where necessary.
+
+[ ] Use BigInt for integer arithmetic where appropriate.
+
+[ ] Use decimal-safe handling for decimal quantities.
+
+[ ] Update UI formatting helpers.
+
+[ ] Update sorting logic.
+
+[ ] Update filtering logic.
+
+[ ] Update pagination handling.
+
+[ ] Update tests using numeric fixtures.
+
+[ ] Ensure displayed values remain unchanged for users.
+
+
+10. Boundary Tests
+
+[ ] Test 0.
+
+[ ] Test 1.
+
+[ ] Test maximum normal amount.
+
+[ ] Test Number.MAX_SAFE_INTEGER.
+
+[ ] Test Number.MAX_SAFE_INTEGER + 1.
+
+[ ] Test values significantly above safe integer range.
+
+[ ] Test maximum expected ledger.
+
+[ ] Test large stroop amount.
+
+[ ] Test large token quantity.
+
+[ ] Test timestamp boundaries.
+
+[ ] Verify JSON serialization preserves exact strings.
+
+[ ] Verify JSON parsing preserves exact strings.
+
+[ ] Verify API → SDK preserves values.
+
+[ ] Verify SDK → app preserves values.
+
+[ ] Verify app display preserves values.
+
+
+11. Compatibility Tests
+
+[ ] Test existing clients against the compatibility behavior.
+
+[ ] Test new clients against the new contract.
+
+[ ] Verify old response fields where they remain supported.
+
+[ ] Verify deprecated fields behave consistently.
+
+[ ] Test version negotiation if implemented.
+
+[ ] Test unsupported response versions.
+
+[ ] Document intentional breaking changes.
+
+[ ] Ensure compatibility behavior is covered by tests.
+
+[ ] Ensure no silent precision conversion occurs.
+
+
+12. Documentation
+
+[ ] Document the response contract.
+
+[ ] Document every numeric field.
+
+[ ] Document units for amounts.
+
+[ ] Document stroops.
+
+[ ] Document ledger sequences.
+
+[ ] Document timestamps.
+
+[ ] Document wire types.
+
+[ ] Document string-based integer fields.
+
+[ ] Document decimal precision.
+
+[ ] Document nullability.
+
+[ ] Document versioning.
+
+[ ] Document compatibility behavior.
+
+[ ] Add API response examples.
+
+[ ] Add SDK usage examples.
+
+[ ] Warn consumers against converting exact values to number.
+
+
+13. Validation
+
+[ ] Run API serializer tests.
+
+[ ] Run SDK tests.
+
+[ ] Run app tests.
+
+[ ] Run contract tests.
+
+[ ] Test JSON round trips.
+
+[ ] Test all boundary-sized values.
+
+[ ] Verify no financial value is rounded.
+
+[ ] Verify every numeric field has documented units.
+
+[ ] Verify wire types match the contract.
+
+[ ] Verify compatibility behavior is deliberate.
+
+[ ] Review generated API/SDK types.
+
+[ ] Review all changed consumers.
+
+[ ] Check for remaining unsafe numeric conversions.
+
+
+PR Checklist
+
+[ ] Numeric serialization inventory completed.
+
+[ ] Versioned response contract defined.
+
+[ ] Large financial integers returned as strings.
+
+[ ] Stroops explicitly documented.
+
+[ ] Ledger units/types explicitly documented.
+
+[ ] Timestamp units explicitly documented.
+
+[ ] SDK types updated.
+
+[ ] App consumers updated.
+
+[ ] Boundary tests added.
+
+[ ] JSON precision tests added.
+
+[ ] Compatibility tests added.
+
+[ ] Documentation updated.
+
+[ ] No financial rounding.
+
+[ ] No unsafe implicit number conversion.
+
+[ ] API → SDK → app flow verified.
+
+[ ] PR explains compatibility behavior.
