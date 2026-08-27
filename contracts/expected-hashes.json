@@ -1,0 +1,13 @@
+{
+  "_comment": "Expected SHA-256 hashes of release WASM artifacts built from this commit.",
+  "_comment2": "Regenerate with: npm run hash-artifacts --workspace=scripts",
+  "_comment3": "Commit this file together with contracts/rust-toolchain.toml whenever contracts change.",
+  "toolchain": "1.81.0",
+  "target": "wasm32-unknown-unknown",
+  "profile": "release",
+  "artifacts": {
+    "reputation.wasm": "",
+    "circle_factory.wasm": "",
+    "circle.wasm": ""
+  }
+}

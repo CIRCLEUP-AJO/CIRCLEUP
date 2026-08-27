@@ -5,7 +5,11 @@
     "deploy:testnet": "ts-node src/deploy.ts",
     "seed:demo": "ts-node src/seed-demo.ts",
     "release-check": "ts-node src/release-check.ts",
-    "validate-env": "ts-node src/validate-env.ts"
+    "validate-env": "ts-node src/validate-env.ts",
+    "hash-artifacts": "ts-node src/check-artifact-hashes.ts --update",
+    "verify-artifacts": "ts-node src/check-artifact-hashes.ts",
+    "funding-diagnostics": "ts-node src/funding-diagnostics.ts",
+    "validate-manifest": "ts-node src/deployment-manifest.ts"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^12.3.0",
