@@ -403,6 +403,7 @@ mod tests {
         testutils::{Address as _, Ledger},
         Env,
     };
+    use reputation::{ReputationContract, ReputationContractClient, ReputationError};
 
     // ── Fixture ───────────────────────────────────────────────────────────────
 
@@ -918,6 +919,192 @@ mod tests {
         assert!(result.is_err(), "negative round_amount create must be rejected");
         assert_eq!(s.client.get_circle_count(), 0);
         assert!(s.client.get_circles().is_empty());
+    }
+
+    // ── Integrated fixture: factory ↔ reputation trust boundary ──────────────
+    //
+    // These tests wire the factory and reputation contracts together as real
+    // native Rust contracts in the test environment, verifying the trust
+    // relationship described in the module header without relying on a live
+    // ledger or compiled WASM.
+    //
+    // Note: the full `create_circle` success path (deploy + init + register)
+    // requires a valid circle WASM hash obtained from a compiled binary.
+    // That path is covered by the end-to-end contract integration tests in
+    // contracts/circle/src/tests.rs which register all three contracts.
+    // The tests below focus on the factory ↔ reputation portion of that flow.
+
+    struct IntegratedSetup<'a> {
+        env: Env,
+        factory_id: Address,
+        factory: CircleFactoryClient<'a>,
+        reputation_id: Address,
+        reputation: ReputationContractClient<'a>,
+        admin: Address,
+        usdc: Address,
+    }
+
+    fn setup_integrated() -> IntegratedSetup<'static> {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let usdc  = Address::generate(&env);
+
+        // Register reputation with factory as its admin (mirrors real deployment).
+        let reputation_id = env.register_contract(None, ReputationContract);
+        let reputation = ReputationContractClient::new(&env, &reputation_id);
+
+        // Register the factory.
+        let factory_id = env.register_contract(None, CircleFactory);
+        let factory = CircleFactoryClient::new(&env, &factory_id);
+
+        // Wire: reputation admin = factory (so only the factory may register circles).
+        reputation.initialize(&factory_id);
+
+        // Wire: factory knows the reputation contract address.
+        let dummy_wasm: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_wasm, &reputation_id, &usdc);
+
+        IntegratedSetup { env, factory_id, factory, reputation_id, reputation, admin, usdc }
+    }
+
+    /// Factory address must equal the admin stored inside the reputation contract.
+    /// This ensures that only the factory can add or remove authorized callers on
+    /// reputation — no other wallet or contract can widen the trust boundary.
+    #[test]
+    fn test_integrated_factory_is_reputation_admin() {
+        let s = setup_integrated();
+        assert_eq!(
+            s.reputation.get_admin(),
+            s.factory_id,
+            "reputation admin must be the factory contract address"
+        );
+    }
+
+    /// A non-factory address must be rejected by reputation when it tries to
+    /// register an authorized caller, proving that the trust boundary holds even
+    /// when mock_all_auths is active (the check is the stored admin, not a sig).
+    #[test]
+    fn test_integrated_reputation_rejects_non_factory_caller_registration() {
+        let s = setup_integrated();
+        let attacker = Address::generate(&s.env);
+        let circle   = Address::generate(&s.env);
+
+        let result = s.reputation.try_add_authorized_caller(&attacker, &circle);
+        assert_eq!(
+            result,
+            Err(Ok(ReputationError::NotAdmin)),
+            "reputation must reject add_authorized_caller from a non-factory address"
+        );
+        assert_eq!(
+            s.reputation.get_authorized_callers().len(),
+            0,
+            "the rejected call must leave the authorized caller list untouched"
+        );
+    }
+
+    /// The factory address (acting as reputation admin) must be able to register
+    /// a circle as an authorized reputation caller.  This simulates step 6 of
+    /// `create_circle` without needing a deployed circle WASM.
+    #[test]
+    fn test_integrated_factory_can_register_circle_with_reputation() {
+        let s = setup_integrated();
+        let synthetic_circle = Address::generate(&s.env);
+
+        // Simulate what create_circle step 6 does: factory calls
+        // reputation.add_authorized_caller(factory_id, circle_address).
+        s.reputation.add_authorized_caller(&s.factory_id, &synthetic_circle);
+
+        assert!(
+            s.reputation.get_authorized_callers().contains(&synthetic_circle),
+            "reputation must record the circle as authorized after factory registration"
+        );
+        assert_eq!(
+            s.reputation.get_authorized_callers().len(),
+            1,
+            "only one circle must appear in the authorized callers list"
+        );
+    }
+
+    /// Multiple invalid `create_circle` calls must leave the reputation contract
+    /// completely unaffected.  Because the factory fails at the deploy step (step 4),
+    /// step 6 (reputation registration) is never reached, so the reputation
+    /// authorized-caller list must remain empty after any number of bad creates.
+    #[test]
+    fn test_integrated_failed_creates_never_mutate_reputation() {
+        let s = setup_integrated();
+
+        // Five adversarial create attempts — all fail at input validation (before
+        // deploy), so reputation must never be touched.
+        let invalid_calls: &[(&dyn Fn() -> bool)] = &[
+            &|| {
+                let m = make_members(&s.env, 1); // too few members
+                s.factory.try_create_circle(
+                    &Address::generate(&s.env), &m, &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
+                ).is_err()
+            },
+            &|| {
+                let m = make_members(&s.env, 2);
+                s.factory.try_create_circle(
+                    &Address::generate(&s.env), &m, &0i128, &MIN_ROUND_DEADLINE_LEDGERS,
+                ).is_err()
+            },
+            &|| {
+                let m = make_members(&s.env, 2);
+                s.factory.try_create_circle(
+                    &Address::generate(&s.env), &m, &1_000_000i128, &(MIN_ROUND_DEADLINE_LEDGERS - 1),
+                ).is_err()
+            },
+            &|| {
+                let m = make_members(&s.env, 2);
+                s.factory.try_create_circle(
+                    &Address::generate(&s.env), &m, &1_000_000i128, &(MAX_ROUND_DEADLINE_LEDGERS + 1),
+                ).is_err()
+            },
+            &|| {
+                let a = Address::generate(&s.env);
+                let mut m = Vec::new(&s.env);
+                m.push_back(a.clone());
+                m.push_back(a); // duplicate member
+                s.factory.try_create_circle(
+                    &Address::generate(&s.env), &m, &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
+                ).is_err()
+            },
+        ];
+
+        for (i, call) in invalid_calls.iter().enumerate() {
+            assert!(call(), "adversarial call {} must be rejected", i + 1);
+        }
+
+        assert_eq!(
+            s.reputation.get_authorized_callers().len(),
+            0,
+            "reputation authorized callers must be empty after all failed factory creates"
+        );
+    }
+
+    /// Each test must start from a completely independent state: separate Env
+    /// instances guarantee no circle registry, no reputation state, and no
+    /// authorized callers carry over between test cases.
+    #[test]
+    fn test_integrated_each_test_has_isolated_state() {
+        // Two setups in the same test function — each gets a fresh environment.
+        let s1 = setup_integrated();
+        let s2 = setup_integrated();
+
+        // Register a circle in s1 only.
+        let circle = Address::generate(&s1.env);
+        s1.reputation.add_authorized_caller(&s1.factory_id, &circle);
+
+        // s2's reputation must remain untouched.
+        assert_eq!(
+            s2.reputation.get_authorized_callers().len(),
+            0,
+            "state from one test setup must not leak into another"
+        );
+        assert_eq!(s2.factory.get_circle_count(), 0);
+        assert!(s2.factory.get_circles().is_empty());
     }
 
     /// A batch of five different adversarial create_circle calls (each with a
