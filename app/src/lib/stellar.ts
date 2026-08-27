@@ -41,6 +41,11 @@ import {
   assertSorobanContractId,
   assertCanonicalStellarAddress,
 } from "./address";
+import {
+  parseContractError,
+  userMessageForError,
+  type ContractAppError,
+} from "./contractErrors";
 
 // ─── Freighter detection & error types ───────────────────────────────────────
 
@@ -167,8 +172,8 @@ const TX_TIMEOUT_SECONDS = Math.round(
 );
 
 /**
- * Converts a raw Soroban/network error into a human-readable message that
- * includes retry guidance when appropriate.
+ * Converts a raw Soroban/network error into a human-readable message.
+ * @deprecated Prefer {@link userMessageForError} with a typed {@link ContractAppError}.
  */
 export function formatContractError(raw: string | undefined): string {
   if (!raw) return "Transaction failed for an unknown reason.";
@@ -217,7 +222,7 @@ export function formatContractError(raw: string | undefined): string {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-// ─── Phase 1: Simulation ──────────────────────────────────────────────────────
+// ─── Typed result types ────────────────────────────────────────────────────────
 
 /**
  * Result returned by {@link simulateContractTx} on success.
@@ -241,9 +246,26 @@ export interface SimulateResult {
 export interface SimulateError {
   success: false;
   error: string;
+  typedError?: ContractAppError;
 }
 
 export type SimulateContractTxResult = SimulateResult | SimulateError;
+
+/**
+ * Result of a contract invocation or submission.
+ * The `typedError` field carries a {@link ContractAppError} on every failure
+ * path so callers can branch on stable codes rather than message strings.
+ */
+export interface InvokeResult {
+  txHash: string;
+  success: boolean;
+  /** User-facing formatted message (prefer `typedError.message` when set). */
+  error?: string;
+  /** Typed, categorised error for deterministic branching. Only set on failure. */
+  typedError?: ContractAppError;
+}
+
+// ─── Phase 1: Simulation ──────────────────────────────────────────────────────
 
 /**
  * Phase 1 of the transaction lifecycle: build and simulate a Soroban contract
@@ -287,9 +309,11 @@ export async function simulateContractTx(
     const isNetwork =
       msg.toLowerCase().includes("network") || msg.toLowerCase().includes("fetch");
     emit(txCtx, "failed", categorizeError(isNetwork ? "network" : msg));
+    const typedError = parseContractError(isNetwork ? "network error" : msg);
     return {
       success: false,
-      error: formatContractError(isNetwork ? "network error" : msg),
+      error: userMessageForError(typedError),
+      typedError,
     };
   }
 
@@ -310,7 +334,12 @@ export async function simulateContractTx(
     // Never forward the raw simResult.error string (may contain contract
     // panic messages that echo argument values).
     emit(txCtx, "simulate_failed", categorizeError(simResult.error));
-    return { success: false, error: formatContractError(simResult.error) };
+    const typedError = parseContractError(simResult.error);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   // ── Telemetry: simulated ─────────────────────────────────────────────────
@@ -341,12 +370,10 @@ export async function simulateContractTx(
 export async function submitContractTx(
   preparedXdr: string,
   txCtx: ReturnType<typeof startTx>,
-): Promise<{ txHash: string; success: boolean; error?: string }> {
+): Promise<InvokeResult> {
   const rpc = getRpc();
 
   // ── Wallet signing ───────────────────────────────────────────────────────
-  // signTransaction v2 returns the signed XDR string directly.
-  // The XDR is never forwarded to telemetry.
   let signedXdr: string;
   try {
     signedXdr = await signTransaction(preparedXdr, {
@@ -362,19 +389,33 @@ export async function submitContractTx(
       lower.includes("canceled")
     ) {
       emit(txCtx, "wallet_rejected", "wallet_denied");
+      const typedError = parseContractError(msg || "User rejected");
       return {
         txHash: "",
         success: false,
-        error: "You cancelled the transaction in Freighter. No funds were moved.",
+        error: userMessageForError(typedError),
+        typedError,
       };
     }
+    const typedError = parseContractError(msg || "User rejected");
     emit(txCtx, "failed", categorizeError(msg || "User rejected"));
-    return { txHash: "", success: false, error: formatContractError(msg || "User rejected") };
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   if (!signedXdr) {
+    const typedError = parseContractError("Freighter did not return a signed transaction.");
     emit(txCtx, "failed", "unknown");
-    return { txHash: "", success: false, error: "Freighter did not return a signed transaction." };
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   // ── Submission ───────────────────────────────────────────────────────────
@@ -384,22 +425,27 @@ export async function submitContractTx(
       TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
     );
   } catch (err: any) {
+    const typedError = parseContractError(err?.message ?? "network error");
     emit(txCtx, "failed", categorizeError(err?.message ?? "network error"));
     return {
       txHash: "",
       success: false,
-      error: formatContractError(err?.message ?? "network error"),
+      error: userMessageForError(typedError),
+      typedError,
     };
   }
 
   if (sendResult.status === "ERROR") {
     // The hash is available at this point; included in the return value for
     // the user but never forwarded to telemetry.
+    const rawErr = JSON.stringify(sendResult.errorResult);
+    const typedError = parseContractError(rawErr);
     emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
       success: false,
-      error: formatContractError(JSON.stringify(sendResult.errorResult)),
+      error: userMessageForError(typedError),
+      typedError,
     };
   }
 
@@ -416,7 +462,7 @@ export async function submitContractTx(
     try {
       status = await rpc.getTransaction(hash);
     } catch {
-      // Transient polling error — keep trying; no telemetry for transient errors
+      // Transient polling error — keep trying
       continue;
     }
 
@@ -425,17 +471,25 @@ export async function submitContractTx(
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+      const typedError = parseContractError("transaction failed");
       emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
         success: false,
-        error: formatContractError("transaction failed"),
+        error: userMessageForError(typedError),
+        typedError,
       };
     }
   }
 
+  const timedOutError = parseContractError("timeout");
   emit(txCtx, "timed_out", "timeout");
-  return { txHash: hash, success: false, error: formatContractError("timeout") };
+  return {
+    txHash: hash,
+    success: false,
+    error: userMessageForError(timedOutError),
+    typedError: timedOutError,
+  };
 }
 
 // ─── Convenience wrapper (simulate + submit) ──────────────────────────────────
@@ -448,10 +502,6 @@ export async function submitContractTx(
  * then {@link submitContractTx} under the same telemetry context, so the full
  * lifecycle is recorded as one logical operation.
  *
- * Call the lower-level functions directly when you need to inspect the
- * simulation result before prompting the user to sign — for example, to show
- * a fee estimate or a dry-run return value in the UI.
- *
  * Address validation:
  *  - `contractId` must be a valid Soroban contract ID (C-prefix, 56 chars).
  *  - `walletAddress` must be a valid Stellar public key (G-prefix, 56 chars).
@@ -461,12 +511,17 @@ export async function invokeContract(
   method: string,
   args: xdr.ScVal[],
   walletAddress: string,
-): Promise<{ txHash: string; success: boolean; error?: string }> {
+): Promise<InvokeResult> {
   const txCtx = startTx(method);
 
   const simOutcome = await simulateContractTx(contractId, method, args, walletAddress, txCtx);
   if (!simOutcome.success) {
-    return { txHash: "", success: false, error: simOutcome.error };
+    return {
+      txHash: "",
+      success: false,
+      error: simOutcome.error,
+      typedError: simOutcome.typedError,
+    };
   }
 
   return submitContractTx(simOutcome.preparedXdr, txCtx);
@@ -478,7 +533,7 @@ export async function invokeContract(
  * Simulate a read-only contract call and return the native-decoded return value.
  *
  * Uses a static fake account so no real sequence-number fetch is required.
- * The transaction is never submitted — `sendTransaction` is never called.
+ * The transaction is never submitted.
  *
  * Address validation:
  *  - `contractId` must be a valid Soroban contract ID (C-prefix, 56 chars).
@@ -492,8 +547,6 @@ export async function readContract<T>(
 
   const rpc = getRpc();
   const contract = new Contract(contractId);
-  // A minimal stub that satisfies the TransactionBuilder's Account interface.
-  // We only need a static sequence for read-only simulation — it is never submitted.
   const fakeAccount = {
     id: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
     sequence: "0",

@@ -53,6 +53,8 @@ mod circle_tests {
         bob: Address,
         carol: Address,
         dave: Address,
+        /// Address with pause/resume authority over this circle.
+        circle_admin: Address,
     }
 
     impl<'a> TestSetup<'a> {
@@ -187,6 +189,9 @@ mod circle_tests {
         rep_client.initialize(&rep_admin);
         rep_client.add_authorized_caller(&rep_admin, &circle_id);
 
+        // Circle admin — the address with pause/resume authority
+        let circle_admin = Address::generate(&env);
+
         let mut members = Vec::new(&env);
         members.push_back(alice.clone());
         members.push_back(bob.clone());
@@ -194,6 +199,7 @@ mod circle_tests {
         members.push_back(dave.clone());
 
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_id.address(),
@@ -213,6 +219,7 @@ mod circle_tests {
             bob,
             carol,
             dave,
+            circle_admin,
         }
     }
 
@@ -655,6 +662,7 @@ mod circle_tests {
         let circle_id = t.env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&t.env, &circle_id);
         circle.initialize(
+            &t.circle_admin,
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -670,6 +678,7 @@ mod circle_tests {
         let circle_id = t.env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&t.env, &circle_id);
         circle.initialize(
+            &t.circle_admin,
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -723,7 +732,9 @@ mod circle_tests {
         members.push_back(member_a.clone());
         members.push_back(member_b.clone());
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &1i128,
             &token_address,
@@ -757,7 +768,9 @@ mod circle_tests {
             i += 1;
         }
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -1307,7 +1320,9 @@ mod circle_tests {
         members.push_back(member_a);
         members.push_back(member_b);
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -1438,7 +1453,9 @@ mod circle_tests {
         members.push_back(member_a);
         members.push_back(member_b);
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -2406,8 +2423,7 @@ mod circle_tests {
         let closed_events = events_named(&t.env, "closed");
         assert_eq!(closed_events.len(), 1, "expected exactly one closed event");
         let closed_data = closed_events[0].clone();
-        let (_closer, total_released, _total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, _total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         assert_eq!(
@@ -2448,8 +2464,7 @@ mod circle_tests {
             .map(|(_c, _t, d)| d.clone())
             .expect("expected a closed event");
 
-        let (_closer, _total_released, total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, _total_released, total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         let expected = ROUND_AMOUNT * COLLATERAL_MULTIPLIER * (t.members.len() as i128);
@@ -2484,8 +2499,7 @@ mod circle_tests {
             .map(|(_c, _t, d)| d.clone())
             .expect("expected a closed event");
 
-        let (_closer, total_released, total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         assert_eq!(
@@ -2523,8 +2537,7 @@ mod circle_tests {
             .map(|(_c, _t, d)| d.clone())
             .expect("expected a closed event");
 
-        let (_closer, total_released, _total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, _total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_data);
 
         assert_eq!(
@@ -2868,8 +2881,7 @@ mod circle_tests {
         // Decode the aggregate closed event
         let closed_events = events_named(&t.env, "closed");
         assert_eq!(closed_events.len(), 1, "expected exactly one closed event");
-        let (_closer, total_released, _total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, _total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed_events[0]);
 
         // 1. total_released must equal the pre-close storage sum
@@ -2883,7 +2895,7 @@ mod circle_tests {
         let events_sum: i128 = released_events
             .iter()
             .map(|v| {
-                let (_member, amount): (Address, i128) =
+                let (_circle, _member, amount): (Address, Address, i128) =
                     soroban_sdk::FromVal::from_val(&t.env, v);
                 amount
             })
@@ -2913,8 +2925,7 @@ mod circle_tests {
             t.circle.close(&t.alice);
 
             let closed = events_named(&t.env, "closed");
-            let (_closer, _released, _expected, reason):
-                (Address, i128, i128, soroban_sdk::Symbol) =
+            let (_circle, _closer, _released, _expected, reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
                 soroban_sdk::FromVal::from_val(&t.env, &closed[0]);
             assert_eq!(
                 reason,
@@ -2932,8 +2943,7 @@ mod circle_tests {
             t.circle.close(&t.alice);
 
             let closed = events_named(&t.env, "closed");
-            let (_closer, _released, _expected, reason):
-                (Address, i128, i128, soroban_sdk::Symbol) =
+            let (_circle, _closer, _released, _expected, reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
                 soroban_sdk::FromVal::from_val(&t.env, &closed[0]);
             assert_eq!(
                 reason,
@@ -2962,8 +2972,7 @@ mod circle_tests {
         t.circle.close(&t.alice);
 
         let closed = events_named(&t.env, "closed");
-        let (_closer, total_released, total_expected, _reason):
-            (Address, i128, i128, soroban_sdk::Symbol) =
+        let (_circle, _closer, total_released, total_expected, _reason): (Address, Address, i128, i128, soroban_sdk::Symbol) =
             soroban_sdk::FromVal::from_val(&t.env, &closed[0]);
 
         let full_expected = ROUND_AMOUNT * COLLATERAL_MULTIPLIER * 4; // 4 members
@@ -3068,7 +3077,9 @@ mod circle_tests {
 
         // Must not panic — all three addresses are distinct and all parameters
         // are at their minimum valid values.
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &1i128,
             &token_address,
@@ -3106,7 +3117,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &max_amount,
             &token_address,
@@ -3129,7 +3142,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3161,7 +3176,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         // Pass the circle's own address as the USDC token — must be rejected.
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &circle_id,       // ← circle contract used as token address
@@ -3220,7 +3237,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         // Pass the circle's own address as the reputation contract — must be rejected.
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3277,7 +3296,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         // Both reputation and token point at token_address — must be rejected.
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3334,7 +3355,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3376,7 +3399,9 @@ mod circle_tests {
         assert!(bad_result.is_err(), "first attempt must fail");
 
         // Second attempt with corrected parameters must succeed.
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3407,9 +3432,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
-        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+        circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
         // Second call must be rejected.
-        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+        circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
 
     /// Regression: fewer than 2 members still rejected.
@@ -3423,7 +3448,7 @@ mod circle_tests {
         let mut members = Vec::new(&env);
         members.push_back(Address::generate(&env));
 
-        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+        circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
 
     /// Regression: duplicate members still rejected.
@@ -3439,7 +3464,8 @@ mod circle_tests {
         members.push_back(a.clone());
         members.push_back(a); // duplicate
 
-        circle.initialize(&members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+        let circle_admin = Address::generate(&env);
+        circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
 
     /// Regression: zero round_amount still rejected.
@@ -3454,7 +3480,8 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
-        circle.initialize(&members, &0i128, &token_address, &reputation_id, &ROUND_DEADLINE);
+        let circle_admin = Address::generate(&env);
+        circle.initialize(&circle_admin, &members, &0i128, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
 
     /// Regression: deadline below minimum still rejected.
@@ -3469,7 +3496,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members, &ROUND_AMOUNT, &token_address, &reputation_id,
             &(MIN_ROUND_DEADLINE_LEDGERS - 1),
         );
@@ -3487,7 +3516,9 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
 
+        let circle_admin = Address::generate(&env);
         circle.initialize(
+            &circle_admin,
             &members, &ROUND_AMOUNT, &token_address, &reputation_id,
             &(MAX_ROUND_DEADLINE_LEDGERS + 1),
         );
@@ -3996,5 +4027,459 @@ mod circle_tests {
         // This test confirms the correct behavior: no partial payout.
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #335 — Verify token identity at initialization
+    //
+    // Acceptance criteria:
+    //   • Unusable token addresses are rejected early (panic at initialize).
+    //   • Every transfer uses the stored token (all transfers go via config.usdc_token).
+    //   • Token configuration cannot change after activation (get_usdc_token is
+    //     immutable; no entry-point overwrites DataKey::UsdcToken).
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// get_usdc_token returns the address stored at initialization time.
+    #[test]
+    fn test_335_get_usdc_token_returns_initialized_address() {
+        let t = setup_circle();
+        let token = t.circle.get_usdc_token();
+        // Must equal the token address passed to initialize.
+        assert_eq!(token, t.token_address, "get_usdc_token must return the address used in initialize");
+    }
+
+    /// get_usdc_token before initialize returns NotInitialized.
+    #[test]
+    fn test_335_get_usdc_token_before_initialize_returns_not_initialized() {
+        let (env, _token_address, _rep_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+        let result = circle.try_get_usdc_token();
+        assert!(result.is_err(), "get_usdc_token before initialize must return an error");
+    }
+
+    /// Token address is stable across the full lifecycle — after join, after
+    /// contribute, after payout, and after close.
+    #[test]
+    fn test_335_token_address_immutable_across_full_lifecycle() {
+        let t = setup_circle();
+        let initial_token = t.circle.get_usdc_token();
+
+        // Pending → Active
+        t.activate();
+        assert_eq!(t.circle.get_usdc_token(), initial_token, "token must not change after activation");
+
+        // Active → complete all rounds
+        t.complete_all_rounds();
+        assert_eq!(t.circle.get_usdc_token(), initial_token, "token must not change after all rounds complete");
+
+        // Completed → close
+        t.circle.close(&t.alice);
+        assert_eq!(t.circle.get_usdc_token(), initial_token, "token must not change after close");
+    }
+
+    /// Token address is stable after cancel + close lifecycle.
+    #[test]
+    fn test_335_token_address_immutable_after_cancel_and_close() {
+        let t = setup_circle();
+        let initial_token = t.circle.get_usdc_token();
+
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_usdc_token(), initial_token, "token must not change after cancel");
+
+        t.circle.close(&t.alice);
+        assert_eq!(t.circle.get_usdc_token(), initial_token, "token must not change after close on cancelled circle");
+    }
+
+    /// Non-token address (a plain wallet / account address) does not implement
+    /// the token interface — initialize must reject it with a usability panic.
+    #[test]
+    #[should_panic(expected = "usdc_token does not implement the standard token interface")]
+    fn test_335_non_token_address_rejected_at_initialize() {
+        let (env, _token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        // Use a freshly generated wallet address — it is not a token contract.
+        let not_a_token = Address::generate(&env);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        let circle_admin = Address::generate(&env);
+        circle.initialize(
+            &circle_admin,
+            &members,
+            &ROUND_AMOUNT,
+            &not_a_token,   // ← not a token contract
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+    }
+
+    /// A failed initialize (invalid token) must leave no state — the contract
+    /// can be successfully initialized with a corrected token address afterwards.
+    #[test]
+    fn test_335_failed_token_probe_leaves_no_state_allows_retry() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let not_a_token = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+
+        // First attempt: invalid token — must fail.
+        let bad = circle.try_initialize(
+            &members,
+            &ROUND_AMOUNT,
+            &not_a_token,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+        assert!(bad.is_err(), "initialize with non-token address must fail");
+
+        // Config must be absent after failure.
+        assert!(circle.try_get_config().is_err(), "Config must not exist after failed initialize");
+        assert!(circle.try_get_usdc_token().is_err(), "UsdcToken key must not exist after failed initialize");
+
+        // Second attempt with the correct token address must succeed.
+        let circle_admin = Address::generate(&env);
+        circle.initialize(
+            &circle_admin,
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+        assert_eq!(circle.get_usdc_token(), token_address, "corrected initialize must store the token");
+    }
+
+    /// get_usdc_token and get_config must agree on the token address.
+    #[test]
+    fn test_335_get_usdc_token_matches_config_usdc_token() {
+        let t = setup_circle();
+        let via_view = t.circle.get_usdc_token();
+        let via_config = t.circle.get_config().usdc_token;
+        assert_eq!(via_view, via_config, "get_usdc_token must agree with get_config().usdc_token");
+    }
+
+    /// All transfers (join collateral, contribute, close release) use the
+    /// token stored in config — verified by checking that alice's balance on
+    /// the registered token changes correctly for each operation.
+    #[test]
+    fn test_335_all_transfers_use_stored_token() {
+        let t = setup_circle();
+
+        // The stored token is the registered test token.
+        let stored_token = t.circle.get_usdc_token();
+        assert_eq!(stored_token, t.token_address);
+
+        // join: collateral leaves alice's wallet on the stored token.
+        let alice_before_join = t.token.balance(&t.alice);
+        t.circle.join(&t.alice);
+        let alice_after_join = t.token.balance(&t.alice);
+        assert_eq!(
+            alice_before_join - alice_after_join,
+            ROUND_AMOUNT * COLLATERAL_MULTIPLIER,
+            "join collateral must be deducted from the stored token"
+        );
+
+        // contribute: round amount leaves alice's wallet on the stored token.
+        t.circle.join(&t.bob);
+        t.circle.join(&t.carol);
+        t.circle.join(&t.dave);
+        let alice_before_contrib = t.token.balance(&t.alice);
+        t.circle.contribute(&t.alice);
+        let alice_after_contrib = t.token.balance(&t.alice);
+        assert_eq!(
+            alice_before_contrib - alice_after_contrib,
+            ROUND_AMOUNT,
+            "contribute must deduct from the stored token"
+        );
+
+        // payout: round 0 recipient (alice) receives pot on the stored token.
+        t.circle.contribute(&t.bob);
+        t.circle.contribute(&t.carol);
+        t.circle.contribute(&t.dave);
+        let alice_before_payout = t.token.balance(&t.alice);
+        t.circle.payout();
+        let alice_after_payout = t.token.balance(&t.alice);
+        // Alice receives pot (4 × ROUND_AMOUNT), net = pot - her own contribution already deducted
+        let pot = ROUND_AMOUNT * 4;
+        assert_eq!(
+            alice_after_payout - alice_before_payout,
+            pot,
+            "payout must credit the stored token to the recipient"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #334 — Pause and emergency recovery controls
+    //
+    // Acceptance criteria:
+    //   • Unauthorized accounts cannot pause or resume.
+    //   • Paused actions cannot move funds unexpectedly.
+    //   • Resumption preserves round and member data.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── is_paused / get_admin views ───────────────────────────────────────────
+
+    #[test]
+    fn test_334_is_paused_false_by_default() {
+        let t = setup_circle();
+        assert!(!t.circle.is_paused(), "circle must not be paused after initialize");
+    }
+
+    #[test]
+    fn test_334_get_admin_returns_initialized_admin() {
+        let t = setup_circle();
+        let admin = t.circle.get_admin();
+        assert_eq!(admin, t.circle_admin, "get_admin must return the admin set in initialize");
+    }
+
+    #[test]
+    fn test_334_get_admin_before_initialize_returns_error() {
+        let (env, _token, _rep) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+        let result = circle.try_get_admin();
+        assert!(result.is_err(), "get_admin before initialize must return an error");
+    }
+
+    // ── pause: authorization ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_334_admin_can_pause() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        assert!(t.circle.is_paused(), "circle must be paused after admin calls pause");
+    }
+
+    #[test]
+    fn test_334_non_admin_cannot_pause() {
+        let t = setup_circle();
+        let result = t.circle.try_pause(&t.alice);
+        assert!(result.is_err(), "non-admin must not be able to pause");
+        assert!(!t.circle.is_paused(), "circle must remain unpaused after rejected pause");
+    }
+
+    #[test]
+    fn test_334_stranger_cannot_pause() {
+        let t = setup_circle();
+        let stranger = Address::generate(&t.env);
+        let result = t.circle.try_pause(&stranger);
+        assert!(result.is_err(), "stranger must not be able to pause");
+    }
+
+    #[test]
+    fn test_334_double_pause_returns_error() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        let result = t.circle.try_pause(&t.circle_admin);
+        assert!(result.is_err(), "pausing an already-paused circle must return an error");
+    }
+
+    // ── resume: authorization ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_334_admin_can_resume() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        assert!(t.circle.is_paused());
+        t.circle.resume(&t.circle_admin);
+        assert!(!t.circle.is_paused(), "circle must not be paused after admin calls resume");
+    }
+
+    #[test]
+    fn test_334_non_admin_cannot_resume() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        let result = t.circle.try_resume(&t.alice);
+        assert!(result.is_err(), "non-admin must not be able to resume");
+        assert!(t.circle.is_paused(), "circle must remain paused after rejected resume");
+    }
+
+    #[test]
+    fn test_334_resume_when_not_paused_returns_error() {
+        let t = setup_circle();
+        let result = t.circle.try_resume(&t.circle_admin);
+        assert!(result.is_err(), "resuming an unpaused circle must return an error");
+    }
+
+    // ── pause blocks fund-moving writes ──────────────────────────────────────
+
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn test_334_join_blocked_while_paused() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        t.circle.join(&t.alice);
+    }
+
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn test_334_contribute_blocked_while_paused() {
+        let t = setup_circle();
+        t.activate();
+        t.circle.pause(&t.circle_admin);
+        t.circle.contribute(&t.alice);
+    }
+
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn test_334_payout_blocked_while_paused() {
+        let t = setup_circle();
+        t.activate();
+        t.contribute_all();
+        t.circle.pause(&t.circle_admin);
+        t.circle.payout();
+    }
+
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn test_334_mark_default_blocked_while_paused() {
+        let t = setup_circle();
+        t.activate();
+        t.advance_past_deadline();
+        t.circle.pause(&t.circle_admin);
+        t.circle.mark_default(&t.carol);
+    }
+
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn test_334_close_blocked_while_paused() {
+        let t = setup_circle();
+        t.activate();
+        t.force_status(CircleStatus::Completed);
+        t.circle.pause(&t.circle_admin);
+        t.circle.close(&t.alice);
+    }
+
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn test_334_cancel_blocked_while_paused() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        t.circle.cancel(&t.alice);
+    }
+
+    // ── reads remain available while paused ──────────────────────────────────
+
+    #[test]
+    fn test_334_reads_available_while_paused() {
+        let t = setup_circle();
+        t.activate();
+        t.circle.pause(&t.circle_admin);
+
+        // All read-only views must succeed while paused
+        assert!(t.circle.is_paused());
+        let _ = t.circle.get_config();
+        assert_eq!(t.circle.get_status(), CircleStatus::Active);
+        let _ = t.circle.get_current_round();
+        let _ = t.circle.get_pot_amount();
+        let _ = t.circle.get_collateral(&t.alice);
+        let _ = t.circle.get_defaults(&t.alice);
+        let _ = t.circle.get_protocol_params();
+        let _ = t.circle.get_usdc_token();
+        let _ = t.circle.get_admin();
+        assert!(!t.circle.is_closed());
+    }
+
+    // ── resume restores full operation ────────────────────────────────────────
+
+    #[test]
+    fn test_334_resume_restores_join() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        t.circle.resume(&t.circle_admin);
+        // join must succeed after resume
+        t.circle.join(&t.alice);
+        assert_eq!(t.circle.get_collateral(&t.alice), ROUND_AMOUNT * COLLATERAL_MULTIPLIER);
+    }
+
+    #[test]
+    fn test_334_resumption_preserves_round_and_member_data() {
+        let t = setup_circle();
+        t.activate();
+
+        // Capture state before pause
+        let round_before = t.circle.get_current_round();
+        let collateral_alice = t.circle.get_collateral(&t.alice);
+
+        t.circle.pause(&t.circle_admin);
+
+        // Pause preserves round and member data
+        let round_during = t.circle.get_current_round();
+        assert_eq!(round_during.round_index, round_before.round_index,
+            "round_index must be preserved during pause");
+        assert_eq!(round_during.deadline_ledger, round_before.deadline_ledger,
+            "deadline_ledger must be preserved during pause");
+
+        t.circle.resume(&t.circle_admin);
+
+        // After resume, state is identical to before pause
+        let round_after = t.circle.get_current_round();
+        assert_eq!(round_after.round_index, round_before.round_index,
+            "round_index must be unchanged after resume");
+        assert_eq!(t.circle.get_collateral(&t.alice), collateral_alice,
+            "collateral must be unchanged after resume");
+        assert_eq!(t.circle.get_status(), CircleStatus::Active,
+            "status must be unchanged after resume");
+
+        // Full contribute + payout cycle works after resume
+        t.contribute_all();
+        t.circle.payout();
+        assert_eq!(t.circle.get_current_round().round_index, 1,
+            "payout must advance round correctly after resume");
+    }
+
+    #[test]
+    fn test_334_multiple_pause_resume_cycles_work() {
+        let t = setup_circle();
+        t.activate();
+
+        // First cycle
+        t.circle.pause(&t.circle_admin);
+        assert!(t.circle.is_paused());
+        t.circle.resume(&t.circle_admin);
+        assert!(!t.circle.is_paused());
+
+        // Second cycle — circle still operational
+        t.contribute_all();
+        t.circle.pause(&t.circle_admin);
+        assert!(t.circle.is_paused());
+        t.circle.resume(&t.circle_admin);
+        assert!(!t.circle.is_paused());
+
+        // Payout works after second resume
+        t.circle.payout();
+        assert_eq!(t.circle.get_current_round().round_index, 1);
+    }
+
+    // ── pause emits events ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_334_pause_emits_paused_event() {
+        let t = setup_circle();
+        let _ = t.env.events().all(); // flush
+        t.circle.pause(&t.circle_admin);
+        let paused_events = events_named(&t.env, "paused");
+        assert_eq!(paused_events.len(), 1, "expected one 'paused' event");
+    }
+
+    #[test]
+    fn test_334_resume_emits_resumed_event() {
+        let t = setup_circle();
+        t.circle.pause(&t.circle_admin);
+        let _ = t.env.events().all(); // flush
+        t.circle.resume(&t.circle_admin);
+        let resumed_events = events_named(&t.env, "resumed");
+        assert_eq!(resumed_events.len(), 1, "expected one 'resumed' event");
+    }
+
 }
+
 

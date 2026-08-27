@@ -108,6 +108,20 @@ pub enum DataKey {
     RoundsCompleted,
     Initializing,                // reentrancy guard held for the duration of `initialize`
     Closed,                      // true after close() successfully settles all collateral; re-invocation guard
+    /// Canonical USDC token address locked at initialization time.
+    /// Stored separately from Config so `get_usdc_token` can be called
+    /// without deserializing the full CircleConfig, and to make the
+    /// immutability of the token selection explicit in storage layout.
+    UsdcToken,
+    /// Admin address — the only account that may pause or resume this circle.
+    /// Set once at `initialize` time; typically the factory contract or deployer.
+    /// Immutable after initialization.
+    Admin,
+    /// Pause flag — present and `true` when the circle is paused.
+    /// Absent (or `false`) when the circle is operating normally.
+    /// When present, all fund-moving entry-points (join, contribute, payout,
+    /// mark_default, close) are blocked.  Read-only views remain available.
+    Paused,
 }
 
 // ─── Initialization-specific error type ──────────────────────────────────────
@@ -161,6 +175,35 @@ pub enum InitError {
     /// caught earlier, or the rotation array has a different length from the
     /// member array — guards against inconsistent off-chain construction).
     InconsistentRotation = 12,
+    /// `usdc_token` does not respond to the standard token interface
+    /// (`balance` call failed) — the address is not a usable token contract.
+    /// Accepting an unusable token would strand all member deposits with no
+    /// recovery path.
+    UnusableTokenContract = 13,
+}
+
+// ─── Pause / emergency-recovery error type ───────────────────────────────────
+//
+// Returned by `pause` and `resume` so callers receive a typed, inspectable
+// error code rather than an opaque panic when authorization or state guards
+// fire.  Using `contracterror` keeps the error model consistent with the rest
+// of the contract's typed-error approach and lets SDK consumers branch on
+// stable codes rather than message strings.
+
+/// Typed errors returned by `pause` and `resume`.
+///
+/// The numeric discriminants are stable — do not renumber existing variants.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PauseError {
+    /// Caller is not the stored admin address.
+    Unauthorized = 1,
+    /// `pause` was called when the circle is already paused.
+    AlreadyPaused = 2,
+    /// `resume` was called when the circle is not paused.
+    NotPaused = 3,
+    /// `pause` or `resume` was called before `initialize`.
+    NotInitialized = 4,
 }
 
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
@@ -289,6 +332,27 @@ impl CircleContract {
         }
     }
 
+    /// Panics with a clear message if the circle is currently paused.
+    ///
+    /// Called at the top of every fund-moving entry-point (join, contribute,
+    /// payout, mark_default, close) so the pause check is applied uniformly
+    /// without duplicating the storage read at each call site.
+    ///
+    /// Read-only views intentionally do NOT call this — reads remain available
+    /// while paused so indexers and front-ends can still inspect circle state
+    /// and display the pause reason to members.
+    #[inline]
+    fn assert_not_paused(env: &Env) {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic!("circle is paused: no fund-moving operations are allowed until an admin resumes it");
+        }
+    }
+
     fn assert_unique_members(members: &Vec<Address>) {
         let len = members.len();
         let mut i: u32 = 0;
@@ -335,9 +399,11 @@ impl CircleContract {
     /// | Token address | `usdc_token == current contract` | `"usdc_token must not be the circle contract itself"` |
     /// | Reputation address | `reputation_contract == current contract` | `"reputation_contract must not be the circle contract itself"` |
     /// | Reputation ≠ token | `reputation_contract == usdc_token` | `"reputation_contract must not be the same address as usdc_token"` |
+    /// | Token usability | `token.try_balance` fails | `"usdc_token does not implement the standard token interface"` |
     /// | Rotation consistency | `members.len() == 0` after validation passes | (defensive; unreachable in practice) |
     pub fn initialize(
         env: Env,
+        admin: Address,
         members: Vec<Address>,
         round_amount: i128,
         usdc_token: Address,
@@ -357,6 +423,13 @@ impl CircleContract {
             panic!("initialize already in progress");
         }
         env.storage().instance().set(&DataKey::Initializing, &true);
+
+        // Admin authorization: the admin must sign this invocation.
+        // The admin is the only account permitted to pause/resume this circle.
+        // Typically the factory contract (Contract Invoker rule) or a governance
+        // multisig in direct deployments.
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
 
         if members.len() < 2 {
             panic!("need at least 2 members");
@@ -412,6 +485,32 @@ impl CircleContract {
             panic!("reputation_contract must not be the same address as usdc_token");
         }
 
+        // ── Token identity / usability probe ──────────────────────────────────
+        //
+        // Verify that `usdc_token` is a live, callable token contract by probing
+        // its standard `balance` entry-point with a try_ call.  A successful
+        // probe (even returning 0) confirms the address hosts a contract that
+        // implements the token interface; a failure means the address is either
+        // not a contract, not deployed, or implements a different interface —
+        // any of which would silently strand all member deposits.
+        //
+        // Why probe at initialization rather than at first transfer:
+        //   A misconfigured token cannot be corrected after initialization
+        //   (the stored address is immutable).  Catching it here gives the
+        //   deployer an immediate, clear failure message and leaves the circle
+        //   un-initialized so it can be redeployed with the correct token.
+        //
+        // The probe uses the circle's own address as the balance query target —
+        // this is always a valid address (the contract itself) so the call will
+        // not fail due to an invalid argument.
+        let token_probe = token::Client::new(&env, &usdc_token);
+        if token_probe
+            .try_balance(&env.current_contract_address())
+            .is_err()
+        {
+            panic!("usdc_token does not implement the standard token interface; verify the token contract address");
+        }
+
         // ── Rotation consistency check ────────────────────────────────────────
         //
         // The rotation order is defined by the `members` list — each member at
@@ -432,7 +531,7 @@ impl CircleContract {
         let config = CircleConfig {
             members: members.clone(),
             round_amount,
-            usdc_token,
+            usdc_token: usdc_token.clone(),
             reputation_contract,
             round_deadline_ledgers,
         };
@@ -440,6 +539,12 @@ impl CircleContract {
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::Status, &CircleStatus::Pending);
         env.storage().instance().set(&DataKey::RoundsCompleted, &0u32);
+
+        // Store the token address under its own key so `get_usdc_token` can
+        // return it without deserializing the full CircleConfig, and to make
+        // the immutability of the token selection explicit and independently
+        // observable.  Once written here it is never overwritten.
+        env.storage().instance().set(&DataKey::UsdcToken, &usdc_token);
 
         // Round 0 is prepared at init; the live deadline is refreshed when the
         // circle becomes Active (all members joined), not at initialize time.
@@ -458,9 +563,14 @@ impl CircleContract {
 
         env.storage().instance().remove(&DataKey::Initializing);
 
+        // Event: circle/initialized
+        // Data: (circle_address, member_count, round_amount)
+        //   circle_address — identifies this circle in multi-circle indexer queries
+        //   member_count   — number of members configured (equals total rounds)
+        //   round_amount   — USDC stroops each member contributes per round
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "initialized")),
-            member_count,
+            (env.current_contract_address(), member_count, round_amount),
         );
     }
 
@@ -485,6 +595,8 @@ impl CircleContract {
     /// to join also writes two instance entries (`Status`, `CurrentRound`).
     pub fn join(env: Env, member: Address) {
         member.require_auth();
+
+        Self::assert_not_paused(&env);
 
         let config: CircleConfig = env
             .storage()
@@ -566,16 +678,31 @@ impl CircleContract {
                 + config.round_deadline_ledgers as u64;
             env.storage().instance().set(&DataKey::CurrentRound, &round);
 
+            // Event: circle/active
+            // Data: (circle_address, deadline_ledger)
+            //   circle_address  — identifies this circle for multi-circle indexer queries
+            //   deadline_ledger — round-0 deadline set at activation; consumers can start
+            //                     countdown timers without polling get_current_round
             env.events()
-                .publish((Symbol::new(&env, "circle"), Symbol::new(&env, "active")), ());
+                .publish(
+                    (Symbol::new(&env, "circle"), Symbol::new(&env, "active")),
+                    (env.current_contract_address(), round.deadline_ledger),
+                );
         }
 
-        // Emit (member, join_order) so indexers and front-ends can show a live
-        // join-progress indicator ("2 of 4 members joined") and record who
-        // claimed which position in the queue without secondary lookups.
+        // Event: circle/joined
+        // Data: (circle_address, member, join_order, collateral_amount)
+        //   circle_address   — identifies this circle for multi-circle indexer queries
+        //   member           — the address that just joined
+        //   join_order       — 1-based position in the join queue (N triggers Active)
+        //   collateral_amount — USDC stroops locked by this member
+        let collateral_amount = config
+            .round_amount
+            .checked_mul(COLLATERAL_MULTIPLIER)
+            .unwrap_or(0);
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "joined")),
-            (member, join_order),
+            (env.current_contract_address(), member, join_order, collateral_amount),
         );
     }
 
@@ -590,6 +717,8 @@ impl CircleContract {
     /// - Active / Completed circles cannot be cancelled.
     pub fn cancel(env: Env, caller: Address) {
         caller.require_auth();
+
+        Self::assert_not_paused(&env);
 
         let config: CircleConfig = env
             .storage()
@@ -614,9 +743,14 @@ impl CircleContract {
             .instance()
             .set(&DataKey::Status, &CircleStatus::Cancelled);
 
+        // Event: circle/cancelled
+        // Data: (circle_address, caller, ledger)
+        //   circle_address — identifies this circle for replay
+        //   caller         — member who triggered cancellation
+        //   ledger         — ledger sequence at cancellation time
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "cancelled")),
-            (caller, env.ledger().sequence()),
+            (env.current_contract_address(), caller, env.ledger().sequence()),
         );
     }
 
@@ -629,6 +763,8 @@ impl CircleContract {
     /// updates one instance entry (`CurrentRound`).
     pub fn contribute(env: Env, member: Address) {
         member.require_auth();
+
+        Self::assert_not_paused(&env);
 
         let config: CircleConfig = env
             .storage()
@@ -688,9 +824,15 @@ impl CircleContract {
         round.contributions_received += 1;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
+        // Event: circle/contributed
+        // Data: (circle_address, member, round_index, amount)
+        //   circle_address — identifies this circle for replay
+        //   member         — contributor's address
+        //   round_index    — which round this contribution belongs to
+        //   amount         — USDC stroops transferred (= round_amount)
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "contributed")),
-            (member, round.round_index),
+            (env.current_contract_address(), member, round.round_index, config.round_amount),
         );
     }
 
@@ -755,6 +897,7 @@ impl CircleContract {
     ///
     /// Anyone may call this.
     pub fn payout(env: Env) {
+        Self::assert_not_paused(&env);
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -881,9 +1024,15 @@ impl CircleContract {
             .try_increment(&env.current_contract_address(), &round.recipient)
             .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
 
+        // Event: circle/payout
+        // Data: (circle_address, recipient, amount, round_index)
+        //   circle_address — identifies this circle for replay
+        //   recipient      — address that received the pot
+        //   amount         — total USDC stroops paid out (= round_amount × member_count)
+        //   round_index    — which round was settled
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
-            (round.recipient.clone(), pot, round.round_index),
+            (env.current_contract_address(), round.recipient.clone(), pot, round.round_index),
         );
 
         // Advance to next round or mark the circle as completed
@@ -892,9 +1041,13 @@ impl CircleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Status, &CircleStatus::Completed);
+            // Event: circle/completed
+            // Data: (circle_address, rounds_completed)
+            //   circle_address   — identifies this circle for replay
+            //   rounds_completed — total rounds that ran (equals member_count)
             env.events().publish(
                 (Symbol::new(&env, "circle"), Symbol::new(&env, "completed")),
-                (),
+                (env.current_contract_address(), member_count),
             );
         } else {
             let next_recipient = config
@@ -917,9 +1070,15 @@ impl CircleContract {
             // Notify indexers and front-ends that a new contribution window has
             // opened.  Consumers can use this event to reset contribution status
             // displays and restart deadline countdowns without polling get_current_round.
+            // Event: circle/round_started
+            // Data: (circle_address, round_index, recipient, deadline_ledger)
+            //   circle_address  — identifies this circle for replay
+            //   round_index     — the new round that just opened
+            //   recipient       — address scheduled to receive the pot this round
+            //   deadline_ledger — ledger after which contributions are rejected
             env.events().publish(
                 (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
-                (next_round_index, next_recipient, next_round.deadline_ledger),
+                (env.current_contract_address(), next_round_index, next_recipient, next_round.deadline_ledger),
             );
         }
     }
@@ -940,6 +1099,7 @@ impl CircleContract {
     /// `Defaults(member)`) and updates one persistent entry
     /// (`Collateral(member)`).
     pub fn mark_default(env: Env, member: Address) {
+        Self::assert_not_paused(&env);
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -1019,9 +1179,16 @@ impl CircleContract {
             .persistent()
             .set(&DataKey::Defaults(member.clone()), &(defaults + 1));
 
+        // Event: circle/default
+        // Data: (circle_address, member, penalty, round_index, new_collateral)
+        //   circle_address  — identifies this circle for replay
+        //   member          — the member who was penalised
+        //   penalty         — USDC stroops deducted from collateral
+        //   round_index     — round in which the default occurred
+        //   new_collateral  — member's collateral balance after penalty
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
-            (member, penalty, round.round_index, new_collateral),
+            (env.current_contract_address(), member, penalty, round.round_index, new_collateral),
         );
     }
 
@@ -1078,6 +1245,8 @@ impl CircleContract {
     /// entry (`Collateral(member)`) per member that held a non-zero balance.
     pub fn close(env: Env, closer: Address) {
         closer.require_auth();
+
+        Self::assert_not_paused(&env);
 
         let config: CircleConfig = env
             .storage()
@@ -1191,14 +1360,17 @@ impl CircleContract {
                     .unwrap_or_else(|| panic!("total released overflow"));
                 members_released += 1;
 
-                // Per-member audit trail: indexers sum these to reconcile
-                // with total_released in the closed event.
+                // Event: circle/collateral_released (per member with positive balance)
+                // Data: (circle_address, member, amount)
+                //   circle_address — identifies this circle for replay
+                //   member         — recipient of the released collateral
+                //   amount         — USDC stroops returned to this member
                 env.events().publish(
                     (
                         Symbol::new(&env, "circle"),
                         Symbol::new(&env, "collateral_released"),
                     ),
-                    (member, collateral),
+                    (env.current_contract_address(), member, collateral),
                 );
             }
         }
@@ -1222,12 +1394,17 @@ impl CircleContract {
             Symbol::new(&env, "cancelled")
         };
 
-        // Aggregate settlement event.
-        // Data: (closer, total_released, total_expected_collateral, reason)
-        //   total_expected_collateral - total_released = total penalties forfeited
+        // Event: circle/closed
+        // Data: (circle_address, closer, total_released, total_expected_collateral, reason)
+        //   circle_address           — identifies this circle for replay
+        //   closer                   — member who triggered settlement
+        //   total_released           — total USDC stroops returned across all members
+        //   total_expected_collateral — what would have been released with zero penalties
+        //   reason                   — Symbol "completed" or "cancelled"
+        //   total_expected − total_released = total penalties forfeited (auditable)
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
-            (closer, total_released, total_expected_collateral, reason),
+            (env.current_contract_address(), closer, total_released, total_expected_collateral, reason),
         );
     }
 
@@ -1238,6 +1415,167 @@ impl CircleContract {
     /// replaying the event log.
     pub fn is_closed(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Closed)
+    }
+
+    // ── Pause / emergency recovery ────────────────────────────────────────────
+
+    /// Pause the circle, blocking all fund-moving operations.
+    ///
+    /// Only the stored `admin` address (set at initialization) may call this.
+    /// A paused circle accepts no `join`, `contribute`, `payout`, `mark_default`,
+    /// or `close` calls.  All read-only views remain available so indexers and
+    /// front-ends can display the current state and the pause reason to members.
+    ///
+    /// # Authorization
+    /// `admin.require_auth()` is called inside this function; the admin must sign
+    /// the transaction that invokes `pause`.
+    ///
+    /// # Errors (via `try_pause`)
+    /// - `PauseError::NotInitialized` — called before `initialize`.
+    /// - `PauseError::Unauthorized` — caller is not the stored admin.
+    /// - `PauseError::AlreadyPaused` — circle is already paused.
+    ///
+    /// # Events
+    /// Emits `circle` / `paused` with data `(admin: Address, ledger: u32)`.
+    pub fn pause(env: Env, admin: Address) -> Result<(), PauseError> {
+        // Must be initialized before pause is meaningful.
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PauseError::NotInitialized)?;
+
+        // Require the admin's signature before any state check so authorization
+        // is always the first gate — consistent with Soroban auth best practices.
+        admin.require_auth();
+
+        if admin != stored_admin {
+            return Err(PauseError::Unauthorized);
+        }
+
+        // Idempotency guard: pausing an already-paused circle is an error so
+        // callers get clear feedback rather than a silent no-op that might mask
+        // a double-invocation bug.
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(PauseError::AlreadyPaused);
+        }
+
+        env.storage().instance().set(&DataKey::Paused, &true);
+
+        // Event: circle/paused
+        // Data: (circle_address, admin, ledger)
+        //   circle_address — identifies this circle for replay
+        //   admin          — address that triggered the pause
+        //   ledger         — ledger sequence at pause time
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "paused")),
+            (env.current_contract_address(), admin, env.ledger().sequence()),
+        );
+
+        Ok(())
+    }
+
+    /// Resume a paused circle, restoring normal operations.
+    ///
+    /// Only the stored `admin` address may call this.  After a successful
+    /// `resume` all entry-points are available again with the round and member
+    /// data intact — no state is lost during a pause/resume cycle.
+    ///
+    /// # Authorization
+    /// `admin.require_auth()` is called inside this function.
+    ///
+    /// # Errors (via `try_resume`)
+    /// - `PauseError::NotInitialized` — called before `initialize`.
+    /// - `PauseError::Unauthorized` — caller is not the stored admin.
+    /// - `PauseError::NotPaused` — circle is not currently paused.
+    ///
+    /// # Events
+    /// Emits `circle` / `resumed` with data `(admin: Address, ledger: u32)`.
+    pub fn resume(env: Env, admin: Address) -> Result<(), PauseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(PauseError::NotInitialized)?;
+
+        admin.require_auth();
+
+        if admin != stored_admin {
+            return Err(PauseError::Unauthorized);
+        }
+
+        // Cannot resume a circle that is not paused.
+        if !env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(PauseError::NotPaused);
+        }
+
+        // Remove the flag entirely rather than setting it to `false` so
+        // `is_paused` can use a simple `has` check and the storage is clean.
+        env.storage().instance().remove(&DataKey::Paused);
+
+        // Event: circle/resumed
+        // Data: (circle_address, admin, ledger)
+        //   circle_address — identifies this circle for replay
+        //   admin          — address that triggered the resume
+        //   ledger         — ledger sequence at resume time
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "resumed")),
+            (env.current_contract_address(), admin, env.ledger().sequence()),
+        );
+
+        Ok(())
+    }
+
+    /// Returns `true` when the circle is currently paused.
+    ///
+    /// This view is always available — it does not require the circle to be
+    /// initialized and does not check the pause state before returning.
+    /// Front-ends should call this before showing action buttons so users see
+    /// a clear "circle is paused" message rather than a cryptic transaction
+    /// failure.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Returns the admin address stored at initialization.
+    ///
+    /// Returns `Err(ContractError::NotInitialized)` when called before
+    /// `initialize`.  SDKs can use this to verify which address has pause/resume
+    /// authority without hard-coding it.
+    pub fn get_admin(env: Env) -> Result<Address, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ContractError::NotInitialized)
+    }
+
+    /// Returns the canonical USDC token address that was locked at initialization.
+    ///
+    /// This view exposes the immutable token selection so SDKs and indexers can
+    /// verify which token a circle uses without deserializing the full
+    /// [`CircleConfig`].  The address cannot change after initialization — it is
+    /// written once under [`DataKey::UsdcToken`] and never overwritten.
+    ///
+    /// Returns `Err(ContractError::NotInitialized)` when called before
+    /// `initialize`.
+    pub fn get_usdc_token(env: Env) -> Result<Address, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::UsdcToken)
+            .ok_or(ContractError::NotInitialized)
     }
 
     // ── Read-only views ───────────────────────────────────────────────────────

@@ -193,7 +193,8 @@ export default function CreateClient() {
       );
 
       if (!result.success) {
-        setError(result.error || "Transaction failed");
+        // Use the typed error message for user-facing copy; fall back to generic.
+        setError(result.typedError?.message || result.error || "Transaction failed");
         return;
       }
 
