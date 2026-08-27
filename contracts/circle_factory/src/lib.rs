@@ -291,8 +291,14 @@ impl CircleFactory {
         // ── 5. Initialize the circle ─────────────────────────────────────────
         // Runs inside the same transaction. A panic here rolls back the deploy
         // via the host's transaction-level abort, leaving the registry clean.
+        // The factory contract itself is passed as the circle admin so it
+        // retains pause/resume authority over every circle it deploys.
         let init_args = soroban_sdk::vec![
             &env,
+            soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(
+                &env.current_contract_address(),
+                &env,
+            ),
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&members, &env),
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&round_amount, &env),
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&usdc, &env),

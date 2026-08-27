@@ -474,7 +474,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )
     : false;
 
-  /** Returns true when the error looks like a timeout or network failure. */
+  /** Returns true when the error looks like a timeout or network failure that is worth retrying. */
   function isRetryableError(err: string): boolean {
     const lower = err.toLowerCase();
     return (
@@ -482,7 +482,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       lower.includes("timed out") ||
       lower.includes("network") ||
       lower.includes("fetch") ||
-      lower.includes("connection")
+      lower.includes("connection") ||
+      lower.includes("rpc") ||
+      lower.includes("temporarily unavailable")
     );
   }
 
@@ -568,7 +570,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         walletAddress,
       );
       if (!result.success) {
-        const errMsg = result.error || "Transaction failed";
+        // Prefer the typed error message — it's the canonical user-facing copy
+        // from contractErrors.ts; fall back to the raw error string if somehow
+        // typedError is not set (e.g. legacy call path).
+        const errMsg = result.typedError?.message || result.error || "Transaction failed";
         setError(errMsg);
         if (isRetryableError(errMsg)) {
           setRetryAction(() => () => doAction(action, args));
