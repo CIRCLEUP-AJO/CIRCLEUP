@@ -19,7 +19,10 @@
     "deploy:testnet": "npm run deploy:testnet --workspace=scripts",
     "seed:demo": "npm run seed:demo --workspace=scripts",
     "migrate": "npm run migrate:dev --workspace=indexer",
-    "lint": "npm run lint --workspace=app"
+    "lint": "npm run lint --workspace=app",
+    "test": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
+    "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
+    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.4.5"
