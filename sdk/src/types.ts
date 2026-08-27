@@ -640,14 +640,147 @@ export function isSimulateFailure(r: SimulateResult): r is SimulateFailure {
   return r.ok === false;
 }
 
+// ─── Transaction correlation metadata ─────────────────────────────────────────
+//
+// Caller-supplied observability data that ties a UI action (a button click, an
+// HTTP request id, a background-job step) to the on-chain transaction it
+// produced.  The SDK echoes it back on every {@link TxResult} and includes it
+// in structured tx log events, so a confirmed hash — or a failure — can always
+// be traced back to the intent that created it.
+//
+// ── Correlation is NOT deduplication ──
+//
+// This metadata is for *tracing*, never for *idempotency*.  It has no effect on
+// whether a transaction is submitted, retried, or accepted:
+//
+//   • Deduplication is the network's job.  A transaction is uniquely identified
+//     by its source account + sequence number; resubmitting the same signed
+//     transaction yields the RPC status `DUPLICATE`, and the SDK simply keeps
+//     polling the existing hash (see `buildAndSend`).  Attaching the same
+//     correlation metadata to two calls does **not** make them the same
+//     transaction, and attaching different metadata to a retry does **not**
+//     make it a new one.
+//
+//   • Correlation is the caller's label.  Reusing an `operation` id across a
+//     retry is exactly how you follow one logical action through several
+//     submission attempts; the SDK preserves it verbatim on each attempt's
+//     result so the attempts can be grouped in a log aggregator.
+//
+// If you need an idempotency key, derive it from the transaction itself (source
+// + sequence), not from this field.
+
+/**
+ * A single JSON-serialisable scalar permitted as a correlation metadata value.
+ *
+ * Values are restricted to scalars so metadata is always safe to serialise into
+ * a log line or a JSON result without depth/cycle concerns, and so a caller
+ * cannot accidentally stuff a signed transaction object or a Keypair into it.
+ */
+export type TxMetadataValue = string | number | boolean | null;
+
+/**
+ * Caller-supplied correlation metadata for a write operation.
+ *
+ * A flat bag of scalar identifiers — e.g.
+ * `{ operation: "join-circle", uiRequestId: "req_8a1f", attempt: 1 }`.
+ *
+ * Passed via the `metadata` option on any mutation (`join`, `contribute`,
+ * `payout`, `markDefault`, `close`, `createCircle`) and returned unchanged on
+ * the resulting {@link TxResult} — see the section comment above for how this
+ * differs from deduplication.
+ *
+ * The SDK runs every value through {@link sanitizeTxMetadata} before it is
+ * attached to a result or emitted in a log, so secrets and signed payloads are
+ * stripped even if a caller passes them by mistake.
+ */
+export interface TxMetadata {
+  readonly [key: string]: TxMetadataValue;
+}
+
+/** Maximum number of keys retained by {@link sanitizeTxMetadata}. */
+const MAX_METADATA_KEYS = 32;
+
+/**
+ * Maximum length of a string metadata value.  Anything longer is dropped as a
+ * likely signed-XDR / base64 payload rather than a correlation id.
+ */
+const MAX_METADATA_STRING_LENGTH = 512;
+
+/**
+ * A Stellar *secret* seed strkey: 56 chars starting with `S`.  A value matching
+ * this is a private key and must never be echoed back or logged, regardless of
+ * the key it was stored under.
+ */
+const STELLAR_SECRET_SEED_RE = /^S[A-Z2-7]{55}$/;
+
+/**
+ * Key names that indicate a secret or a signed payload.  Matched
+ * case-insensitively as a substring so `signedXdr`, `sourceSecret`,
+ * `api_key`, etc. are all caught.
+ */
+const SECRET_KEY_RE =
+  /secret|seed|private|mnemonic|passphrase|password|signed|signature|xdr|api[_-]?key/i;
+
+/**
+ * Sanitise caller-supplied correlation metadata into a safe, log-ready shape.
+ *
+ * Guarantees (this is a security boundary — see {@link TxMetadata}):
+ *   1. **No secrets by key name** — any key matching {@link SECRET_KEY_RE}
+ *      (`secret`, `seed`, `private`, `signed`, `xdr`, `apiKey`, …) is dropped.
+ *   2. **No secrets by value** — any string matching a Stellar secret seed
+ *      (`S…`, 56 chars) is dropped even under an innocuous key.
+ *   3. **No payloads** — strings longer than
+ *      {@link MAX_METADATA_STRING_LENGTH} (likely signed XDR) are dropped.
+ *   4. **Scalars only** — objects, arrays, functions, `bigint`, `symbol`, and
+ *      `undefined` values are dropped, so a signed transaction object cannot be
+ *      smuggled through.
+ *   5. **Bounded** — at most {@link MAX_METADATA_KEYS} keys are retained.
+ *
+ * The input is never mutated.  Returns a frozen object, or `undefined` when the
+ * input is not a plain object or nothing survives sanitisation (so an empty
+ * `{}` is never attached to a result).
+ */
+export function sanitizeTxMetadata(input: unknown): TxMetadata | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return undefined;
+  }
+
+  const out: Record<string, TxMetadataValue> = {};
+  let kept = 0;
+
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (kept >= MAX_METADATA_KEYS) break;
+    if (SECRET_KEY_RE.test(key)) continue;
+
+    if (typeof value === "string") {
+      if (value.length > MAX_METADATA_STRING_LENGTH) continue;
+      if (STELLAR_SECRET_SEED_RE.test(value)) continue;
+      out[key] = value;
+      kept++;
+    } else if (typeof value === "number") {
+      if (!Number.isFinite(value)) continue; // drop NaN / ±Infinity
+      out[key] = value;
+      kept++;
+    } else if (typeof value === "boolean" || value === null) {
+      out[key] = value;
+      kept++;
+    }
+    // Everything else (object, array, function, bigint, symbol, undefined) is
+    // intentionally dropped — see guarantee 4.
+  }
+
+  if (kept === 0) return undefined;
+  return Object.freeze(out);
+}
+
 // ── Tx result ─────────────────────────────────────────────────────────────────
 //
 // A discriminated union so callers can pattern-match on `success` and get
 // correct types in each branch — no need to check for optional fields or cast.
 //
-//   const result = await client.join(keypair);
+//   const result = await client.join(keypair, { metadata: { operation: "join" } });
 //   if (result.success) {
-//     console.log(result.txHash, result.ledger);   // ledger is number here
+//     console.log(result.txHash, result.ledger, result.metadata);  // ledger is number here
 //   } else {
 //     console.error(result.errorMessage);          // errorMessage is string here
 //   }
@@ -668,6 +801,13 @@ export interface TxSuccess {
    * {@link decodeAddress}, {@link decodeU32}, {@link decodeBigInt}.
    */
   readonly returnValue?: unknown;
+  /**
+   * Correlation metadata supplied by the caller on the originating write, echoed
+   * back verbatim (after {@link sanitizeTxMetadata}).  `undefined` when the
+   * caller supplied none or nothing survived sanitisation.  Use it to tie this
+   * confirmed `txHash` back to the UI action that produced it.
+   */
+  readonly metadata?: TxMetadata;
 }
 
 /**
@@ -683,6 +823,7 @@ export interface TxSuccess {
  * | `"tx_rejected"` | The transaction was submitted but immediately rejected (`status === "ERROR"`). | Yes, after rebuilding. |
  * | `"tx_failed"` | The transaction was included in a ledger but its status is FAILED. | No — it ran and failed on-chain. |
  * | `"stale_rpc"` | The RPC stopped advancing its ledger while the transaction was pending. | Yes — against a healthy RPC. |
+ * | `"stale_state"` | An opt-in write preflight found the on-chain state had moved past the caller's expected state, so the submission would predictably fail. | No — refresh state and rebuild. |
  * | `"timeout"` | Confirmation polling exceeded the timeout window. | Check the hash before retrying. |
  * | `"unknown"` | An unclassified error (should not normally occur). | Unknown. |
  *
@@ -704,8 +845,32 @@ export type TxErrorCode =
   | "tx_rejected"
   | "tx_failed"
   | "stale_rpc"
+  | "stale_state"
   | "timeout"
   | "unknown";
+
+/**
+ * One field of on-chain state that has diverged from the value a caller
+ * expected, as detected by the opt-in write preflight (issue #347).
+ *
+ * `expected` is what the caller's UI/decision was based on; `actual` is the
+ * freshly-read chain value.  A non-empty list of these is what makes a stale
+ * submission *predictable* — e.g. `{ field: "roundIndex", expected: 2,
+ * actual: 3 }` means the round advanced after the caller loaded the page.
+ */
+export interface StateMismatch {
+  /** Which comparable state field diverged. */
+  readonly field:
+    | "status"
+    | "roundIndex"
+    | "contributionsReceived"
+    | "hasContributed"
+    | "paidOut";
+  /** The value the caller expected (from their snapshot). */
+  readonly expected: string | number | boolean;
+  /** The value freshly read from the chain at preflight time. */
+  readonly actual: string | number | boolean;
+}
 
 /** A transaction that failed to submit, was rejected, or timed out. */
 export interface TxFailure {
@@ -725,6 +890,14 @@ export interface TxFailure {
    * @see {@link TxErrorCode} for the full list of codes and their meanings.
    */
   readonly errorCode: TxErrorCode;
+  /**
+   * Correlation metadata supplied by the caller on the originating write, echoed
+   * back verbatim (after {@link sanitizeTxMetadata}).  Present on failures too,
+   * so a failed attempt — including one that will be retried — can be tied back
+   * to the same UI action as its eventual success.  `undefined` when the caller
+   * supplied none or nothing survived sanitisation.
+   */
+  readonly metadata?: TxMetadata;
 }
 
 /** Discriminated union of all possible transaction outcomes. */
@@ -936,4 +1109,173 @@ export interface ApiMemberContributionsResponse {
 export interface ApiHealthResponse {
   status: "ok";
   timestamp: string;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Indexer read models (issue #342)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Shared, typed views of the indexer REST responses. RPC values and indexer
+// responses diverge in field names, numeric representation, and optionality;
+// these models give consumers one shape per resource that makes explicit the
+// two things raw JSON does not encode:
+//
+//   • Units — every monetary field is in **stroops**, the canonical integer
+//     unit (1 USDC = 10,000,000 stroops = STROOPS_PER_USDC). Amounts are typed
+//     `string` because a pot can exceed Number.MAX_SAFE_INTEGER. Convert to
+//     display units only at render time. No field below is a display-unit number.
+//   • Missing data — every value the indexer can omit or leave unresolved is
+//     explicitly `T | null`, never an implicit `undefined` or a silent `0`.
+//
+// Numeric representation rules applied throughout:
+//   • Monetary amounts (stroops) and on-chain u64 ledger sequences → `string`.
+//   • Counts, round indices and order positions (bounded, small) → `number`.
+//   • Timestamps → ISO-8601 `string`.
+
+/** Lifecycle phase of a single round, as reconciled by the indexer. */
+export type RoundPhase = "completed" | "current" | "cancelled" | "open";
+
+/**
+ * Compact per-circle model for list views (`GET /circles`).
+ */
+export interface CircleSummary {
+  /** Circle contract address (C…). */
+  address: string;
+  /** Address that created the circle. */
+  creator: string;
+  /** Per-round contribution amount, in **stroops** (string). */
+  roundAmount: string;
+  /** Number of member slots configured in the circle. */
+  memberCount: number;
+  /** Circle lifecycle status. */
+  status: CircleStatus;
+  /** 0-based index of the round currently in progress. */
+  currentRound: number;
+  /** Total number of rounds the circle runs (one payout per member). */
+  totalRounds: number;
+  /** Ledger sequence at which the circle was created (u64 → string). */
+  createdLedger: string;
+  /** ISO-8601 timestamp of the most recent indexer update to this circle. */
+  updatedAt: string;
+}
+
+/**
+ * Per-member status within a circle (`GET /circles/:address/members`, and the
+ * `members` array of the circle-detail response).
+ */
+export interface MemberStatus {
+  /** Member account address (G…). */
+  memberAddress: string;
+  /** Member's position in the payout rotation, as recorded by the indexer. */
+  payoutOrder: number;
+  /** Collateral locked by this member, in **stroops** (string). */
+  collateral: string;
+  /** Number of rounds in which this member has defaulted. */
+  defaults: number;
+  /** On-chain reputation score; `null` when the member has no reputation record yet. */
+  reputationScore: number | null;
+  /**
+   * Total contributions this member has made across the circle (string).
+   * `null` when the source view omits it — the circle-detail endpoint does not
+   * include per-member contribution totals.
+   */
+  totalContributions: string | null;
+}
+
+/**
+ * Full per-circle model for detail views (`GET /circles/:address`).
+ * Extends {@link CircleSummary} with the roster, deadline data, and the
+ * indexer's latest processed ledger for staleness checks.
+ */
+export interface CircleDetail extends CircleSummary {
+  /**
+   * Number of ledgers a round stays open for contributions (the deadline
+   * window), u64 → string. `null` for circles indexed before this field was
+   * tracked.
+   */
+  roundDeadlineLedgers: string | null;
+  /**
+   * Absolute ledger sequence by which the current round must be funded.
+   * `null` when there is no active round or the indexer cannot resolve it.
+   */
+  deadlineLedger: number | null;
+  /** Full member roster with per-member status. */
+  members: MemberStatus[];
+  /**
+   * Latest ledger height the indexer has processed, enabling staleness checks.
+   * `null` when the indexer has not recorded any ledger yet.
+   */
+  latestLedger: number | null;
+}
+
+/** A single contribution row nested inside a {@link RoundStatus}. */
+export interface RoundContribution {
+  /** Contributing member (G…). */
+  memberAddress: string;
+  /** Contribution amount, in **stroops** (string). */
+  amount: string;
+  /** Contribution transaction hash. */
+  txHash: string;
+  /** Ledger sequence of the contribution (u64 → string). */
+  ledger: string;
+}
+
+/** A single default row nested inside a {@link RoundStatus}. */
+export interface RoundDefault {
+  /** Defaulting member (G…). */
+  memberAddress: string;
+  /** Penalty applied for the default, in **stroops** (string). */
+  penalty: string;
+  /** Default-record transaction hash. */
+  txHash: string;
+  /** Ledger sequence of the default record (u64 → string). */
+  ledger: string;
+}
+
+/**
+ * Reconciled status of a single round (`GET /circles/:address/rounds`).
+ * The payout fields are all populated together once the round completes and
+ * are `null` beforehand.
+ */
+export interface RoundStatus {
+  /** 0-based round index. */
+  roundIndex: number;
+  /** Lifecycle phase of this round. */
+  status: RoundPhase;
+  /** Payout recipient (G…); `null` until the round is paid out. */
+  recipient: string | null;
+  /** Payout amount, in **stroops** (string); `null` until the round is paid out. */
+  amount: string | null;
+  /** Payout transaction hash; `null` until the round is paid out. */
+  txHash: string | null;
+  /** Ledger sequence of the payout (u64 → string); `null` until paid out. */
+  ledger: string | null;
+  /** Contributions recorded for this round. */
+  contributions: RoundContribution[];
+  /** Defaults recorded for this round. */
+  defaults: RoundDefault[];
+}
+
+/** A single settled payout inside a {@link PayoutHistory}. */
+export interface PayoutRecord {
+  /** 0-based index of the round this payout settled. */
+  roundIndex: number;
+  /** Payout recipient (G…). */
+  recipient: string;
+  /** Payout amount, in **stroops** (string). */
+  amount: string;
+  /** Payout transaction hash. */
+  txHash: string;
+  /** Ledger sequence of the payout (u64 → string). */
+  ledger: string;
+  /** ISO-8601 timestamp of the payout. */
+  settledAt: string;
+}
+
+/** Chronological payout history for a circle, one entry per completed round. */
+export interface PayoutHistory {
+  /** Circle these payouts belong to (C…). */
+  circleAddress: string;
+  /** Payout records, oldest-first by round index. */
+  payouts: PayoutRecord[];
 }
