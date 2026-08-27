@@ -9,22 +9,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- `sdk/src/gating.ts` — new `default` action in `computeActionEligibility`,
-  gating the `mark_default` write. It layers a fresh-snapshot check, `Active`
-  status, active-round, membership, and not-already-contributed guards on top of
-  a **fail-closed** deadline check: unlike `contribute` (which fails *open* on
-  unknown ledger data so an honest member is never blocked), `default` requires
-  positive proof the round deadline has passed before allowing the punitive
-  write. Adds the `deadline_not_passed` block reason
-- `app/src/lib/gating.ts` — mirrors the SDK `default` action for the app gating
-  layer, adapted to `AppStateSnapshot` (kept in sync manually; the app does not
-  depend on `@circleup/sdk`)
-- `sdk/src/__tests__/actionGating.test.ts` — coverage for the `default` action:
-  deadline boundary (blocked at exactly `deadlineLedger`), fail-closed on unknown
-  ledger, membership, status, already-contributed, and stale-snapshot cases
-- `app/src/lib/gating.mutation.test.ts` — mutation-guard coverage for the app
-  `default` action, including the contribute-vs-default deadline asymmetry
-  (at exactly the deadline: `contribute` allowed, `default` blocked)
+- `sdk/src/index.ts` — documented the public API surface at the package entry
+  point: a grouped map (clients, errors, config & types, gating, utilities,
+  constants, low-level encoders) states that the package root is the only
+  supported import path and that deep paths / test modules carry no stability
+  guarantee. Re-export order is annotated so each symbol has one canonical source
+- `sdk/examples/public-api.ts` — side-effect-free fixture that imports every
+  documented symbol from the package root (no deep or `../src` paths) and is
+  type-checked by `sdk/examples/tsconfig.json`, so the public contract stays
+  reachable-from-root and cannot silently regress
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
@@ -60,8 +53,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
+- `sdk/src/utils.ts` — `usdcToStroops` now routes both `string` and `number`
+  input through one exact string-parsing path that expands JavaScript exponent
+  notation (`1e-7`, `1e+21`) losslessly and counts only *significant* decimals.
+  Valid small/large numeric amounts such as `0.0000001` now convert exactly
+  instead of throwing, while `> 7`-decimal precision, negatives, non-finite
+  numbers, and malformed exponents are rejected with specific messages. Also
+  documented USDC units/precision and that `formatUsdc` truncates (never rounds
+  up) so a displayed amount can never overstate the true balance
 
 ### Fixed
+- `app/src/lib/config.ts` — `usdcToStroops` silently discarded any digits beyond
+  7 decimal places (`frac.padEnd(7, "0").slice(0, 7)`), so an over-precise amount
+  was signed for a *different* value than the user entered. It now rejects excess
+  precision (and handles exponent notation) identically to the SDK. Realigned the
+  other money helpers with `sdk/src/utils.ts` too: added the missing negative /
+  `NaN` guards to `stroopsToUsdc` and `formatUsdc`, and the non-integer / negative
+  member-count guard to `formatPot` (a fractional count previously made
+  `BigInt(memberCount)` throw)
 - SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with
   `this.source.sequenceNumber is not a function`. The read path built its
   transaction from an account stub that was missing that method, and it always

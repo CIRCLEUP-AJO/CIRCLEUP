@@ -81,10 +81,8 @@ export function ReputationBadge({ score, size = "md" }: ReputationBadgeProps) {
 
   return (
     <span
+      role="img"
       className={`inline-flex items-center gap-1 rounded-full font-medium ${level.color} ${sizeClass}`}
-      // Provide a meaningful accessible label so screen readers announce
-      // "Reputation: Legend, score 12" instead of reading the emoji and
-      // label text literally as separate tokens.
       aria-label={`Reputation level: ${level.label}, score ${score}`}
       title={`${level.label} — ${level.description}`}
     >

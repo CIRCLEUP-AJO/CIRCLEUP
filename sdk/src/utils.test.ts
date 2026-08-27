@@ -38,7 +38,109 @@ describe("usdcToStroops", () => {
     expect(() => usdcToStroops("1.12345678")).toThrow(TypeError);
     expect(() => usdcToStroops("0.00000001")).toThrow(TypeError);
   });
+
+  it("treats insignificant trailing zeros as exact, not excess precision", () => {
+    // 7 significant digits written with extra trailing zeros / padding.
+    expect(usdcToStroops("1.5000000")).toBe(15_000_000n);
+    expect(usdcToStroops("10.00")).toBe(100_000_000n);
+    expect(usdcToStroops("0.0100000")).toBe(100_000n);
+    // 8 characters after the point, but the last is a value-less zero → 7 sig.
+    expect(usdcToStroops("1.12345670")).toBe(11_234_567n);
+  });
+
+  it("handles every spelling of zero", () => {
+    expect(usdcToStroops(0)).toBe(0n);
+    expect(usdcToStroops("0")).toBe(0n);
+    expect(usdcToStroops("0.0")).toBe(0n);
+    expect(usdcToStroops("0.0000000")).toBe(0n);
+    expect(usdcToStroops("0e0")).toBe(0n);
+  });
+
+  it("accepts fractional numbers that JS renders in exponent notation", () => {
+    // String(0.0000001) === "1e-7" — the old String(usdc) path rejected this
+    // valid one-stroop amount outright.
+    expect(usdcToStroops(0.0000001)).toBe(1n);
+    expect(usdcToStroops(0.5)).toBe(5_000_000n);
+  });
+
+  it("rejects non-finite numbers explicitly", () => {
+    expect(() => usdcToStroops(NaN)).toThrow(TypeError);
+    expect(() => usdcToStroops(Infinity)).toThrow(TypeError);
+    expect(() => usdcToStroops(-Infinity)).toThrow(TypeError);
+  });
+
+  it("rejects empty / whitespace-only input", () => {
+    expect(() => usdcToStroops("")).toThrow(TypeError);
+    expect(() => usdcToStroops("   ")).toThrow(TypeError);
+  });
+
+  it("rejects negative numbers as well as negative strings", () => {
+    expect(() => usdcToStroops(-1)).toThrow(TypeError);
+    expect(() => usdcToStroops(-0.5)).toThrow(TypeError);
+    expect(() => usdcToStroops(-0.0000001)).toThrow(TypeError); // String() → "-1e-7"
+  });
 });
+
+// ─── usdcToStroops — exponent notation ─────────────────────────────────────────
+
+describe("usdcToStroops (exponent notation)", () => {
+  it("expands negative exponents losslessly", () => {
+    expect(usdcToStroops("1e-7")).toBe(1n);
+    expect(usdcToStroops("1E-7")).toBe(1n); // case-insensitive
+    expect(usdcToStroops("5e-1")).toBe(5_000_000n);
+    expect(usdcToStroops("1.5e-1")).toBe(1_500_000n);
+  });
+
+  it("expands positive exponents losslessly", () => {
+    expect(usdcToStroops("1.5e3")).toBe(15_000_000_000n);
+    expect(usdcToStroops("1e+21")).toBe(10n ** 28n);
+    expect(usdcToStroops(1e21)).toBe(10n ** 28n); // number → "1e+21"
+  });
+
+  it("still enforces the 7-decimal limit after expansion", () => {
+    // 1e-8 → "0.00000001" → 8 decimal places.
+    expect(() => usdcToStroops("1e-8")).toThrow(TypeError);
+    expect(() => usdcToStroops(1e-8)).toThrow(TypeError);
+    expect(() => usdcToStroops("1.5e-7")).toThrow(TypeError); // → "0.00000015"
+  });
+
+  it("rejects malformed exponent notation with a clear error", () => {
+    expect(() => usdcToStroops("1e")).toThrow(TypeError);
+    expect(() => usdcToStroops("1e2e3")).toThrow(TypeError);
+    expect(() => usdcToStroops("e5")).toThrow(TypeError);
+    expect(() => usdcToStroops("1.2e")).toThrow(TypeError);
+  });
+});
+
+// ─── usdcToStroops — large values ──────────────────────────────────────────────
+
+describe("usdcToStroops (large values)", () => {
+  it("converts large plain-decimal strings without loss", () => {
+    expect(usdcToStroops("1000000000000")).toBe(10n ** 19n); // 1e12 USDC
+    expect(usdcToStroops("999999999999.9999999")).toBe(9_999_999_999_999_999_999n);
+  });
+});
+
+// ─── round trips ───────────────────────────────────────────────────────────────
+
+describe("usdcToStroops ∘ stroopsToUsdc round trips", () => {
+  it("recovers the original stroops for every representative value", () => {
+    const values = [
+      0n,
+      1n,
+      100_000n,
+      15_000_000n,
+      100_000_000n,
+      123_456_789n,
+      10_000_000_000n,
+      10n ** 19n,
+    ];
+    for (const v of values) {
+      expect(usdcToStroops(stroopsToUsdc(v))).toBe(v);
+    }
+  });
+});
+
 
 // ─── stroopsToUsdc ────────────────────────────────────────────────────────────
 
