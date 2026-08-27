@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Versioned performance budgets for CircleUp. Update only with measurement evidence.",
+  "version": "1.0.0",
+  "updatedAt": "2026-08-26",
+
+  "api": {
+    "$comment": "Indexer query and response budgets measured against the fixture dataset (50 circles, 10 members each)",
+    "circleList": {
+      "queryMs": 50,
+      "$comment": "Max DB query time for GET /circles with 50 rows",
+      "payloadKb": 32,
+      "$comment": "Max JSON response size for 50 circles"
+    },
+    "circleListEmpty": {
+      "queryMs": 20,
+      "payloadKb": 1
+    },
+    "circleDetail": {
+      "queryMs": 30,
+      "payloadKb": 8
+    },
+    "memberContributions": {
+      "queryMs": 30,
+      "payloadKb": 16
+    }
+  },
+
+  "bundle": {
+    "$comment": "Next.js page JS budgets (gzipped). Measured with `next build` output. Exceptions documented below.",
+    "homePage": {
+      "firstLoadKb": 120,
+      "$comment": "Includes React runtime and shared chunks"
+    },
+    "createPage": {
+      "firstLoadKb": 140,
+      "$comment": "stellar-sdk adds ~15 KB gzipped; exception granted until tree-shaking is implemented"
+    },
+    "circleDetailPage": {
+      "firstLoadKb": 130
+    },
+    "reputationPage": {
+      "firstLoadKb": 120
+    },
+    "sharedChunksKb": 90,
+    "$exception": {
+      "stellar-sdk": "stellar-sdk cannot be tree-shaken without bundler config changes; tracked in issue #todo"
+    }
+  },
+
+  "render": {
+    "$comment": "Component render time budgets in ms measured in jsdom (vitest). These are ceiling values, not targets.",
+    "circleCardMs": 10,
+    "reputationBadgeMs": 5,
+    "circleListSkeleton6CardsMs": 20
+  },
+
+  "payload": {
+    "$comment": "Wire payload size budgets (uncompressed) for the initial circle list in different states",
+    "emptyListBytes": 50,
+    "populatedList50CirclesKb": 40,
+    "populatedList10CirclesKb": 10
+  }
+}

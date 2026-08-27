@@ -640,14 +640,147 @@ export function isSimulateFailure(r: SimulateResult): r is SimulateFailure {
   return r.ok === false;
 }
 
+// ─── Transaction correlation metadata ─────────────────────────────────────────
+//
+// Caller-supplied observability data that ties a UI action (a button click, an
+// HTTP request id, a background-job step) to the on-chain transaction it
+// produced.  The SDK echoes it back on every {@link TxResult} and includes it
+// in structured tx log events, so a confirmed hash — or a failure — can always
+// be traced back to the intent that created it.
+//
+// ── Correlation is NOT deduplication ──
+//
+// This metadata is for *tracing*, never for *idempotency*.  It has no effect on
+// whether a transaction is submitted, retried, or accepted:
+//
+//   • Deduplication is the network's job.  A transaction is uniquely identified
+//     by its source account + sequence number; resubmitting the same signed
+//     transaction yields the RPC status `DUPLICATE`, and the SDK simply keeps
+//     polling the existing hash (see `buildAndSend`).  Attaching the same
+//     correlation metadata to two calls does **not** make them the same
+//     transaction, and attaching different metadata to a retry does **not**
+//     make it a new one.
+//
+//   • Correlation is the caller's label.  Reusing an `operation` id across a
+//     retry is exactly how you follow one logical action through several
+//     submission attempts; the SDK preserves it verbatim on each attempt's
+//     result so the attempts can be grouped in a log aggregator.
+//
+// If you need an idempotency key, derive it from the transaction itself (source
+// + sequence), not from this field.
+
+/**
+ * A single JSON-serialisable scalar permitted as a correlation metadata value.
+ *
+ * Values are restricted to scalars so metadata is always safe to serialise into
+ * a log line or a JSON result without depth/cycle concerns, and so a caller
+ * cannot accidentally stuff a signed transaction object or a Keypair into it.
+ */
+export type TxMetadataValue = string | number | boolean | null;
+
+/**
+ * Caller-supplied correlation metadata for a write operation.
+ *
+ * A flat bag of scalar identifiers — e.g.
+ * `{ operation: "join-circle", uiRequestId: "req_8a1f", attempt: 1 }`.
+ *
+ * Passed via the `metadata` option on any mutation (`join`, `contribute`,
+ * `payout`, `markDefault`, `close`, `createCircle`) and returned unchanged on
+ * the resulting {@link TxResult} — see the section comment above for how this
+ * differs from deduplication.
+ *
+ * The SDK runs every value through {@link sanitizeTxMetadata} before it is
+ * attached to a result or emitted in a log, so secrets and signed payloads are
+ * stripped even if a caller passes them by mistake.
+ */
+export interface TxMetadata {
+  readonly [key: string]: TxMetadataValue;
+}
+
+/** Maximum number of keys retained by {@link sanitizeTxMetadata}. */
+const MAX_METADATA_KEYS = 32;
+
+/**
+ * Maximum length of a string metadata value.  Anything longer is dropped as a
+ * likely signed-XDR / base64 payload rather than a correlation id.
+ */
+const MAX_METADATA_STRING_LENGTH = 512;
+
+/**
+ * A Stellar *secret* seed strkey: 56 chars starting with `S`.  A value matching
+ * this is a private key and must never be echoed back or logged, regardless of
+ * the key it was stored under.
+ */
+const STELLAR_SECRET_SEED_RE = /^S[A-Z2-7]{55}$/;
+
+/**
+ * Key names that indicate a secret or a signed payload.  Matched
+ * case-insensitively as a substring so `signedXdr`, `sourceSecret`,
+ * `api_key`, etc. are all caught.
+ */
+const SECRET_KEY_RE =
+  /secret|seed|private|mnemonic|passphrase|password|signed|signature|xdr|api[_-]?key/i;
+
+/**
+ * Sanitise caller-supplied correlation metadata into a safe, log-ready shape.
+ *
+ * Guarantees (this is a security boundary — see {@link TxMetadata}):
+ *   1. **No secrets by key name** — any key matching {@link SECRET_KEY_RE}
+ *      (`secret`, `seed`, `private`, `signed`, `xdr`, `apiKey`, …) is dropped.
+ *   2. **No secrets by value** — any string matching a Stellar secret seed
+ *      (`S…`, 56 chars) is dropped even under an innocuous key.
+ *   3. **No payloads** — strings longer than
+ *      {@link MAX_METADATA_STRING_LENGTH} (likely signed XDR) are dropped.
+ *   4. **Scalars only** — objects, arrays, functions, `bigint`, `symbol`, and
+ *      `undefined` values are dropped, so a signed transaction object cannot be
+ *      smuggled through.
+ *   5. **Bounded** — at most {@link MAX_METADATA_KEYS} keys are retained.
+ *
+ * The input is never mutated.  Returns a frozen object, or `undefined` when the
+ * input is not a plain object or nothing survives sanitisation (so an empty
+ * `{}` is never attached to a result).
+ */
+export function sanitizeTxMetadata(input: unknown): TxMetadata | undefined {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return undefined;
+  }
+
+  const out: Record<string, TxMetadataValue> = {};
+  let kept = 0;
+
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (kept >= MAX_METADATA_KEYS) break;
+    if (SECRET_KEY_RE.test(key)) continue;
+
+    if (typeof value === "string") {
+      if (value.length > MAX_METADATA_STRING_LENGTH) continue;
+      if (STELLAR_SECRET_SEED_RE.test(value)) continue;
+      out[key] = value;
+      kept++;
+    } else if (typeof value === "number") {
+      if (!Number.isFinite(value)) continue; // drop NaN / ±Infinity
+      out[key] = value;
+      kept++;
+    } else if (typeof value === "boolean" || value === null) {
+      out[key] = value;
+      kept++;
+    }
+    // Everything else (object, array, function, bigint, symbol, undefined) is
+    // intentionally dropped — see guarantee 4.
+  }
+
+  if (kept === 0) return undefined;
+  return Object.freeze(out);
+}
+
 // ── Tx result ─────────────────────────────────────────────────────────────────
 //
 // A discriminated union so callers can pattern-match on `success` and get
 // correct types in each branch — no need to check for optional fields or cast.
 //
-//   const result = await client.join(keypair);
+//   const result = await client.join(keypair, { metadata: { operation: "join" } });
 //   if (result.success) {
-//     console.log(result.txHash, result.ledger);   // ledger is number here
+//     console.log(result.txHash, result.ledger, result.metadata);  // ledger is number here
 //   } else {
 //     console.error(result.errorMessage);          // errorMessage is string here
 //   }
@@ -668,6 +801,13 @@ export interface TxSuccess {
    * {@link decodeAddress}, {@link decodeU32}, {@link decodeBigInt}.
    */
   readonly returnValue?: unknown;
+  /**
+   * Correlation metadata supplied by the caller on the originating write, echoed
+   * back verbatim (after {@link sanitizeTxMetadata}).  `undefined` when the
+   * caller supplied none or nothing survived sanitisation.  Use it to tie this
+   * confirmed `txHash` back to the UI action that produced it.
+   */
+  readonly metadata?: TxMetadata;
 }
 
 /**
@@ -725,6 +865,14 @@ export interface TxFailure {
    * @see {@link TxErrorCode} for the full list of codes and their meanings.
    */
   readonly errorCode: TxErrorCode;
+  /**
+   * Correlation metadata supplied by the caller on the originating write, echoed
+   * back verbatim (after {@link sanitizeTxMetadata}).  Present on failures too,
+   * so a failed attempt — including one that will be retried — can be tied back
+   * to the same UI action as its eventual success.  `undefined` when the caller
+   * supplied none or nothing survived sanitisation.
+   */
+  readonly metadata?: TxMetadata;
 }
 
 /** Discriminated union of all possible transaction outcomes. */
