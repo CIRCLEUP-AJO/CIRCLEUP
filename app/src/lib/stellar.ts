@@ -22,6 +22,11 @@ import {
 } from "@stellar/freighter-api";
 import { STELLAR_RPC_URL, NETWORK_PASSPHRASE, REPUTATION_ADDRESS } from "./config";
 import { startTx, emit, categorizeError } from "./telemetry";
+import {
+  parseContractError,
+  userMessageForError,
+  type ContractAppError,
+} from "./contractErrors";
 
 // ─── Freighter detection & error types ───────────────────────────────────────
 
@@ -200,12 +205,26 @@ export function formatContractError(raw: string | undefined): string {
 
 // ─── Generic contract call (signed by Freighter) ─────────────────────────────
 
+/**
+ * Result of a contract invocation.  The `typedError` field carries a
+ * {@link ContractAppError} on every failure path so callers can branch on
+ * stable codes rather than message strings.
+ */
+export interface InvokeResult {
+  txHash: string;
+  success: boolean;
+  /** User-facing formatted message (legacy — prefer `typedError.message`). */
+  error?: string;
+  /** Typed, categorised error for deterministic branching. Only set on failure. */
+  typedError?: ContractAppError;
+}
+
 export async function invokeContract(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
   walletAddress: string,
-): Promise<{ txHash: string; success: boolean; error?: string }> {
+): Promise<InvokeResult> {
   const rpc = getRpc();
 
   // ── Telemetry: started ───────────────────────────────────────────────────
@@ -223,14 +242,13 @@ export async function invokeContract(
     const isNetwork =
       msg.toLowerCase().includes("network") || msg.toLowerCase().includes("fetch");
     emit(txCtx, "failed", categorizeError(isNetwork ? "network" : msg));
-    if (isNetwork) {
-      return {
-        txHash: "",
-        success: false,
-        error: formatContractError("network error"),
-      };
-    }
-    return { txHash: "", success: false, error: formatContractError(msg) };
+    const typedError = parseContractError(isNetwork ? "network error" : msg);
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   const contract = new Contract(contractId);
@@ -248,11 +266,14 @@ export async function invokeContract(
   const simResult = await rpc.simulateTransaction(tx);
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
-    // Emit simulate_failed with a category derived from the error type, but
-    // never forward the raw simResult.error string (may contain contract
-    // panic messages that echo argument values).
     emit(txCtx, "simulate_failed", categorizeError(simResult.error));
-    return { txHash: "", success: false, error: formatContractError(simResult.error) };
+    const typedError = parseContractError(simResult.error);
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   // ── Telemetry: simulated ─────────────────────────────────────────────────
@@ -277,21 +298,34 @@ export async function invokeContract(
       lower.includes("cancelled") ||
       lower.includes("canceled")
     ) {
-      // ── Telemetry: wallet_rejected ───────────────────────────────────────
       emit(txCtx, "wallet_rejected", "wallet_denied");
+      const typedError = parseContractError(msg || "User rejected");
       return {
         txHash: "",
         success: false,
-        error: "You cancelled the transaction in Freighter. No funds were moved.",
+        error: userMessageForError(typedError),
+        typedError,
       };
     }
+    const typedError = parseContractError(msg || "User rejected");
     emit(txCtx, "failed", categorizeError(msg || "User rejected"));
-    return { txHash: "", success: false, error: formatContractError(msg || "User rejected") };
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   if (!signedXdr) {
+    const typedError = parseContractError("Freighter did not return a signed transaction.");
     emit(txCtx, "failed", "unknown");
-    return { txHash: "", success: false, error: "Freighter did not return a signed transaction." };
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
   }
 
   // ── Submission ───────────────────────────────────────────────────────────
@@ -301,23 +335,25 @@ export async function invokeContract(
       TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
     );
   } catch (err: any) {
+    const typedError = parseContractError(err?.message ?? "network error");
     emit(txCtx, "failed", categorizeError(err?.message ?? "network error"));
     return {
       txHash: "",
       success: false,
-      error: formatContractError(err?.message ?? "network error"),
+      error: userMessageForError(typedError),
+      typedError,
     };
   }
 
   if (sendResult.status === "ERROR") {
-    // ── Telemetry: submission_failed ─────────────────────────────────────
-    // The hash is available at this point; it is included in the return value
-    // for the user but never forwarded to telemetry.
+    const rawErr = JSON.stringify(sendResult.errorResult);
+    const typedError = parseContractError(rawErr);
     emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
       success: false,
-      error: formatContractError(JSON.stringify(sendResult.errorResult)),
+      error: userMessageForError(typedError),
+      typedError,
     };
   }
 
@@ -346,19 +382,25 @@ export async function invokeContract(
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      // ── Telemetry: failed ──────────────────────────────────────────────
+      const typedError = parseContractError("transaction failed");
       emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
         success: false,
-        error: formatContractError("transaction failed"),
+        error: userMessageForError(typedError),
+        typedError,
       };
     }
   }
 
-  // ── Telemetry: timed_out ─────────────────────────────────────────────────
+  const timedOutError = parseContractError("timeout");
   emit(txCtx, "timed_out", "timeout");
-  return { txHash: hash, success: false, error: formatContractError("timeout") };
+  return {
+    txHash: hash,
+    success: false,
+    error: userMessageForError(timedOutError),
+    typedError: timedOutError,
+  };
 }
 
 // ─── Read-only simulation ─────────────────────────────────────────────────────
