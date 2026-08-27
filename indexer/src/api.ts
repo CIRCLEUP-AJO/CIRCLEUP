@@ -22,6 +22,36 @@ import { runAllHealthChecks } from "./health";
 import { redactAddress } from "./redact";
 import type { MigrationHealth } from "./db/migrate";
 
+// ── Address validation ────────────────────────────────────────────────────────
+//
+// Stellar has two address namespaces:
+//   G-prefix (56 base32 chars) — ed25519 public key (wallet / member address)
+//   C-prefix (56 base32 chars) — Soroban contract ID (circle / factory / token)
+//
+// These regexes are intentionally inlined here so the indexer has no
+// dependency on the app package's address module.
+const STELLAR_PUBLIC_KEY_RE = /^G[A-Z2-7]{55}$/;
+const SOROBAN_CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/** Returns true for a valid Stellar ed25519 public key (G-prefix, 56 chars). */
+function isStellarPublicKey(addr: string): boolean {
+  return STELLAR_PUBLIC_KEY_RE.test(addr);
+}
+
+/** Returns true for a valid Soroban contract ID (C-prefix, 56 chars). */
+function isSorobanContractId(addr: string): boolean {
+  return SOROBAN_CONTRACT_ID_RE.test(addr);
+}
+
+/**
+ * Returns true for any valid canonical Stellar address — either a public key
+ * or a Soroban contract ID.  Route params that may legitimately be either type
+ * (e.g. `:member`, `:address`) should be validated with this function.
+ */
+function isCanonicalStellarAddress(addr: string): boolean {
+  return isStellarPublicKey(addr) || isSorobanContractId(addr);
+}
+
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
 // ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
@@ -302,6 +332,35 @@ function nonBlankParam(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
+/**
+ * Validates and returns a canonical Stellar address from a route parameter.
+ *
+ * Returns `{ value }` on success, or `{ error }` with a 400-ready message when
+ * the param is missing, blank, or not a valid G-key / C-contract ID.  Using a
+ * discriminated union keeps call-sites explicit about which branch they are in.
+ *
+ * Circle addresses are always C-prefixed contract IDs; member / wallet
+ * addresses are always G-prefixed public keys.  Both pass this check so the
+ * API remains forward-compatible with contract-based multisig members.
+ */
+function stellarAddressParam(
+  value: string | undefined,
+  label: string,
+): { value: string } | { error: string } {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return { error: `${label} is required` };
+  }
+  if (!isCanonicalStellarAddress(trimmed)) {
+    return {
+      error:
+        `${label} must be a valid Stellar address ` +
+        `(G-prefixed public key or C-prefixed contract ID, 56 base32 characters each)`,
+    };
+  }
+  return { value: trimmed };
+}
+
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
   app.use(cors(buildCorsOptions()));
@@ -447,11 +506,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address", async (req: Request, res: Response) => {
-    const address = nonBlankParam(req.params.address);
-    if (!address) {
-      res.status(400).json({ error: "Circle address is required" });
+    const addrResult = stellarAddressParam(req.params.address, "Circle address");
+    if ("error" in addrResult) {
+      res.status(400).json({ error: addrResult.error });
       return;
     }
+    const address = addrResult.value;
     try {
       const [circle] = await query<CircleRow>(
         `SELECT * FROM circles WHERE address = $1`,
@@ -513,11 +573,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address/members", async (req: Request, res: Response) => {
-    const address = nonBlankParam(req.params.address);
-    if (!address) {
-      res.status(400).json({ error: "Circle address is required" });
+    const addrResult = stellarAddressParam(req.params.address, "Circle address");
+    if ("error" in addrResult) {
+      res.status(400).json({ error: addrResult.error });
       return;
     }
+    const address = addrResult.value;
     try {
       const [circle] = await query<Pick<CircleRow, "address">>(
         `SELECT address FROM circles WHERE address = $1`,
@@ -578,11 +639,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address/rounds", async (req: Request, res: Response) => {
-    const address = nonBlankParam(req.params.address);
-    if (!address) {
-      res.status(400).json({ error: "Circle address is required" });
+    const addrResult = stellarAddressParam(req.params.address, "Circle address");
+    if ("error" in addrResult) {
+      res.status(400).json({ error: addrResult.error });
       return;
     }
+    const address = addrResult.value;
     try {
       const [circle] = await query<
         Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status">
@@ -644,11 +706,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // the filter itself is invalid rather than a silently empty result.
 
   app.get("/members/:member/contributions", async (req: Request, res: Response) => {
-    const member = nonBlankParam(req.params.member);
-    if (!member) {
-      res.status(400).json({ error: "Member address is required" });
+    const memberResult = stellarAddressParam(req.params.member, "Member address");
+    if ("error" in memberResult) {
+      res.status(400).json({ error: memberResult.error });
       return;
     }
+    const member = memberResult.value;
 
     const pageResult = parsePage(req.query.page);
     const limitResult = parseLimit(req.query.limit);
@@ -733,11 +796,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // ── Reputation ───────────────────────────────────────────────────────────────
 
   app.get("/reputation/:member", async (req: Request, res: Response) => {
-    const member = nonBlankParam(req.params.member);
-    if (!member) {
-      res.status(400).json({ error: "Member address is required" });
+    const memberResult = stellarAddressParam(req.params.member, "Member address");
+    if ("error" in memberResult) {
+      res.status(400).json({ error: memberResult.error });
       return;
     }
+    const member = memberResult.value;
 
     // Optional ?circle=<address> narrows the contributions/defaults
     // breakdown to a single circle, e.g. for a member-in-circle detail view
