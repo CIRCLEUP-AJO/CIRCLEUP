@@ -1,0 +1,16 @@
+# Pin the Rust toolchain used to build Soroban contracts.
+#
+# All contributors and CI must build with this exact toolchain so that
+# compiled WASM artifacts are byte-for-byte identical across machines
+# (build reproducibility, issue #396).
+#
+# To update:
+#   1. Change the channel below.
+#   2. Rebuild all contracts: cargo build --release --target wasm32-unknown-unknown
+#   3. Re-run scripts/src/check-artifact-hashes.ts to update expected-hashes.json
+#   4. Commit rust-toolchain.toml + expected-hashes.json together.
+
+[toolchain]
+channel  = "1.81.0"
+targets  = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]
