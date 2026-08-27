@@ -328,3 +328,459 @@ Web App Development — 225-Item TODO Checklist
 - [ ] 223. Review the complete application.
 - [ ] 224. Deploy the application.
 - [ ] 225. Monitor the production application.
+TODO — Harden Indexer Replay Validation
+
+Description: Replay is a recovery tool and must not mutate the wrong network or process an unbounded range by mistake. Dry-run scope must be obvious.
+
+1. Review Existing Implementation
+
+[ ] Open indexer/src/db/replay.ts.
+
+[ ] Identify command-line argument parsing.
+
+[ ] Identify network/environment selection.
+
+[ ] Identify replay range parsing.
+
+[ ] Identify batch-size handling.
+
+[ ] Identify mutation/write behavior.
+
+[ ] Identify existing dry-run behavior.
+
+[ ] Identify resume/checkpoint behavior.
+
+[ ] Review existing replay tests.
+
+[ ] Review database projection write functions.
+
+[ ] Review indexer network configuration.
+
+[ ] Confirm how replay identifies the target network.
+
+[ ] Confirm how replay determines the start position.
+
+[ ] Confirm how replay determines the end position.
+
+[ ] Confirm whether omitted arguments currently have defaults.
+
+[ ] Identify any potentially unsafe defaults.
+
+
+2. Network Validation
+
+[ ] Require an explicit network for replay.
+
+[ ] Validate network against the supported network list.
+
+[ ] Reject unknown network names.
+
+[ ] Reject empty network values.
+
+[ ] Reject network values containing unexpected characters.
+
+[ ] Ensure network selection cannot fall back silently.
+
+[ ] Ensure replay cannot accidentally use production configuration.
+
+[ ] Verify database connection matches the selected network.
+
+[ ] Ensure network is included in the printed replay scope.
+
+[ ] Add tests for invalid network names.
+
+[ ] Add tests for missing network.
+
+[ ] Add tests for valid network selection.
+
+[ ] Add tests ensuring another network is never touched.
+
+
+3. Range Validation
+
+[ ] Require an explicit replay range.
+
+[ ] Validate the range start.
+
+[ ] Validate the range end.
+
+[ ] Reject non-numeric values.
+
+[ ] Reject negative values where unsupported.
+
+[ ] Reject NaN.
+
+[ ] Reject infinite values.
+
+[ ] Reject fractional values if ranges require integers.
+
+[ ] Reject start > end.
+
+[ ] Decide and document whether start === end is valid.
+
+[ ] Reject an empty range when it is ambiguous.
+
+[ ] Reject unbounded start values.
+
+[ ] Reject unbounded end values.
+
+[ ] Prevent accidental full-history replay.
+
+[ ] Add a maximum allowed range size.
+
+[ ] Make the maximum range configurable if appropriate.
+
+[ ] Print the exact start and end values before execution.
+
+
+4. Batch Size Validation
+
+[ ] Require a positive batch size.
+
+[ ] Reject zero.
+
+[ ] Reject negative batch sizes.
+
+[ ] Reject non-numeric batch sizes.
+
+[ ] Reject fractional batch sizes.
+
+[ ] Reject NaN.
+
+[ ] Reject infinite values.
+
+[ ] Add a safe maximum batch size.
+
+[ ] Prevent extremely large batches from exhausting memory.
+
+[ ] Print the selected batch size in the replay scope.
+
+[ ] Test minimum valid batch size.
+
+[ ] Test maximum valid batch size.
+
+[ ] Test values above the maximum.
+
+[ ] Test invalid batch-size input.
+
+
+5. Explicit Mutation Mode
+
+[ ] Make dry-run the default behavior.
+
+[ ] Require an explicit write flag for mutations.
+
+[ ] Use an unambiguous flag such as --write.
+
+[ ] Reject ambiguous mutation arguments.
+
+[ ] Ensure --dry-run never enables writes.
+
+[ ] Ensure --write is required before projection mutation.
+
+[ ] Do not infer write mode from environment.
+
+[ ] Do not infer write mode from network.
+
+[ ] Print DRY RUN prominently when write mode is disabled.
+
+[ ] Print WRITE MODE prominently when mutation is enabled.
+
+[ ] Include a clear warning before writes begin.
+
+[ ] Ensure dry-run exits without database mutation.
+
+
+6. Scope Output
+
+[ ] Print the selected network.
+
+[ ] Print replay start.
+
+[ ] Print replay end.
+
+[ ] Print total range size.
+
+[ ] Print batch size.
+
+[ ] Print mutation mode.
+
+[ ] Print resume/checkpoint state.
+
+[ ] Print target projection/database context where safe.
+
+[ ] Make dry-run status visually obvious.
+
+[ ] Ensure secrets are never printed.
+
+[ ] Ensure database credentials are never printed.
+
+[ ] Ensure connection strings are never printed.
+
+[ ] Require validation to complete before replay starts.
+
+[ ] Do not partially execute before printing the final scope.
+
+
+7. Malformed Command Protection
+
+[ ] Reject unknown command-line options.
+
+[ ] Reject duplicate conflicting flags.
+
+[ ] Reject missing required values.
+
+[ ] Reject unexpected positional arguments.
+
+[ ] Reject conflicting --dry-run/--write combinations.
+
+[ ] Reject malformed ranges.
+
+[ ] Reject malformed network names.
+
+[ ] Reject malformed batch sizes.
+
+[ ] Return a non-zero exit code on validation failure.
+
+[ ] Ensure validation failure performs zero writes.
+
+[ ] Ensure validation errors do not partially initialize replay.
+
+[ ] Add regression tests for every rejected input.
+
+
+8. Replay Execution
+
+[ ] Keep replay processing bounded by the validated range.
+
+[ ] Process records in deterministic order.
+
+[ ] Use the validated batch size.
+
+[ ] Never silently expand the requested range.
+
+[ ] Ensure each batch stays inside the requested range.
+
+[ ] Ensure the final batch can be smaller than the configured size.
+
+[ ] Stop exactly at the requested end.
+
+[ ] Preserve existing projection semantics.
+
+[ ] Avoid changing unrelated indexer behavior.
+
+[ ] Keep dry-run execution path separate from mutation path.
+
+[ ] Ensure dry-run still reports what would be processed.
+
+
+9. Resumable Batches
+
+[ ] Review existing checkpoint/resume logic.
+
+[ ] Ensure checkpoints are scoped to the selected network.
+
+[ ] Ensure checkpoints are scoped to the replay range.
+
+[ ] Ensure checkpoints are scoped to the relevant projection if necessary.
+
+[ ] Prevent a checkpoint from another network being reused.
+
+[ ] Prevent a checkpoint outside the requested range from being used.
+
+[ ] Validate resume position before processing.
+
+[ ] Resume from the correct batch boundary.
+
+[ ] Test interruption and resume.
+
+[ ] Test resume after a completed batch.
+
+[ ] Test resume at the final batch.
+
+[ ] Ensure resumed replay produces the same final state.
+
+
+10. Idempotency
+
+[ ] Identify projection writes affected by replay.
+
+[ ] Confirm replaying the same range does not corrupt state.
+
+[ ] Use existing upsert/idempotent operations where appropriate.
+
+[ ] Avoid duplicate records.
+
+[ ] Avoid duplicate events.
+
+[ ] Avoid double-counting derived values.
+
+[ ] Replay an identical range twice in tests.
+
+[ ] Compare resulting projection state.
+
+[ ] Confirm both executions produce equivalent state.
+
+[ ] Test idempotency across batch boundaries.
+
+[ ] Test idempotency after resume.
+
+
+11. Tests
+
+[ ] Test valid replay command.
+
+[ ] Test missing network.
+
+[ ] Test invalid network.
+
+[ ] Test missing range.
+
+[ ] Test malformed start.
+
+[ ] Test malformed end.
+
+[ ] Test start > end.
+
+[ ] Test empty range.
+
+[ ] Test unbounded range.
+
+[ ] Test negative range.
+
+[ ] Test zero batch size.
+
+[ ] Test negative batch size.
+
+[ ] Test non-numeric batch size.
+
+[ ] Test excessive batch size.
+
+[ ] Test default dry-run behavior.
+
+[ ] Test explicit --dry-run.
+
+[ ] Test explicit --write.
+
+[ ] Test conflicting write flags.
+
+[ ] Test dry-run performs zero writes.
+
+[ ] Test malformed commands perform zero writes.
+
+[ ] Test scope output contains network.
+
+[ ] Test scope output contains range.
+
+[ ] Test scope output contains batch size.
+
+[ ] Test scope output clearly identifies dry-run.
+
+[ ] Test bounded batch processing.
+
+[ ] Test resumable replay.
+
+[ ] Test replay idempotency.
+
+[ ] Test cross-network isolation.
+
+[ ] Test repeated replay of the same range.
+
+
+12. Documentation
+
+[ ] Document required replay arguments.
+
+[ ] Document supported networks.
+
+[ ] Document valid range syntax.
+
+[ ] Document range limits.
+
+[ ] Document batch-size limits.
+
+[ ] Document that dry-run is the default.
+
+[ ] Document the explicit write flag.
+
+[ ] Document the scope output.
+
+[ ] Document resume behavior.
+
+[ ] Document idempotency guarantees.
+
+[ ] Add safe command examples.
+
+[ ] Add dry-run example.
+
+[ ] Add write-mode example.
+
+[ ] Add invalid-command examples.
+
+[ ] Warn against unbounded production replay.
+
+[ ] Document recovery procedure for interrupted replay.
+
+
+13. Acceptance Validation
+
+[ ] Confirm malformed commands cannot mutate projections.
+
+[ ] Confirm wrong-network commands are rejected.
+
+[ ] Confirm replay ranges are always bounded.
+
+[ ] Confirm batch sizes are bounded.
+
+[ ] Confirm dry-run performs zero writes.
+
+[ ] Confirm write mode requires explicit opt-in.
+
+[ ] Confirm scope is printed before processing.
+
+[ ] Confirm resume cannot cross network/range boundaries.
+
+[ ] Confirm replay is deterministic.
+
+[ ] Confirm replay is idempotent.
+
+[ ] Run all replay tests.
+
+[ ] Run relevant indexer tests.
+
+[ ] Verify no unrelated projection behavior changed.
+
+[ ] Review the final diff for accidental write paths.
+
+[ ] Verify no secrets appear in logs.
+
+[ ] Verify documentation is included in the PR.
+
+
+PR Checklist
+
+[ ] Network validation
+
+[ ] Range validation
+
+[ ] Batch-size validation
+
+[ ] Explicit write mode
+
+[ ] Safe dry-run
+
+[ ] Scope output
+
+[ ] Replay/resume tests
+
+[ ] Cross-network isolation tests
+
+[ ] Idempotency tests
+
+[ ] Documentation
+
+[ ] No unbounded replay path
+
+[ ] No accidental mutation path
+
+[ ] Acceptance criteria verified
