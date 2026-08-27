@@ -11,4 +11,94 @@ body {
   color: rgb(var(--foreground-rgb));
   background: rgb(var(--background-rgb));
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  /* Prevent horizontal overflow on narrow viewports */
+  overflow-x: hidden;
+}
+
+/* ── Responsive layout helpers ───────────────────────────────────────────────
+ *
+ * These rules supplement Tailwind utilities for cases where inline classes
+ * are insufficient or where we need cascading behaviour across breakpoints.
+ *
+ * 1. action-group  — wraps circle / create action buttons so they stack
+ *    vertically on narrow viewports instead of overflowing or overlapping.
+ *
+ * 2. mono-truncate — mono text in tight containers truncates gracefully so
+ *    long Stellar addresses cannot break out of card bounds at any width.
+ *
+ * 3. touch-target  — ensures interactive elements always meet the 44×44 px
+ *    minimum touch target even when padding/size classes are reduced on small
+ *    viewports.
+ *
+ * 4. form-row      — two-column form rows collapse to a single column below
+ *    the sm breakpoint to prevent input fields being too narrow to type in.
+ */
+
+@layer utilities {
+  /* Action button groups: always wrap, never clip or overlap */
+  .action-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem; /* gap-3 */
+    align-items: flex-start;
+  }
+
+  /* On very narrow screens (< 400 px) make each action button full-width */
+  @media (max-width: 399px) {
+    .action-group > button,
+    .action-group > a {
+      width: 100%;
+      justify-content: center;
+    }
+  }
+
+  /* Mono address text: allow wrapping but prefer truncation in tight cells */
+  .mono-truncate {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+      "Liberation Mono", "Courier New", monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+
+  /* Ensure interactive controls always meet the 44×44 touch target baseline */
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Form rows that should collapse on mobile */
+  .form-row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  @media (min-width: 640px) {
+    .form-row {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+}
+
+/* ── Focus visible ring ───────────────────────────────────────────────────────
+ *
+ * Global :focus-visible override so any element receiving programmatic focus
+ * (tabIndex={-1} error/success regions) also shows a visible ring, not just
+ * elements that receive keyboard Tab focus.  This supplements but does not
+ * replace per-component focus-visible: classes.
+ */
+
+:focus-visible {
+  outline: 2px solid #16a34a; /* brand-600 */
+  outline-offset: 2px;
+}
+
+/* Remove the visible outline when focus is via pointer (not keyboard) */
+:focus:not(:focus-visible) {
+  outline: none;
 }

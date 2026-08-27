@@ -1,8 +1,9 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
+import { isSorobanContractId } from "@/lib/address";
 import {
   buildAppSnapshot,
   computeActionEligibility,
@@ -403,6 +404,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Invite link URL — populated client-side to avoid SSR window access
   const [inviteUrl, setInviteUrl] = useState("");
 
+  // Refs for focus management: move focus to error/success regions after an
+  // action completes so keyboard users are not left stranded on the button.
+  const errorRegionRef  = useRef<HTMLDivElement>(null);
+  const successRegionRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     getWalletAddress().then(setWalletAddress);
   }, []);
@@ -415,6 +421,23 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       setInviteUrl(window.location.href);
     }
   }, []);
+
+  // Focus management: when an error appears, move keyboard focus to the error
+  // region so screen-reader users are immediately positioned on the message.
+  // tabIndex={-1} on the error div allows programmatic focus.
+  useEffect(() => {
+    if (error && errorRegionRef.current) {
+      errorRegionRef.current.focus();
+    }
+  }, [error]);
+
+  // Focus management: when a success message appears, move focus to the
+  // confirmation region so the user knows the action completed.
+  useEffect(() => {
+    if (success && successRegionRef.current) {
+      successRegionRef.current.focus();
+    }
+  }, [success]);
 
   const isMember = walletAddress
     ? data.members.some((m) => m.member_address === walletAddress)
@@ -638,7 +661,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         {error && (
           <div
             role="alert"
-            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 mb-3"
+            ref={errorRegionRef}
+            tabIndex={-1}
+            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 mb-3 focus:outline-none focus:ring-2 focus:ring-red-400"
           >
             {error}
             {retryAction && (
@@ -654,9 +679,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
         {success && (
           <div
-            className="bg-brand-50 border border-brand-200 rounded-lg p-3 text-sm text-brand-700 mb-3 space-y-2"
+            className="bg-brand-50 border border-brand-200 rounded-lg p-3 text-sm text-brand-700 mb-3 space-y-2 focus:outline-none"
             role="status"
             aria-live="polite"
+            ref={successRegionRef}
+            tabIndex={-1}
           >
             <p>
               <span aria-hidden="true">✅ </span>
@@ -699,7 +726,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           </div>
         )}
 
-        <div className="flex flex-wrap gap-3">
+        <div className="action-group">
           {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
             <button
               onClick={handleJoin}
