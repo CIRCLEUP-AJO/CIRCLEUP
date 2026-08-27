@@ -33,6 +33,7 @@
  * | already_joined (hasLockedCollateral) | join | double-collateral pull from UI |
  * | already_contributed (hasContributedCurrentRound) | contribute | double-contribute from UI |
  * | round_not_complete (contributionsReceived < memberCount) | payout | premature payout triggered |
+ * | deadline_not_passed (latestLedger <= deadlineLedger or unknown) | default | member punished before window closes |
  * | wrong_status (not terminal for close) | close | close on Active/Pending circle |
  *
  * CI budget: these are pure TypeScript computations; the full suite runs in < 1 s.
@@ -67,8 +68,11 @@ function makeSnap(overrides: Partial<AppStateSnapshot> = {}): AppStateSnapshot {
   return buildAppSnapshot(
     overrides.status           ?? "Active",
     overrides.currentRound     ?? 0,
-    overrides.deadlineLedger   ?? 5000,
-    overrides.latestLedger     ?? 4000, // below deadline — not yet passed
+    // deadlineLedger/latestLedger are nullable: `null` is a meaningful value
+    // (unknown ledger), so honour an explicitly-provided key rather than using
+    // `??`, which would coerce `null` back to the default.
+    "deadlineLedger" in overrides ? overrides.deadlineLedger : 5000,
+    "latestLedger"   in overrides ? overrides.latestLedger   : 4000, // below deadline — not yet passed
     overrides.memberAddresses  ?? MEMBERS,
     overrides.hasLockedCollateral          ?? true,
     overrides.hasContributedCurrentRound   ?? false,
@@ -78,11 +82,12 @@ function makeSnap(overrides: Partial<AppStateSnapshot> = {}): AppStateSnapshot {
 }
 
 /** Returns a snapshot that will appear stale (older than maxAge). */
-function staleSnap(action: "join" | "contribute" | "payout" | "close"): AppStateSnapshot {
+function staleSnap(action: "join" | "contribute" | "payout" | "default" | "close"): AppStateSnapshot {
   const statusMap = {
     join: "Pending",
     contribute: "Active",
     payout: "Active",
+    default: "Active",
     close: "Completed",
   } as const;
   return makeSnap({
@@ -132,7 +137,7 @@ function assertAllowed(
  * A weakened gateJoin/gateContribute/gatePayout/gateClose that never checks age.
  */
 function mutantNoStalenessCheck(
-  action: "join" | "contribute" | "payout" | "close",
+  action: "join" | "contribute" | "payout" | "default" | "close",
   snap: AppStateSnapshot,
 ): GateResult {
   // Skip freshness check entirely — proceed to status/state checks
@@ -148,6 +153,13 @@ function mutantNoStalenessCheck(
       if (snap.status !== "Active") return { allowed: false, reason: "wrong_status", message: "wrong status" };
       if (snap.contributionsReceived < snap.memberAddresses.length)
         return { allowed: false, reason: "round_not_complete", message: "not complete" };
+      return { allowed: true };
+    case "default":
+      if (snap.status !== "Active") return { allowed: false, reason: "wrong_status", message: "wrong status" };
+      if (snap.deadlineLedger === null || snap.latestLedger === null || snap.latestLedger <= snap.deadlineLedger)
+        return { allowed: false, reason: "deadline_not_passed", message: "deadline not passed" };
+      if (snap.hasContributedCurrentRound)
+        return { allowed: false, reason: "already_contributed", message: "already contributed" };
       return { allowed: true };
     case "close":
       if (snap.status !== "Completed" && snap.status !== "Cancelled")
@@ -240,12 +252,28 @@ function mutantNoStatusCheckClose(snap: AppStateSnapshot, nowMs: number, maxAge:
   return { allowed: true };
 }
 
+/**
+ * MUTANT: deadline_not_passed guard removed for default.
+ * Allows a member to be marked in default even when the deadline has NOT
+ * passed — or cannot be confirmed from ledger data.  This is the fail-closed
+ * guard that protects an honest member from a premature punitive write.
+ */
+function mutantNoDeadlinePassedCheckDefault(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
+  if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs))
+    return { allowed: false, reason: "stale_snapshot", message: "stale" };
+  if (snap.status !== "Active") return { allowed: false, reason: "wrong_status", message: "wrong status" };
+  // Skip deadline_not_passed check — allow marking default before window closes
+  if (snap.hasContributedCurrentRound)
+    return { allowed: false, reason: "already_contributed", message: "already contributed" };
+  return { allowed: true };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // GUARD 1: stale_snapshot — all four actions
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("MutationGuard: stale_snapshot", () => {
-  for (const action of ["join", "contribute", "payout", "close"] as const) {
+  for (const action of ["join", "contribute", "payout", "default", "close"] as const) {
     test(`${action}: production blocks stale snapshot`, () => {
       const snap = staleSnap(action);
       assertBlocked(action, snap, "stale_snapshot");
@@ -581,6 +609,131 @@ describe("MutationGuard: wrong_status for close", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// GUARD 9: deadline_not_passed — default requires positive proof deadline passed
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// `default` is punitive, so it fails CLOSED where `contribute` fails OPEN:
+//   • contribute: unknown ledger data → ALLOWED (never block an honest member)
+//   • default:    unknown ledger data → BLOCKED (never punish without proof)
+// The two guards therefore diverge at exactly the deadline ledger and whenever
+// ledger height is unavailable.
+
+describe("MutationGuard: deadline_not_passed for default", () => {
+  test("production blocks default when latestLedger < deadlineLedger (window open)", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: 5000,
+      latestLedger: 4000,
+      hasContributedCurrentRound: false,
+    });
+    assertBlocked("default", snap, "deadline_not_passed");
+  });
+
+  test("production blocks default at exactly the deadline (latestLedger == deadlineLedger)", () => {
+    // Boundary: default fails closed at ==, mirroring contribute allowing at ==.
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: 4000,
+      latestLedger: 4000,
+      hasContributedCurrentRound: false,
+    });
+    assertBlocked("default", snap, "deadline_not_passed");
+  });
+
+  test("production blocks default when deadlineLedger is null (fail closed)", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: null,
+      latestLedger: 9999,
+      hasContributedCurrentRound: false,
+    });
+    assertBlocked("default", snap, "deadline_not_passed");
+  });
+
+  test("production blocks default when latestLedger is null (fail closed)", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: 1000,
+      latestLedger: null,
+      hasContributedCurrentRound: false,
+    });
+    assertBlocked("default", snap, "deadline_not_passed");
+  });
+
+  test("mutant (no deadline_not_passed check) allows premature default — proving guard is load-bearing", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: 5000,
+      latestLedger: 4000, // window still open
+      hasContributedCurrentRound: false,
+    });
+    const mutantResult = mutantNoDeadlinePassedCheckDefault(snap, FIXED_NOW, DEFAULT_MAX_SNAPSHOT_AGE_MS);
+    assert.equal(
+      mutantResult.allowed,
+      true,
+      "mutant must allow premature default (no deadline_not_passed guard)",
+    );
+  });
+
+  test("mutant (no deadline_not_passed check) allows default on unknown ledger — proving fail-closed guard", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: null,
+      latestLedger: null,
+      hasContributedCurrentRound: false,
+    });
+    const mutantResult = mutantNoDeadlinePassedCheckDefault(snap, FIXED_NOW, DEFAULT_MAX_SNAPSHOT_AGE_MS);
+    assert.equal(
+      mutantResult.allowed,
+      true,
+      "mutant must allow default with unknown ledger (no fail-closed guard)",
+    );
+  });
+
+  test("production allows default when deadline has passed and member has not contributed", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: 3000,
+      latestLedger: 3001, // one past deadline
+      hasContributedCurrentRound: false,
+    });
+    assertAllowed("default", snap);
+  });
+
+  test("production blocks default when member already contributed (even after deadline)", () => {
+    const snap = makeSnap({
+      status: "Active",
+      deadlineLedger: 3000,
+      latestLedger: 5000,
+      hasContributedCurrentRound: true,
+    });
+    assertBlocked("default", snap, "already_contributed");
+  });
+
+  test("production blocks default on non-Active circle (wrong_status)", () => {
+    const snap = makeSnap({
+      status: "Pending",
+      deadlineLedger: 3000,
+      latestLedger: 5000,
+      hasContributedCurrentRound: false,
+    });
+    assertBlocked("default", snap, "wrong_status");
+  });
+
+  test("ASYMMETRY: at exactly the deadline, contribute is allowed but default is blocked", () => {
+    // The single most important behavioural contrast between the two guards.
+    const atDeadline = makeSnap({
+      status: "Active",
+      deadlineLedger: 4000,
+      latestLedger: 4000,
+      hasContributedCurrentRound: false,
+    });
+    assertAllowed("contribute", atDeadline);
+    assertBlocked("default", atDeadline, "deadline_not_passed");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Guard ordering invariants
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -591,6 +744,7 @@ describe("Guard ordering invariants", () => {
       ["join", "Active"],
       ["contribute", "Pending"],
       ["payout", "Completed"],
+      ["default", "Pending"],
       ["close", "Active"],
     ] as const) {
       const snap = makeSnap({
