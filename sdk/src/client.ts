@@ -19,6 +19,7 @@ import type {
   TxSuccess,
   TxFailure,
   TxErrorCode,
+  TxMetadata,
   SimulateResult,
   ReadResult,
   ApiCirclesListResponse,
@@ -41,6 +42,7 @@ import {
   decodeBoolean,
   decodeAddressList,
   validateContractArgs,
+  sanitizeTxMetadata,
 } from "./types";
 import {
   buildSnapshot,
@@ -236,6 +238,20 @@ function txSuccess(
   returnValue?: unknown,
 ): TxSuccess {
   return { success: true, txHash, ledger, returnValue };
+}
+
+/**
+ * Attach caller correlation metadata to a result without mutating it.
+ *
+ * `metadata` is expected to have already passed through
+ * {@link sanitizeTxMetadata}; `undefined` leaves the result untouched so a
+ * result is never widened with an empty `metadata` field.
+ */
+function attachMetadata<T extends TxResult>(
+  result: T,
+  metadata: TxMetadata | undefined,
+): T {
+  return metadata ? { ...result, metadata } : result;
 }
 
 /**
@@ -618,12 +634,81 @@ export function scAddressVec(addresses: string[]): xdr.ScVal {
   );
 }
 
+// ─── Write options & structured tx logging ────────────────────────────────────
+
+/**
+ * Per-call options accepted by every mutation method (`join`, `contribute`,
+ * `payout`, `markDefault`, `close`, `createCircle`).
+ */
+export interface WriteOptions {
+  /**
+   * Caller correlation metadata to tie this operation to the UI action, request,
+   * or job step that triggered it.  Echoed back on the resulting
+   * {@link TxResult} and included in structured tx log events.
+   *
+   * Sanitised by {@link sanitizeTxMetadata} before use, so secrets and signed
+   * payloads are stripped.  This is a *tracing* label, not a deduplication /
+   * idempotency key — see {@link TxMetadata}.
+   */
+  metadata?: TxMetadata;
+}
+
+/**
+ * Lifecycle phase of a {@link TxLogEvent}.
+ *
+ * `simulated` and `submitted` fire mid-flight (the latter is the first point a
+ * hash exists); exactly one terminal event (`confirmed` or `failed`) fires per
+ * call.
+ */
+export type TxLogPhase = "simulated" | "submitted" | "confirmed" | "failed";
+
+/**
+ * A structured, log-safe record of one point in a write's lifecycle, handed to
+ * the {@link TxLogger} registered via {@link CircleUpClient.setTxLogger}.
+ *
+ * **Safe by construction.** An event carries only the contract address, the
+ * method name, the (public) transaction hash, an error code, and the
+ * already-sanitised correlation metadata.  It never contains the signing
+ * `Keypair`, its secret, the signed transaction XDR, or the raw `ScVal`
+ * arguments — none of those are ever passed to the logger.
+ */
+export interface TxLogEvent {
+  /** Lifecycle phase this event represents. */
+  readonly phase: TxLogPhase;
+  /** `contractId.method`, matching the context used in error messages. */
+  readonly ctx: string;
+  /** The Soroban contract address the call targets. */
+  readonly contractId: string;
+  /** The contract method name (e.g. "join", "contribute"). */
+  readonly method: string;
+  /** Transaction hash, once known (from `submitted` onward). */
+  readonly txHash?: string;
+  /** Ledger the transaction confirmed in — present on `confirmed` only. */
+  readonly ledger?: number;
+  /** Error category — present on `failed` only. */
+  readonly errorCode?: TxErrorCode;
+  /** Caller correlation metadata (already sanitised), when supplied. */
+  readonly metadata?: TxMetadata;
+}
+
+/**
+ * A sink for {@link TxLogEvent}s.  Register one with
+ * {@link CircleUpClient.setTxLogger} to forward correlation-tagged lifecycle
+ * events to a logger, tracing backend, or test spy.
+ *
+ * The SDK invokes it fire-and-forget: a throwing logger never affects the
+ * transaction result.
+ */
+export type TxLogger = (event: TxLogEvent) => void;
+
 // ─── Base client ─────────────────────────────────────────────────────────────
 
 export class CircleUpClient {
   protected rpc: SorobanRpc.Server;
   protected config: CircleUpConfig;
   protected pollConfig: Required<PollConfig>;
+  /** Optional structured-log sink; see {@link setTxLogger}. */
+  protected txLogger?: TxLogger;
 
   constructor(config: CircleUpConfig, pollConfig?: PollConfig) {
     // Validate upfront so callers get a clear message for misconfiguration
@@ -637,6 +722,41 @@ export class CircleUpClient {
     validatePollConfig(this.pollConfig);
   }
 
+  // ── Structured logging ───────────────────────────────────────────────────────
+
+  /**
+   * Register a {@link TxLogger} to receive correlation-tagged lifecycle events
+   * (`simulated` → `submitted` → `confirmed` | `failed`) for every write.
+   *
+   * Opt-in: with no logger registered the SDK emits nothing, so it never writes
+   * to `console` on a caller's behalf. Pass `undefined` to detach.  Returns
+   * `this` for chaining.
+   *
+   * The logger only ever receives log-safe fields (see {@link TxLogEvent}) — the
+   * signing key, its secret, the signed XDR, and the raw arguments are never
+   * handed to it.
+   */
+  setTxLogger(logger: TxLogger | undefined): this {
+    this.txLogger = logger;
+    return this;
+  }
+
+  /**
+   * Deliver one {@link TxLogEvent} to the registered logger, fire-and-forget.
+   *
+   * A logger that throws must never turn a successful (or already-failed)
+   * transaction into a different outcome, so its error is swallowed here.
+   */
+  private emitTxLog(event: TxLogEvent): void {
+    const logger = this.txLogger;
+    if (!logger) return;
+    try {
+      logger(event);
+    } catch {
+      // A misbehaving logger must not affect the transaction result.
+    }
+  }
+
   // ── Tx helpers ──────────────────────────────────────────────────────────────
 
   /**
@@ -646,12 +766,64 @@ export class CircleUpClient {
    * Every failure mode returns a {@link TxFailure} carrying a
    * {@link TxErrorCode}; this method never throws, so callers can branch on
    * one result object instead of combining a try/catch with a status check.
+   *
+   * This is a thin wrapper around {@link buildAndSendCore}: it sanitises the
+   * caller's correlation {@link WriteOptions.metadata} exactly once, echoes the
+   * sanitised copy onto the returned {@link TxResult}, and emits the single
+   * terminal (`confirmed` | `failed`) structured-log event.  The mid-flight
+   * `simulated` / `submitted` events are emitted from the core.
    */
   protected async buildAndSend(
     sourceKeypair: Keypair,
     contractId: string,
     method: string,
     args: xdr.ScVal[],
+    options?: WriteOptions,
+  ): Promise<TxResult> {
+    // Sanitise once at the entry point so both the echoed result metadata and
+    // every log event carry the identical secret-free copy.
+    const metadata = sanitizeTxMetadata(options?.metadata);
+
+    const result = await this.buildAndSendCore(
+      sourceKeypair,
+      contractId,
+      method,
+      args,
+      metadata,
+    );
+
+    // Exactly one terminal event per call, derived from the final result so it
+    // fires no matter which of the many failure branches the core took.
+    this.emitTxLog({
+      phase: result.success ? "confirmed" : "failed",
+      ctx: `${contractId}.${method}`,
+      contractId,
+      method,
+      // Empty-string hashes (failures before submission) collapse to undefined.
+      txHash: result.txHash || undefined,
+      ledger: result.success ? result.ledger : undefined,
+      errorCode: result.success ? undefined : result.errorCode,
+      metadata,
+    });
+
+    return attachMetadata(result, metadata);
+  }
+
+  /**
+   * The implementation behind {@link buildAndSend}.  Kept separate so the
+   * wrapper owns metadata sanitisation, the terminal log event, and metadata
+   * echoing, leaving this method free to `return` from any failure branch
+   * without repeating that bookkeeping.
+   *
+   * `metadata` is already sanitised; it is used only to tag the mid-flight
+   * `simulated` / `submitted` log events.
+   */
+  protected async buildAndSendCore(
+    sourceKeypair: Keypair,
+    contractId: string,
+    method: string,
+    args: xdr.ScVal[],
+    metadata?: TxMetadata,
   ): Promise<TxResult> {
     // Context string prepended to every error from this invocation so callers
     // can correlate an error back to the contract method without a stack trace.
@@ -723,6 +895,10 @@ export class CircleUpClient {
       );
     }
 
+    // Simulation succeeded: the call is valid against current on-chain state.
+    // No hash exists yet — that arrives once the network queues the submission.
+    this.emitTxLog({ phase: "simulated", ctx, contractId, method, metadata });
+
     let preparedTx: ReturnType<TransactionBuilder["build"]>;
     try {
       preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
@@ -787,6 +963,11 @@ export class CircleUpClient {
 
     // Poll for confirmation with exponential backoff + full jitter
     const hash = sendResult.hash;
+
+    // The network has queued the transaction and a hash now exists — this is the
+    // first point a UI action can be tied to an on-chain identifier.
+    this.emitTxLog({ phase: "submitted", ctx, contractId, method, txHash: hash, metadata });
+
     const { timeoutMs, initialIntervalMs, maxIntervalMs, backoffFactor, maxConsecutiveErrors } =
       this.pollConfig;
     const start = Date.now();
@@ -904,18 +1085,24 @@ export class CircleUpClient {
     contractId: string,
     method: string,
     encodeArgs: () => xdr.ScVal[],
+    options?: WriteOptions,
   ): Promise<TxResult> {
     let args: xdr.ScVal[];
     try {
       args = encodeArgs();
     } catch (err: any) {
-      return txFailure(
-        "",
-        `Invalid arguments for ${contractId}.${method}: ${err?.message ?? "unknown"}`,
-        "invalid_argument",
+      // Preserve correlation metadata even when argument encoding fails, so a
+      // caller's failed attempt still ties back to the originating UI action.
+      return attachMetadata(
+        txFailure(
+          "",
+          `Invalid arguments for ${contractId}.${method}: ${err?.message ?? "unknown"}`,
+          "invalid_argument",
+        ),
+        sanitizeTxMetadata(options?.metadata),
       );
     }
-    return this.buildAndSend(sourceKeypair, contractId, method, args);
+    return this.buildAndSend(sourceKeypair, contractId, method, args, options);
   }
 
   /**
@@ -1039,12 +1226,15 @@ export class FactoryClient extends CircleUpClient {
    * Never throws: a malformed member list or round amount comes back as
    * `result.errorCode === "invalid_argument"`, like every other failure.
    */
-  async createCircle(params: {
-    creator: Keypair;
-    members: string[];
-    roundAmountStroops: bigint;
-    roundDeadlineLedgers: number;
-  }): Promise<{ result: TxResult; circleAddress?: string }> {
+  async createCircle(
+    params: {
+      creator: Keypair;
+      members: string[];
+      roundAmountStroops: bigint;
+      roundDeadlineLedgers: number;
+    },
+    options?: WriteOptions,
+  ): Promise<{ result: TxResult; circleAddress?: string }> {
     // Validate all parameters upfront so the error message names the exact
     // field that is wrong, rather than surfacing as an opaque encoding throw.
     const argError = validateContractArgs([
@@ -1053,12 +1243,17 @@ export class FactoryClient extends CircleUpClient {
       { name: "roundDeadlineLedgers", value: params.roundDeadlineLedgers, type: "u32" },
     ]);
     if (argError) {
-      const result: TxResult = {
-        success: false,
-        txHash: "",
-        errorMessage: `Invalid arguments for create_circle: ${argError}`,
-        errorCode: "invalid_argument",
-      };
+      // Echo correlation metadata even on this pre-flight rejection so the
+      // caller can tie the failed attempt back to its originating UI action.
+      const result: TxResult = attachMetadata(
+        {
+          success: false,
+          txHash: "",
+          errorMessage: `Invalid arguments for create_circle: ${argError}`,
+          errorCode: "invalid_argument",
+        },
+        sanitizeTxMetadata(options?.metadata),
+      );
       return { result };
     }
 
@@ -1072,6 +1267,7 @@ export class FactoryClient extends CircleUpClient {
         scI128(params.roundAmountStroops),
         scU32(params.roundDeadlineLedgers),
       ],
+      options,
     );
 
     if (!result.success || !isValidStellarAddress(result.returnValue)) {
@@ -1183,64 +1379,82 @@ export class CircleClient extends CircleUpClient {
 
   // ── Mutations ────────────────────────────────────────────────────────────────
 
-  async join(member: Keypair): Promise<TxResult> {
+  async join(member: Keypair, options?: WriteOptions): Promise<TxResult> {
     const result = await this.encodeAndSend(
       member,
       this.circleAddress,
       "join",
       () => [scAddress(member.publicKey())],
+      options,
     );
     if (result.success) this.invalidateCache();
     return result;
   }
 
-  async contribute(member: Keypair): Promise<TxResult> {
+  async contribute(member: Keypair, options?: WriteOptions): Promise<TxResult> {
     const result = await this.encodeAndSend(
       member,
       this.circleAddress,
       "contribute",
       () => [scAddress(member.publicKey())],
+      options,
     );
     if (result.success) this.invalidateCache();
     return result;
   }
 
-  async payout(caller: Keypair): Promise<TxResult> {
-    const result = await this.buildAndSend(caller, this.circleAddress, "payout", []);
+  async payout(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const result = await this.buildAndSend(
+      caller,
+      this.circleAddress,
+      "payout",
+      [],
+      options,
+    );
     if (result.success) this.invalidateCache();
     return result;
   }
 
-  async markDefault(caller: Keypair, member: string): Promise<TxResult> {
+  async markDefault(
+    caller: Keypair,
+    member: string,
+    options?: WriteOptions,
+  ): Promise<TxResult> {
     // Validate the member address early so callers get a clear error that names
     // the field rather than an opaque scAddress throw wrapped in encodeAndSend.
     const argError = validateContractArgs([
       { name: "member", value: member, type: "address" },
     ]);
     if (argError) {
-      return {
-        success: false,
-        txHash: "",
-        errorMessage: `Invalid arguments for mark_default: ${argError}`,
-        errorCode: "invalid_argument",
-      };
+      // Preserve correlation metadata on the pre-flight rejection too.
+      return attachMetadata(
+        {
+          success: false,
+          txHash: "",
+          errorMessage: `Invalid arguments for mark_default: ${argError}`,
+          errorCode: "invalid_argument",
+        },
+        sanitizeTxMetadata(options?.metadata),
+      );
     }
     const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
       "mark_default",
       () => [scAddress(member)],
+      options,
     );
     if (result.success) this.invalidateCache();
     return result;
   }
 
-  async close(caller: Keypair): Promise<TxResult> {
+  async close(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
     const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
       "close",
       () => [scAddress(caller.publicKey())],
+      options,
     );
     if (result.success) this.invalidateCache();
     return result;
