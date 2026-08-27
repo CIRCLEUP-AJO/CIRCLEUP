@@ -11,6 +11,8 @@
 //     empty value is allowed so `npm run dev` still starts without a full
 //     deployment.
 
+import { isSorobanContractId } from "./address";
+
 const REQUIRED_ALWAYS = [
   "NEXT_PUBLIC_STELLAR_RPC_URL",
   "NEXT_PUBLIC_NETWORK_PASSPHRASE",
@@ -52,20 +54,52 @@ export function getMissingEnvVars(
 }
 
 /**
- * Throw an error listing every missing variable so the problem is immediately
- * obvious in logs / terminal output.
+ * Validate that every set contract address env var is a well-formed Soroban
+ * contract ID (C-prefixed, 56 base32 chars).  Returns one error string per
+ * malformed value.  Exported for unit testing.
+ *
+ * An empty/unset value is not flagged here — presence is checked separately by
+ * {@link getMissingEnvVars}.  This only fires when a value is present but
+ * malformed, making misconfigured deployments fail fast with a clear message.
+ */
+export function getMalformedContractAddresses(
+  env: Record<string, string | undefined> = process.env as Record<
+    string,
+    string | undefined
+  >,
+): string[] {
+  const malformed: string[] = [];
+  for (const key of REQUIRED_IN_PRODUCTION) {
+    const value = env[key]?.trim();
+    if (value && !isSorobanContractId(value)) {
+      malformed.push(
+        `${key} is not a valid Soroban contract ID (expected C-prefixed 56-char base32, got "${value}")`,
+      );
+    }
+  }
+  return malformed;
+}
+
+/**
+ * Throw an error listing every missing or malformed variable so the problem is
+ * immediately obvious in logs / terminal output.
  * Only runs server-side (typeof window === "undefined").
  */
 function assertEnvVars(): void {
   if (typeof window !== "undefined") return; // client bundle — skip
 
   const missing = getMissingEnvVars();
-  if (missing.length === 0) return;
+  const malformed = getMalformedContractAddresses();
+  const problems = [
+    ...missing.map((k) => `  • ${k} is missing`),
+    ...malformed.map((m) => `  • ${m}`),
+  ];
+  if (problems.length === 0) return;
 
   throw new Error(
-    `[CircleUp] Missing required environment variables:\n` +
-      missing.map((k) => `  • ${k}`).join("\n") +
-      `\n\nCopy app/.env.example to app/.env.local and fill in the missing values.`,
+    `[CircleUp] Environment variable configuration error:\n` +
+      problems.join("\n") +
+      `\n\nCopy app/.env.example to app/.env.local and fill in the correct values.`,
   );
 }
 

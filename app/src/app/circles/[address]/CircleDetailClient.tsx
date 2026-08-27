@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { shortAddress, formatUsdc, INDEXER_URL } from "@/lib/config";
+import { isSorobanContractId } from "@/lib/address";
 import {
   buildAppSnapshot,
   computeActionEligibility,
@@ -477,6 +478,19 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
     // Guard: prevent a second call while one is already in flight
     if (loading !== null) return;
+
+    // ── Route-param validation ─────────────────────────────────────────────
+    // circleAddress comes from the Next.js URL segment and is never sanitised
+    // by the router. Reject it early — before any RPC call — so a malformed or
+    // injected address fails with a clear UI message rather than a cryptic SDK
+    // error deep inside invokeContract.
+    if (!isSorobanContractId(circleAddress)) {
+      setError(
+        `Invalid circle address "${shortAddress(circleAddress)}". ` +
+          "Expected a C-prefixed 56-character Soroban contract ID.",
+      );
+      return;
+    }
 
     setError("");
     setSuccess(null);
