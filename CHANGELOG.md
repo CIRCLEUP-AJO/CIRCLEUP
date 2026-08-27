@@ -9,6 +9,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- `sdk/src/index.ts` — documented the public API surface at the package entry
+  point: a grouped map (clients, errors, config & types, gating, utilities,
+  constants, low-level encoders) states that the package root is the only
+  supported import path and that deep paths / test modules carry no stability
+  guarantee. Re-export order is annotated so each symbol has one canonical source
+- `sdk/examples/public-api.ts` — side-effect-free fixture that imports every
+  documented symbol from the package root (no deep or `../src` paths) and is
+  type-checked by `sdk/examples/tsconfig.json`, so the public contract stays
+  reachable-from-root and cannot silently regress
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
@@ -34,26 +43,27 @@ Versions follow [Semantic Versioning](https://semver.org/).
   partial replay semantics and preflight non-mutation guarantee
 - `indexer` boot sequence now logs a prominent `SCHEMA WARNING` for `drifted` or
   `partial` states after migrations run, surfacing drift before the poller starts
-- `sdk/src/gating.ts` — `detectStateMismatches()`: a pure, content-based comparator
-  that reports exactly which state fields (`status`, `roundIndex`,
-  `contributionsReceived`, `hasContributed`, `paidOut`) diverged between a caller's
-  declared `ExpectedState` and freshly-read `ActualState`; complements the existing
-  age-based gating by catching *predictable* stale submissions even when the caller
-  believes their data is fresh
-- `sdk/src/client.ts` — `CircleClient.preflight()`: an opt-in, read-only check that
-  force-refreshes on-chain state and returns typed `PreflightResult` mismatches
-  without submitting a transaction; every mutation (`join`, `contribute`, `payout`,
-  `markDefault`, `close`) now accepts an optional `PreflightOptions` that aborts a
-  stale write with `errorCode: "stale_state"` before submission. Omitting it
-  preserves the zero-extra-RPC fast path, and a preflight *read* failure never
-  blocks the write — the contract remains the final authority
-- `sdk/src/types.ts` — `StateMismatch` type, the `"stale_state"` `TxErrorCode`, and
-  an optional `mismatches` field on `TxFailure` so callers can tell the user exactly
-  what changed instead of a generic retry prompt
-- `sdk/src/__tests__/preflight.test.ts` — unit tests for `detectStateMismatches`
-  (field-by-field divergence, stable ordering, null/unknown skipping) and
-  integration tests for `preflight()` and the per-mutation guard (stale block,
-  passing pass-through, fast path, read-failure proceed, args-unchanged guarantee)
+- SDK: caller correlation metadata on every write. Mutation methods (`join`,
+  `contribute`, `payout`, `markDefault`, `close`, `createCircle`) accept an
+  optional `{ metadata }` (a flat bag of scalar identifiers, e.g.
+  `{ operation: "join-circle", uiRequestId: "req_8a1f" }`) that is echoed back on
+  the resulting `TxResult` — present on failures too, so a UI action ties to a tx
+  hash whether it confirmed or failed
+- SDK: `sanitizeTxMetadata` security boundary strips secrets before metadata is
+  ever echoed or logged — drops keys named like secrets (`secret`, `seed`,
+  `signed`, `xdr`, `apiKey`, …), Stellar secret-seed values under any key,
+  over-long strings (signed XDR), and all non-scalars; caps at 32 keys
+- SDK: opt-in structured tx logging via `CircleUpClient.setTxLogger`. A registered
+  `TxLogger` receives log-safe `TxLogEvent`s across the write lifecycle
+  (`simulated` → `submitted` → `confirmed` | `failed`) carrying the contract,
+  method, tx hash, ledger/error code, and sanitised correlation metadata — never
+  the signing key, its secret, the signed XDR, or the raw arguments. A throwing
+  logger can never change a transaction's outcome
+- `sdk/src/__tests__/txMetadata.test.ts` — unit tests for `sanitizeTxMetadata`
+  (secret/payload/non-scalar stripping, key cap, no-mutation/frozen output) and
+  the write path (metadata echoed on success and failure results, log lifecycle
+  ordering and log-safe fields, correlation preserved across retried attempts,
+  end-to-end threading through `CircleClient.join`)
 
 ### Changed
 - `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
@@ -64,8 +74,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
+- `sdk/src/utils.ts` — `usdcToStroops` now routes both `string` and `number`
+  input through one exact string-parsing path that expands JavaScript exponent
+  notation (`1e-7`, `1e+21`) losslessly and counts only *significant* decimals.
+  Valid small/large numeric amounts such as `0.0000001` now convert exactly
+  instead of throwing, while `> 7`-decimal precision, negatives, non-finite
+  numbers, and malformed exponents are rejected with specific messages. Also
+  documented USDC units/precision and that `formatUsdc` truncates (never rounds
+  up) so a displayed amount can never overstate the true balance
 
 ### Fixed
+- `app/src/lib/config.ts` — `usdcToStroops` silently discarded any digits beyond
+  7 decimal places (`frac.padEnd(7, "0").slice(0, 7)`), so an over-precise amount
+  was signed for a *different* value than the user entered. It now rejects excess
+  precision (and handles exponent notation) identically to the SDK. Realigned the
+  other money helpers with `sdk/src/utils.ts` too: added the missing negative /
+  `NaN` guards to `stroopsToUsdc` and `formatUsdc`, and the non-integer / negative
+  member-count guard to `formatPot` (a fractional count previously made
+  `BigInt(memberCount)` throw)
 - SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with
   `this.source.sequenceNumber is not a function`. The read path built its
   transaction from an account stub that was missing that method, and it always

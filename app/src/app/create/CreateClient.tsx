@@ -5,11 +5,10 @@ import {
   CIRCLE_FACTORY_ADDRESS,
   usdcToStroops,
   shortAddress,
+  daysToLedgers,
 } from "@/lib/config";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
-
-const DAYS_TO_LEDGERS = (d: number) => Math.round((d * 24 * 60 * 60) / 5);
 
 /** Stellar Expert base URL for testnet transactions. */
 const EXPLORER_BASE = "https://stellar.expert/explorer/testnet/tx";

@@ -34,11 +34,17 @@ export const DEFAULT_MAX_SNAPSHOT_AGE_MS = 30_000;
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /**
- * The four write actions that require state-based gating.
- * `mark_default` is omitted from UI-level gating because it is caller-agnostic
- * and is typically triggered by a bot/keeper rather than a member wallet.
+ * The five write actions that require state-based gating.
+ *
+ * `default` (the on-chain `mark_default`) is caller-agnostic — it is typically
+ * triggered by a bot/keeper rather than the defaulting member's own wallet —
+ * but the app and integrations still need one advisory rule for *when* a member
+ * is eligible to be marked in default (round Active, its deadline demonstrably
+ * passed, and the target has not already contributed). Keeping it in the same
+ * vocabulary as the other actions is exactly what issue #344 asks for; on-chain
+ * enforcement in the contract remains authoritative.
  */
-export type CircleAction = "join" | "contribute" | "payout" | "close";
+export type CircleAction = "join" | "contribute" | "payout" | "default" | "close";
 
 /**
  * A snapshot of the on-chain circle state combined with the wall-clock time at
@@ -105,6 +111,7 @@ export interface GateBlocked {
    * | `deadline_passed` | The round deadline has expired; contributions are locked. |
    * | `round_not_complete` | Not all members have contributed; payout is premature. |
    * | `no_active_round` | No in-progress round exists (Completed or Cancelled). |
+   * | `deadline_not_passed` | `default` was requested but the round deadline has not demonstrably passed (or ledger height is unknown). |
    */
   readonly reason: GateBlockReason;
   /** Human-readable explanation of why the action is blocked. */
@@ -118,6 +125,7 @@ export type GateBlockReason =
   | "already_joined"
   | "already_contributed"
   | "deadline_passed"
+  | "deadline_not_passed"
   | "round_not_complete"
   | "no_active_round";
 
@@ -140,7 +148,9 @@ export interface GateOptions {
 
   /**
    * The member wallet address performing the action.  Required for
-   * `join`, `contribute`, and `close`.  Ignored for `payout`.
+   * `join`, `contribute`, and `close`.  For `default` this is the member
+   * being marked as defaulted (the target), not necessarily the caller.
+   * Ignored for `payout`.
    */
   memberAddress?: string;
 
@@ -384,6 +394,90 @@ function gatePayout(snapshot: StateSnapshot, opts: GateOptions, nowMs: number): 
 }
 
 /**
+ * Gate a `default` (on-chain `mark_default`) call.
+ *
+ * `mark_default` records that a member failed to fund the current round before
+ * its deadline.  Because it is a punitive action, this gate is deliberately
+ * *fail-closed* on missing data: unlike {@link gateContribute} — which allows
+ * the write when ledger height is unknown — `default` is blocked whenever we
+ * cannot positively prove the deadline has passed.  This directly implements
+ * the issue #344 rule "unknown data disables unsafe actions".
+ *
+ * The result is purely advisory; the contract's own `mark_default` remains the
+ * authoritative check.
+ *
+ * Preconditions (checked in order):
+ *   1. Snapshot is fresh.
+ *   2. Circle status is `Active`.
+ *   3. An active round exists.
+ *   4. `memberAddress` (the member being marked) is in the member list.
+ *   5. That member has not already contributed this round.
+ *   6. The round deadline has demonstrably passed — `latestLedger` is known and
+ *      strictly greater than `deadlineLedger`.  Unknown ledger height blocks.
+ */
+function gateDefault(snapshot: StateSnapshot, opts: GateOptions, nowMs: number): GateResult {
+  const maxAge = opts.maxSnapshotAgeMs ?? DEFAULT_MAX_SNAPSHOT_AGE_MS;
+
+  if (!isSnapshotFresh(snapshot, maxAge, nowMs)) {
+    return blocked(
+      "stale_snapshot",
+      `Circle snapshot is ${snapshotAgeMs(snapshot, nowMs)}ms old (limit: ${maxAge}ms). ` +
+        "Refresh the circle state before marking a default.",
+    );
+  }
+
+  if (snapshot.status !== "Active") {
+    return blocked(
+      "wrong_status",
+      `default requires an Active circle; current status is ${snapshot.status}.`,
+    );
+  }
+
+  const round = snapshot.currentRound;
+  if (!round) {
+    return blocked(
+      "no_active_round",
+      "No active round found in the snapshot. The circle may be Completed or Cancelled.",
+    );
+  }
+
+  if (opts.memberAddress && !isMemberAddress(snapshot.config.members, opts.memberAddress)) {
+    return blocked(
+      "not_a_member",
+      `Address ${opts.memberAddress} is not in this circle's member list.`,
+    );
+  }
+
+  if (opts.hasContributedCurrentRound) {
+    return blocked(
+      "already_contributed",
+      `Member already contributed to round ${round.roundIndex}; they cannot be marked in default.`,
+    );
+  }
+
+  // Fail-closed deadline check: only a positively-verified expired deadline
+  // permits a default.  Without ledger height we refuse rather than risk
+  // defaulting a member whose contribution window may still be open.
+  if (snapshot.latestLedger === null) {
+    return blocked(
+      "deadline_not_passed",
+      `Cannot verify that round ${round.roundIndex} deadline (ledger ${round.deadlineLedger}) ` +
+        "has passed: latest ledger height is unknown. Refusing to mark default without ledger data.",
+    );
+  }
+
+  if (snapshot.latestLedger <= Number(round.deadlineLedger)) {
+    return blocked(
+      "deadline_not_passed",
+      `Round ${round.roundIndex} deadline is ledger ${round.deadlineLedger}; ` +
+        `latest indexed ledger is ${snapshot.latestLedger}. The contribution window is still open.`,
+    );
+  }
+
+  return allowed();
+}
+
+/**
  * Gate a `close` call.
  *
  * Preconditions (checked in order):
@@ -465,6 +559,8 @@ export function computeActionEligibility(
       return gateContribute(snapshot, opts, nowMs);
     case "payout":
       return gatePayout(snapshot, opts, nowMs);
+    case "default":
+      return gateDefault(snapshot, opts, nowMs);
     case "close":
       return gateClose(snapshot, opts, nowMs);
     default: {
