@@ -22,6 +22,36 @@ import { runAllHealthChecks } from "./health";
 import { redactAddress } from "./redact";
 import type { MigrationHealth } from "./db/migrate";
 
+// ── Address validation ────────────────────────────────────────────────────────
+//
+// Stellar has two address namespaces:
+//   G-prefix (56 base32 chars) — ed25519 public key (wallet / member address)
+//   C-prefix (56 base32 chars) — Soroban contract ID (circle / factory / token)
+//
+// These regexes are intentionally inlined here so the indexer has no
+// dependency on the app package's address module.
+const STELLAR_PUBLIC_KEY_RE = /^G[A-Z2-7]{55}$/;
+const SOROBAN_CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/** Returns true for a valid Stellar ed25519 public key (G-prefix, 56 chars). */
+function isStellarPublicKey(addr: string): boolean {
+  return STELLAR_PUBLIC_KEY_RE.test(addr);
+}
+
+/** Returns true for a valid Soroban contract ID (C-prefix, 56 chars). */
+function isSorobanContractId(addr: string): boolean {
+  return SOROBAN_CONTRACT_ID_RE.test(addr);
+}
+
+/**
+ * Returns true for any valid canonical Stellar address — either a public key
+ * or a Soroban contract ID.  Route params that may legitimately be either type
+ * (e.g. `:member`, `:address`) should be validated with this function.
+ */
+function isCanonicalStellarAddress(addr: string): boolean {
+  return isStellarPublicKey(addr) || isSorobanContractId(addr);
+}
+
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
 // ALLOWED_ORIGINS is a comma-separated allow-list, e.g.

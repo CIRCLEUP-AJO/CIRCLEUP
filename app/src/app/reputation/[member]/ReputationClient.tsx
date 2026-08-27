@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { INDEXER_URL, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
+import { isCanonicalStellarAddress } from "@/lib/address";
 
 // ─── Local type definition ────────────────────────────────────────────────────
 //
@@ -35,6 +36,12 @@ type FetchResult =
   | { ok: false; reason: "not_found" | "network" | "unknown" };
 
 async function fetchReputation(member: string): Promise<FetchResult> {
+  // Validate the route param before making any network request. A malformed
+  // address (e.g. from a manually typed URL) would otherwise reach the indexer
+  // and return a 404 that looks indistinguishable from "no activity yet".
+  if (!isCanonicalStellarAddress(member)) {
+    return { ok: false, reason: "not_found" };
+  }
   try {
     const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
       // Always fetch fresh data — the user can also trigger a manual refresh.

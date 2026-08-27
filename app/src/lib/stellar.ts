@@ -3,6 +3,20 @@
  * Thin browser-side Stellar / Soroban helpers.
  * Uses @stellar/freighter-api v2 (isConnected → boolean, getPublicKey → string,
  * signTransaction → string XDR, requestAccess → string).
+ *
+ * Transaction lifecycle — separated into three distinct phases so callers can
+ * preview a simulation result before committing to a signature + submission:
+ *
+ *  1. simulateContractTx  — builds the unsigned transaction, runs simulation,
+ *                           assembles fee/resource footprint, returns the
+ *                           prepared XDR ready for signing.  No wallet prompt.
+ *
+ *  2. submitContractTx    — signs the prepared XDR with Freighter, broadcasts
+ *                           it, and polls for confirmation.  Returns the tx hash
+ *                           and success/failure status.
+ *
+ *  3. invokeContract      — convenience wrapper that calls (1) then (2) in one
+ *                           go, preserving the existing call-sites unchanged.
  */
 import {
   SorobanRpc,
@@ -22,6 +36,11 @@ import {
 } from "@stellar/freighter-api";
 import { STELLAR_RPC_URL, NETWORK_PASSPHRASE, REPUTATION_ADDRESS } from "./config";
 import { startTx, emit, categorizeError } from "./telemetry";
+import {
+  assertStellarPublicKey,
+  assertSorobanContractId,
+  assertCanonicalStellarAddress,
+} from "./address";
 
 // ─── Freighter detection & error types ───────────────────────────────────────
 
@@ -198,21 +217,66 @@ export function formatContractError(raw: string | undefined): string {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-// ─── Generic contract call (signed by Freighter) ─────────────────────────────
+// ─── Phase 1: Simulation ──────────────────────────────────────────────────────
 
-export async function invokeContract(
+/**
+ * Result returned by {@link simulateContractTx} on success.
+ *
+ * The `preparedXdr` is the unsigned, fee-and-footprint-assembled transaction
+ * XDR.  Pass it directly to {@link submitContractTx} to sign and broadcast,
+ * or inspect `simResult` to preview resource usage / return value before
+ * deciding whether to proceed.
+ */
+export interface SimulateResult {
+  success: true;
+  /** Assembled, unsigned transaction XDR ready for wallet signing. */
+  preparedXdr: string;
+  /** Raw simulation result — inspect for return values or resource estimates. */
+  simResult: SorobanRpc.Api.SimulateTransactionSuccessResponse;
+}
+
+/**
+ * Result returned by {@link simulateContractTx} on failure.
+ */
+export interface SimulateError {
+  success: false;
+  error: string;
+}
+
+export type SimulateContractTxResult = SimulateResult | SimulateError;
+
+/**
+ * Phase 1 of the transaction lifecycle: build and simulate a Soroban contract
+ * invocation, then assemble the fee and resource footprint from the simulation
+ * result.
+ *
+ * No wallet interaction occurs — the returned `preparedXdr` is an unsigned
+ * transaction.  Call {@link submitContractTx} with it (and the telemetry
+ * context from this call) to sign and broadcast, or discard it if you only
+ * need a dry-run / fee estimate.
+ *
+ * Address validation:
+ *  - `contractId` must be a valid Soroban contract ID (C-prefix, 56 chars).
+ *  - `walletAddress` must be a valid Stellar public key (G-prefix, 56 chars).
+ *
+ * @param contractId    The Soroban contract to invoke.
+ * @param method        The contract method name.
+ * @param args          Encoded ScVal arguments.
+ * @param walletAddress The signing account — used to fetch the sequence number.
+ * @param txCtx         Telemetry context handle from {@link startTx}.
+ */
+export async function simulateContractTx(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
   walletAddress: string,
-): Promise<{ txHash: string; success: boolean; error?: string }> {
-  const rpc = getRpc();
+  txCtx: ReturnType<typeof startTx>,
+): Promise<SimulateContractTxResult> {
+  // ── Address validation ───────────────────────────────────────────────────
+  assertSorobanContractId(contractId, "contractId");
+  assertStellarPublicKey(walletAddress, "walletAddress");
 
-  // ── Telemetry: started ───────────────────────────────────────────────────
-  // startTx emits the "started" stage and returns a context handle that
-  // tracks the per-invocation start time.  Only the method name is recorded —
-  // contractId, walletAddress, and args are never passed to telemetry.
-  const txCtx = startTx(method);
+  const rpc = getRpc();
 
   // ── Account fetch ────────────────────────────────────────────────────────
   let account: Awaited<ReturnType<typeof rpc.getAccount>>;
@@ -223,36 +287,30 @@ export async function invokeContract(
     const isNetwork =
       msg.toLowerCase().includes("network") || msg.toLowerCase().includes("fetch");
     emit(txCtx, "failed", categorizeError(isNetwork ? "network" : msg));
-    if (isNetwork) {
-      return {
-        txHash: "",
-        success: false,
-        error: formatContractError("network error"),
-      };
-    }
-    return { txHash: "", success: false, error: formatContractError(msg) };
+    return {
+      success: false,
+      error: formatContractError(isNetwork ? "network error" : msg),
+    };
   }
 
   const contract = new Contract(contractId);
 
-  const txBuilder = new TransactionBuilder(account, {
+  const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   })
     .addOperation(contract.call(method, ...args))
-    .setTimeout(30);
-
-  const tx = txBuilder.build();
+    .setTimeout(30)
+    .build();
 
   // ── Simulation ───────────────────────────────────────────────────────────
   const simResult = await rpc.simulateTransaction(tx);
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
-    // Emit simulate_failed with a category derived from the error type, but
-    // never forward the raw simResult.error string (may contain contract
+    // Never forward the raw simResult.error string (may contain contract
     // panic messages that echo argument values).
     emit(txCtx, "simulate_failed", categorizeError(simResult.error));
-    return { txHash: "", success: false, error: formatContractError(simResult.error) };
+    return { success: false, error: formatContractError(simResult.error) };
   }
 
   // ── Telemetry: simulated ─────────────────────────────────────────────────
@@ -260,12 +318,38 @@ export async function invokeContract(
 
   const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
 
+  return {
+    success: true,
+    preparedXdr: preparedTx.toXDR(),
+    simResult: simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse,
+  };
+}
+
+// ─── Phase 2: Submission ──────────────────────────────────────────────────────
+
+/**
+ * Phase 2 of the transaction lifecycle: sign a prepared transaction XDR with
+ * Freighter, broadcast it to the Soroban RPC, and poll for confirmation.
+ *
+ * Expects the `preparedXdr` produced by {@link simulateContractTx} and the
+ * same `txCtx` telemetry handle so the full lifecycle (started → simulated →
+ * submitted → confirmed) is recorded as a single logical operation.
+ *
+ * @param preparedXdr Unsigned, assembled transaction XDR from {@link simulateContractTx}.
+ * @param txCtx       Telemetry context handle from the originating {@link startTx} call.
+ */
+export async function submitContractTx(
+  preparedXdr: string,
+  txCtx: ReturnType<typeof startTx>,
+): Promise<{ txHash: string; success: boolean; error?: string }> {
+  const rpc = getRpc();
+
   // ── Wallet signing ───────────────────────────────────────────────────────
   // signTransaction v2 returns the signed XDR string directly.
   // The XDR is never forwarded to telemetry.
   let signedXdr: string;
   try {
-    signedXdr = await signTransaction(preparedTx.toXDR(), {
+    signedXdr = await signTransaction(preparedXdr, {
       networkPassphrase: NETWORK_PASSPHRASE,
     });
   } catch (err: any) {
@@ -277,7 +361,6 @@ export async function invokeContract(
       lower.includes("cancelled") ||
       lower.includes("canceled")
     ) {
-      // ── Telemetry: wallet_rejected ───────────────────────────────────────
       emit(txCtx, "wallet_rejected", "wallet_denied");
       return {
         txHash: "",
@@ -310,9 +393,8 @@ export async function invokeContract(
   }
 
   if (sendResult.status === "ERROR") {
-    // ── Telemetry: submission_failed ─────────────────────────────────────
-    // The hash is available at this point; it is included in the return value
-    // for the user but never forwarded to telemetry.
+    // The hash is available at this point; included in the return value for
+    // the user but never forwarded to telemetry.
     emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
@@ -322,8 +404,6 @@ export async function invokeContract(
   }
 
   // ── Telemetry: submitted ─────────────────────────────────────────────────
-  // Hash is now known.  It is returned to the caller and visible in the
-  // browser UI, but is not included in the telemetry event.
   emit(txCtx, "submitted");
 
   const hash = sendResult.hash;
@@ -341,12 +421,10 @@ export async function invokeContract(
     }
 
     if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
-      // ── Telemetry: confirmed ───────────────────────────────────────────
       emit(txCtx, "confirmed");
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      // ── Telemetry: failed ──────────────────────────────────────────────
       emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
@@ -356,18 +434,62 @@ export async function invokeContract(
     }
   }
 
-  // ── Telemetry: timed_out ─────────────────────────────────────────────────
   emit(txCtx, "timed_out", "timeout");
   return { txHash: hash, success: false, error: formatContractError("timeout") };
 }
 
+// ─── Convenience wrapper (simulate + submit) ──────────────────────────────────
+
+/**
+ * Simulate and submit a signed Soroban contract invocation in one call.
+ *
+ * This is the single entry point used by all write paths in the app (create
+ * circle, join, contribute, payout, close).  It calls {@link simulateContractTx}
+ * then {@link submitContractTx} under the same telemetry context, so the full
+ * lifecycle is recorded as one logical operation.
+ *
+ * Call the lower-level functions directly when you need to inspect the
+ * simulation result before prompting the user to sign — for example, to show
+ * a fee estimate or a dry-run return value in the UI.
+ *
+ * Address validation:
+ *  - `contractId` must be a valid Soroban contract ID (C-prefix, 56 chars).
+ *  - `walletAddress` must be a valid Stellar public key (G-prefix, 56 chars).
+ */
+export async function invokeContract(
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[],
+  walletAddress: string,
+): Promise<{ txHash: string; success: boolean; error?: string }> {
+  const txCtx = startTx(method);
+
+  const simOutcome = await simulateContractTx(contractId, method, args, walletAddress, txCtx);
+  if (!simOutcome.success) {
+    return { txHash: "", success: false, error: simOutcome.error };
+  }
+
+  return submitContractTx(simOutcome.preparedXdr, txCtx);
+}
+
 // ─── Read-only simulation ─────────────────────────────────────────────────────
 
+/**
+ * Simulate a read-only contract call and return the native-decoded return value.
+ *
+ * Uses a static fake account so no real sequence-number fetch is required.
+ * The transaction is never submitted — `sendTransaction` is never called.
+ *
+ * Address validation:
+ *  - `contractId` must be a valid Soroban contract ID (C-prefix, 56 chars).
+ */
 export async function readContract<T>(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
 ): Promise<T> {
+  assertSorobanContractId(contractId, "contractId");
+
   const rpc = getRpc();
   const contract = new Contract(contractId);
   // A minimal stub that satisfies the TransactionBuilder's Account interface.
@@ -398,20 +520,48 @@ export async function readContract<T>(
 
 // ─── Contract-specific helpers ────────────────────────────────────────────────
 
+/**
+ * Fetch the on-chain reputation score for a member address.
+ *
+ * Address validation:
+ *  - `member` must be a canonical Stellar address (G-key or C-contract).
+ */
 export async function getReputationScore(member: string): Promise<number> {
+  assertCanonicalStellarAddress(member, "member");
   return readContract<number>(REPUTATION_ADDRESS, "score", [
     new Address(member).toScVal(),
   ]);
 }
 
+/**
+ * Fetch the current status string of a circle contract.
+ *
+ * Address validation:
+ *  - `circleAddress` must be a valid Soroban contract ID (C-prefix, 56 chars).
+ */
 export async function getCircleStatus(circleAddress: string): Promise<string> {
+  assertSorobanContractId(circleAddress, "circleAddress");
   return readContract<string>(circleAddress, "get_status", []);
 }
 
+/**
+ * Fetch the current round index of a circle contract.
+ *
+ * Address validation:
+ *  - `circleAddress` must be a valid Soroban contract ID (C-prefix, 56 chars).
+ */
 export async function getCurrentRound(circleAddress: string): Promise<unknown> {
+  assertSorobanContractId(circleAddress, "circleAddress");
   return readContract<unknown>(circleAddress, "get_current_round", []);
 }
 
+/**
+ * Fetch the initialisation config of a circle contract.
+ *
+ * Address validation:
+ *  - `circleAddress` must be a valid Soroban contract ID (C-prefix, 56 chars).
+ */
 export async function getCircleConfig(circleAddress: string): Promise<unknown> {
+  assertSorobanContractId(circleAddress, "circleAddress");
   return readContract<unknown>(circleAddress, "get_config", []);
 }
