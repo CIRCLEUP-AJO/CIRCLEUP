@@ -3,10 +3,33 @@ import "./globals.css";
 import { WalletButton } from "@/components/WalletButton";
 import { WalletRepLink } from "@/components/WalletRepLink";
 
+// ─── Site origin ──────────────────────────────────────────────────────────────
+//
+// NEXT_PUBLIC_SITE_URL should be set to the canonical origin (e.g.
+// "https://circleup.app") in production.  In development it falls back to
+// localhost.  We never use `new URL(req.url)` here because this is a Server
+// Component that cannot access the request object directly in the App Router
+// metadata export.
+
+export const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") || "http://localhost:3000";
+
 export const metadata: Metadata = {
-  title: "CircleUp — On-Chain Savings Circles",
+  title: {
+    default: "CircleUp — On-Chain Savings Circles",
+    template: "%s — CircleUp",
+  },
   description:
     "Rotating savings & credit associations (Ajo / Esusu / Tanda / Chama) on Stellar Soroban",
+  metadataBase: new URL(SITE_URL),
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    siteName: "CircleUp",
+    type: "website",
+    locale: "en_US",
+  },
 };
 
 export default function RootLayout({
@@ -18,7 +41,7 @@ export default function RootLayout({
     <html lang="en">
       <body className="min-h-screen bg-slate-50">
         <nav className="bg-white border-b border-slate-200 px-4 py-3 flex items-center gap-3">
-          <span className="text-2xl">🔄</span>
+          <span className="text-2xl" aria-hidden="true">🔄</span>
           <span className="font-bold text-slate-800 text-lg">CircleUp</span>
           <span className="text-slate-400 text-sm hidden sm:block">
             Trustless savings circles on Stellar
