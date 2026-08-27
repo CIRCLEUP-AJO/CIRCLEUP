@@ -2,7 +2,7 @@
 import { useState, useEffect } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
-import { shortAddress, formatUsdc, INDEXER_URL } from "@/lib/config";
+import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
 import {
   buildAppSnapshot,
   computeActionEligibility,
@@ -593,6 +593,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       ? ` Round ${Math.max(0, currentRound)} of ${totalRounds}.`
       : "");
 
+  // Network-aware explorer link for the last successful action's transaction.
+  // Null on unsupported/custom networks — the hash is then shown as plain text.
+  const successTxUrl = success?.txHash
+    ? getExplorerLink(ACTIVE_NETWORK, "tx", success.txHash)
+    : null;
+
   return (
     <div className="space-y-8">
 
@@ -646,15 +652,21 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             {success.txHash && (
               <p className="text-xs">
                 Tx:{" "}
-                <a
-                  href={`https://stellar.expert/explorer/testnet/tx/${success.txHash}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="font-mono underline hover:text-brand-900"
-                  title={success.txHash}
-                >
-                  {shortAddress(success.txHash)}
-                </a>
+                {successTxUrl ? (
+                  <a
+                    href={successTxUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono underline hover:text-brand-900"
+                    title={success.txHash}
+                  >
+                    {shortAddress(success.txHash)}
+                  </a>
+                ) : (
+                  <span className="font-mono" title={success.txHash}>
+                    {shortAddress(success.txHash)}
+                  </span>
+                )}
               </p>
             )}
             {refreshState === "refreshing" && (
@@ -938,6 +950,12 @@ function RoundCard({ round }: RoundCardProps) {
     open:      "text-amber-700 bg-amber-50 border-amber-200",
   };
 
+  // Network-aware explorer link for this round's payout tx. Null on
+  // unsupported/custom networks — the hash is then shown as plain text.
+  const txUrl = round.txHash
+    ? getExplorerLink(ACTIVE_NETWORK, "tx", round.txHash)
+    : null;
+
   return (
     <div className="border border-slate-100 rounded-lg p-4">
       {/* Header row: round number + status badge (left) / tx link (right) */}
@@ -956,15 +974,21 @@ function RoundCard({ round }: RoundCardProps) {
         </div>
 
         {round.txHash ? (
-          <a
-            href={`https://stellar.expert/explorer/testnet/tx/${round.txHash}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-xs text-brand-600 hover:underline font-mono"
-            title={round.txHash}
-          >
-            {shortAddress(round.txHash)}
-          </a>
+          txUrl ? (
+            <a
+              href={txUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-brand-600 hover:underline font-mono"
+              title={round.txHash}
+            >
+              {shortAddress(round.txHash)}
+            </a>
+          ) : (
+            <span className="text-xs text-slate-500 font-mono" title={round.txHash}>
+              {shortAddress(round.txHash)}
+            </span>
+          )
         ) : (
           <span className="text-xs text-slate-400 italic">awaiting payout</span>
         )}

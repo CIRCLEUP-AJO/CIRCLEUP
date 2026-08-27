@@ -94,6 +94,82 @@ export const USDC_ADDRESS: string =
 export const INDEXER_URL: string =
   process.env.NEXT_PUBLIC_INDEXER_URL || "http://localhost:3001";
 
+// ─── Network resolution & block explorer links ────────────────────────────────
+//
+// Mirror of the explorer helpers in sdk/src/constants.ts — kept in sync manually
+// because the app does not take a direct dependency on the @circleup/sdk package
+// (see app/src/lib/gating.ts for the same pattern).
+
+/** Recognised public Stellar network passphrases (mirror of SDK constants). */
+const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
+const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+
+/** Identifies which Stellar network the app is currently targeting. */
+export type NetworkName = "testnet" | "mainnet";
+
+/** The kinds of on-chain entity a block explorer link can point at. */
+export type ExplorerEntityType = "tx" | "account" | "contract";
+
+/** Host prefix shared by every Stellar Expert explorer URL. */
+export const EXPLORER_BASE_URL = "https://stellar.expert/explorer";
+
+/**
+ * Stellar Expert's URL path segment for each network. Mainnet is `public` on
+ * the explorer, not `mainnet` — centralised here so no call site gets it wrong.
+ */
+const EXPLORER_NETWORK_SEGMENT: Record<NetworkName, string> = {
+  testnet: "testnet",
+  mainnet: "public",
+};
+
+/** Returns `true` when `value` is a recognised {@link NetworkName}. */
+export function isValidNetwork(value: string): value is NetworkName {
+  return value === "testnet" || value === "mainnet";
+}
+
+/**
+ * Resolve the active network name from a configured network passphrase.
+ * Returns `"custom"` for any passphrase that is not a recognised public Stellar
+ * network (e.g. a standalone/quickstart chain) so that explorer links degrade
+ * to plain text rather than pointing at the wrong network.
+ */
+export function resolveNetworkName(passphrase: string): string {
+  if (passphrase === MAINNET_PASSPHRASE) return "mainnet";
+  if (passphrase === TESTNET_PASSPHRASE) return "testnet";
+  return "custom";
+}
+
+/**
+ * The active network, resolved once from `NEXT_PUBLIC_NETWORK_PASSPHRASE`.
+ * `"custom"` when the passphrase is not a recognised public network.
+ */
+export const ACTIVE_NETWORK: string = resolveNetworkName(NETWORK_PASSPHRASE);
+
+/**
+ * Build a Stellar Expert explorer URL for a transaction, account, or contract.
+ *
+ * The link always matches the requested network (mainnet maps to the explorer's
+ * `public` segment). The identifier is URL-encoded so slashes or other path
+ * characters can never break out of the intended path. Returns `null` — a safe
+ * non-link the caller renders as plain text — when the network is unsupported
+ * or the identifier is empty/whitespace-only.
+ *
+ * Mirror of `getExplorerLink` in sdk/src/constants.ts.
+ */
+export function getExplorerLink(
+  network: string,
+  type: ExplorerEntityType,
+  identifier: string,
+): string | null {
+  if (!isValidNetwork(network)) return null;
+
+  const trimmed = typeof identifier === "string" ? identifier.trim() : "";
+  if (trimmed === "") return null;
+
+  const segment = EXPLORER_NETWORK_SEGMENT[network];
+  return `${EXPLORER_BASE_URL}/${segment}/${type}/${encodeURIComponent(trimmed)}`;
+}
+
 // ─── USDC / stroops conversion ────────────────────────────────────────────────
 //
 // These helpers MIRROR sdk/src/utils.ts. The app intentionally does not depend
