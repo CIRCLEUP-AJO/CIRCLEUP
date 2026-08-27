@@ -1025,6 +1025,245 @@ impl CircleContract {
         );
     }
 
+    // ── Settle Round (missed-recipient policy) ────────────────────────────────
+
+    /// Resolve a stuck round after the deadline has passed without full contributions.
+    ///
+    /// # Policy
+    ///
+    /// When one or more members fail to contribute before the round deadline the
+    /// normal `payout` path is permanently blocked (it requires every member to
+    /// have contributed).  `settle_round` provides the escape hatch:
+    ///
+    /// 1. All members who have **not** contributed this round and have **not**
+    ///    already been flagged are penalised (20 % of their current collateral),
+    ///    exactly as `mark_default` would do.
+    /// 2. The pot is the sum of tokens actually transferred to the contract this
+    ///    round (`contributed_count × round_amount`).  The scheduled recipient
+    ///    still receives whatever was collected — defaulting members cannot
+    ///    redirect or withhold the recipient's payout.
+    /// 3. The round is marked settled and the circle advances (or completes) on
+    ///    the same logic as `payout`.
+    /// 4. An `exceptional_settlement` event is emitted **before** the normal
+    ///    `payout` event so indexers can distinguish this code path from a clean
+    ///    full-contribution payout.
+    ///
+    /// # Preconditions
+    ///
+    /// - Circle must be `Active`.
+    /// - The round must **not** already be paid out.
+    /// - The round deadline must have **strictly** passed
+    ///   (`current_ledger > deadline_ledger`).
+    /// - At least one member must have contributed (an all-default round with
+    ///   zero contributions produces a zero pot; the contract still settles and
+    ///   advances but emits `pot = 0`).
+    ///
+    /// # Acceptance criteria mapping
+    ///
+    /// - A missed recipient cannot permanently freeze the circle: `settle_round`
+    ///   unblocks the payout path after the deadline, regardless of how many
+    ///   members defaulted.
+    /// - Funds follow the documented policy: the scheduled recipient receives the
+    ///   partial pot; defaulting members forfeit 20 % of collateral.
+    /// - Indexer consumers can identify exceptional settlement: the
+    ///   `exceptional_settlement` event is emitted only by this code path.
+    ///
+    /// Anyone may call this.
+    pub fn settle_round(env: Env) {
+        let config: CircleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| panic!("circle: settle_round called before initialize"));
+        let status: CircleStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
+
+        if status != CircleStatus::Active {
+            panic!("circle is not active");
+        }
+
+        let mut round: RoundState = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentRound)
+            .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
+
+        if round.paid_out {
+            panic!("round already paid out");
+        }
+
+        // Deadline must have strictly passed before exceptional settlement is allowed.
+        if !Self::deadline_passed(&env, &round) {
+            panic!("round deadline not yet passed; use payout once all members have contributed");
+        }
+
+        // If everyone has already contributed, the normal payout path works fine.
+        let member_count = config.members.len();
+        if round.contributions_received == member_count {
+            panic!("all members have contributed; use payout instead of settle_round");
+        }
+
+        // ── Phase 1: penalise all non-contributors who haven't been flagged yet ──
+
+        let mut defaulted_members: Vec<Address> = Vec::new(&env);
+        let mut contributed_count: u32 = 0;
+
+        for member in config.members.iter() {
+            let contrib_key = DataKey::Contributed(member.clone(), round.round_index);
+            if env.storage().persistent().has(&contrib_key) {
+                contributed_count += 1;
+                continue; // already contributed — no penalty
+            }
+
+            // Must have joined (locked collateral) to be penalisable.
+            let collateral: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Collateral(member.clone()))
+                .unwrap_or(0);
+
+            if collateral <= 0 {
+                // Member never joined (possible in edge cases) — skip without penalty.
+                continue;
+            }
+
+            let defaulted_key = DataKey::Defaulted(member.clone(), round.round_index);
+            if env.storage().persistent().has(&defaulted_key) {
+                // Already marked via a prior `mark_default` call — do not double-penalise.
+                continue;
+            }
+
+            // Apply the standard 20 % penalty.
+            let penalty = collateral * PENALTY_BPS / BPS_DENOM;
+            let new_collateral = collateral - penalty;
+            env.storage()
+                .persistent()
+                .set(&DataKey::Collateral(member.clone()), &new_collateral);
+            env.storage().persistent().set(&defaulted_key, &true);
+
+            let defaults: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Defaults(member.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Defaults(member.clone()), &(defaults + 1));
+
+            // Emit the standard `default` event for each newly penalised member
+            // so existing indexers that listen for `circle/default` still work.
+            env.events().publish(
+                (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
+                (member.clone(), penalty, round.round_index, new_collateral),
+            );
+
+            defaulted_members.push_back(member);
+        }
+
+        // Compute the partial pot: only contributions that actually arrived.
+        let pot: i128 = config
+            .round_amount
+            .checked_mul(contributed_count as i128)
+            .unwrap_or_else(|| panic!("pot amount overflow"));
+
+        // ── CHECKS-EFFECTS-INTERACTIONS ───────────────────────────────────────
+
+        // Effect: mark the round as settled before any external call.
+        round.paid_out = true;
+        env.storage().instance().set(&DataKey::CurrentRound, &round);
+
+        let completed: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoundsCompleted)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoundsCompleted, &(completed + 1));
+
+        // Emit the exceptional_settlement event BEFORE the payout event so
+        // indexers can distinguish this path from a normal full-contribution payout.
+        // Payload: (recipient, pot, round_index, defaulted_count)
+        // where defaulted_count = total members who did NOT contribute this round
+        // (including those already flagged via earlier mark_default calls).
+        let total_defaulted = member_count - contributed_count;
+        env.events().publish(
+            (
+                Symbol::new(&env, "circle"),
+                Symbol::new(&env, "exceptional_settlement"),
+            ),
+            (
+                round.recipient.clone(),
+                pot,
+                round.round_index,
+                total_defaulted,
+            ),
+        );
+
+        // Interaction 1: transfer partial pot to the scheduled recipient.
+        // A zero pot is valid (all members defaulted) — the transfer is skipped
+        // to avoid a no-op call to the token contract.
+        if pot > 0 {
+            let token_client = token::Client::new(&env, &config.usdc_token);
+            Self::safe_transfer(
+                &token_client,
+                &env.current_contract_address(),
+                &round.recipient,
+                &pot,
+                "exceptional round settlement",
+            );
+        }
+
+        // Interaction 2: increment reputation for the recipient even in an
+        // exceptional settlement — they were available to receive; the default
+        // was caused by other members, not by them.
+        let rep_client =
+            reputation::ReputationContractClient::new(&env, &config.reputation_contract);
+        let _ = rep_client
+            .try_increment(&env.current_contract_address(), &round.recipient)
+            .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
+
+        // Emit the standard payout event (consistent with normal payout path).
+        env.events().publish(
+            (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
+            (round.recipient.clone(), pot, round.round_index),
+        );
+
+        // Advance to next round or mark the circle as completed.
+        let next_round_index = round.round_index + 1;
+        if next_round_index >= member_count as u32 {
+            env.storage()
+                .instance()
+                .set(&DataKey::Status, &CircleStatus::Completed);
+            env.events().publish(
+                (Symbol::new(&env, "circle"), Symbol::new(&env, "completed")),
+                (),
+            );
+        } else {
+            let next_recipient = config
+                .members
+                .get(next_round_index)
+                .unwrap_or_else(|| panic!("circle: next recipient at index {} missing — storage inconsistency", next_round_index));
+            let next_round = RoundState {
+                round_index: next_round_index,
+                recipient: next_recipient.clone(),
+                contributions_received: 0,
+                deadline_ledger: env.ledger().sequence() as u64
+                    + config.round_deadline_ledgers as u64,
+                paid_out: false,
+            };
+            env.storage().instance().set(&DataKey::CurrentRound, &next_round);
+
+            env.events().publish(
+                (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
+                (next_round_index, next_recipient, next_round.deadline_ledger),
+            );
+        }
+    }
+
     // ── Close ─────────────────────────────────────────────────────────────────
 
     /// Settle and release remaining collateral back to all members.
