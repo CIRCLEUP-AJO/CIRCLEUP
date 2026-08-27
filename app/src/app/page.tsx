@@ -9,6 +9,16 @@ export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
   description:
     "Start a savings circle on Stellar. Ajo, Esusu, Tanda, and Chama — on-chain. Everyone pays in once a round, and the smart contract hands the pot to whoever's turn it is.",
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    title: "CircleUp — Trustless Savings Circles on Stellar",
+    description:
+      "Ajo, Esusu, Tanda, and Chama on Stellar. Everyone pays in once a round, and the contract hands the whole pot to whoever's turn it is.",
+    url: "/",
+    type: "website",
+  },
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────

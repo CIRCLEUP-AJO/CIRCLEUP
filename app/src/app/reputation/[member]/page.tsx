@@ -1,25 +1,48 @@
 import type { Metadata } from "next";
 import { shortAddress } from "@/lib/config";
+import { isCanonicalStellarAddress } from "@/lib/address";
 import ReputationClient from "./ReputationClient";
 
 // ─── Metadata ─────────────────────────────────────────────────────────────────
 //
 // generateMetadata runs server-side; the member address comes from the dynamic
-// route segment so we can produce a meaningful, per-member title without any
-// network call.  The full address would overflow a typical <title> tag, so we
-// use the same shortAddress helper the rest of the UI uses.
+// route segment.  We validate it with isCanonicalStellarAddress before using
+// it in any metadata string — a malformed or injected URL segment must not
+// appear verbatim in <title> or <meta> attributes.
+//
+// Canonical URL: /reputation/<address>  (normalises the validated address).
+// A malformed segment returns a generic title with no canonical link, which
+// prevents search engines from indexing bogus paths.
 
 export async function generateMetadata({
   params,
 }: {
   params: { member: string };
 }): Promise<Metadata> {
+  // Guard: only accept well-formed Stellar/Soroban addresses
+  if (!isCanonicalStellarAddress(params.member)) {
+    return {
+      title: "Reputation — CircleUp",
+      description: "On-chain reputation score and contribution history on CircleUp.",
+    };
+  }
+
   const short = shortAddress(params.member);
   return {
-    title: `Reputation: ${short} — CircleUp`,
+    title: `Reputation: ${short}`,
     description:
       `On-chain reputation score and circle participation history for ${params.member} on CircleUp. ` +
       `View completed rounds, defaults, and contribution records.`,
+    alternates: {
+      canonical: `/reputation/${params.member}`,
+    },
+    openGraph: {
+      title: `Reputation: ${short} — CircleUp`,
+      description:
+        `On-chain reputation score and circle participation history for ${params.member} on CircleUp.`,
+      url: `/reputation/${params.member}`,
+      type: "profile",
+    },
   };
 }
 

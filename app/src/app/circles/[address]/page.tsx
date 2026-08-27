@@ -14,19 +14,51 @@ export async function generateMetadata({
 }: {
   params: { address: string };
 }): Promise<Metadata> {
+  // Validate the address before using it in any metadata string.
+  // A path traversal or injected value would otherwise appear verbatim in
+  // <title> and <meta> tags.  We only accept canonical 56-char Soroban
+  // contract IDs (C-prefix, base32) — anything else gets the safe fallback.
+  const safeAddress = /^C[A-Z2-7]{55}$/.test(params.address)
+    ? params.address
+    : null;
+
+  if (!safeAddress) {
+    // Malformed address segment: return a generic fallback rather than
+    // surfacing the raw (potentially malicious) string in the document head.
+    return {
+      title: "Circle — CircleUp",
+      description: "Savings circle on CircleUp.",
+    };
+  }
+
   // Attempt to enrich the metadata with live circle data.  A failure here must
   // never 500 the page — fall back to the address-only title gracefully.
   try {
-    const result = await getCircleDetail(params.address);
+    const result = await getCircleDetail(safeAddress);
     if (result.ok) {
       const { circle } = result.data;
+      // All values used below come from the indexer (trusted server data),
+      // but we still sanitise them before interpolating into HTML attributes
+      // to prevent injection if the indexer response is ever compromised.
+      const status = String(circle.status).replace(/[<>"'&]/g, "");
       const pot = `$${formatPot(circle.round_amount, circle.member_count)}`;
       const roundAmount = `$${formatUsdc(circle.round_amount)}`;
+      const shortAddr = safeAddress.slice(0, 8);
       return {
-        title: `${roundAmount}/round Circle (${circle.status}) — CircleUp`,
+        title: `${roundAmount}/round Circle (${status})`,
         description:
           `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}. ` +
-          `Savings circle at ${params.address} on CircleUp. Track rotation order, round progress, and contribution history.`,
+          `Savings circle at ${safeAddress} on CircleUp.`,
+        alternates: {
+          canonical: `/circles/${safeAddress}`,
+        },
+        openGraph: {
+          title: `${roundAmount}/round Circle (${status}) — CircleUp`,
+          description:
+            `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}.`,
+          url: `/circles/${safeAddress}`,
+          type: "website",
+        },
       };
     }
   } catch {
@@ -35,9 +67,13 @@ export async function generateMetadata({
 
   // Default: address-only fallback when the indexer is unreachable or the
   // circle is not found (404 will be served by the page render, not here).
+  const shortAddr = safeAddress.slice(0, 8);
   return {
-    title: `Circle ${params.address.slice(0, 8)}… — CircleUp`,
-    description: `Savings circle at ${params.address} on CircleUp. Track rotation order, round progress, and contribution history.`,
+    title: `Circle ${shortAddr}…`,
+    description: `Savings circle at ${safeAddress} on CircleUp. Track rotation order, round progress, and contribution history.`,
+    alternates: {
+      canonical: `/circles/${safeAddress}`,
+    },
   };
 }
 
