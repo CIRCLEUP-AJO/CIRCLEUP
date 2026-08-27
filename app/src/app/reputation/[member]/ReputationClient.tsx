@@ -33,9 +33,9 @@ interface ReputationResponse {
 
 type FetchResult =
   | { ok: true; data: ReputationResponse }
-  | { ok: false; reason: "not_found" | "network" | "unknown" };
+  | { ok: false; reason: "not_found" | "network" | "unknown" | "aborted" };
 
-async function fetchReputation(member: string): Promise<FetchResult> {
+async function fetchReputation(member: string, signal?: AbortSignal): Promise<FetchResult> {
   // Validate the route param before making any network request. A malformed
   // address (e.g. from a manually typed URL) would otherwise reach the indexer
   // and return a 404 that looks indistinguishable from "no activity yet".
@@ -44,13 +44,16 @@ async function fetchReputation(member: string): Promise<FetchResult> {
   }
   try {
     const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
-      // Always fetch fresh data — the user can also trigger a manual refresh.
       cache: "no-store",
+      signal,
     });
     if (res.status === 404) return { ok: false, reason: "not_found" };
     if (!res.ok) return { ok: false, reason: "unknown" };
     return { ok: true, data: (await res.json()) as ReputationResponse };
-  } catch {
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return { ok: false, reason: "aborted" };
+    }
     return { ok: false, reason: "network" };
   }
 }
@@ -66,9 +69,10 @@ export default function ReputationClient({ member }: { member: string }) {
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
 
   const load = useCallback(
-    async (isManual = false) => {
+    async (isManual = false, signal?: AbortSignal) => {
       if (isManual) setRefreshing(true);
-      const fetched = await fetchReputation(member);
+      const fetched = await fetchReputation(member, signal);
+      if (signal?.aborted) return;
       setResult(fetched);
       setLastRefreshed(new Date());
       if (isManual) setRefreshing(false);
@@ -76,9 +80,11 @@ export default function ReputationClient({ member }: { member: string }) {
     [member],
   );
 
-  // Initial fetch on mount
+  // Initial fetch on mount; cancel on unmount or member change
   useEffect(() => {
-    load();
+    const controller = new AbortController();
+    load(false, controller.signal);
+    return () => controller.abort();
   }, [load]);
 
   // ── Loading state ────────────────────────────────────────────────────────────
@@ -102,6 +108,9 @@ export default function ReputationClient({ member }: { member: string }) {
   // ── Error states ─────────────────────────────────────────────────────────────
 
   if (!result.ok) {
+    // Aborted fetches (navigation away then back) should not show error UI
+    if (result.reason === "aborted") return null;
+
     if (result.reason === "not_found") {
       return (
         <div className="text-center py-16 text-slate-500">

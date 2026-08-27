@@ -30,6 +30,13 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Running Migrations](#running-migrations)
   - [Checking Schema Health](#checking-schema-health)
   - [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)
+- [Database Backup and Restore](#database-backup-and-restore)
+  - [Backup](#backup)
+  - [Restore](#restore)
+  - [Post-restore verification](#post-restore-verification)
+  - [Applying migrations after restore](#applying-migrations-after-restore)
+  - [When to use chain replay instead of restore](#when-to-use-chain-replay-instead-of-restore)
+  - [Rollback guidance](#rollback-guidance)
 - [Health Checks and Monitoring](#health-checks-and-monitoring)
   - [Indexer Health Endpoint](#indexer-health-endpoint)
   - [Indexer Audit Endpoint](#indexer-audit-endpoint)
@@ -490,6 +497,127 @@ npm run replay --workspace=indexer -- --from=12345678 --partial
 Replay is atomic: it wraps the wipe and cursor reset in a single transaction. If the process is interrupted, the database returns to its pre-replay state and the replay can be retried safely.
 
 **Warning:** a full replay (without `--partial`) deletes all derived table rows from the given ledger onward and resets the indexer cursor. The indexer will then re-ingest all events from that point. During replay the API continues to serve the (now stale) data until the cursor catches up.
+
+---
+
+## Database Backup and Restore
+
+Although the indexer database is a derived read-model that can be fully reconstructed by replaying Soroban events from the deployment ledger, a tested backup and restore path reduces outage time and protects checkpoint correctness.
+
+### Backup
+
+**Frequency:** Daily backups are recommended for production. The indexer's `last_ledger` cursor is stored in the `indexer_state` table — losing it forces a full replay from `START_LEDGER`, which can take minutes to hours depending on chain history.
+
+**Docker Compose (default local setup):**
+
+```bash
+# Dump the full database to a timestamped file
+docker compose exec -T postgres \
+  pg_dump -U postgres circleup \
+  > backups/circleup_$(date +%Y%m%d_%H%M%S).sql
+```
+
+**External Postgres:**
+
+```bash
+pg_dump "$DATABASE_URL" > backups/circleup_$(date +%Y%m%d_%H%M%S).sql
+```
+
+Store backups off-host (S3, GCS, etc.). Retain at least 7 daily snapshots.
+
+### Restore
+
+**Stop the indexer before restoring** to prevent it from writing to a partially restored database:
+
+```bash
+# 1. Stop the indexer
+npm run stop:indexer   # or kill the process
+
+# 2. Drop and recreate the database (Docker Compose)
+docker compose exec -T postgres \
+  psql -U postgres -c "DROP DATABASE IF EXISTS circleup; CREATE DATABASE circleup;"
+
+# 3. Restore from backup
+docker compose exec -T postgres \
+  psql -U postgres circleup < backups/circleup_<timestamp>.sql
+
+# 4. Verify migrations are clean
+npm run migrate:check --workspace=indexer
+# Expected output: Health state: clean
+
+# 5. Restart the indexer
+npm run dev:indexer
+```
+
+**External Postgres:**
+
+```bash
+psql "$DATABASE_URL" < backups/circleup_<timestamp>.sql
+npm run migrate:check --workspace=indexer
+```
+
+### Post-restore verification
+
+Run these queries to confirm the restore is consistent:
+
+```sql
+-- Confirm the indexer cursor was restored
+SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1;
+
+-- Confirm circle and member counts are non-zero (for a non-empty deployment)
+SELECT COUNT(*) FROM circles;
+SELECT COUNT(*) FROM circle_members;
+
+-- Confirm the dedup table is present and non-empty
+SELECT COUNT(*) FROM ingested_events;
+```
+
+Also check the API:
+
+```bash
+curl http://localhost:3001/health
+# Expected: { "status": "ok", ... }
+
+curl http://localhost:3001/indexer/state
+# Confirm lastLedger matches the value from indexer_state above
+```
+
+### Applying migrations after restore
+
+If the backup predates a schema migration, apply pending migrations before restarting the indexer:
+
+```bash
+npm run migrate --workspace=indexer
+npm run migrate:check --workspace=indexer
+# Expected: Health state: clean
+```
+
+### When to use chain replay instead of restore
+
+Prefer **chain replay** over a backup restore when:
+
+- No recent backup is available.
+- The backup predates a schema migration that changes how events are processed (not just adds columns).
+- You suspect the backup contains corrupt or duplicate rows from a failed replay.
+
+To replay from the deployment ledger:
+
+```bash
+# Full replay — wipes all derived rows from START_LEDGER onward
+npm run replay --workspace=indexer -- --from=<deployment_ledger>
+```
+
+See [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger) for dry-run and partial replay options.
+
+### Rollback guidance
+
+If a migration or deploy causes data corruption:
+
+1. Stop the indexer immediately.
+2. Restore the most recent pre-migration backup (see [Restore](#restore) above).
+3. Verify the schema state with `npm run migrate:check`.
+4. If the backup is too old, replay from the last known-good ledger using `npm run replay -- --from=<ledger>`.
+5. Do **not** re-run a failed migration without first reverting the migration file — the runner will attempt to re-apply it and may produce duplicate or conflicting schema changes.
 
 ---
 

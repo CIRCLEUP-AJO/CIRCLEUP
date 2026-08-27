@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { notFound } from "next/navigation";
 import { shortAddress } from "@/lib/config";
 import { isCanonicalStellarAddress } from "@/lib/address";
 import ReputationClient from "./ReputationClient";
@@ -58,5 +59,11 @@ export default function ReputationPage({
 }: {
   params: { member: string };
 }) {
+  // Invalid address segments produce a proper 404 rather than an empty screen
+  // that looks identical to "no activity yet" (Issue #385).
+  if (!isCanonicalStellarAddress(params.member)) {
+    notFound();
+  }
+
   return <ReputationClient member={params.member} />;
 }
