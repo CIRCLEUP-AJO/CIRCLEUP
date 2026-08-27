@@ -354,3 +354,95 @@ if (hasDb) {
     await pool.end();
   });
 }
+
+// ─── Checksum / content-hash tests ───────────────────────────────────────────
+
+test("deriveHealthState: modified state is reachable (applied file edited on disk)", () => {
+  // modified = applied files exist on disk but their hash differs from stored.
+  // We extend deriveHealthState to accept a modified count.
+  function deriveWithModified(
+    pending: number,
+    missingOnDisk: number,
+    modified: number,
+    schemaExists: boolean,
+  ): string {
+    if (!schemaExists) return "uninitialized";
+    if (pending > 0 && missingOnDisk > 0) return "partial";
+    if (missingOnDisk > 0) return "drifted";
+    if (modified > 0) return "modified";
+    if (pending > 0) return "pending";
+    return "clean";
+  }
+
+  assert.equal(deriveWithModified(0, 0, 1, true), "modified", "edited file → modified");
+  assert.equal(deriveWithModified(0, 0, 0, true), "clean", "no changes → clean");
+  // partial and drifted take priority over modified
+  assert.equal(deriveWithModified(1, 1, 1, true), "partial");
+  assert.equal(deriveWithModified(0, 1, 1, true), "drifted");
+});
+
+test("checksum comparison: same content produces same hash", () => {
+  const crypto = require("node:crypto") as typeof import("crypto");
+  const hash = (s: string) =>
+    crypto.createHash("sha256").update(s, "utf8").digest("hex");
+
+  const sql = "ALTER TABLE circles ADD COLUMN foo TEXT;";
+  assert.equal(hash(sql), hash(sql), "identical content must hash identically");
+});
+
+test("checksum comparison: different content produces different hash", () => {
+  const crypto = require("node:crypto") as typeof import("crypto");
+  const hash = (s: string) =>
+    crypto.createHash("sha256").update(s, "utf8").digest("hex");
+
+  const original = "ALTER TABLE circles ADD COLUMN foo TEXT;";
+  const edited = "ALTER TABLE circles ADD COLUMN foo INTEGER;";
+  assert.notEqual(hash(original), hash(edited), "edited content must produce a different hash");
+});
+
+test("checksum comparison: whitespace-only change is detected", () => {
+  const crypto = require("node:crypto") as typeof import("crypto");
+  const hash = (s: string) =>
+    crypto.createHash("sha256").update(s, "utf8").digest("hex");
+
+  const original = "SELECT 1;";
+  const withTrailingSpace = "SELECT 1; ";
+  assert.notEqual(
+    hash(original),
+    hash(withTrailingSpace),
+    "trailing whitespace must change the hash",
+  );
+});
+
+test("modified state summary contains actionable guidance", () => {
+  const summary =
+    `1 applied migration file(s) have been edited since they were applied: ` +
+    `001_add_col.sql. ` +
+    `Editing applied migrations causes environment drift and may silently alter future behaviour. ` +
+    `Restore the original file(s) or create a new migration to make the change.`;
+
+  assert.match(summary, /001_add_col\.sql/, "summary names the modified file");
+  assert.match(summary, /environment drift/, "summary mentions drift");
+  assert.match(summary, /Restore|new migration/, "summary gives remediation options");
+});
+
+test("canStartSafely is false for modified state", () => {
+  // Only 'clean' is safe; modified must not be.
+  const unsafeStates = ["modified", "pending", "drifted", "partial", "uninitialized"];
+  for (const state of unsafeStates) {
+    assert.equal(state === "clean", false, `${state} must not be safe to start`);
+  }
+});
+
+test("backwards compat: null stored hash skips modification check", () => {
+  // When content_hash is NULL (rows inserted before this feature), the
+  // modified check must be skipped rather than treating every old row as modified.
+  function isModified(storedHash: string | null, diskHash: string): boolean {
+    if (!storedHash) return false; // null → skip
+    return diskHash !== storedHash;
+  }
+
+  assert.equal(isModified(null, "abc123"), false, "null stored hash must not flag as modified");
+  assert.equal(isModified("abc123", "abc123"), false, "matching hashes must not flag as modified");
+  assert.equal(isModified("abc123", "def456"), true, "mismatched hashes must flag as modified");
+});

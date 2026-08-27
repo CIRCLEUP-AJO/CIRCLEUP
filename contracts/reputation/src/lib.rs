@@ -471,6 +471,18 @@ mod tests {
         });
     }
 
+    /// Force a member's score directly in persistent storage, bypassing the
+    /// `increment` entry point.  Used to exercise boundary and overflow cases
+    /// that would otherwise require running `increment` u32::MAX times.
+    fn force_score(s: &Setup, member: &Address, score: u32) {
+        s.env.as_contract(&s.contract_id, || {
+            s.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Score(member.clone()), &score);
+        });
+    }
+
     /// Data payloads of every emitted event whose second topic is `name`.
     ///
     /// Topic symbols longer than nine characters are host objects rather than
@@ -692,6 +704,79 @@ mod tests {
             "revocation must be irreversible"
         );
         assert!(!s.client.get_authorized_callers().contains(&circle));
+    }
+
+    // ── Monotonicity: overflow and boundary ───────────────────────────────────
+
+    /// Score can grow up to u32::MAX without unexpected clamping or wrapping.
+    /// This verifies the happy path right at the boundary: MAX - 1 → MAX.
+    #[test]
+    fn test_score_at_u32_max_minus_one_increments_to_max() {
+        let s = setup();
+        let member = Address::generate(&s.env);
+        s.client.add_authorized_caller(&s.admin, &s.contract_id);
+        force_score(&s, &member, u32::MAX - 1);
+        s.client.increment(&s.contract_id, &member);
+        assert_eq!(
+            s.client.score(&member),
+            u32::MAX,
+            "score must be able to reach u32::MAX without wrapping or clamping"
+        );
+    }
+
+    /// Incrementing from u32::MAX must trap rather than silently wrap back to 0.
+    /// The release profile sets overflow-checks = true; in the test environment
+    /// Rust's debug overflow checks also fire, so this panic is deterministic.
+    #[test]
+    fn test_score_overflow_at_u32_max_traps() {
+        let s = setup();
+        let member = Address::generate(&s.env);
+        s.client.add_authorized_caller(&s.admin, &s.contract_id);
+        force_score(&s, &member, u32::MAX);
+        // The increment must fail (overflow trap) rather than wrap to 0.
+        let result = s.client.try_increment(&s.contract_id, &member);
+        assert!(
+            result.is_err(),
+            "score must not silently wrap past u32::MAX — the operation must trap"
+        );
+        // The failed call must leave the score unchanged at u32::MAX.
+        assert_eq!(
+            s.client.score(&member),
+            u32::MAX,
+            "score must remain at u32::MAX after the failed increment"
+        );
+    }
+
+    /// One authorized `increment` call creates exactly one score point.
+    /// This pin-tests the "one qualifying circle completion = one defined increment"
+    /// requirement from Issue 89.
+    #[test]
+    fn test_one_authorized_completion_adds_exactly_one_point() {
+        let s = setup();
+        let member = Address::generate(&s.env);
+        s.client.add_authorized_caller(&s.admin, &s.contract_id);
+        let before = s.client.score(&member);
+        s.client.increment(&s.contract_id, &member);
+        let after = s.client.score(&member);
+        assert_eq!(
+            after,
+            before + 1,
+            "one authorized increment must add exactly one point"
+        );
+    }
+
+    /// Score for a member with no recorded history must be zero — not an error,
+    /// not None, not a missing-key panic.  The contract must return 0 for any
+    /// unknown address.
+    #[test]
+    fn test_unknown_member_score_is_deterministically_zero() {
+        let s = setup();
+        let unknown = Address::generate(&s.env);
+        assert_eq!(
+            s.client.score(&unknown),
+            0,
+            "score for an address with no history must be deterministically 0"
+        );
     }
 
     /// The core stale-permission case: even if the allowlist is corrupted so

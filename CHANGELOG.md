@@ -9,6 +9,43 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Issue 30**: Contract argument compatibility fixtures (`sdk/src/__tests__/contractFixtures.test.ts`)
+  — Base64-encoded XDR fixtures for every public contract method (factory, circle,
+  reputation) that verify SDK argument encoding remains compatible with contract
+  signatures across releases. Covers valid arguments and boundary cases for all
+  22 contract methods. See `sdk/CONTRACT_FIXTURES.md` for maintenance guide
+- **Issue 28**: Canonical event identity constraints (`indexer/src/db/migrations/003_event_dedup_constraints.sql`)
+  — Added `event_index` column and unique index on `(ledger, tx_hash, event_index)`
+  to enforce idempotency at the database layer rather than relying on application
+  memory. Makes duplicate event delivery (from at-least-once polling) a silent
+  no-op via `ON CONFLICT DO NOTHING`
+- **Issue 29**: Exponential backoff for RPC polling (`indexer/src/indexer.ts`)
+  — Temporary RPC failures (connection refused, timeout, rate limit) now trigger
+  capped exponential backoff (1s → 2s → 4s → ... → 60s) with full jitter instead
+  of hot-looping or immediate exit. Backoff resets after successful poll. Structured
+  warnings at exponentially-spaced thresholds (3, 4, 8, 16, 32 failures) prevent
+  log spam
+- `docs/INDEXER_RELIABILITY.md` — Comprehensive design document covering atomic
+  ledger checkpointing, event idempotency model, backoff policy, graceful shutdown,
+  and monitoring recommendations
+- `sdk/CONTRACT_FIXTURES.md` — Documentation for maintaining contract fixtures,
+  debugging failed tests, and integrating with CI
+- `indexer/src/backoff.test.ts` — 12 unit tests verifying backoff progression,
+  jitter bounds, reset-after-success, warning thresholds, and cap enforcement
+- `indexer/src/eventIdentity.test.ts` — 13 unit tests verifying `parseEventIndex`
+  extraction, `createEventKey` stability, canonical identity properties, and
+  duplicate detection across ledgers and transactions
+- `indexer/src/indexer.ts` — `parseEventIndex()` function extracts event index
+  from Soroban RPC event.id format (`ledger-txIndex-eventIndex`)
+- `sdk/src/index.ts` — documented the public API surface at the package entry
+  point: a grouped map (clients, errors, config & types, gating, utilities,
+  constants, low-level encoders) states that the package root is the only
+  supported import path and that deep paths / test modules carry no stability
+  guarantee. Re-export order is annotated so each symbol has one canonical source
+- `sdk/examples/public-api.ts` — side-effect-free fixture that imports every
+  documented symbol from the package root (no deep or `../src` paths) and is
+  type-checked by `sdk/examples/tsconfig.json`, so the public contract stays
+  reachable-from-root and cannot silently regress
 - `indexer/src/db/migrate.ts` — `checkMigrationHealth()` function that classifies
   the database schema state as one of five well-defined states: `clean`, `pending`,
   `drifted`, `partial`, or `uninitialized`; exported `SchemaHealthState` type and
@@ -34,8 +71,43 @@ Versions follow [Semantic Versioning](https://semver.org/).
   partial replay semantics and preflight non-mutation guarantee
 - `indexer` boot sequence now logs a prominent `SCHEMA WARNING` for `drifted` or
   `partial` states after migrations run, surfacing drift before the poller starts
+- SDK: caller correlation metadata on every write. Mutation methods (`join`,
+  `contribute`, `payout`, `markDefault`, `close`, `createCircle`) accept an
+  optional `{ metadata }` (a flat bag of scalar identifiers, e.g.
+  `{ operation: "join-circle", uiRequestId: "req_8a1f" }`) that is echoed back on
+  the resulting `TxResult` — present on failures too, so a UI action ties to a tx
+  hash whether it confirmed or failed
+- SDK: `sanitizeTxMetadata` security boundary strips secrets before metadata is
+  ever echoed or logged — drops keys named like secrets (`secret`, `seed`,
+  `signed`, `xdr`, `apiKey`, …), Stellar secret-seed values under any key,
+  over-long strings (signed XDR), and all non-scalars; caps at 32 keys
+- SDK: opt-in structured tx logging via `CircleUpClient.setTxLogger`. A registered
+  `TxLogger` receives log-safe `TxLogEvent`s across the write lifecycle
+  (`simulated` → `submitted` → `confirmed` | `failed`) carrying the contract,
+  method, tx hash, ledger/error code, and sanitised correlation metadata — never
+  the signing key, its secret, the signed XDR, or the raw arguments. A throwing
+  logger can never change a transaction's outcome
+- `sdk/src/__tests__/txMetadata.test.ts` — unit tests for `sanitizeTxMetadata`
+  (secret/payload/non-scalar stripping, key cap, no-mutation/frozen output) and
+  the write path (metadata echoed on success and failure results, log lifecycle
+  ordering and log-safe fields, correlation preserved across retried attempts,
+  end-to-end threading through `CircleClient.join`)
 
 ### Changed
+- **Issue 31**: Event ingestion is now fully restart-safe — the indexer cursor and
+  all event projections (circles, contributions, payouts, etc.) are written in a
+  single database transaction per ledger. On crash before commit, the transaction
+  rolls back and restart processes the same ledger again (idempotent via dedup
+  constraints). On crash after commit, restart resumes from the next ledger. The
+  cursor is always read from the database (never from memory) on startup
+- **Issue 29**: Poll error handling now applies jittered backoff wait inside the
+  error catch block before allowing the next tick, preventing hot loops during
+  sustained RPC outages
+- `indexer/src/indexer.ts` — `ingestEventInTx()` now inserts `event_index` column
+  for canonical identity-based deduplication alongside the legacy `event_key` column
+- `indexer/src/db/schema.sql` — `ingested_events` table now includes `event_index`
+  column and unique index on `(ledger, tx_hash, event_index)` for database-enforced
+  idempotency
 - `indexer/src/index.ts` — imports `checkMigrationHealth` and runs a post-migration
   health check on every boot; non-clean states emit a `SCHEMA WARNING` log line
   rather than aborting so the indexer keeps serving data in ambiguous situations
@@ -44,8 +116,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Homepage hero copy rewritten around what the visitor does and gets
 - Homepage circles fetch is memoized per render, so the hero count, the heading
   count and the list can no longer disagree
+- `sdk/src/utils.ts` — `usdcToStroops` now routes both `string` and `number`
+  input through one exact string-parsing path that expands JavaScript exponent
+  notation (`1e-7`, `1e+21`) losslessly and counts only *significant* decimals.
+  Valid small/large numeric amounts such as `0.0000001` now convert exactly
+  instead of throwing, while `> 7`-decimal precision, negatives, non-finite
+  numbers, and malformed exponents are rejected with specific messages. Also
+  documented USDC units/precision and that `formatUsdc` truncates (never rounds
+  up) so a displayed amount can never overstate the true balance
 
 ### Fixed
+- `app/src/lib/config.ts` — `usdcToStroops` silently discarded any digits beyond
+  7 decimal places (`frac.padEnd(7, "0").slice(0, 7)`), so an over-precise amount
+  was signed for a *different* value than the user entered. It now rejects excess
+  precision (and handles exponent notation) identically to the SDK. Realigned the
+  other money helpers with `sdk/src/utils.ts` too: added the missing negative /
+  `NaN` guards to `stroopsToUsdc` and `formatUsdc`, and the non-integer / negative
+  member-count guard to `formatPot` (a fractional count previously made
+  `BigInt(memberCount)` throw)
 - SDK: every read (`getConfig`, `getStatus`, `getCircles` and the rest) failed with
   `this.source.sequenceNumber is not a function`. The read path built its
   transaction from an account stub that was missing that method, and it always

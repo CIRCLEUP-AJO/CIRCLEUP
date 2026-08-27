@@ -22,6 +22,36 @@ import { runAllHealthChecks } from "./health";
 import { redactAddress } from "./redact";
 import type { MigrationHealth } from "./db/migrate";
 
+// ── Address validation ────────────────────────────────────────────────────────
+//
+// Stellar has two address namespaces:
+//   G-prefix (56 base32 chars) — ed25519 public key (wallet / member address)
+//   C-prefix (56 base32 chars) — Soroban contract ID (circle / factory / token)
+//
+// These regexes are intentionally inlined here so the indexer has no
+// dependency on the app package's address module.
+const STELLAR_PUBLIC_KEY_RE = /^G[A-Z2-7]{55}$/;
+const SOROBAN_CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/** Returns true for a valid Stellar ed25519 public key (G-prefix, 56 chars). */
+function isStellarPublicKey(addr: string): boolean {
+  return STELLAR_PUBLIC_KEY_RE.test(addr);
+}
+
+/** Returns true for a valid Soroban contract ID (C-prefix, 56 chars). */
+function isSorobanContractId(addr: string): boolean {
+  return SOROBAN_CONTRACT_ID_RE.test(addr);
+}
+
+/**
+ * Returns true for any valid canonical Stellar address — either a public key
+ * or a Soroban contract ID.  Route params that may legitimately be either type
+ * (e.g. `:member`, `:address`) should be validated with this function.
+ */
+function isCanonicalStellarAddress(addr: string): boolean {
+  return isStellarPublicKey(addr) || isSorobanContractId(addr);
+}
+
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
 // ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
@@ -164,12 +194,34 @@ function parseStatus(value: unknown): ParseResult<CircleStatus | undefined> {
   return { error: `status must be one of: ${CIRCLE_STATUSES.join(", ")}` };
 }
 
+// Stellar address: G-address (account) or C-address (contract), 56 base32 chars.
+const STELLAR_ADDRESS_RE = /^[GC][A-Z2-7]{55}$/;
+
+function isStellarAddress(value: string): boolean {
+  return STELLAR_ADDRESS_RE.test(value);
+}
+
+function parseAddress(value: string | undefined, label: string): ParseResult<string> {
+  if (!value || value.trim() === "") {
+    return { error: `${label} is required` };
+  }
+  const trimmed = value.trim();
+  if (!isStellarAddress(trimmed)) {
+    return { error: `${label} must be a valid Stellar address (G… or C…, 56 characters)` };
+  }
+  return trimmed;
+}
+
 function parseCircleFilter(value: unknown): ParseResult<string | undefined> {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.trim() === "") {
     return { error: "circle must be a non-empty string" };
   }
-  return value.trim();
+  const trimmed = value.trim();
+  if (!isStellarAddress(trimmed)) {
+    return { error: "circle must be a valid Stellar address (G… or C…, 56 characters)" };
+  }
+  return trimmed;
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -294,12 +346,6 @@ interface IndexerStateAuditRow {
 interface EventTypeCountRow {
   event_type: string | null;
   count: string;
-}
-
-/** Returns a trimmed, non-empty version of a route param, or null if it's missing/blank. */
-function nonBlankParam(value: string | undefined): string | null {
-  const trimmed = value?.trim();
-  return trimmed ? trimmed : null;
 }
 
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
@@ -447,11 +493,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address", async (req: Request, res: Response) => {
-    const address = nonBlankParam(req.params.address);
-    if (!address) {
-      res.status(400).json({ error: "Circle address is required" });
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
       return;
     }
+    const address = addressResult;
     try {
       const [circle] = await query<CircleRow>(
         `SELECT * FROM circles WHERE address = $1`,
@@ -513,11 +560,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address/members", async (req: Request, res: Response) => {
-    const address = nonBlankParam(req.params.address);
-    if (!address) {
-      res.status(400).json({ error: "Circle address is required" });
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
       return;
     }
+    const address = addressResult;
     try {
       const [circle] = await query<Pick<CircleRow, "address">>(
         `SELECT address FROM circles WHERE address = $1`,
@@ -578,11 +626,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   app.get("/circles/:address/rounds", async (req: Request, res: Response) => {
-    const address = nonBlankParam(req.params.address);
-    if (!address) {
-      res.status(400).json({ error: "Circle address is required" });
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
       return;
     }
+    const address = addressResult;
     try {
       const [circle] = await query<
         Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status">
@@ -644,11 +693,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // the filter itself is invalid rather than a silently empty result.
 
   app.get("/members/:member/contributions", async (req: Request, res: Response) => {
-    const member = nonBlankParam(req.params.member);
-    if (!member) {
-      res.status(400).json({ error: "Member address is required" });
+    const memberResult = parseAddress(req.params.member, "Member address");
+    if (isParseError(memberResult)) {
+      res.status(400).json({ error: memberResult.error });
       return;
     }
+    const member = memberResult;
 
     const pageResult = parsePage(req.query.page);
     const limitResult = parseLimit(req.query.limit);
@@ -733,11 +783,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // ── Reputation ───────────────────────────────────────────────────────────────
 
   app.get("/reputation/:member", async (req: Request, res: Response) => {
-    const member = nonBlankParam(req.params.member);
-    if (!member) {
-      res.status(400).json({ error: "Member address is required" });
+    const memberResult = parseAddress(req.params.member, "Member address");
+    if (isParseError(memberResult)) {
+      res.status(400).json({ error: memberResult.error });
       return;
     }
+    const member = memberResult;
 
     // Optional ?circle=<address> narrows the contributions/defaults
     // breakdown to a single circle, e.g. for a member-in-circle detail view

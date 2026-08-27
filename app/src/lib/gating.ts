@@ -1,9 +1,10 @@
 /**
  * Canonical action-gating model for the CircleUp app.
  *
- * Before any contract write (join, contribute, payout, close) is submitted,
- * the action must pass a deterministic gate check against a fresh state
- * snapshot.  This prevents stale UI state from causing invalid on-chain writes.
+ * Before any contract write (join, contribute, payout, default, close) is
+ * submitted, the action must pass a deterministic gate check against a fresh
+ * state snapshot.  This prevents stale UI state from causing invalid on-chain
+ * writes.
  *
  * This module is pure: no RPC calls, no I/O.  It takes a {@link AppStateSnapshot}
  * (built from the indexer data already loaded in the component) and returns a
@@ -24,8 +25,15 @@ export const DEFAULT_MAX_SNAPSHOT_AGE_MS = 30_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-/** The four contract writes that require state-based gating. */
-export type CircleAction = "join" | "contribute" | "payout" | "close";
+/**
+ * The contract writes that require state-based gating.
+ *
+ * `default` marks a member who missed the current round's contribution
+ * deadline. Unlike `contribute` (which fails *open* on unknown ledger data so
+ * an honest member is never blocked), `default` fails *closed*: it requires
+ * positive proof the deadline has passed before allowing a punitive write.
+ */
+export type CircleAction = "join" | "contribute" | "payout" | "default" | "close";
 
 /**
  * Snapshot of the circle state as seen by the app at a specific point in time.
@@ -76,6 +84,7 @@ export type GateBlockReason =
   | "already_joined"
   | "already_contributed"
   | "deadline_passed"
+  | "deadline_not_passed"
   | "round_not_complete"
   | "no_active_round";
 
@@ -181,6 +190,45 @@ function gatePayout(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gate
   return allowed();
 }
 
+function gateDefault(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
+  if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs)) {
+    return blocked(
+      "stale_snapshot",
+      `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before marking a default.`,
+    );
+  }
+  if (snap.status !== "Active") {
+    return blocked(
+      "wrong_status",
+      `Default can only be marked on an Active circle. Current status: ${snap.status}.`,
+    );
+  }
+  // Fail closed: a punitive action requires positive proof the deadline
+  // passed. Unlike gateContribute (which allows when ledger data is missing),
+  // any unknown ledger height blocks the default.
+  if (snap.deadlineLedger === null || snap.latestLedger === null) {
+    return blocked(
+      "deadline_not_passed",
+      `Cannot verify that round ${snap.currentRound} deadline has passed: ledger data is ` +
+        "unavailable. Refusing to mark a default without confirmed ledger height.",
+    );
+  }
+  if (snap.latestLedger <= snap.deadlineLedger) {
+    return blocked(
+      "deadline_not_passed",
+      `Round ${snap.currentRound} deadline is ledger ${snap.deadlineLedger}; latest indexed ` +
+        `ledger is ${snap.latestLedger}. The contribution window is still open.`,
+    );
+  }
+  if (snap.hasContributedCurrentRound) {
+    return blocked(
+      "already_contributed",
+      `This member already contributed to round ${snap.currentRound}; they cannot be marked in default.`,
+    );
+  }
+  return allowed();
+}
+
 function gateClose(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
   if (!isSnapshotFresh(snap.fetchedAtMs, maxAge, nowMs)) {
     return blocked(
@@ -232,6 +280,7 @@ export function computeActionEligibility(
     case "join":       return gateJoin(snapshot, nowMs, maxAge);
     case "contribute": return gateContribute(snapshot, nowMs, maxAge);
     case "payout":     return gatePayout(snapshot, nowMs, maxAge);
+    case "default":    return gateDefault(snapshot, nowMs, maxAge);
     case "close":      return gateClose(snapshot, nowMs, maxAge);
     default: {
       const _exhaustive: never = action;
