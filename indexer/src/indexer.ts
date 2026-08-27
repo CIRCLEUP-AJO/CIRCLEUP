@@ -232,6 +232,26 @@ export function createEventKey(event: SdkEvent): string {
   ].join(":");
 }
 
+/**
+ * Extract the event index from an SDK event's `id` field.
+ *
+ * The Soroban RPC event id format is: "ledger-txIndex-eventIndex" (0-padded).
+ * Example: "0000012345678-0000000002-0000000001" represents:
+ *   ledger 12345678, tx index 2, event index 1
+ *
+ * Returns null if the id is missing or malformed.
+ */
+export function parseEventIndex(event: SdkEvent): number | null {
+  const id = event.id;
+  if (typeof id !== "string") return null;
+  
+  const parts = id.split("-");
+  if (parts.length !== 3) return null;
+  
+  const eventIndex = parseInt(parts[2], 10);
+  return Number.isNaN(eventIndex) ? null : eventIndex;
+}
+
 // ─── Ledger ordering utilities ────────────────────────────────────────────────
 
 /**
@@ -280,6 +300,10 @@ export function detectLedgerGaps(
  * without running the handler (idempotent replay path).  Otherwise records
  * the key and runs handleEvent inside the same transaction.
  *
+ * Issue 28: Now includes event_index in the insert for canonical identity-based
+ * deduplication. The unique constraint on (ledger, tx_hash, event_index) makes
+ * duplicate delivery a silent no-op at the database layer.
+ *
  * Callers should wrap this in a SAVEPOINT so a throwing handler rolls back
  * only that event's writes and not the entire ledger batch.
  */
@@ -289,6 +313,7 @@ export async function ingestEventInTx(
   handleEvent: (client: PoolClient) => Promise<void>,
 ): Promise<boolean> {
   const eventKey = createEventKey(event);
+  const eventIndex = parseEventIndex(event);
 
   const existing = await client.query<{ event_key: string }>(
     "SELECT event_key FROM ingested_events WHERE event_key = $1",
@@ -302,10 +327,10 @@ export async function ingestEventInTx(
   const eventType = topic0 && topic1 ? `${topic0}:${topic1}` : topic0;
 
   await client.query(
-    `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type, event_index)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (event_key) DO NOTHING`,
-    [eventKey, contractId, event.ledger, event.txHash, eventType],
+    [eventKey, contractId, event.ledger, event.txHash, eventType, eventIndex],
   );
 
   await handleEvent(client);
@@ -791,7 +816,72 @@ async function processEvents(fromLedger: number, toLedger: number) {
   );
 }
 
+// ─── Backoff policy (Issue 29) ────────────────────────────────────────────────
+
+/**
+ * Exponential backoff state for the polling loop.
+ *
+ * Temporary RPC failures should not cause a hot loop or immediate process exit.
+ * This policy tracks consecutive failures and computes the next wait interval
+ * with capped exponential backoff + jitter.
+ */
+interface BackoffState {
+  consecutiveFailures: number;
+  currentIntervalMs: number;
+}
+
+const BACKOFF_INITIAL_MS = parseInt(
+  process.env.POLL_BACKOFF_INITIAL_MS || "1000",
+  10,
+);
+const BACKOFF_MAX_MS = parseInt(
+  process.env.POLL_BACKOFF_MAX_MS || "60000",
+  10,
+);
+const BACKOFF_MULTIPLIER = parseFloat(
+  process.env.POLL_BACKOFF_MULTIPLIER || "2.0",
+);
+
+function createBackoffState(): BackoffState {
+  return {
+    consecutiveFailures: 0,
+    currentIntervalMs: BACKOFF_INITIAL_MS,
+  };
+}
+
+function resetBackoff(state: BackoffState): void {
+  state.consecutiveFailures = 0;
+  state.currentIntervalMs = BACKOFF_INITIAL_MS;
+}
+
+function incrementBackoff(state: BackoffState): void {
+  state.consecutiveFailures++;
+  state.currentIntervalMs = Math.min(
+    BACKOFF_MAX_MS,
+    state.currentIntervalMs * BACKOFF_MULTIPLIER,
+  );
+}
+
+/**
+ * Compute the actual wait time with full jitter: returns a random value in
+ * [0, currentIntervalMs] to spread load when many indexers recover simultaneously.
+ */
+function computeJitteredWait(state: BackoffState): number {
+  return Math.floor(Math.random() * state.currentIntervalMs);
+}
+
+/**
+ * Check if we should log a warning about repeated failures.
+ * Warns at failure 3, 6, 12, 24, ... (doubling interval).
+ */
+function shouldWarnBackoff(state: BackoffState): boolean {
+  const n = state.consecutiveFailures;
+  return n >= 3 && (n & (n - 1)) === 0; // power of 2 check
+}
+
 // ─── Poll cycle ───────────────────────────────────────────────────────────────
+
+const backoffState = createBackoffState();
 
 /**
  * One poll iteration: read the durable cursor from DB, fetch the latest
@@ -800,6 +890,10 @@ async function processEvents(fromLedger: number, toLedger: number) {
  * The cursor is always read from the DB (not from an in-memory variable) so
  * that any per-ledger progress made before a crash is reflected on restart
  * without any special recovery logic.
+ *
+ * Issue 29: Added exponential backoff on transient RPC failures so temporary
+ * outages don't cause a hot loop or process exit. The backoff state resets
+ * after any successful poll.
  */
 async function runPollCycle(): Promise<void> {
   let lastLedger = await getLastLedger();
@@ -811,6 +905,9 @@ async function runPollCycle(): Promise<void> {
   if (toLedger > lastLedger) {
     await processEvents(lastLedger + 1, toLedger);
   }
+  
+  // Success — reset backoff so the next failure starts from the initial interval
+  resetBackoff(backoffState);
 }
 
 // ─── Poller lifecycle (graceful shutdown) ─────────────────────────────────────
@@ -844,7 +941,24 @@ export async function startIndexer() {
       try {
         await runPollCycle();
       } catch (err) {
-        console.error("[indexer] Poll error (will retry on next tick):", err);
+        incrementBackoff(backoffState);
+        
+        if (shouldWarnBackoff(backoffState)) {
+          console.warn(
+            `[indexer] Poll has failed ${backoffState.consecutiveFailures} consecutive times. ` +
+            `Current backoff interval: ${Math.floor(backoffState.currentIntervalMs / 1000)}s. ` +
+            `Check RPC connectivity and logs.`,
+          );
+        }
+        
+        console.error(
+          `[indexer] Poll error (will retry after backoff):`,
+          err,
+        );
+        
+        // Apply jittered backoff before the next tick
+        const waitMs = computeJitteredWait(backoffState);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
     })().finally(() => {
       pollInFlight = null;
