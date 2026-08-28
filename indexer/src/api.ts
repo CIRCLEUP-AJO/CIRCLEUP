@@ -55,54 +55,162 @@ function isCanonicalStellarAddress(addr: string): boolean {
 // ── CORS ─────────────────────────────────────────────────────────────────────
 //
 // ALLOWED_ORIGINS is a comma-separated allow-list, e.g.
-// "https://app.circleup.xyz,https://staging.circleup.xyz". If unset, every
-// origin is allowed (useful for local dev) but a warning is logged so this
-// isn't mistaken for a deliberate production setting.
-function parseAllowedOrigins(raw: string | undefined): string[] {
-  return (raw || "")
-    .split(",")
-    .map((o) => o.trim())
-    .filter(Boolean);
+// "https://app.circleup.xyz,https://staging.circleup.xyz". Only entries that
+// are well-formed http(s) origins (scheme + host [+ port], no path/query) are
+// honoured — malformed entries are dropped (dev) or, in production, treated
+// as a configuration error (see buildCorsOptions below).
+function isValidOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    // An Origin header is scheme + host [+ port] only — reject anything that
+    // also carries a path, query string, or fragment.
+    return `${parsed.protocol}//${parsed.host}` === origin;
+  } catch {
+    return false;
+  }
 }
 
+function parseAllowedOrigins(raw: string | undefined): { origins: string[]; invalid: string[] } {
+  const entries = (raw || "").split(",").map((o) => o.trim()).filter(Boolean);
+  const origins: string[] = [];
+  const invalid: string[] = [];
+  for (const entry of entries) {
+    (isValidOrigin(entry) ? origins : invalid).push(entry);
+  }
+  return { origins, invalid };
+}
+
+/**
+ * Build the CORS options for the API.
+ *
+ * When `allowedOrigins` is omitted, the list is parsed from ALLOWED_ORIGINS.
+ * An empty or entirely-invalid list falls back to allowing every origin in
+ * development (with a warning) but throws in production — a service running
+ * with `NODE_ENV=production` must never silently start wide open.
+ *
+ * Credentials are always disabled: the API is read-only and unauthenticated
+ * (no cookies or HTTP auth are ever expected), so there is no case where a
+ * cross-origin request needs `Access-Control-Allow-Credentials`.
+ */
 export function buildCorsOptions(
-  allowedOrigins = parseAllowedOrigins(process.env.ALLOWED_ORIGINS),
+  allowedOrigins?: string[],
+  { nodeEnv = process.env.NODE_ENV }: { nodeEnv?: string } = {},
 ): cors.CorsOptions {
-  if (allowedOrigins.length === 0) {
+  const isProduction = nodeEnv === "production";
+  let origins: string[];
+
+  if (allowedOrigins !== undefined) {
+    origins = allowedOrigins;
+  } else {
+    const parsed = parseAllowedOrigins(process.env.ALLOWED_ORIGINS);
+    if (parsed.invalid.length > 0) {
+      const message =
+        `[api] ALLOWED_ORIGINS contains invalid entries: ${parsed.invalid.join(", ")}. ` +
+        `Each origin must be an absolute http(s) URL with no path, e.g. "https://app.circleup.xyz".`;
+      if (isProduction) throw new Error(message);
+      console.warn(`${message} Ignoring the invalid entries.`);
+    }
+    origins = parsed.origins;
+  }
+
+  if (origins.length === 0) {
+    if (isProduction) {
+      throw new Error(
+        "[api] ALLOWED_ORIGINS must be set to a comma-separated list of allowed origins " +
+          "when NODE_ENV=production. Refusing to start with CORS open to all origins.",
+      );
+    }
     console.warn(
       "[api] ALLOWED_ORIGINS is not set — allowing all origins. " +
         "Set ALLOWED_ORIGINS to a comma-separated list in production.",
     );
-    return { origin: true };
+    return { origin: true, credentials: false };
   }
 
   return {
     origin(origin, callback) {
       // requests with no Origin header (curl, server-to-server, health checks)
-      if (!origin || allowedOrigins.includes(origin)) {
+      if (!origin || origins.includes(origin)) {
         callback(null, true);
         return;
       }
       callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
+    credentials: false,
   };
 }
 
+// ── Proxy trust (client identity for rate limiting) ──────────────────────────
+//
+// express-rate-limit keys requests by req.ip. Behind a reverse proxy (nginx,
+// an ALB, Cloudflare) the real client address only appears in
+// X-Forwarded-For, so Express must be told how many proxy hops to trust —
+// left unset, every client is bucketed under the proxy's own IP (one shared
+// limit for the whole service); trusted blindly (`trust proxy: true`), a
+// client can forge X-Forwarded-For to reset its own limit on every request.
+//
+// TRUST_PROXY_HOPS: number of hops between the client and this process.
+//   0 (default) — trust nothing; req.ip is the direct socket address. Correct
+//                 for local dev and any deployment exposed directly.
+//   N            — trust the Nth hop from the edge (e.g. 1 behind a single
+//                  load balancer / reverse proxy).
+function parseTrustProxyHops(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 0;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(
+      `[api] TRUST_PROXY_HOPS must be a non-negative integer, got: "${raw}"`,
+    );
+  }
+  return n;
+}
+
+export const TRUST_PROXY_HOPS = parseTrustProxyHops(process.env.TRUST_PROXY_HOPS);
+
 // ── Rate limiting ────────────────────────────────────────────────────────────
+//
+// List, detail, health, and history routes have different cost and abuse
+// profiles, so each route class gets its own bucket instead of one global
+// limit: a burst against the expensive list/history endpoints can no longer
+// starve health checks or cheap detail reads, and vice versa. Every class
+// shares RATE_LIMIT_WINDOW_MS but has its own max, independently tunable via
+// env so operators can raise/lower a single class without touching the rest.
+//
+// Response body is the same generic message for every class and every 429 —
+// it never reveals which limit was hit, its configured value, or anything
+// else about the service's internals. standardHeaders (RateLimit-*,
+// Retry-After) is enabled because those headers are the intended, documented
+// way for a well-behaved client to back off; that is not an internal detail.
 
 const RATE_LIMIT_WINDOW_MS = parseInt(
   process.env.RATE_LIMIT_WINDOW_MS || "60000",
   10,
 );
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "100", 10);
 
-const apiRateLimiter = rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  limit: RATE_LIMIT_MAX,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests, please try again later" },
-});
+/** Paginated, sortable, joined list — the most expensive read the API offers. */
+const RATE_LIMIT_LIST_MAX = parseInt(process.env.RATE_LIMIT_LIST_MAX || "30", 10);
+/** Single-entity / small-aggregate reads (circle detail, members, rounds, reputation, summary, indexer state). */
+const RATE_LIMIT_DETAIL_MAX = parseInt(process.env.RATE_LIMIT_DETAIL_MAX || "100", 10);
+/** Member contribution history — paginated and joined, walkable across many pages by an attacker. */
+const RATE_LIMIT_HISTORY_MAX = parseInt(process.env.RATE_LIMIT_HISTORY_MAX || "30", 10);
+/** Health checks are polled frequently by uptime monitors/load balancers and must stay reachable under load elsewhere. */
+const RATE_LIMIT_HEALTH_MAX = parseInt(process.env.RATE_LIMIT_HEALTH_MAX || "300", 10);
+
+function createRateLimiter(max: number) {
+  return rateLimit({
+    windowMs: RATE_LIMIT_WINDOW_MS,
+    limit: max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later" },
+  });
+}
+
+const listRateLimiter = createRateLimiter(RATE_LIMIT_LIST_MAX);
+const detailRateLimiter = createRateLimiter(RATE_LIMIT_DETAIL_MAX);
+const historyRateLimiter = createRateLimiter(RATE_LIMIT_HISTORY_MAX);
+const healthRateLimiter = createRateLimiter(RATE_LIMIT_HEALTH_MAX);
 
 // ── Error helpers ────────────────────────────────────────────────────────────
 
@@ -350,8 +458,8 @@ interface EventTypeCountRow {
 
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
+  app.set("trust proxy", TRUST_PROXY_HOPS);
   app.use(cors(buildCorsOptions()));
-  app.use(apiRateLimiter);
   app.use(express.json());
 
   // cors() calls next(err) for rejected origins instead of sending a response
@@ -381,7 +489,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // or errored, so load-balancers and uptime monitors can act on the status
   // code without parsing the body.
 
-  app.get("/health", async (_req: Request, res: Response) => {
+  app.get("/health", healthRateLimiter, async (_req: Request, res: Response) => {
     const report = await runAllHealthChecks({
       rpc,
       usdcAddress: USDC,
@@ -392,7 +500,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
   // ── Circles ──────────────────────────────────────────────────────────────────
 
-  app.get("/circles", async (req: Request, res: Response) => {
+  app.get("/circles", listRateLimiter, async (req: Request, res: Response) => {
     const pageResult = parsePage(req.query.page);
     const limitResult = parseLimit(req.query.limit);
     const sortResult = parseSort(req.query.sort);
@@ -465,7 +573,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.get("/circles/summary", async (_req: Request, res: Response) => {
+  app.get("/circles/summary", detailRateLimiter, async (_req: Request, res: Response) => {
     try {
       const rows = await query<{ status: string; count: string }>(
         `SELECT status, COUNT(*) as count FROM circles GROUP BY status`,
@@ -492,7 +600,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.get("/circles/:address", async (req: Request, res: Response) => {
+  app.get("/circles/:address", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
     if (isParseError(addressResult)) {
       res.status(400).json({ error: addressResult.error });
@@ -559,7 +667,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.get("/circles/:address/members", async (req: Request, res: Response) => {
+  app.get("/circles/:address/members", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
     if (isParseError(addressResult)) {
       res.status(400).json({ error: addressResult.error });
@@ -625,7 +733,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.get("/circles/:address/rounds", async (req: Request, res: Response) => {
+  app.get("/circles/:address/rounds", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
     if (isParseError(addressResult)) {
       res.status(400).json({ error: addressResult.error });
@@ -692,7 +800,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // An unknown ?circle= address is a 404 so callers get a clear signal that
   // the filter itself is invalid rather than a silently empty result.
 
-  app.get("/members/:member/contributions", async (req: Request, res: Response) => {
+  app.get("/members/:member/contributions", historyRateLimiter, async (req: Request, res: Response) => {
     const memberResult = parseAddress(req.params.member, "Member address");
     if (isParseError(memberResult)) {
       res.status(400).json({ error: memberResult.error });
@@ -782,7 +890,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
   // ── Reputation ───────────────────────────────────────────────────────────────
 
-  app.get("/reputation/:member", async (req: Request, res: Response) => {
+  app.get("/reputation/:member", detailRateLimiter, async (req: Request, res: Response) => {
     const memberResult = parseAddress(req.params.member, "Member address");
     if (isParseError(memberResult)) {
       res.status(400).json({ error: memberResult.error });
@@ -857,7 +965,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // Audit endpoint for ops/monitoring: reports how far the indexer has
   // progressed and how many events it has ingested per type, independent of
   // /health (which only checks connectivity, not indexing progress).
-  app.get("/indexer/state", async (_req: Request, res: Response) => {
+  app.get("/indexer/state", detailRateLimiter, async (_req: Request, res: Response) => {
     try {
       const [stateRows, eventCountRows] = await Promise.all([
         query<IndexerStateAuditRow>(

@@ -2,7 +2,7 @@ import { Suspense, cache } from "react";
 import Link from "next/link";
 import type { Metadata } from "next";
 import { INDEXER_URL } from "@/lib/config";
-import { CircleCard } from "@/components/CircleCard";
+import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 
 export const metadata: Metadata = {
@@ -97,16 +97,22 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
     return { ok: false, error: "parse" };
   }
 
-  // Deduplicate by address — the indexer should never return duplicates, but
-  // guard here so a transient bug never causes a React key collision or a
-  // misleading count in the heading.
-  const raw = (data as { circles: Circle[] }).circles;
+  const rawCircles = (data as { circles: unknown[] }).circles;
+
+  // Each row is validated independently via parseCircleRow — a single
+  // malformed row (a missing field, a non-canonical address, a negative
+  // count) is dropped rather than crashing the render, and no unchecked cast
+  // crosses into CircleCard. Deduplicate by address afterwards: the indexer
+  // should never return duplicates, but guard here so a transient bug never
+  // causes a React key collision or a misleading count in the heading.
   const seen = new Set<string>();
-  const circles = raw.filter((c) => {
-    if (seen.has(c.address)) return false;
-    seen.add(c.address);
-    return true;
-  });
+  const circles: Circle[] = [];
+  for (const rawCircle of rawCircles) {
+    const circle = parseCircleRow(rawCircle);
+    if (!circle || seen.has(circle.address)) continue;
+    seen.add(circle.address);
+    circles.push(circle);
+  }
 
   return { ok: true, circles };
 });
