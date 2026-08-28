@@ -25,6 +25,10 @@ const REQUIRED_IN_PRODUCTION = [
   "NEXT_PUBLIC_USDC_ADDRESS",
 ];
 
+/** Recognised public Stellar network passphrases (mirror of SDK constants). */
+const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
+const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+
 /**
  * Validate environment variables and return a list of missing keys.
  * Exported for unit testing.
@@ -81,6 +85,52 @@ export function getMalformedContractAddresses(
 }
 
 /**
+ * Detect network mismatches: a testnet RPC URL paired with the mainnet
+ * passphrase (or vice versa) will silently reject every transaction.  Returns
+ * one diagnostic string per conflict.  Exported for unit testing.
+ *
+ * Detection is heuristic: it looks for "testnet" in the RPC hostname and
+ * compares the passphrase against the two well-known public network strings.
+ * Custom or private networks that happen to use these patterns are out of
+ * scope — operators running non-standard networks should set matching values
+ * and this function will produce no output.
+ */
+export function getNetworkConflicts(
+  env: Record<string, string | undefined> = process.env as Record<
+    string,
+    string | undefined
+  >,
+): string[] {
+  const conflicts: string[] = [];
+  const rpcUrl = (env["NEXT_PUBLIC_STELLAR_RPC_URL"] ?? "").trim();
+  const passphrase = (env["NEXT_PUBLIC_NETWORK_PASSPHRASE"] ?? "").trim();
+
+  if (!rpcUrl || !passphrase) return conflicts;
+
+  const rpcIsTestnet = /testnet/i.test(rpcUrl);
+  const passphraseIsMainnet = passphrase === MAINNET_PASSPHRASE;
+  const passphraseIsTestnet = passphrase === TESTNET_PASSPHRASE;
+
+  if (passphraseIsMainnet && rpcIsTestnet) {
+    conflicts.push(
+      `NEXT_PUBLIC_NETWORK_PASSPHRASE is the mainnet passphrase but ` +
+        `NEXT_PUBLIC_STELLAR_RPC_URL appears to target testnet ("${rpcUrl}"). ` +
+        `Every transaction will be rejected. Set both to the same network.`,
+    );
+  }
+
+  if (passphraseIsTestnet && !rpcIsTestnet && rpcUrl.includes("soroban.stellar.org")) {
+    conflicts.push(
+      `NEXT_PUBLIC_NETWORK_PASSPHRASE is the testnet passphrase but ` +
+        `NEXT_PUBLIC_STELLAR_RPC_URL appears to target mainnet ("${rpcUrl}"). ` +
+        `Every transaction will be rejected. Set both to the same network.`,
+    );
+  }
+
+  return conflicts;
+}
+
+/**
  * Throw an error listing every missing or malformed variable so the problem is
  * immediately obvious in logs / terminal output.
  * Only runs server-side (typeof window === "undefined").
@@ -90,9 +140,11 @@ function assertEnvVars(): void {
 
   const missing = getMissingEnvVars();
   const malformed = getMalformedContractAddresses();
+  const conflicts = getNetworkConflicts();
   const problems = [
     ...missing.map((k) => `  • ${k} is missing`),
     ...malformed.map((m) => `  • ${m}`),
+    ...conflicts.map((c) => `  • ${c}`),
   ];
   if (problems.length === 0) return;
 
@@ -133,10 +185,6 @@ export const INDEXER_URL: string =
 // Mirror of the explorer helpers in sdk/src/constants.ts — kept in sync manually
 // because the app does not take a direct dependency on the @circleup/sdk package
 // (see app/src/lib/gating.ts for the same pattern).
-
-/** Recognised public Stellar network passphrases (mirror of SDK constants). */
-const TESTNET_PASSPHRASE = "Test SDF Network ; September 2015";
-const MAINNET_PASSPHRASE = "Public Global Stellar Network ; September 2015";
 
 /** Identifies which Stellar network the app is currently targeting. */
 export type NetworkName = "testnet" | "mainnet";
