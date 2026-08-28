@@ -585,10 +585,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         });
         // Refresh circle data after a successful action
         setRefreshState("refreshing");
+        const refreshController = new AbortController();
         try {
           const [circleRes, roundsRes] = await Promise.all([
-            fetch(`${INDEXER_URL}/circles/${circleAddress}`, { cache: "no-store" }),
-            fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, { cache: "no-store" }),
+            fetch(`${INDEXER_URL}/circles/${circleAddress}`, { cache: "no-store", signal: refreshController.signal }),
+            fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, { cache: "no-store", signal: refreshController.signal }),
           ]);
           if (circleRes.ok) {
             const updatedCircle = (await circleRes.json()) as Partial<CircleDetailData>;
@@ -598,10 +599,15 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             setData((prev) => ({ ...prev, ...updatedCircle, ...updatedRounds }));
           }
           setRefreshState("idle");
-        } catch {
-          // Data refresh failure is non-fatal — the action already succeeded.
-          // Show a subtle warning so the user knows to refresh manually.
-          setRefreshState("error");
+        } catch (refreshErr) {
+          // Aborted refreshes (unmount during refresh) are silent — not an error.
+          if (refreshErr instanceof DOMException && refreshErr.name === "AbortError") {
+            setRefreshState("idle");
+          } else {
+            // Data refresh failure is non-fatal — the action already succeeded.
+            // Show a subtle warning so the user knows to refresh manually.
+            setRefreshState("error");
+          }
         }
       }
     } catch (err: unknown) {
