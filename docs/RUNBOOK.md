@@ -818,6 +818,46 @@ A revoked circle can never call `increment` again, even if the factory re-deploy
 
 ---
 
+## Secrets and CI Injection
+
+### Why secrets must never appear in logs
+
+`scripts/src/deploy.ts` and `scripts/src/seed-demo.ts` automatically redact Stellar secret-key patterns (`S[A-Z2-7]{55}`) from all console output and error messages before they are emitted. This means a key that leaks into a command output or an exception message will be replaced with `[SECRET_REDACTED]` in the log. The redaction is a safety net, not a substitute for keeping keys out of commands in the first place.
+
+### Secure local injection
+
+Store secrets in the untracked `scripts/.env` file (copied from `scripts/.env.example`). The deploy script loads this file automatically via `dotenv`. Never commit `scripts/.env` — it is listed in `.gitignore`.
+
+```bash
+cp scripts/.env.example scripts/.env
+# Edit scripts/.env and fill in DEPLOYER_IDENTITY, NETWORK, etc.
+# The deployer private key stays in the stellar-cli keystore, not in .env:
+stellar keys generate --global deployer --network testnet
+```
+
+The deployer private key is managed entirely by `stellar-cli`. The deploy script references the deployer by *identity name* (`DEPLOYER_IDENTITY=deployer`), never by raw private key, so the key is never passed on the command line or stored in any env file.
+
+### CI injection (GitHub Actions)
+
+Store secrets in the repository's encrypted secret store (**Settings → Secrets and variables → Actions**). Inject them as environment variables in the workflow step, not as inline values in the YAML file:
+
+```yaml
+- name: Deploy contracts
+  env:
+    NETWORK: testnet
+    DEPLOYER_IDENTITY: deployer
+    STELLAR_SECRET_KEY: ${{ secrets.DEPLOYER_SECRET_KEY }}
+  run: npm run deploy:testnet --workspace=scripts
+```
+
+Never print secrets with `echo` or `run: env` steps. GitHub Actions automatically masks values registered as secrets, but the deploy script's built-in redaction provides a second layer for any pattern that slips through.
+
+### Failing fast on missing secrets
+
+The deploy script validates that `NETWORK`, `NETWORK_PASSPHRASE`, and `RPC_URL` are set before any write transaction. If a required value is absent the script exits with code 1 and a clear error message listing the missing variable — it never falls through to a deployment with an empty or default value. Run `npm run validate-env --workspace=scripts` before deploying to check the profile independently.
+
+---
+
 ## Security Notes
 
 - **No rug-pulls**: The organizer cannot withdraw funds. All USDC is held by the circle contract, not any wallet. Only `payout()` and `close()` release funds, and only to the scheduled recipient or back to members respectively.
