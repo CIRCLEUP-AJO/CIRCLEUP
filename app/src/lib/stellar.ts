@@ -46,6 +46,11 @@ import {
   userMessageForError,
   type ContractAppError,
 } from "./contractErrors";
+import {
+  detectWalletCapabilities,
+  explainUnsupportedAction,
+  type WalletCapabilities,
+} from "./walletCapabilities";
 
 // ─── Freighter detection & error types ───────────────────────────────────────
 
@@ -357,12 +362,30 @@ export async function simulateContractTx(
 // ─── Phase 2: Submission ──────────────────────────────────────────────────────
 
 /**
+ * Pre-check wallet capabilities before attempting a transaction.
+ * Returns a typed error if the wallet cannot perform the required action,
+ * or null if the wallet is ready.
+ */
+export function checkWalletCapabilities(): ContractAppError | null {
+  const caps = detectWalletCapabilities();
+  const unsupported = explainUnsupportedAction("sign", caps);
+  if (unsupported) {
+    return parseContractError(unsupported);
+  }
+  return null;
+}
+
+/**
  * Phase 2 of the transaction lifecycle: sign a prepared transaction XDR with
  * Freighter, broadcast it to the Soroban RPC, and poll for confirmation.
  *
  * Expects the `preparedXdr` produced by {@link simulateContractTx} and the
  * same `txCtx` telemetry handle so the full lifecycle (started → simulated →
  * submitted → confirmed) is recorded as a single logical operation.
+ *
+ * Pre-checks:
+ *  - Verifies the wallet provider can sign transactions before prompting.
+ *  - Handles wallet rejection with typed error responses.
  *
  * @param preparedXdr Unsigned, assembled transaction XDR from {@link simulateContractTx}.
  * @param txCtx       Telemetry context handle from the originating {@link startTx} call.
@@ -372,6 +395,18 @@ export async function submitContractTx(
   txCtx: ReturnType<typeof startTx>,
 ): Promise<InvokeResult> {
   const rpc = getRpc();
+
+  // ── Pre-flight: verify wallet can sign ─────────────────────────────────────
+  const capError = checkWalletCapabilities();
+  if (capError) {
+    emit(txCtx, "failed", categorizeError(capError.message));
+    return {
+      txHash: "",
+      success: false,
+      error: userMessageForError(capError),
+      typedError: capError,
+    };
+  }
 
   // ── Wallet signing ───────────────────────────────────────────────────────
   let signedXdr: string;
