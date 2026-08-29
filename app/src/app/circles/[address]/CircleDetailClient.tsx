@@ -122,7 +122,7 @@ interface Props {
 // Constraining the loading key to the four real actions prevents accidental
 // typos from leaving the spinner stuck forever.
 
-type ActionKey = "join" | "contribute" | "payout" | "close";
+type ActionKey = "join" | "contribute" | "payout" | "default" | "close";
 
 // ─── Success state shape ──────────────────────────────────────────────────────
 
@@ -137,6 +137,32 @@ interface SuccessState {
 // show a subtle "updating…" indicator rather than stale data silently persisting.
 
 type RefreshState = "idle" | "refreshing" | "error";
+
+// ─── Contribution receipt ──────────────────────────────────────────────────────
+//
+// Captures key fields from a confirmed contribute transaction so the receipt
+// persists through data refreshes and is not cleared when success state changes.
+
+interface ContributionReceipt {
+  amount: string;
+  roundIndex: number;
+  txHash: string;
+  explorerUrl: string | null;
+}
+
+// ─── Default confirmation ──────────────────────────────────────────────────────
+//
+// Holds the identity of the member being defaulted while the user reviews the
+// confirmation panel. Cleared on cancel (no transaction) or on execute.
+
+interface DefaultConfirmState {
+  memberAddress: string;
+  roundIndex: number;
+}
+
+// ─── Copy feedback ────────────────────────────────────────────────────────────
+
+type CopyState = "idle" | "success" | "error";
 
 // ─── Round deadline countdown ─────────────────────────────────────────────────
 
@@ -403,6 +429,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
   // Invite link URL — populated client-side to avoid SSR window access
   const [inviteUrl, setInviteUrl] = useState("");
+  const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
+  const [defaultConfirm, setDefaultConfirm] = useState<DefaultConfirmState | null>(null);
+  const [inviteCopyState, setInviteCopyState] = useState<CopyState>("idle");
+  const [receiptCopyState, setReceiptCopyState] = useState<CopyState>("idle");
 
   // Refs for focus management: move focus to error/success regions after an
   // action completes so keyboard users are not left stranded on the button.
@@ -418,7 +448,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     // server. During SSR the input renders with an empty string and the
     // placeholder text is shown instead.
     if (typeof window !== "undefined") {
-      setInviteUrl(window.location.href);
+      setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
     }
   }, []);
 
@@ -474,6 +504,31 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )
     : false;
 
+  // Pre-compute payout eligibility for disabled-state display. maxSnapshotAgeMs
+  // is Infinity here — we only want the "round not complete" reason; the staleness
+  // guard fires on submit inside doAction where it counts.
+  const payoutGate = computeActionEligibility(
+    "payout",
+    buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+      myContributedThisRound,
+      data.currentRound?.contributions.length ?? 0,
+    ),
+    { maxSnapshotAgeMs: Infinity },
+  );
+
+  // True when the indexed latest ledger is past the round deadline, enabling
+  // the "Mark Default" button in the member list.
+  const deadlinePassed =
+    data.circle.deadline_ledger != null &&
+    data.latestLedger != null &&
+    data.latestLedger > data.circle.deadline_ledger;
+
   /** Returns true when the error looks like a timeout or network failure that is worth retrying. */
   function isRetryableError(err: string): boolean {
     const lower = err.toLowerCase();
@@ -492,6 +547,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     join:       "Collateral locked — you have joined the circle!",
     contribute: "Contribution submitted successfully.",
     payout:     "Payout triggered successfully.",
+    default:    "Member marked as defaulted.",
     close:      "Collateral released successfully.",
   };
 
@@ -519,6 +575,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setError("");
     setSuccess(null);
     setRetryAction(null);
+    if (action === "contribute") setContributionReceipt(null);
     setLoading(action);
 
     try {
@@ -583,6 +640,16 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           message: ACTION_SUCCESS_MESSAGES[action],
           txHash: result.txHash,
         });
+        if (action === "contribute") {
+          setContributionReceipt({
+            amount: data.circle.round_amount,
+            roundIndex: data.circle.current_round,
+            txHash: result.txHash ?? "",
+            explorerUrl: result.txHash
+              ? getExplorerLink(ACTIVE_NETWORK, "tx", result.txHash)
+              : null,
+          });
+        }
         // Refresh circle data after a successful action
         setRefreshState("refreshing");
         const refreshController = new AbortController();
@@ -627,6 +694,145 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const handleContribute = () => doAction("contribute", [new Address(walletAddress!).toScVal()]);
   const handlePayout     = () => doAction("payout",     []);
   const handleClose      = () => doAction("close",      [new Address(walletAddress!).toScVal()]);
+
+  async function handleCopyInvite() {
+    if (!inviteUrl) return;
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setInviteCopyState("success");
+      setTimeout(() => setInviteCopyState("idle"), 2500);
+    } catch {
+      setInviteCopyState("error");
+      setTimeout(() => setInviteCopyState("idle"), 3000);
+    }
+  }
+
+  async function handleCopyReceiptHash() {
+    if (!contributionReceipt?.txHash) return;
+    try {
+      await navigator.clipboard.writeText(contributionReceipt.txHash);
+      setReceiptCopyState("success");
+      setTimeout(() => setReceiptCopyState("idle"), 2500);
+    } catch {
+      setReceiptCopyState("error");
+      setTimeout(() => setReceiptCopyState("idle"), 3000);
+    }
+  }
+
+  function handleMarkDefault(memberAddress: string) {
+    setDefaultConfirm({ memberAddress, roundIndex: currentRound });
+  }
+
+  async function doDefault(memberAddress: string) {
+    if (!walletAddress) {
+      setError("Connect your wallet first.");
+      return;
+    }
+    if (loading !== null) return;
+    if (!isSorobanContractId(circleAddress)) {
+      setError(
+        `Invalid circle address "${shortAddress(circleAddress)}". ` +
+          "Expected a C-prefixed 56-character Soroban contract ID.",
+      );
+      return;
+    }
+
+    // Build a snapshot with the TARGET member's contribution status, not the
+    // caller's — gateDefault checks whether the member being defaulted has
+    // already contributed, not whether the invoking wallet has.
+    const targetContributed =
+      data.currentRound != null
+        ? data.currentRound.contributions.some(
+            (c) => c.member_address === memberAddress,
+          )
+        : data.members.some(
+            (m) =>
+              m.member_address === memberAddress &&
+              Number(m.total_contributions) > currentRound,
+          );
+
+    const snapshot = buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      false,
+      targetContributed,
+      data.currentRound?.contributions.length ?? 0,
+    );
+
+    const gate = computeActionEligibility("default", snapshot);
+    if (isGateBlocked(gate)) {
+      setError(gate.message);
+      if (gate.reason === "stale_snapshot") {
+        setRetryAction(() => () => doDefault(memberAddress));
+      }
+      return;
+    }
+
+    setError("");
+    setSuccess(null);
+    setRetryAction(null);
+    setLoading("default");
+
+    try {
+      const result = await invokeContract(
+        circleAddress,
+        "mark_default",
+        [new Address(memberAddress).toScVal()],
+        walletAddress,
+      );
+      if (!result.success) {
+        const errMsg = result.typedError?.message || result.error || "Transaction failed";
+        setError(errMsg);
+        if (isRetryableError(errMsg)) {
+          setRetryAction(() => () => doDefault(memberAddress));
+        }
+      } else {
+        setSuccess({
+          message: `${shortAddress(memberAddress)} marked as defaulted for round ${currentRound}.`,
+          txHash: result.txHash,
+        });
+        setRefreshState("refreshing");
+        const ctrl = new AbortController();
+        try {
+          const [circleRes, roundsRes] = await Promise.all([
+            fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
+              cache: "no-store",
+              signal: ctrl.signal,
+            }),
+            fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, {
+              cache: "no-store",
+              signal: ctrl.signal,
+            }),
+          ]);
+          if (circleRes.ok) {
+            const updatedCircle = (await circleRes.json()) as Partial<CircleDetailData>;
+            const updatedRounds = roundsRes.ok
+              ? ((await roundsRes.json()) as Partial<CircleDetailData>)
+              : {};
+            setData((prev) => ({ ...prev, ...updatedCircle, ...updatedRounds }));
+          }
+          setRefreshState("idle");
+        } catch (refreshErr) {
+          if (refreshErr instanceof DOMException && refreshErr.name === "AbortError") {
+            setRefreshState("idle");
+          } else {
+            setRefreshState("error");
+          }
+        }
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+      if (isRetryableError(message)) {
+        setRetryAction(() => () => doDefault(memberAddress));
+      }
+    } finally {
+      setLoading(null);
+    }
+  }
 
   // Spoken summary of circle status + round progress. Rendered in a polite
   // live region below so screen-reader users hear "Circle status: Active.
@@ -737,6 +943,71 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           </div>
         )}
 
+        {defaultConfirm && (
+          <div
+            role="alertdialog"
+            aria-modal="false"
+            aria-labelledby="default-confirm-title"
+            className="bg-amber-50 border border-amber-300 rounded-lg p-4 mb-3 space-y-3"
+          >
+            <h3
+              id="default-confirm-title"
+              className="font-semibold text-amber-900 text-sm"
+            >
+              ⚠️ Confirm Default
+            </h3>
+            <dl className="text-sm space-y-1 text-amber-800">
+              <div className="flex gap-2">
+                <dt className="font-medium w-16 shrink-0">Member</dt>
+                <dd className="font-mono text-xs break-all">
+                  {defaultConfirm.memberAddress}
+                </dd>
+              </div>
+              <div className="flex gap-2">
+                <dt className="font-medium w-16 shrink-0">Round</dt>
+                <dd>{defaultConfirm.roundIndex}</dd>
+              </div>
+              {data.circle.deadline_ledger != null && (
+                <div className="flex gap-2">
+                  <dt className="font-medium w-16 shrink-0">Deadline</dt>
+                  <dd>
+                    Ledger {data.circle.deadline_ledger.toLocaleString()}
+                    {deadlinePassed && (
+                      <span className="ml-1 text-red-700 font-medium">
+                        (overdue)
+                      </span>
+                    )}
+                  </dd>
+                </div>
+              )}
+            </dl>
+            <p className="text-xs text-amber-700">
+              A penalty will be deducted from this member&apos;s locked collateral.
+              This action is irreversible once confirmed on-chain. Cancel if you
+              are not certain the contribution window has closed.
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setDefaultConfirm(null)}
+                className="px-3 py-2 text-sm rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const addr = defaultConfirm.memberAddress;
+                  setDefaultConfirm(null);
+                  doDefault(addr);
+                }}
+                disabled={loading !== null}
+                className="px-3 py-2 text-sm rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                Confirm &amp; Sign
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="action-group">
           {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
             <button
@@ -765,14 +1036,26 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             )}
 
           {data.circle.status === "Active" && (
-            <button
-              onClick={handlePayout}
-              disabled={loading !== null}
-              aria-busy={loading === "payout" ? "true" : "false"}
-              className="bg-blue-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
-            >
-              {loading === "payout" ? "Paying out…" : "🎯 Trigger Payout"}
-            </button>
+            <div className="flex flex-col gap-1">
+              <button
+                onClick={handlePayout}
+                disabled={loading !== null || !payoutGate.allowed}
+                aria-busy={loading === "payout" ? "true" : "false"}
+                aria-describedby={!payoutGate.allowed ? "payout-gate-reason" : undefined}
+                className="bg-blue-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
+              >
+                {loading === "payout" ? "Paying out…" : "🎯 Trigger Payout"}
+              </button>
+              {!payoutGate.allowed && (
+                <p
+                  id="payout-gate-reason"
+                  className="text-xs text-slate-500"
+                  role="note"
+                >
+                  {payoutGate.message}
+                </p>
+              )}
+            </div>
           )}
 
           {(data.circle.status === "Completed" ||
@@ -803,6 +1086,71 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           )}
         </div>
       </div>
+
+      {/* Contribution receipt — persists after confirmation; clears when a new
+          contribute action starts. Shows amount, round, and a copyable hash. */}
+      {contributionReceipt && (
+        <div
+          role="region"
+          aria-label="Contribution receipt"
+          className="bg-white rounded-xl border border-brand-200 p-5"
+        >
+          <h2 className="font-semibold text-slate-800 mb-3">
+            <span aria-hidden="true">💳 </span>Contribution Receipt
+          </h2>
+          <dl className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <dt className="text-slate-500">Round</dt>
+              <dd className="font-medium text-slate-800">
+                {contributionReceipt.roundIndex}
+              </dd>
+            </div>
+            <div className="flex justify-between">
+              <dt className="text-slate-500">Amount contributed</dt>
+              <dd className="font-medium text-slate-800">
+                ${formatUsdc(contributionReceipt.amount)}
+              </dd>
+            </div>
+            {contributionReceipt.txHash && (
+              <div className="flex justify-between items-center gap-2">
+                <dt className="text-slate-500 shrink-0">Transaction</dt>
+                <dd className="flex items-center gap-1.5 min-w-0">
+                  {contributionReceipt.explorerUrl ? (
+                    <a
+                      href={contributionReceipt.explorerUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-mono text-xs text-brand-600 hover:underline truncate"
+                      title={contributionReceipt.txHash}
+                    >
+                      {shortAddress(contributionReceipt.txHash)}
+                    </a>
+                  ) : (
+                    <span
+                      className="font-mono text-xs text-slate-600 truncate"
+                      title={contributionReceipt.txHash}
+                    >
+                      {shortAddress(contributionReceipt.txHash)}
+                    </span>
+                  )}
+                  <button
+                    onClick={handleCopyReceiptHash}
+                    className="shrink-0 text-xs text-slate-400 hover:text-slate-700 px-1.5 py-0.5 rounded border border-slate-200 hover:border-slate-400 transition-colors"
+                    title="Copy full transaction hash"
+                    aria-label="Copy transaction hash"
+                  >
+                    {receiptCopyState === "success"
+                      ? "Copied!"
+                      : receiptCopyState === "error"
+                      ? "Failed"
+                      : "Copy"}
+                  </button>
+                </dd>
+              </div>
+            )}
+          </dl>
+        </div>
+      )}
 
       {/* Round deadline countdown */}
       <RoundDeadlineStatus
@@ -884,7 +1232,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                     </span>
                   ) : (
                     // Future slot — show per-member contribution status for active circles
-                    <ContributionStatusBadge status={contribStatus} />
+                    <div className="flex flex-col items-end gap-1">
+                      <ContributionStatusBadge status={contribStatus} />
+                      {contribStatus === "pending" &&
+                        data.circle.status === "Active" &&
+                        deadlinePassed && (
+                          <button
+                            onClick={() => handleMarkDefault(member.member_address)}
+                            disabled={loading !== null}
+                            className="text-xs text-red-600 hover:text-red-800 underline disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            Mark Default
+                          </button>
+                        )}
+                    </div>
                   )}
                 </div>
               </div>
@@ -953,23 +1314,46 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         </div>
       )}
 
-      {/* Invite link */}
+      {/* Invite link — URL is built from circleAddress + origin so it is
+          identical across server-rendered and client-rendered contexts. */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
         <h2 className="font-semibold text-slate-700 mb-2">🔗 Invite link</h2>
         <p className="text-xs text-slate-500 mb-2">
           Share this link so members can find and join this circle:
         </p>
-        <input
-          readOnly
-          value={inviteUrl}
-          className="w-full font-mono text-xs bg-white border border-slate-300 rounded px-3 py-2 text-slate-600 placeholder:text-slate-400"
-          onClick={(e) => (e.target as HTMLInputElement).select()}
-          aria-label="Invite link for this circle"
-          // Shown during SSR and before the client-side effect fires.
-          // window.location is never accessed outside a useEffect, so this
-          // component is safe to render on the server.
-          placeholder="Loading invite link…"
-        />
+        <div className="flex gap-2">
+          <input
+            readOnly
+            value={inviteUrl}
+            className="flex-1 min-w-0 font-mono text-xs bg-white border border-slate-300 rounded px-3 py-2 text-slate-600 placeholder:text-slate-400"
+            onClick={(e) => (e.target as HTMLInputElement).select()}
+            aria-label="Invite link for this circle"
+            placeholder="Loading invite link…"
+          />
+          <button
+            onClick={handleCopyInvite}
+            disabled={!inviteUrl}
+            className="shrink-0 text-xs font-medium px-3 py-2 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            aria-label={
+              inviteCopyState === "success"
+                ? "Link copied!"
+                : inviteCopyState === "error"
+                ? "Copy failed — try selecting and copying manually"
+                : "Copy invite link"
+            }
+          >
+            {inviteCopyState === "success"
+              ? "Copied!"
+              : inviteCopyState === "error"
+              ? "Failed"
+              : "Copy"}
+          </button>
+        </div>
+        {inviteCopyState === "error" && (
+          <p className="text-xs text-red-600 mt-1" role="alert">
+            Copy failed. Please select the link and copy it manually.
+          </p>
+        )}
       </div>
     </div>
   );
