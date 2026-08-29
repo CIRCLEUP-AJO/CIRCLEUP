@@ -26,8 +26,19 @@ vi.mock("@/lib/stellar", () => {
   };
 });
 
-// ─── Mock @/lib/config ────────────────────────────────────────────────────────
+// Mock @/lib/walletCapabilities to control capability detection in tests
+vi.mock("@/lib/walletCapabilities", () => ({
+  detectWalletCapabilities: vi.fn(() => ({
+    installed: true,
+    canConnect: true,
+    canSignTransaction: true,
+    canGetNetwork: true,
+    canWatchChanges: false,
+  })),
+  explainUnsupportedAction: vi.fn(() => null),
+}));
 
+// Mock @/lib/config to avoid env-var assertions at import time
 vi.mock("@/lib/config", () => ({
   shortAddress: (addr: string) => `${addr.slice(0, 4)}…${addr.slice(-4)}`,
   NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
@@ -66,10 +77,9 @@ const mockStellar = stellar as {
   WalletError: new (reason: string, msg: string) => Error & { reason: string };
 };
 
-const mockCaps = walletCaps as {
+const mockWalletCaps = walletCaps as {
   detectWalletCapabilities: ReturnType<typeof vi.fn>;
-  checkNetworkMismatch: ReturnType<typeof vi.fn>;
-  describeNetworkMismatch: ReturnType<typeof vi.fn>;
+  explainUnsupportedAction: ReturnType<typeof vi.fn>;
 };
 
 beforeEach(() => {
@@ -194,9 +204,21 @@ describe("WalletButton — connected state", () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Not-installed state
-// ─────────────────────────────────────────────────────────────────────────────
+describe("WalletButton — limited capabilities state", () => {
+  it("shows warning when wallet cannot sign transactions", async () => {
+    const addr = "G" + "A".repeat(55);
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(addr);
+    mockWalletCaps.explainUnsupportedAction.mockReturnValue(
+      "Your wallet does not support the ability to sign this transaction."
+    );
+
+    render(<WalletButton />);
+    await waitFor(() => {
+      expect(screen.getByText(/does not support the ability to sign/)).toBeInTheDocument();
+    });
+  });
+});
 
 describe("WalletButton — not_installed state", () => {
   it("renders install link pointing to freighter.app", async () => {

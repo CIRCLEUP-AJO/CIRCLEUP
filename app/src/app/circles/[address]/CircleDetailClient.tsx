@@ -1,5 +1,6 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+"use client";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
@@ -118,9 +119,6 @@ interface Props {
 }
 
 // ─── Action key type ──────────────────────────────────────────────────────────
-//
-// Constraining the loading key to the four real actions prevents accidental
-// typos from leaving the spinner stuck forever.
 
 type ActionKey = "join" | "contribute" | "payout" | "default" | "close";
 
@@ -133,15 +131,41 @@ interface SuccessState {
 
 // ─── Data-refresh state ───────────────────────────────────────────────────────
 //
-// Tracks whether the post-action background refresh is in flight so we can
-// show a subtle "updating…" indicator rather than stale data silently persisting.
+// "idle"      — no refresh in flight.
+// "refreshing" — post-action background refresh is running.
+// "error"     — refresh failed after a successful action; data may be stale.
 
 type RefreshState = "idle" | "refreshing" | "error";
 
-// ─── Contribution receipt ──────────────────────────────────────────────────────
+// ─── Wallet load state ────────────────────────────────────────────────────────
 //
-// Captures key fields from a confirmed contribute transaction so the receipt
-// persists through data refreshes and is not cleared when success state changes.
+// Distinct from walletAddress === null, which conflates "still loading" with
+// "genuinely not connected". Action buttons must not render until we know
+// definitively which case we're in.
+//
+// "loading"     — getWalletAddress() has not resolved yet.
+// "connected"   — wallet is installed and an address was returned.
+// "disconnected" — wallet is installed but no address (not connected).
+// "not_installed" — Freighter extension is absent.
+
+type WalletLoadState = "loading" | "connected" | "disconnected" | "not_installed";
+
+// ─── Data completeness state ──────────────────────────────────────────────────
+//
+// Tracks whether the data passed in (or updated via refresh) has all fields
+// required for safe action-gating. This is separate from network errors — it
+// describes the *content* of a successful response.
+//
+// "ready"     — all required fields are present and non-empty.
+// "partial"   — data is present but some fields are missing (members[], latestLedger,
+//               currentRound). Actions are blocked until a refresh fills the gaps.
+// "stale"     — the data was last fetched more than MAX_DATA_AGE_MS ago.
+//               The user sees a banner and must explicitly refresh.
+// "refreshing" — a manual refresh is in flight (data from prop is kept visible).
+
+export type DataReadiness = "ready" | "partial" | "stale" | "refreshing";
+
+// ─── Contribution receipt ──────────────────────────────────────────────────────
 
 interface ContributionReceipt {
   amount: string;
@@ -151,9 +175,6 @@ interface ContributionReceipt {
 }
 
 // ─── Default confirmation ──────────────────────────────────────────────────────
-//
-// Holds the identity of the member being defaulted while the user reviews the
-// confirmation panel. Cleared on cancel (no transaction) or on execute.
 
 interface DefaultConfirmState {
   memberAddress: string;
@@ -164,9 +185,23 @@ interface DefaultConfirmState {
 
 type CopyState = "idle" | "success" | "error";
 
-// ─── Round deadline countdown ─────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const SECONDS_PER_LEDGER = 5;
+
+/**
+ * Maximum age (ms) before the component considers its data stale and shows a
+ * banner prompting the user to refresh. Conservative at 2 min — long enough
+ * to read the page but short enough to catch a missed payout event.
+ *
+ * Distinct from DEFAULT_MAX_SNAPSHOT_AGE_MS (30 s) in gating.ts, which is the
+ * per-action pre-flight check. Both guards are required: the page-level check
+ * prevents the user from sitting on stale data without noticing; the gate
+ * check fires just before the on-chain write.
+ */
+export const MAX_DATA_AGE_MS = 2 * 60 * 1000; // 2 minutes
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function ledgersToHuman(ledgers: number): string {
   if (ledgers <= 0) return "overdue";
@@ -181,6 +216,47 @@ function ledgersToHuman(ledgers: number): string {
   if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
 }
+
+/**
+ * Compute the data readiness from the current data snapshot and the timestamp
+ * at which data was last successfully fetched.
+ *
+ * "ready"   — members loaded, latestLedger known, currentRound available (or
+ *             circle is not Active so currentRound is not required).
+ * "partial" — members empty OR (circle is Active AND currentRound is null).
+ *
+ * Staleness is checked separately against fetchedAtMs in the render path.
+ */
+export function computeDataReadiness(
+  data: CircleDetailData,
+): "ready" | "partial" {
+  // Members are required for all membership-gated actions
+  if (data.members.length === 0) return "partial";
+
+  // For an Active circle, currentRound must be present so we can accurately
+  // determine who has contributed (avoid the heuristic fallback).
+  if (data.circle.status === "Active" && data.currentRound == null) {
+    return "partial";
+  }
+
+  return "ready";
+}
+
+/** Returns true when the error looks like a timeout or network failure worth retrying. */
+function isRetryableError(err: string): boolean {
+  const lower = err.toLowerCase();
+  return (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("network") ||
+    lower.includes("fetch") ||
+    lower.includes("connection") ||
+    lower.includes("rpc") ||
+    lower.includes("temporarily unavailable")
+  );
+}
+
+// ─── Sub-components ───────────────────────────────────────────────────────────
 
 interface DeadlineProps {
   deadlineLedger: number | null | undefined;
@@ -283,14 +359,97 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
   );
 }
 
-// ─── Workflow explanation banner ──────────────────────────────────────────────
+// ─── Partial data banner ──────────────────────────────────────────────────────
 //
-// Shown to members who are on a Pending or Active circle to explain what the
-// next step is and what it means. Hides once the circle is Completed/Cancelled.
+// Shown when data is structurally present but incomplete. Explains why actions
+// are locked and provides a Retry button. Distinct from a network/fetch error —
+// this is "we got a response, but it doesn't have everything we need yet."
+
+interface PartialDataBannerProps {
+  data: CircleDetailData;
+  onRefresh: () => void;
+  isRefreshing: boolean;
+}
+
+function PartialDataBanner({ data, onRefresh, isRefreshing }: PartialDataBannerProps) {
+  const missing: string[] = [];
+  if (data.members.length === 0) missing.push("member list");
+  if (data.circle.status === "Active" && data.currentRound == null)
+    missing.push("current-round contribution data");
+
+  if (missing.length === 0) return null;
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-4 flex items-start gap-3 text-sm"
+    >
+      <span className="text-xl mt-0.5" aria-hidden="true">⏳</span>
+      <div className="flex-1">
+        <p className="font-semibold text-amber-800">
+          Some data is still loading
+        </p>
+        <p className="text-amber-700 mt-1">
+          The indexer hasn't finished processing this circle yet. Missing:{" "}
+          <span className="font-medium">{missing.join(", ")}</span>. Actions are
+          disabled until all data is available to prevent unsafe transactions.
+        </p>
+        <button
+          onClick={onRefresh}
+          disabled={isRefreshing}
+          className="mt-2 text-xs font-medium underline text-amber-800 hover:text-amber-900 disabled:opacity-50"
+        >
+          {isRefreshing ? "Refreshing…" : "Refresh now"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Stale data banner ────────────────────────────────────────────────────────
+//
+// Shown when the data is older than MAX_DATA_AGE_MS. Distinct from partial data:
+// the data was complete when it arrived, but it's now too old to trust for
+// financial operations.
+
+interface StaleDataBannerProps {
+  onRefresh: () => void;
+  isRefreshing: boolean;
+}
+
+function StaleDataBanner({ onRefresh, isRefreshing }: StaleDataBannerProps) {
+  return (
+    <div
+      role="alert"
+      className="bg-orange-50 border border-orange-300 rounded-xl px-5 py-4 flex items-start gap-3 text-sm"
+    >
+      <span className="text-xl mt-0.5" aria-hidden="true">🕐</span>
+      <div className="flex-1">
+        <p className="font-semibold text-orange-800">Circle data is out of date</p>
+        <p className="text-orange-700 mt-1">
+          The data on this page is more than 2 minutes old. Actions are disabled
+          until you refresh to ensure you're not submitting a transaction based on
+          stale state.
+        </p>
+        <button
+          onClick={onRefresh}
+          disabled={isRefreshing}
+          className="mt-2 text-xs font-medium underline text-orange-800 hover:text-orange-900 disabled:opacity-50"
+        >
+          {isRefreshing ? "Refreshing…" : "Refresh now"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Workflow explanation banner ──────────────────────────────────────────────
 
 interface WorkflowBannerProps {
   status: string;
   isMember: boolean;
+  walletLoadState: WalletLoadState;
   walletAddress: string | null;
   alreadyContributed: boolean;
   currentRound: number;
@@ -300,12 +459,17 @@ interface WorkflowBannerProps {
 function WorkflowBanner({
   status,
   isMember,
+  walletLoadState,
   walletAddress,
   alreadyContributed,
   currentRound,
   totalRounds,
 }: WorkflowBannerProps) {
   if (status === "Completed" || status === "Cancelled") return null;
+
+  // Don't show a "connect your wallet" banner while still loading — it would
+  // flash and disappear once the wallet check resolves.
+  if (walletLoadState === "loading") return null;
 
   if (!walletAddress) {
     return (
@@ -396,10 +560,6 @@ function WorkflowBanner({
 }
 
 // ─── getMemberContributionStatus ─────────────────────────────────────────────
-//
-// Determines whether a member has contributed, is pending, or has defaulted
-// for the current active round. Returns "not_applicable" for non-active
-// circles or for the recipient slot itself.
 
 function getMemberContributionStatus(
   member: CircleMember,
@@ -407,67 +567,213 @@ function getMemberContributionStatus(
   status: string,
 ): "contributed" | "pending" | "defaulted" | "not_applicable" {
   if (status !== "Active") return "not_applicable";
-  // The recipient slot for this round is handled separately in the render
   if (member.payout_order === currentRound) return "not_applicable";
-  // total_contributions is 0-indexed: if it's > currentRound the member has
-  // already contributed this round.
   if (Number(member.total_contributions) > currentRound) return "contributed";
   if (member.defaults > 0) return "defaulted";
   return "pending";
 }
 
+// ─── fetchCircleData ──────────────────────────────────────────────────────────
+//
+// Shared fetch logic used both by the initial SSR prop and the client-side
+// manual refresh. Returns the merged data or an error discriminant.
+//
+// Error kinds:
+//   "not_found" — indexer returned 404 (circle does not exist).
+//   "network"   — fetch threw (offline, DNS failure, CORS).
+//   "server"    — indexer returned 5xx or non-ok non-404.
+
+export type RefreshError = "not_found" | "network" | "server";
+
+export type RefreshResult =
+  | { ok: true; data: CircleDetailData; fetchedAtMs: number }
+  | { ok: false; error: RefreshError };
+
+export async function fetchCircleData(
+  circleAddress: string,
+  signal?: AbortSignal,
+): Promise<RefreshResult> {
+  let circleRes: Response;
+  let roundsRes: Response;
+
+  try {
+    [circleRes, roundsRes] = await Promise.all([
+      fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
+        cache: "no-store",
+        signal,
+      }),
+      fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, {
+        cache: "no-store",
+        signal,
+      }),
+    ]);
+  } catch (err) {
+    // AbortError is not a real failure — the component unmounted during refresh
+    if (err instanceof DOMException && err.name === "AbortError") {
+      return { ok: false, error: "network" };
+    }
+    return { ok: false, error: "network" };
+  }
+
+  if (circleRes.status === 404) return { ok: false, error: "not_found" };
+  if (!circleRes.ok) return { ok: false, error: "server" };
+
+  let circleJson: Record<string, unknown>;
+  let roundsJson: Record<string, unknown>;
+
+  try {
+    circleJson = (await circleRes.json()) as Record<string, unknown>;
+  } catch {
+    return { ok: false, error: "server" };
+  }
+
+  try {
+    roundsJson = roundsRes.ok
+      ? ((await roundsRes.json()) as Record<string, unknown>)
+      : { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
+  } catch {
+    roundsJson = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
+  }
+
+  if (typeof circleJson.circle !== "object" || circleJson.circle === null) {
+    return { ok: false, error: "server" };
+  }
+
+  const members = Array.isArray(circleJson.members)
+    ? (circleJson.members as CircleMember[])
+    : [];
+
+  return {
+    ok: true,
+    fetchedAtMs: Date.now(),
+    data: {
+      circle: circleJson.circle as CircleDetailData["circle"],
+      members,
+      rounds: Array.isArray(roundsJson.rounds)
+        ? (roundsJson.rounds as CircleRound[])
+        : [],
+      openRounds: Array.isArray(roundsJson.openRounds)
+        ? (roundsJson.openRounds as CircleRound[])
+        : [],
+      pendingDefaults: Array.isArray(roundsJson.pendingDefaults)
+        ? (roundsJson.pendingDefaults as CirclePendingDefault[])
+        : [],
+      latestLedger:
+        typeof circleJson.latestLedger === "number"
+          ? circleJson.latestLedger
+          : null,
+      currentRound:
+        roundsJson.currentRound != null &&
+        typeof roundsJson.currentRound === "object"
+          ? (roundsJson.currentRound as CircleRound)
+          : null,
+    },
+  };
+}
+
 // ─── Main client component ────────────────────────────────────────────────────
 
 export function CircleDetailClient({ circleAddress, circleData }: Props) {
+  // ── Wallet load state ──────────────────────────────────────────────────────
+  //
+  // Distinguishes "still loading" from "not connected" so action buttons don't
+  // flash on/off during the async wallet check.
+  const [walletLoadState, setWalletLoadState] = useState<WalletLoadState>("loading");
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
-  // null  → no action in flight; ActionKey → that specific action is running
+
+  // ── Circle data ────────────────────────────────────────────────────────────
+  const [data, setData] = useState<CircleDetailData>(circleData);
+
+  // Wall-clock timestamp of the last *successful* data fetch.
+  // Seeded to Date.now() on mount because circleData comes from a fresh SSR
+  // fetch; updated on every successful manual or post-action refresh.
+  const [dataFetchedAtMs, setDataFetchedAtMs] = useState<number>(() => Date.now());
+
+  // ── Action state ───────────────────────────────────────────────────────────
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
   const [error,        setError]        = useState<string>("");
   const [success,      setSuccess]      = useState<SuccessState | null>(null);
   const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
-  const [data,         setData]         = useState<CircleDetailData>(circleData);
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
-  // Invite link URL — populated client-side to avoid SSR window access
-  const [inviteUrl, setInviteUrl] = useState("");
-  const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
-  const [defaultConfirm, setDefaultConfirm] = useState<DefaultConfirmState | null>(null);
-  const [inviteCopyState, setInviteCopyState] = useState<CopyState>("idle");
-  const [receiptCopyState, setReceiptCopyState] = useState<CopyState>("idle");
 
-  // Refs for focus management: move focus to error/success regions after an
-  // action completes so keyboard users are not left stranded on the button.
-  const errorRegionRef  = useRef<HTMLDivElement>(null);
-  const successRegionRef = useRef<HTMLDivElement>(null);
+  // ── UI state ───────────────────────────────────────────────────────────────
+  const [inviteUrl,           setInviteUrl]           = useState("");
+  const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
+  const [defaultConfirm,      setDefaultConfirm]      = useState<DefaultConfirmState | null>(null);
+  const [inviteCopyState,     setInviteCopyState]     = useState<CopyState>("idle");
+  const [receiptCopyState,    setReceiptCopyState]    = useState<CopyState>("idle");
+
+  // Whether a manual refresh (triggered by Stale or Partial banners) is running
+  const [isManualRefreshing, setIsManualRefreshing] = useState(false);
+
+  // Refresh error message when a manual refresh fails
+  const [manualRefreshError, setManualRefreshError] = useState<string>("");
+
+  // ── Staleness tracking ─────────────────────────────────────────────────────
+  //
+  // Re-evaluated every second so the stale banner appears automatically once
+  // data ages past MAX_DATA_AGE_MS, even if the user hasn't interacted.
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Ref for aborting any in-flight manual or post-action refresh when the
+  // component unmounts, preventing setState calls on an unmounted tree.
+  const refreshAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    getWalletAddress().then(setWalletAddress);
+    return () => {
+      refreshAbortRef.current?.abort();
+    };
+  }, []);
+
+  // Focus management refs
+  const errorRegionRef   = useRef<HTMLDivElement>(null);
+  const successRegionRef = useRef<HTMLDivElement>(null);
+
+  // ── Wallet resolution ──────────────────────────────────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    getWalletAddress()
+      .then((address) => {
+        if (cancelled) return;
+        if (address) {
+          setWalletAddress(address);
+          setWalletLoadState("connected");
+        } else {
+          setWalletLoadState("disconnected");
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // WalletError with reason "not_installed" lands here
+        setWalletLoadState("not_installed");
+      });
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
-    // Safe: window is only accessed inside useEffect, which never runs on the
-    // server. During SSR the input renders with an empty string and the
-    // placeholder text is shown instead.
     if (typeof window !== "undefined") {
       setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
     }
-  }, []);
+  }, [circleAddress]);
 
-  // Focus management: when an error appears, move keyboard focus to the error
-  // region so screen-reader users are immediately positioned on the message.
-  // tabIndex={-1} on the error div allows programmatic focus.
+  // Focus management
   useEffect(() => {
     if (error && errorRegionRef.current) {
       errorRegionRef.current.focus();
     }
   }, [error]);
 
-  // Focus management: when a success message appears, move focus to the
-  // confirmation region so the user knows the action completed.
   useEffect(() => {
     if (success && successRegionRef.current) {
       successRegionRef.current.focus();
     }
   }, [success]);
+
+  // ── Derived membership state ───────────────────────────────────────────────
 
   const isMember = walletAddress
     ? data.members.some((m) => m.member_address === walletAddress)
@@ -483,65 +789,147 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   const currentRound = data.circle.current_round;
 
-  // Determine whether the connected wallet has already contributed this round.
+  // ── Contribution check ─────────────────────────────────────────────────────
   //
-  // Preferred: check the actual contribution list for the current round returned
-  // by the indexer's /rounds endpoint (data.currentRound.contributions).
-  // This is accurate regardless of how many rounds have elapsed.
+  // Prefer the authoritative currentRound contributions list when available.
+  // When it is absent (partial data), conservatively treat the contribution as
+  // unknown (false) — this means the Contribute button may appear for a member
+  // who already contributed, but the gate will block the double-submit.
+  // This is safer than the inverse: treating unknown as "already contributed"
+  // would hide the button from a member who genuinely needs to contribute.
   //
-  // Fallback: total_contributions > currentRound (a lifetime count). This can
-  // over-count if the indexer hasn't processed the latest round yet, so it is
-  // only used when data.currentRound is not yet available.
-  const myContributedThisRound = walletAddress
-    ? data.currentRound != null
-      ? data.currentRound.contributions.some(
-          (c) => c.member_address === walletAddress,
-        )
-      : data.members.some(
-          (m) =>
-            m.member_address === walletAddress &&
-            Number(m.total_contributions) > currentRound,
-        )
+  // Note: the heuristic fallback (total_contributions > currentRound) that was
+  // present before this refactor has been removed. The fallback could allow a
+  // second contribution prompt when the indexer hadn't yet incremented the
+  // counter. The partial-data state now covers this case explicitly.
+  const myContributedThisRound = walletAddress != null && data.currentRound != null
+    ? data.currentRound.contributions.some(
+        (c) => c.member_address === walletAddress,
+      )
     : false;
 
-  // Pre-compute payout eligibility for disabled-state display. maxSnapshotAgeMs
-  // is Infinity here — we only want the "round not complete" reason; the staleness
-  // guard fires on submit inside doAction where it counts.
-  const payoutGate = computeActionEligibility(
-    "payout",
-    buildAppSnapshot(
-      data.circle.status,
-      currentRound,
-      data.circle.deadline_ledger,
-      data.latestLedger,
-      data.members.map((m) => m.member_address),
-      myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
-      myContributedThisRound,
-      data.currentRound?.contributions.length ?? 0,
-    ),
-    { maxSnapshotAgeMs: Infinity },
-  );
+  // ── Data readiness ─────────────────────────────────────────────────────────
+  //
+  // "stale" is evaluated from the ticker so it flips in real-time.
+  const isDataStale = nowMs - dataFetchedAtMs >= MAX_DATA_AGE_MS;
+  const contentReadiness = computeDataReadiness(data);
+  const dataReadiness: DataReadiness = isManualRefreshing
+    ? "refreshing"
+    : isDataStale
+    ? "stale"
+    : contentReadiness;
 
-  // True when the indexed latest ledger is past the round deadline, enabling
-  // the "Mark Default" button in the member list.
+  // Actions are only allowed when data is fully ready.
+  // This is the single authoritative gate for data completeness.
+  const actionsEnabled = dataReadiness === "ready" && walletLoadState !== "loading";
+
+  // ── Payout gate (for disabled-state display) ───────────────────────────────
+  //
+  // Pre-computed with maxSnapshotAgeMs: Infinity so the "round not complete"
+  // reason shows up in the button caption even when we're not about to submit.
+  // The staleness check is intentionally skipped here — it's handled by the
+  // actionsEnabled gate above.
+  //
+  // Guard: when members[] is empty, 0 contributions >= 0 members is
+  // mathematically true but semantically wrong. We force block in that case.
+  const payoutGate = (() => {
+    if (data.members.length === 0) {
+      return {
+        allowed: false as const,
+        reason: "round_not_complete" as const,
+        message: "Member data is not yet available. Payout cannot be triggered.",
+      };
+    }
+    return computeActionEligibility(
+      "payout",
+      buildAppSnapshot(
+        data.circle.status,
+        currentRound,
+        data.circle.deadline_ledger,
+        data.latestLedger,
+        data.members.map((m) => m.member_address),
+        myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+        myContributedThisRound,
+        data.currentRound?.contributions.length ?? 0,
+        dataFetchedAtMs, // use data fetch time, not snapshot build time
+      ),
+      { maxSnapshotAgeMs: Infinity },
+    );
+  })();
+
+  // True when the indexed latest ledger is past the round deadline
   const deadlinePassed =
     data.circle.deadline_ledger != null &&
     data.latestLedger != null &&
     data.latestLedger > data.circle.deadline_ledger;
 
-  /** Returns true when the error looks like a timeout or network failure that is worth retrying. */
-  function isRetryableError(err: string): boolean {
-    const lower = err.toLowerCase();
-    return (
-      lower.includes("timeout") ||
-      lower.includes("timed out") ||
-      lower.includes("network") ||
-      lower.includes("fetch") ||
-      lower.includes("connection") ||
-      lower.includes("rpc") ||
-      lower.includes("temporarily unavailable")
-    );
+  // ── Manual refresh ─────────────────────────────────────────────────────────
+  //
+  // Used by the Stale and Partial data banners. Updates data in place without
+  // a full page reload. On success: updates data + resets fetchedAtMs.
+  // On failure: shows a contextual message; existing (stale/partial) data kept
+  // visible so the user can still read the page.
+
+  const handleManualRefresh = useCallback(async () => {
+    if (isManualRefreshing) return;
+    setIsManualRefreshing(true);
+    setManualRefreshError("");
+
+    const ctrl = new AbortController();
+    refreshAbortRef.current?.abort();
+    refreshAbortRef.current = ctrl;
+
+    const result = await fetchCircleData(circleAddress, ctrl.signal);
+
+    if (ctrl.signal.aborted) return; // unmounted during fetch
+
+    if (result.ok) {
+      setData(result.data);
+      setDataFetchedAtMs(result.fetchedAtMs);
+      setManualRefreshError("");
+    } else {
+      const messages: Record<typeof result.error, string> = {
+        not_found:
+          "This circle no longer exists on the indexer. The page may be out of date.",
+        network:
+          "Could not reach the indexer. Check your connection and try again.",
+        server:
+          "The indexer returned an error. This is likely temporary — try again.",
+      };
+      setManualRefreshError(messages[result.error]);
+    }
+
+    setIsManualRefreshing(false);
+  }, [circleAddress, isManualRefreshing]);
+
+  // ── Post-action refresh ────────────────────────────────────────────────────
+  //
+  // Called after every successful contract write. Uses the shared fetchCircleData
+  // helper so merging is always safe — we replace the whole data object rather
+  // than patching fields, preventing stale sub-object leaks.
+
+  async function postActionRefresh(ctrl: AbortController) {
+    refreshAbortRef.current?.abort();
+    refreshAbortRef.current = ctrl;
+    setRefreshState("refreshing");
+    const result = await fetchCircleData(circleAddress, ctrl.signal);
+
+    if (ctrl.signal.aborted) return; // unmounted during refresh
+
+    if (result.ok) {
+      setData(result.data);
+      setDataFetchedAtMs(result.fetchedAtMs);
+      setRefreshState("idle");
+    } else if (result.error === "network") {
+      // Genuine network failure after action — show warning
+      setRefreshState("error");
+    } else {
+      // Non-fatal: the action succeeded, refresh just failed
+      setRefreshState("error");
+    }
   }
+
+  // ── Action handler ─────────────────────────────────────────────────────────
 
   const ACTION_SUCCESS_MESSAGES: Record<ActionKey, string> = {
     join:       "Collateral locked — you have joined the circle!",
@@ -556,18 +944,26 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       setError("Connect your wallet first.");
       return;
     }
-    // Guard: prevent a second call while one is already in flight
     if (loading !== null) return;
 
-    // ── Route-param validation ─────────────────────────────────────────────
-    // circleAddress comes from the Next.js URL segment and is never sanitised
-    // by the router. Reject it early — before any RPC call — so a malformed or
-    // injected address fails with a clear UI message rather than a cryptic SDK
-    // error deep inside invokeContract.
     if (!isSorobanContractId(circleAddress)) {
       setError(
         `Invalid circle address "${shortAddress(circleAddress)}". ` +
           "Expected a C-prefixed 56-character Soroban contract ID.",
+      );
+      return;
+    }
+
+    // ── Data completeness guard ────────────────────────────────────────────
+    //
+    // Even though the buttons are disabled when dataReadiness !== "ready",
+    // re-check here as a defence-in-depth measure in case the UI guard is
+    // bypassed (e.g. by automated tests, accessibility tools, or race conditions).
+    if (dataReadiness !== "ready") {
+      setError(
+        dataReadiness === "stale"
+          ? "Circle data is out of date. Please refresh the page before submitting a transaction."
+          : "Circle data is still loading. Please wait a moment and try again.",
       );
       return;
     }
@@ -579,17 +975,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setLoading(action);
 
     try {
-      // ── Stale-state protection ─────────────────────────────────────────────
+      // ── Stale-state gate ───────────────────────────────────────────────────
       //
-      // Build a snapshot from the component's current data object and run the
-      // canonical gate check before submitting any transaction.  This ensures
-      // that if the circle state changed on-chain since the last data refresh
-      // (e.g. another member already contributed, payout already ran, or the
-      // round deadline passed) the action is blocked immediately with a clear
-      // message instead of producing an on-chain contract error.
-      //
-      // contributionsReceived is derived from the current round's contributions
-      // list when available, otherwise falls back to the member count heuristic.
+      // Build the snapshot using dataFetchedAtMs — the timestamp when the
+      // data was actually loaded, NOT Date.now(). This is the fix for the
+      // critical bug where the old code passed nowMs=Date.now() into
+      // buildAppSnapshot, making fetchedAtMs === nowMs and the stale check
+      // always pass regardless of how old the data was.
       const currentRoundContributions =
         data.currentRound?.contributions.length ?? 0;
 
@@ -599,19 +991,15 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         data.circle.deadline_ledger,
         data.latestLedger,
         data.members.map((m) => m.member_address),
-        /* hasLockedCollateral */ myMember != null
-          ? BigInt(myMember.collateral || "0") > BigInt(0)
-          : false,
-        /* hasContributedCurrentRound */ myContributedThisRound,
-        /* contributionsReceived */ currentRoundContributions,
+        myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+        myContributedThisRound,
+        currentRoundContributions,
+        dataFetchedAtMs, // ← correct: when the data was fetched, not now
       );
 
       const gate = computeActionEligibility(action, snapshot);
       if (isGateBlocked(gate)) {
         setError(gate.message);
-        // Stale snapshots are always retryable — the user just needs to refresh.
-        // Other block reasons (wrong_status, already_contributed, etc.) are not
-        // transient so we don't show a retry link for them.
         if (gate.reason === "stale_snapshot") {
           setRetryAction(() => () => doAction(action, args));
         }
@@ -626,10 +1014,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         args,
         walletAddress,
       );
+
       if (!result.success) {
-        // Prefer the typed error message — it's the canonical user-facing copy
-        // from contractErrors.ts; fall back to the raw error string if somehow
-        // typedError is not set (e.g. legacy call path).
         const errMsg = result.typedError?.message || result.error || "Transaction failed";
         setError(errMsg);
         if (isRetryableError(errMsg)) {
@@ -650,32 +1036,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               : null,
           });
         }
-        // Refresh circle data after a successful action
-        setRefreshState("refreshing");
-        const refreshController = new AbortController();
-        try {
-          const [circleRes, roundsRes] = await Promise.all([
-            fetch(`${INDEXER_URL}/circles/${circleAddress}`, { cache: "no-store", signal: refreshController.signal }),
-            fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, { cache: "no-store", signal: refreshController.signal }),
-          ]);
-          if (circleRes.ok) {
-            const updatedCircle = (await circleRes.json()) as Partial<CircleDetailData>;
-            const updatedRounds = roundsRes.ok
-              ? ((await roundsRes.json()) as Partial<CircleDetailData>)
-              : {};
-            setData((prev) => ({ ...prev, ...updatedCircle, ...updatedRounds }));
-          }
-          setRefreshState("idle");
-        } catch (refreshErr) {
-          // Aborted refreshes (unmount during refresh) are silent — not an error.
-          if (refreshErr instanceof DOMException && refreshErr.name === "AbortError") {
-            setRefreshState("idle");
-          } else {
-            // Data refresh failure is non-fatal — the action already succeeded.
-            // Show a subtle warning so the user knows to refresh manually.
-            setRefreshState("error");
-          }
-        }
+
+        const ctrl = new AbortController();
+        await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -688,12 +1051,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
-  // Each handler guards with the `loading` check inside doAction,
-  // so even if the button is somehow clicked twice only one call fires.
+  // ── Action shortcuts ───────────────────────────────────────────────────────
+
   const handleJoin       = () => doAction("join",       [new Address(walletAddress!).toScVal()]);
   const handleContribute = () => doAction("contribute", [new Address(walletAddress!).toScVal()]);
   const handlePayout     = () => doAction("payout",     []);
   const handleClose      = () => doAction("close",      [new Address(walletAddress!).toScVal()]);
+
+  // ── Copy helpers ───────────────────────────────────────────────────────────
 
   async function handleCopyInvite() {
     if (!inviteUrl) return;
@@ -719,6 +1084,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
+  // ── Default flow ───────────────────────────────────────────────────────────
+
   function handleMarkDefault(memberAddress: string) {
     setDefaultConfirm({ memberAddress, roundIndex: currentRound });
   }
@@ -737,19 +1104,29 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       return;
     }
 
-    // Build a snapshot with the TARGET member's contribution status, not the
-    // caller's — gateDefault checks whether the member being defaulted has
-    // already contributed, not whether the invoking wallet has.
+    // Data completeness guard — same defence-in-depth as doAction
+    if (dataReadiness !== "ready") {
+      setError(
+        dataReadiness === "stale"
+          ? "Circle data is out of date. Please refresh before marking a default."
+          : "Circle data is still loading. Wait a moment and try again.",
+      );
+      return;
+    }
+
+    // Clear stale action state before the gate check so the user always sees
+    // fresh output for this attempt.
+    setError("");
+    setSuccess(null);
+    setRetryAction(null);
+
+    // Build snapshot for the TARGET member's contribution status
     const targetContributed =
       data.currentRound != null
         ? data.currentRound.contributions.some(
             (c) => c.member_address === memberAddress,
           )
-        : data.members.some(
-            (m) =>
-              m.member_address === memberAddress &&
-              Number(m.total_contributions) > currentRound,
-          );
+        : false; // when currentRound is null, fail safe: assume not contributed
 
     const snapshot = buildAppSnapshot(
       data.circle.status,
@@ -760,6 +1137,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       false,
       targetContributed,
       data.currentRound?.contributions.length ?? 0,
+      dataFetchedAtMs, // ← correct: use data fetch time
     );
 
     const gate = computeActionEligibility("default", snapshot);
@@ -771,9 +1149,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       return;
     }
 
-    setError("");
-    setSuccess(null);
-    setRetryAction(null);
     setLoading("default");
 
     try {
@@ -794,34 +1169,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           message: `${shortAddress(memberAddress)} marked as defaulted for round ${currentRound}.`,
           txHash: result.txHash,
         });
-        setRefreshState("refreshing");
         const ctrl = new AbortController();
-        try {
-          const [circleRes, roundsRes] = await Promise.all([
-            fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
-              cache: "no-store",
-              signal: ctrl.signal,
-            }),
-            fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, {
-              cache: "no-store",
-              signal: ctrl.signal,
-            }),
-          ]);
-          if (circleRes.ok) {
-            const updatedCircle = (await circleRes.json()) as Partial<CircleDetailData>;
-            const updatedRounds = roundsRes.ok
-              ? ((await roundsRes.json()) as Partial<CircleDetailData>)
-              : {};
-            setData((prev) => ({ ...prev, ...updatedCircle, ...updatedRounds }));
-          }
-          setRefreshState("idle");
-        } catch (refreshErr) {
-          if (refreshErr instanceof DOMException && refreshErr.name === "AbortError") {
-            setRefreshState("idle");
-          } else {
-            setRefreshState("error");
-          }
-        }
+        await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -834,11 +1183,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
-  // Spoken summary of circle status + round progress. Rendered in a polite
-  // live region below so screen-reader users hear "Circle status: Active.
-  // Round 3 of 10." whenever an action (contribute / payout / close) refreshes
-  // the circle data. The round fragment is omitted when total_rounds is
-  // missing or invalid rather than announcing "Round 0 of 0".
+  // ── Accessibility ──────────────────────────────────────────────────────────
+
   const totalRounds = data.circle.total_rounds;
   const progressAnnouncement =
     `Circle status: ${data.circle.status}.` +
@@ -846,25 +1192,76 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       ? ` Round ${Math.max(0, currentRound)} of ${totalRounds}.`
       : "");
 
-  // Network-aware explorer link for the last successful action's transaction.
-  // Null on unsupported/custom networks — the hash is then shown as plain text.
   const successTxUrl = success?.txHash
     ? getExplorerLink(ACTIVE_NETWORK, "tx", success.txHash)
     : null;
 
+  // ── Render ─────────────────────────────────────────────────────────────────
+
   return (
     <div className="space-y-8">
 
-      {/* Live announcement of status / round changes. Must be present from
-          the first render — live regions added later are not announced. */}
+      {/* Live announcement of status / round changes */}
       <p className="sr-only" role="status" aria-live="polite">
         {progressAnnouncement}
       </p>
+
+      {/* Data state banners — shown above the action panel so the user
+          understands why actions are locked before they try to click */}
+      {dataReadiness === "stale" && (
+        <StaleDataBanner
+          onRefresh={handleManualRefresh}
+          isRefreshing={isManualRefreshing}
+        />
+      )}
+
+      {dataReadiness === "partial" && (
+        <PartialDataBanner
+          data={data}
+          onRefresh={handleManualRefresh}
+          isRefreshing={isManualRefreshing}
+        />
+      )}
+
+      {dataReadiness === "refreshing" && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="bg-slate-50 border border-slate-200 rounded-xl px-5 py-4 flex items-center gap-3 text-sm text-slate-600"
+        >
+          <span
+            className="inline-block w-4 h-4 border-2 border-slate-300 border-t-brand-600 rounded-full animate-spin"
+            aria-hidden="true"
+          />
+          Refreshing circle data…
+        </div>
+      )}
+
+      {manualRefreshError && (
+        <div
+          role="alert"
+          className="bg-red-50 border border-red-200 rounded-xl px-5 py-4 flex items-start gap-3 text-sm text-red-700"
+        >
+          <span className="text-xl mt-0.5" aria-hidden="true">⚠️</span>
+          <div>
+            <p className="font-semibold">Refresh failed</p>
+            <p className="mt-1">{manualRefreshError}</p>
+            <button
+              onClick={handleManualRefresh}
+              disabled={isManualRefreshing}
+              className="mt-2 text-xs font-medium underline hover:text-red-900 disabled:opacity-50"
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Workflow explanation */}
       <WorkflowBanner
         status={data.circle.status}
         isMember={isMember}
+        walletLoadState={walletLoadState}
         walletAddress={walletAddress}
         alreadyContributed={myContributedThisRound}
         currentRound={currentRound}
@@ -937,7 +1334,15 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             )}
             {refreshState === "error" && (
               <p className="text-xs text-amber-700">
-                ⚠️ Could not refresh data automatically — reload the page to see the latest state.
+                ⚠️ Could not refresh data automatically —{" "}
+                <button
+                  onClick={handleManualRefresh}
+                  disabled={isManualRefreshing}
+                  className="underline font-medium hover:text-amber-900 disabled:opacity-50"
+                >
+                  refresh manually
+                </button>{" "}
+                to see the latest state.
               </p>
             )}
           </div>
@@ -999,7 +1404,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   setDefaultConfirm(null);
                   doDefault(addr);
                 }}
-                disabled={loading !== null}
+                disabled={loading !== null || !actionsEnabled}
                 className="px-3 py-2 text-sm rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 Confirm &amp; Sign
@@ -1009,11 +1414,28 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )}
 
         <div className="action-group">
+          {/* Wallet loading placeholder — prevents layout shift while wallet check is in flight */}
+          {walletLoadState === "loading" && (
+            <span
+              role="status"
+              aria-live="polite"
+              className="flex items-center gap-2 text-sm text-slate-400"
+            >
+              <span
+                className="inline-block w-4 h-4 border-2 border-slate-200 border-t-slate-400 rounded-full animate-spin"
+                aria-hidden="true"
+              />
+              Checking wallet…
+            </span>
+          )}
+
           {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
             <button
               onClick={handleJoin}
-              disabled={loading !== null}
+              disabled={loading !== null || !actionsEnabled}
               aria-busy={loading === "join" ? "true" : "false"}
+              aria-disabled={!actionsEnabled}
+              title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
               className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "join" ? "Joining…" : "🔒 Lock Collateral & Join"}
@@ -1025,8 +1447,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             !myContributedThisRound && (
               <button
                 onClick={handleContribute}
-                disabled={loading !== null}
+                disabled={loading !== null || !actionsEnabled}
                 aria-busy={loading === "contribute" ? "true" : "false"}
+                aria-disabled={!actionsEnabled}
+                title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
                 className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
               >
                 {loading === "contribute"
@@ -1039,14 +1463,22 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             <div className="flex flex-col gap-1">
               <button
                 onClick={handlePayout}
-                disabled={loading !== null || !payoutGate.allowed}
+                disabled={loading !== null || !payoutGate.allowed || !actionsEnabled}
                 aria-busy={loading === "payout" ? "true" : "false"}
                 aria-describedby={!payoutGate.allowed ? "payout-gate-reason" : undefined}
+                aria-disabled={!actionsEnabled || !payoutGate.allowed}
+                title={
+                  !actionsEnabled
+                    ? "Actions unavailable until circle data is fully loaded"
+                    : !payoutGate.allowed
+                    ? payoutGate.message
+                    : undefined
+                }
                 className="bg-blue-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
               >
                 {loading === "payout" ? "Paying out…" : "🎯 Trigger Payout"}
               </button>
-              {!payoutGate.allowed && (
+              {!payoutGate.allowed && actionsEnabled && (
                 <p
                   id="payout-gate-reason"
                   className="text-xs text-slate-500"
@@ -1062,15 +1494,16 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             data.circle.status === "Cancelled") && (
             <button
               onClick={handleClose}
-              disabled={loading !== null}
+              disabled={loading !== null || !actionsEnabled}
               aria-busy={loading === "close" ? "true" : "false"}
+              aria-disabled={!actionsEnabled}
+              title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
               className="bg-slate-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "close" ? "Closing…" : "🔓 Release Collateral"}
             </button>
           )}
 
-          {/* Global spinner label when any action is running */}
           {loading !== null && (
             <span
               role="status"
@@ -1087,8 +1520,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         </div>
       </div>
 
-      {/* Contribution receipt — persists after confirmation; clears when a new
-          contribute action starts. Shows amount, round, and a copyable hash. */}
+      {/* Contribution receipt */}
       {contributionReceipt && (
         <div
           role="region"
@@ -1171,7 +1603,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               (r) => r.roundIndex === i && r.status === "completed",
             );
 
-            // Contribution status for the current active round
             const contribStatus = getMemberContributionStatus(
               member,
               currentRound,
@@ -1217,10 +1648,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   </div>
                 </div>
 
-                {/* Right-hand status column — shrink-0 keeps it visible on narrow screens */}
                 <div className="text-right text-sm shrink-0 max-w-[45%] sm:max-w-none">
                   {isPaid ? (
-                    // Past round recipient
                     <span className="text-slate-500 text-xs sm:text-sm">
                       <span aria-hidden="true">✅ </span>
                       received ${formatUsdc(roundForMember?.amount ?? "0")}
@@ -1231,12 +1660,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                       next payout
                     </span>
                   ) : (
-                    // Future slot — show per-member contribution status for active circles
                     <div className="flex flex-col items-end gap-1">
                       <ContributionStatusBadge status={contribStatus} />
                       {contribStatus === "pending" &&
                         data.circle.status === "Active" &&
-                        deadlinePassed && (
+                        deadlinePassed &&
+                        actionsEnabled && (
                           <button
                             onClick={() => handleMarkDefault(member.member_address)}
                             disabled={loading !== null}
@@ -1260,7 +1689,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )}
       </div>
 
-      {/* Round history — completed rounds only (have a payout). */}
+      {/* Round history */}
       {data.rounds.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 p-5">
           <h2 className="font-semibold text-slate-800 mb-4">📋 Round History</h2>
@@ -1272,9 +1701,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         </div>
       )}
 
-      {/* Open rounds — rounds with recorded activity (contributions / defaults)
-          but no payout yet and not the circle's current round.
-          These were previously silently dropped (issue #170). */}
+      {/* Open rounds */}
       {data.openRounds.length > 0 && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-5">
           <h2 className="font-semibold text-amber-800 mb-1">
@@ -1314,8 +1741,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         </div>
       )}
 
-      {/* Invite link — URL is built from circleAddress + origin so it is
-          identical across server-rendered and client-rendered contexts. */}
+      {/* Invite link */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
         <h2 className="font-semibold text-slate-700 mb-2">🔗 Invite link</h2>
         <p className="text-xs text-slate-500 mb-2">
@@ -1360,11 +1786,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 }
 
 // ─── RoundCard ────────────────────────────────────────────────────────────────
-//
-// Renders a single round row in both the "Round History" (completed) and
-// "Open Rounds" (unpaid-with-activity) sections.  All payout fields are
-// nullable — this component guards every access so the page never crashes on
-// an in-progress or open round.
 
 interface RoundCardProps {
   round: CircleRound;
@@ -1385,15 +1806,12 @@ function RoundCard({ round }: RoundCardProps) {
     open:      "text-amber-700 bg-amber-50 border-amber-200",
   };
 
-  // Network-aware explorer link for this round's payout tx. Null on
-  // unsupported/custom networks — the hash is then shown as plain text.
   const txUrl = round.txHash
     ? getExplorerLink(ACTIVE_NETWORK, "tx", round.txHash)
     : null;
 
   return (
     <div className="border border-slate-100 rounded-lg p-4">
-      {/* Header row: round number + status badge (left) / tx link (right) */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <h3 className="font-medium text-slate-800">
@@ -1429,7 +1847,6 @@ function RoundCard({ round }: RoundCardProps) {
         )}
       </div>
 
-      {/* Payout summary — only shown when a payout exists */}
       {round.status === "completed" &&
         round.amount != null &&
         round.recipient != null ? (
@@ -1442,7 +1859,6 @@ function RoundCard({ round }: RoundCardProps) {
         <p className="text-sm text-slate-500 italic">Payout not yet triggered</p>
       )}
 
-      {/* Contribution / default counts */}
       <p className="text-xs text-slate-400 mt-1">
         {round.contributions.length} contribution
         {round.contributions.length !== 1 ? "s" : ""}
@@ -1457,16 +1873,11 @@ function RoundCard({ round }: RoundCardProps) {
   );
 }
 
-// ─── Contribution status badge ────────────────────────────────────────────────
+// ─── ContributionStatusBadge ──────────────────────────────────────────────────
 
 interface ContributionStatusBadgeProps {
   status: "contributed" | "pending" | "defaulted" | "not_applicable";
 }
-
-// The leading glyphs (✓ / ⏳ / ✗) are decorative — screen readers would
-// otherwise announce them literally ("check mark contributed"), so they are
-// hidden and an sr-only "Contribution status:" prefix gives the bare word
-// context when the badge is read on its own.
 
 function ContributionStatusBadge({ status }: ContributionStatusBadgeProps) {
   switch (status) {

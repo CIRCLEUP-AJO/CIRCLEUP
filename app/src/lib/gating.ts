@@ -12,7 +12,16 @@
  *
  * Mirror of sdk/src/gating.ts — kept in sync manually because the app does
  * not take a direct dependency on the @circleup/sdk package.
+ *
+ * Status checks use the canonical lifecycle model from lifecycle.ts.
  */
+
+import {
+  isActiveStatus,
+  isPendingStatus,
+  isTerminalStatus,
+  type CircleLifecycleStatus,
+} from "./lifecycle";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -170,9 +179,7 @@ function gateJoin(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateRe
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before joining.`,
     );
   }
-  const networkBlock = checkNetworkGate(snap);
-  if (networkBlock) return networkBlock;
-  if (snap.status !== "Pending") {
+  if (!isPendingStatus(snap.status)) {
     return blocked(
       "wrong_status",
       `Join is only available while the circle is Pending. Current status: ${snap.status}.`,
@@ -194,9 +201,7 @@ function gateContribute(snap: AppStateSnapshot, nowMs: number, maxAge: number): 
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before contributing.`,
     );
   }
-  const networkBlock = checkNetworkGate(snap);
-  if (networkBlock) return networkBlock;
-  if (snap.status !== "Active") {
+  if (!isActiveStatus(snap.status)) {
     return blocked(
       "wrong_status",
       `Contribute is only available on an Active circle. Current status: ${snap.status}.`,
@@ -228,9 +233,7 @@ function gatePayout(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gate
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before triggering payout.`,
     );
   }
-  const networkBlock = checkNetworkGate(snap);
-  if (networkBlock) return networkBlock;
-  if (snap.status !== "Active") {
+  if (!isActiveStatus(snap.status)) {
     return blocked(
       "wrong_status",
       `Payout is only available on an Active circle. Current status: ${snap.status}.`,
@@ -253,9 +256,7 @@ function gateDefault(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gat
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before marking a default.`,
     );
   }
-  const networkBlock = checkNetworkGate(snap);
-  if (networkBlock) return networkBlock;
-  if (snap.status !== "Active") {
+  if (!isActiveStatus(snap.status)) {
     return blocked(
       "wrong_status",
       `Default can only be marked on an Active circle. Current status: ${snap.status}.`,
@@ -294,9 +295,7 @@ function gateClose(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateR
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before closing.`,
     );
   }
-  const networkBlock = checkNetworkGate(snap);
-  if (networkBlock) return networkBlock;
-  if (snap.status !== "Completed" && snap.status !== "Cancelled") {
+  if (!isTerminalStatus(snap.status) && snap.status !== "Closed") {
     return blocked(
       "wrong_status",
       `Close is only available on a Completed or Cancelled circle. Current status: ${snap.status}.`,

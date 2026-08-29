@@ -11,11 +11,15 @@ function getFilledMembers(members: string[]): string[] {
   return members.map((m) => m.trim()).filter((m) => m.length > 0);
 }
 
+/**
+ * Find duplicate addresses using case-insensitive comparison.
+ */
 function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
-    if (seen.has(addr)) return addr;
-    seen.add(addr);
+    const lower = addr.toLowerCase();
+    if (seen.has(lower)) return addr;
+    seen.add(lower);
   }
   return null;
 }
@@ -57,6 +61,11 @@ describe("findDuplicateAddress", () => {
   it("returns null for an empty list", () => {
     expect(findDuplicateAddress([])).toBeNull();
   });
+
+  it("detects duplicates case-insensitively", () => {
+    const lowerA = VALID_ADDR_A.toLowerCase();
+    expect(findDuplicateAddress([VALID_ADDR_A, lowerA])).toBe(lowerA);
+  });
 });
 
 describe("isValidStellarAddress", () => {
@@ -89,13 +98,29 @@ describe("isValidStellarAddress", () => {
 describe("form validation pipeline", () => {
   const MIN_MEMBERS = 2;
   const MAX_MEMBERS = 20;
+  const MAX_ROUND_USDC = 1_000_000;
+  const MAX_ROUND_DAYS = 365;
 
-  function validate(members: string[], roundUSDC: string, roundDays: string) {
+  function validate(
+    members: string[],
+    roundUSDC: string,
+    roundDays: string,
+    walletAddress?: string,
+  ) {
     const valid = getFilledMembers(members);
     if (valid.length < MIN_MEMBERS)
       return { error: `A circle needs at least ${MIN_MEMBERS} members.` };
     if (valid.length > MAX_MEMBERS)
       return { error: `A circle cannot have more than ${MAX_MEMBERS} members.` };
+
+    // Self-address check
+    if (walletAddress) {
+      const creatorLower = walletAddress.toLowerCase();
+      const isSelfMember = valid.some((m) => m.toLowerCase() === creatorLower);
+      if (isSelfMember) {
+        return { error: "Your wallet address cannot be included in the member list." };
+      }
+    }
 
     const dup = findDuplicateAddress(valid);
     if (dup) return { error: `Duplicate address detected: ${dup.slice(0, 4)}…${dup.slice(-4)}.` };
@@ -104,10 +129,12 @@ describe("form validation pipeline", () => {
     if (badAddr) return { error: `Invalid Stellar address: "${badAddr.slice(0, 4)}…${badAddr.slice(-4)}".` };
 
     const amount = parseFloat(roundUSDC);
-    if (isNaN(amount) || amount <= 0) return { error: "Enter a valid round amount." };
+    if (isNaN(amount) || amount <= 0) return { error: "Enter a valid round amount greater than zero." };
+    if (amount > MAX_ROUND_USDC) return { error: `Round amount exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()}.` };
 
     const days = parseInt(roundDays, 10);
-    if (isNaN(days) || days < 1) return { error: "Enter a valid round duration." };
+    if (isNaN(days) || days < 1) return { error: "Enter a valid round duration of at least 1 day." };
+    if (days > MAX_ROUND_DAYS) return { error: `Round duration cannot exceed ${MAX_ROUND_DAYS} days.` };
 
     return { error: null };
   }
@@ -124,6 +151,11 @@ describe("form validation pipeline", () => {
 
   it("blocks with duplicate addresses", () => {
     const { error } = validate([VALID_ADDR_A, VALID_ADDR_A], "100", "30");
+    expect(error).toMatch(/duplicate/i);
+  });
+
+  it("blocks with case-insensitive duplicate addresses", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_A.toLowerCase()], "100", "30");
     expect(error).toMatch(/duplicate/i);
   });
 
@@ -152,7 +184,6 @@ describe("form validation pipeline", () => {
       { length: 21 },
       (_, i) => VALID_ADDR_A.slice(0, -1) + String.fromCharCode(65 + (i % 26))
     ).map(
-      // force each to be a syntactically valid address length by padding/slicing
       (_, i) => {
         const base = VALID_ADDR_A.split("");
         base[55] = String.fromCharCode(65 + (i % 26));
@@ -165,6 +196,41 @@ describe("form validation pipeline", () => {
 
   it("accepts exactly 3 valid members", () => {
     const { error } = validate([VALID_ADDR_A, VALID_ADDR_B, VALID_ADDR_C], "50", "14");
+    expect(error).toBeNull();
+  });
+
+  it("blocks self-address (creator as member)", () => {
+    const { error } = validate(
+      [VALID_ADDR_A, VALID_ADDR_B],
+      "100",
+      "30",
+      VALID_ADDR_A, // wallet is same as first member
+    );
+    expect(error).toMatch(/cannot be included/i);
+  });
+
+  it("blocks self-address case-insensitively", () => {
+    const { error } = validate(
+      [VALID_ADDR_A, VALID_ADDR_B],
+      "100",
+      "30",
+      VALID_ADDR_A.toLowerCase(),
+    );
+    expect(error).toMatch(/cannot be included/i);
+  });
+
+  it("blocks round amount exceeding maximum", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "2000000", "30");
+    expect(error).toMatch(/exceeds the maximum/i);
+  });
+
+  it("blocks round duration exceeding maximum", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "100", "400");
+    expect(error).toMatch(/cannot exceed/i);
+  });
+
+  it("passes with maximum valid values", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "1000000", "365");
     expect(error).toBeNull();
   });
 });
