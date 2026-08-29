@@ -20,6 +20,18 @@ vi.mock("@/lib/stellar", () => {
   };
 });
 
+// Mock @/lib/walletCapabilities to control capability detection in tests
+vi.mock("@/lib/walletCapabilities", () => ({
+  detectWalletCapabilities: vi.fn(() => ({
+    installed: true,
+    canConnect: true,
+    canSignTransaction: true,
+    canGetNetwork: true,
+    canWatchChanges: false,
+  })),
+  explainUnsupportedAction: vi.fn(() => null),
+}));
+
 // Mock @/lib/config to avoid env-var assertions at import time
 vi.mock("@/lib/config", () => ({
   shortAddress: (addr: string) => `${addr.slice(0, 4)}…${addr.slice(-4)}`,
@@ -33,12 +45,18 @@ vi.mock("@/lib/config", () => ({
 
 import { WalletButton } from "@/components/WalletButton";
 import * as stellar from "@/lib/stellar";
+import * as walletCaps from "@/lib/walletCapabilities";
 
 const mockStellar = stellar as {
   isFreighterInstalled: ReturnType<typeof vi.fn>;
   getWalletAddress: ReturnType<typeof vi.fn>;
   connectWallet: ReturnType<typeof vi.fn>;
   WalletError: new (reason: string, msg: string) => Error & { reason: string };
+};
+
+const mockWalletCaps = walletCaps as {
+  detectWalletCapabilities: ReturnType<typeof vi.fn>;
+  explainUnsupportedAction: ReturnType<typeof vi.fn>;
 };
 
 beforeEach(() => {
@@ -80,6 +98,22 @@ describe("WalletButton — connected state", () => {
       expect(screen.getByText("GAAA…AAAA")).toBeInTheDocument()
     );
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+});
+
+describe("WalletButton — limited capabilities state", () => {
+  it("shows warning when wallet cannot sign transactions", async () => {
+    const addr = "G" + "A".repeat(55);
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(addr);
+    mockWalletCaps.explainUnsupportedAction.mockReturnValue(
+      "Your wallet does not support the ability to sign this transaction."
+    );
+
+    render(<WalletButton />);
+    await waitFor(() => {
+      expect(screen.getByText(/does not support the ability to sign/)).toBeInTheDocument();
+    });
   });
 });
 
