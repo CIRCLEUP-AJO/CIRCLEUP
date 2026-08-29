@@ -36,6 +36,25 @@ export const DEFAULT_MAX_SNAPSHOT_AGE_MS = 30_000;
 export type CircleAction = "join" | "contribute" | "payout" | "default" | "close";
 
 /**
+ * The network state as seen by the app at snapshot time.
+ *
+ * | Value | Meaning |
+ * |-------|---------|
+ * | `"match"`    | Provider passphrase matches the app's configured passphrase — writes are safe. |
+ * | `"mismatch"` | Provider is on a different network — all writes must be blocked. |
+ * | `"unknown"`  | Network could not be confirmed (provider error or unsupported). |
+ * | `null`       | Network check has not run yet (provider not yet connected). |
+ *
+ * A `"mismatch"` value blocks every write action regardless of all other gate
+ * conditions.  `"unknown"` and `null` are treated as benefit-of-the-doubt so
+ * users on wallets that cannot report the network are not permanently locked out.
+ * The primary transaction-rejection mechanism is the on-chain network passphrase
+ * check; this gate is an early-warning layer that prevents a frustrating
+ * "transaction failed" message after a user has already signed.
+ */
+export type NetworkCheckState = "match" | "mismatch" | "unknown" | null;
+
+/**
  * Snapshot of the circle state as seen by the app at a specific point in time.
  * Built from the indexer response already present in component state — no extra
  * RPC call is needed.
@@ -57,6 +76,16 @@ export interface AppStateSnapshot {
   readonly hasContributedCurrentRound: boolean;
   /** Number of contributions received in the current round (from indexer). */
   readonly contributionsReceived: number;
+  /**
+   * Result of the most recent network-mismatch check.
+   *
+   * `"mismatch"` blocks all write actions — the wallet is on a different
+   * Stellar network from the one the app was configured for.  `null` means
+   * the check has not run yet (e.g. the wallet has just connected); this is
+   * treated as non-blocking.  See {@link NetworkCheckState} for the full set
+   * of values and their semantics.
+   */
+  readonly networkCheck: NetworkCheckState;
   /** Wall-clock ms when this snapshot was constructed. */
   readonly fetchedAtMs: number;
 }
@@ -86,7 +115,8 @@ export type GateBlockReason =
   | "deadline_passed"
   | "deadline_not_passed"
   | "round_not_complete"
-  | "no_active_round";
+  | "no_active_round"
+  | "network_mismatch";
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -111,6 +141,26 @@ export function isSnapshotFresh(
   return nowMs - fetchedAtMs < maxAgeMs;
 }
 
+/**
+ * Returns a {@link GateBlocked} result when the snapshot's `networkCheck`
+ * field records a confirmed mismatch, or `null` if the network is fine (or
+ * unknown — benefit of the doubt).
+ *
+ * This is checked as the **second** gate after staleness, before any
+ * action-specific logic, so a wallet-on-wrong-network never reaches the
+ * contract regardless of what action the user is trying to perform.
+ */
+function checkNetworkGate(snap: AppStateSnapshot): GateBlocked | null {
+  if (snap.networkCheck === "mismatch") {
+    return blocked(
+      "network_mismatch",
+      "Your wallet is connected to a different Stellar network than this app. " +
+        "Switch your wallet to the correct network to enable transactions.",
+    );
+  }
+  return null;
+}
+
 // ─── Per-action gate logic ────────────────────────────────────────────────────
 
 function gateJoin(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateResult {
@@ -120,6 +170,8 @@ function gateJoin(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateRe
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before joining.`,
     );
   }
+  const networkBlock = checkNetworkGate(snap);
+  if (networkBlock) return networkBlock;
   if (snap.status !== "Pending") {
     return blocked(
       "wrong_status",
@@ -142,6 +194,8 @@ function gateContribute(snap: AppStateSnapshot, nowMs: number, maxAge: number): 
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before contributing.`,
     );
   }
+  const networkBlock = checkNetworkGate(snap);
+  if (networkBlock) return networkBlock;
   if (snap.status !== "Active") {
     return blocked(
       "wrong_status",
@@ -174,6 +228,8 @@ function gatePayout(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gate
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before triggering payout.`,
     );
   }
+  const networkBlock = checkNetworkGate(snap);
+  if (networkBlock) return networkBlock;
   if (snap.status !== "Active") {
     return blocked(
       "wrong_status",
@@ -197,6 +253,8 @@ function gateDefault(snap: AppStateSnapshot, nowMs: number, maxAge: number): Gat
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before marking a default.`,
     );
   }
+  const networkBlock = checkNetworkGate(snap);
+  if (networkBlock) return networkBlock;
   if (snap.status !== "Active") {
     return blocked(
       "wrong_status",
@@ -236,6 +294,8 @@ function gateClose(snap: AppStateSnapshot, nowMs: number, maxAge: number): GateR
       `Circle data is ${nowMs - snap.fetchedAtMs}ms old. Refresh the page before closing.`,
     );
   }
+  const networkBlock = checkNetworkGate(snap);
+  if (networkBlock) return networkBlock;
   if (snap.status !== "Completed" && snap.status !== "Cancelled") {
     return blocked(
       "wrong_status",
@@ -313,6 +373,7 @@ export function isGateBlocked(result: GateResult): result is GateBlocked {
  * @param hasLockedCollateral Whether the wallet has collateral > 0
  * @param hasContributed      Whether the wallet has already contributed this round
  * @param contributionsReceived Number of contributions received in current round
+ * @param networkCheck        Result of the most recent network-mismatch check
  * @param nowMs               Override for `Date.now()` (useful in tests)
  */
 export function buildAppSnapshot(
@@ -324,6 +385,7 @@ export function buildAppSnapshot(
   hasLockedCollateral: boolean,
   hasContributed: boolean,
   contributionsReceived: number,
+  networkCheck: NetworkCheckState = null,
   nowMs: number = Date.now(),
 ): AppStateSnapshot {
   return {
@@ -335,6 +397,7 @@ export function buildAppSnapshot(
     hasLockedCollateral,
     hasContributedCurrentRound: hasContributed,
     contributionsReceived,
+    networkCheck,
     fetchedAtMs: nowMs,
   };
 }
