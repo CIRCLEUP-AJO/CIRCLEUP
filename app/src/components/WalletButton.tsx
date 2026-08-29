@@ -1,47 +1,15 @@
 "use client";
-import { useState, useEffect, useCallback, useRef } from "react";
-import {
-  getWalletAddress,
-  connectWallet,
-  isFreighterInstalled,
-  WalletError,
-} from "@/lib/stellar";
-import { shortAddress, NETWORK_PASSPHRASE } from "@/lib/config";
-import {
-  detectWalletCapabilities,
-  checkNetworkMismatch,
-  describeNetworkMismatch,
-  type NetworkMismatchResult,
-} from "@/lib/walletCapabilities";
-
-// ─── State machine ────────────────────────────────────────────────────────────
-//
-// Every lifecycle transition the component can be in, as a discriminated union.
-// The full set covers:
-//
-//   checking      — mount-time silent probe (getWalletAddress)
-//   idle          — Freighter installed, no active account
-//   not_installed — Freighter extension absent
-//   connecting    — user clicked "Connect", waiting for requestAccess
-//   connected     — active account known, writes may or may not be safe
-//   changing      — account or network change detected mid-session
-//   error         — connection rejected or unexpected failure
-//
-// The `connected` state carries the active address plus the result of the
-// most recent network-mismatch check.  A `mismatch` result means write
-// actions in the app should be disabled; the component shows a warning banner.
-//
-// `changing` is a transient state entered when a provider event fires
-// (accountChanged / networkChanged).  It triggers a fresh getWalletAddress +
-// network check cycle and transitions to `connected`, `idle`, or `error`.
+import { useState, useEffect } from "react";
+import { getWalletAddress, connectWallet, isFreighterInstalled, WalletError } from "@/lib/stellar";
+import { shortAddress } from "@/lib/config";
+import { detectWalletCapabilities, explainUnsupportedAction } from "@/lib/walletCapabilities";
 
 type ConnectionState =
   | { status: "checking" }
-  | { status: "idle" }
-  | { status: "not_installed" }
+  | { status: "connected"; address: string; capabilities?: { canSign: boolean; canGetNetwork: boolean } }
   | { status: "connecting" }
-  | { status: "connected"; address: string; networkMismatch: NetworkMismatchResult | null }
-  | { status: "changing" }
+  | { status: "not_installed" }
+  | { status: "limited"; message: string; address?: string }
   | { status: "error"; message: string };
 
 // ─── Provider event shape ─────────────────────────────────────────────────────
@@ -96,39 +64,30 @@ export function WalletButton() {
   // prevents stale state from appearing after navigation).
   const mountedRef = useRef(true);
   useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  // ── Resolve the active account and network check ────────────────────────
-  //
-  // Called on mount, after connect(), and whenever a provider change event
-  // fires.  Always transitions to a stable state (connected / idle / error).
-  const resolveAccount = useCallback(async () => {
-    if (!mountedRef.current) return;
-
-    let address: string | null = null;
-    try {
-      address = await getWalletAddress();
-    } catch (err) {
-      // getWalletAddress throws WalletError("not_installed") when Freighter
-      // is absent — we handle that as the not_installed state rather than error.
-      if (err instanceof WalletError && err.reason === "not_installed") {
-        if (mountedRef.current) setState({ status: "not_installed" });
-        return;
-      }
-      // Any other error during the probe → return to idle so the user can retry
-      if (mountedRef.current) setState({ status: "idle" });
-      return;
-    }
-
-    if (!mountedRef.current) return;
-
-    if (!address) {
-      // No account connected — check installed status to show the right UI
-      if (!isFreighterInstalled()) {
+    let cancelled = false;
+    getWalletAddress().then((address) => {
+      if (cancelled) return;
+      if (address) {
+        // Check capabilities when connected
+        const caps = detectWalletCapabilities();
+        const signWarning = explainUnsupportedAction("sign", caps);
+        if (signWarning) {
+          setState({
+            status: "limited",
+            message: signWarning,
+            address,
+          });
+        } else {
+          setState({
+            status: "connected",
+            address,
+            capabilities: {
+              canSign: caps.canSignTransaction,
+              canGetNetwork: caps.canGetNetwork,
+            },
+          });
+        }
+      } else if (!isFreighterInstalled()) {
         setState({ status: "not_installed" });
       } else {
         setState({ status: "idle" });
@@ -182,10 +141,24 @@ export function WalletButton() {
     setState({ status: "connecting" });
     try {
       const address = await connectWallet();
-      if (!mountedRef.current) return;
-      const networkMismatch = await runNetworkCheck();
-      if (!mountedRef.current) return;
-      setState({ status: "connected", address, networkMismatch });
+      const caps = detectWalletCapabilities();
+      const signWarning = explainUnsupportedAction("sign", caps);
+      if (signWarning) {
+        setState({
+          status: "limited",
+          message: signWarning,
+          address,
+        });
+      } else {
+        setState({
+          status: "connected",
+          address,
+          capabilities: {
+            canSign: caps.canSignTransaction,
+            canGetNetwork: caps.canGetNetwork,
+          },
+        });
+      }
     } catch (err) {
       if (!mountedRef.current) return;
       if (err instanceof WalletError) {
@@ -212,28 +185,37 @@ export function WalletButton() {
         : null;
 
     return (
-      <div className="flex flex-col gap-1.5">
-        <div className="flex items-center gap-2 bg-brand-50 border border-brand-200 rounded-lg px-3 py-2 text-sm">
-          <span className="w-2 h-2 rounded-full bg-brand-500 inline-block flex-shrink-0" aria-hidden="true" />
-          <span className="font-mono text-brand-700 truncate" title={state.address}>
-            {shortAddress(state.address)}
+      <div className="flex items-center gap-2 bg-brand-50 border border-brand-200 rounded-lg px-3 py-2 text-sm">
+        <span className="w-2 h-2 rounded-full bg-brand-500 inline-block" aria-hidden="true" />
+        <span className="font-mono text-brand-700">{shortAddress(state.address)}</span>
+        {state.capabilities && !state.capabilities.canGetNetwork && (
+          <span className="text-xs text-amber-600" title="Wallet cannot verify network">
+            ⚠
           </span>
-        </div>
-
-        {/* Network mismatch warning — shown below the address pill when detected.
-            Read-only pages remain functional; only write actions are blocked
-            (enforced by gating.ts checkNetworkGate). The banner is dismissible
-            per session by the user, but re-appears after a network-change event. */}
-        {mismatchMessage && (
-          <div
-            role="alert"
-            aria-live="polite"
-            className="flex items-start gap-1.5 bg-amber-50 border border-amber-300 text-amber-800 rounded-lg px-3 py-2 text-xs"
-          >
-            <span className="flex-shrink-0 mt-0.5" aria-hidden="true">⚠️</span>
-            <span>{mismatchMessage}</span>
-          </div>
         )}
+      </div>
+    );
+  }
+
+  // ── Limited capabilities ──────────────────────────────────────────────────
+  if (state.status === "limited") {
+    return (
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-sm">
+          {state.address && (
+            <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" aria-hidden="true" />
+          )}
+          {state.address && (
+            <span className="font-mono text-amber-700">{shortAddress(state.address)}</span>
+          )}
+        </div>
+        <span
+          className="text-xs text-amber-600 max-w-[180px] truncate"
+          title={state.message}
+          aria-live="polite"
+        >
+          {state.message}
+        </span>
       </div>
     );
   }

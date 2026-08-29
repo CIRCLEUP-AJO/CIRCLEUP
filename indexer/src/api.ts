@@ -16,7 +16,7 @@ import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { query } from "./db/pool";
-import { rpc, USDC } from "./indexer";
+import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
 import { redactAddress } from "./redact";
@@ -999,6 +999,42 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     } catch (err) {
       console.error("[api] Failed to load indexer state", err);
       sendError(res, 500, "Failed to load indexer state", getErrorMessage(err));
+    }
+  });
+
+  // Operational health endpoint: exposes poll-cycle metrics, backoff state,
+  // and event processing counts for monitoring dashboards and alerting.
+  app.get("/indexer/health", detailRateLimiter, async (_req: Request, res: Response) => {
+    try {
+      const metrics = getIndexerMetrics();
+      const running = isIndexerRunning();
+
+      // Determine overall status: degraded if backoff is elevated, healthy otherwise
+      const status = metrics.backoffConsecutiveFailures > 0 ? "degraded" : "ok";
+
+      res.status(status === "ok" ? 200 : 503).json({
+        status,
+        running,
+        events: {
+          processed: metrics.totalEventsProcessed,
+          failed: metrics.totalEventsFailed,
+        },
+        pollCycles: {
+          completed: metrics.pollCyclesCompleted,
+          failed: metrics.pollCyclesFailed,
+        },
+        lastPoll: {
+          durationMs: metrics.lastPollDurationMs,
+          ledgerRange: metrics.lastPollLedgerRange,
+        },
+        backoff: {
+          consecutiveFailures: metrics.backoffConsecutiveFailures,
+          currentIntervalMs: metrics.backoffCurrentIntervalMs,
+        },
+      });
+    } catch (err) {
+      console.error("[api] Failed to load indexer health", err);
+      sendError(res, 500, "Failed to load indexer health", getErrorMessage(err));
     }
   });
 

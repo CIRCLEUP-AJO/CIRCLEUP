@@ -7,6 +7,8 @@ import {
   stopIndexer,
   isIndexerRunning,
   parseCircleCreatedEvent,
+  computeJitteredDelay,
+  isTransientRpcError,
 } from "./indexer";
 
 test("USDC is read from the validated USDC_ADDRESS env var, not left dangling", () => {
@@ -129,4 +131,65 @@ test("parseCircleCreatedEvent: throws when circle_index is not an integer", () =
     () => parseCircleCreatedEvent(["CABC", "GDEF", 1.5]),
     /circle_index must be a non-negative integer/,
   );
+});
+
+// ─── computeJitteredDelay — full jitter for RPC retry ───────────────────────
+
+test("computeJitteredDelay returns value in [0, delayMs)", () => {
+  for (let i = 0; i < 100; i++) {
+    const result = computeJitteredDelay(500);
+    assert.ok(result >= 0, `jittered delay ${result} should be >= 0`);
+    assert.ok(result < 500, `jittered delay ${result} should be < 500`);
+  }
+});
+
+test("computeJitteredDelay produces varied values", () => {
+  const samples = new Set<number>();
+  for (let i = 0; i < 30; i++) {
+    samples.add(computeJitteredDelay(1000));
+  }
+  // With 30 samples in [0, 1000), we should see variety
+  assert.ok(samples.size > 10, `expected varied jitter values, got ${samples.size} distinct`);
+});
+
+test("computeJitteredDelay(0) always returns 0", () => {
+  for (let i = 0; i < 10; i++) {
+    assert.equal(computeJitteredDelay(0), 0);
+  }
+});
+
+// ─── Metrics — verify new fields are tracked ─────────────────────────────────
+
+test("getIndexerMetrics returns all expected fields", () => {
+  const metrics = getIndexerMetrics();
+  assert.ok("totalEventsProcessed" in metrics, "should have totalEventsProcessed");
+  assert.ok("totalEventsFailed" in metrics, "should have totalEventsFailed");
+  assert.ok("pollCyclesCompleted" in metrics, "should have pollCyclesCompleted");
+  assert.ok("pollCyclesFailed" in metrics, "should have pollCyclesFailed");
+  assert.ok("lastPollDurationMs" in metrics, "should have lastPollDurationMs");
+  assert.ok("lastPollLedgerRange" in metrics, "should have lastPollLedgerRange");
+  assert.ok("backoffConsecutiveFailures" in metrics, "should have backoffConsecutiveFailures");
+  assert.ok("backoffCurrentIntervalMs" in metrics, "should have backoffCurrentIntervalMs");
+});
+
+// ─── isTransientRpcError — expanded coverage ─────────────────────────────────
+
+test("isTransientRpcError identifies all transient error codes", () => {
+  const transientCodes = ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN", "EPIPE", "EHOSTUNREACH"];
+  for (const code of transientCodes) {
+    assert.equal(isTransientRpcError({ code }), true, `${code} should be transient`);
+  }
+});
+
+test("isTransientRpcError identifies transient HTTP status codes", () => {
+  for (const status of [429, 502, 503, 504]) {
+    assert.equal(isTransientRpcError({ status }), true, `status ${status} should be transient`);
+  }
+});
+
+test("isTransientRpcError rejects non-transient errors", () => {
+  assert.equal(isTransientRpcError(null), false);
+  assert.equal(isTransientRpcError(undefined), false);
+  assert.equal(isTransientRpcError({ code: "ENOENT" }), false);
+  assert.equal(isTransientRpcError({ status: 400 }), false);
 });
