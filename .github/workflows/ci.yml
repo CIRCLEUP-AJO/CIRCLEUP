@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Rust contracts ──────────────────────────────────────────────────────────
+  contracts:
+    name: Contracts (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts
+
+      - name: Run contract tests
+        run: cd contracts && cargo test
+        # Failure here blocks merge: names the failed crate in cargo output.
+
+  # ── TypeScript SDK ──────────────────────────────────────────────────────────
+  sdk:
+    name: SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build SDK
+        run: npm run build --workspace=sdk
+
+      - name: Test SDK
+        run: npm run test --workspace=sdk
+
+  # ── Indexer ─────────────────────────────────────────────────────────────────
+  indexer:
+    name: Indexer
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: circleup_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build indexer
+        run: npm run build --workspace=indexer
+
+      - name: Run indexer tests
+        env:
+          # Safe fixture values — no production wallets or funds used.
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/circleup_test
+          STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          CIRCLE_FACTORY_ADDRESS: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+          REPUTATION_ADDRESS: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+          USDC_ADDRESS: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4
+          NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+        run: npm run test --workspace=indexer
+
+  # ── Frontend app ─────────────────────────────────────────────────────────────
+  app:
+    name: App
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint app
+        run: npm run lint --workspace=app
+
+      - name: Build app
+        # Contract addresses may be empty in CI — the app allows this in dev mode.
+        env:
+          NEXT_PUBLIC_STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+          NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS: ""
+          NEXT_PUBLIC_REPUTATION_ADDRESS: ""
+          NEXT_PUBLIC_USDC_ADDRESS: ""
+          NEXT_PUBLIC_INDEXER_URL: http://localhost:3001
+        run: npm run build --workspace=app
+
+      - name: Test app
+        run: npm run test --workspace=app
+
+  # ── Deployment scripts ───────────────────────────────────────────────────────
+  scripts:
+    name: Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck scripts
+        run: cd scripts && npx tsc --noEmit

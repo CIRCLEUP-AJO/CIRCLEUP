@@ -35,6 +35,7 @@ import {
   printFundingDiagnostics,
   checkRpcReachability,
 } from "./funding-diagnostics";
+import { redactSecrets } from "./redact";
 
 // Load from scripts/.env if present, otherwise fall back to root .env
 dotenv.config({ path: path.join(__dirname, "../.env") });
@@ -86,7 +87,7 @@ async function buildAndSend(
   const simResult = await rpc.simulateTransaction(tx);
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(`Simulation error: ${simResult.error}`);
+    throw new Error(`Simulation error: ${redactSecrets(String(simResult.error))}`);
   }
 
   const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
@@ -94,7 +95,7 @@ async function buildAndSend(
 
   const sendResult = await rpc.sendTransaction(preparedTx);
   if (sendResult.status === "ERROR") {
-    throw new Error(`Send error: ${JSON.stringify(sendResult.errorResult)}`);
+    throw new Error(`Send error: ${redactSecrets(JSON.stringify(sendResult.errorResult))}`);
   }
 
   const hash = sendResult.hash;
@@ -333,6 +334,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("[seed] Fatal:", err.message);
+  console.error("[seed] Fatal:", redactSecrets(String(err.message)));
   process.exit(1);
 });

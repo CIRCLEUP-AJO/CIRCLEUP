@@ -43,6 +43,7 @@ import {
   printManifestSummary,
   type ManifestInput,
 } from "./deployment-manifest";
+import { redactSecrets } from "./redact";
 
 // Load scripts/.env
 dotenv.config({ path: path.join(__dirname, "../.env") });
@@ -88,10 +89,9 @@ const MANIFEST_OUT = path.join(__dirname, "../deployed-manifest.json");
 
 function run(cmd: string, label: string): string {
   console.log(`\n[deploy] ${label}...`);
-  console.log(`  > ${cmd}`);
   const result = execSync(cmd, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] });
   const trimmed = result.trim();
-  console.log(`  ✅ ${trimmed}`);
+  console.log(`  ✅ ${redactSecrets(trimmed)}`);
   return trimmed;
 }
 
@@ -488,6 +488,6 @@ async function main() {
 }
 
 main().catch((err: Error) => {
-  console.error("[deploy] Fatal:", err.message);
+  console.error("[deploy] Fatal:", redactSecrets(err.message));
   process.exit(1);
 });
