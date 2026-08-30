@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom";
 import { vi } from "vitest";
 
-// ── Next.js stubs ─────────────────────────────────────────────────────────────
+// ── Next.js navigation stubs ──────────────────────────────────────────────────
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), replace: vi.fn(), prefetch: vi.fn() }),
@@ -9,14 +9,10 @@ vi.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
 }));
 
-vi.mock("next/link", () => ({
-  default: ({ href, children, className, ...rest }: React.AnchorHTMLAttributes<HTMLAnchorElement> & { href: string; children: React.ReactNode }) =>
-    // Render as a plain anchor so href-based assertions work in tests
-    Object.assign(
-      document.createElement("a"),
-      { href, className, ...rest },
-    ),
-}));
+// next/link is NOT mocked here. Individual test files that render components
+// using next/link must include their own vi.mock("next/link", ...) near the
+// top of the file. The per-test mock is hoisted by vitest so it still applies
+// before any imports are resolved.
 
 // ── Freighter stubs ───────────────────────────────────────────────────────────
 // Replaced per-test when specific wallet states are needed.
@@ -36,8 +32,7 @@ Object.defineProperty(window, "freighter", {
 });
 
 // axe-core's color-contrast rule probes canvas for ligature detection; jsdom
-// doesn't implement it. Suppress the not-implemented noise so it doesn't
-// pollute test output — the rule still runs and reports violations correctly.
+// doesn't implement it.
 HTMLCanvasElement.prototype.getContext = () => null as unknown as CanvasRenderingContext2D;
 
 Object.assign(navigator, {

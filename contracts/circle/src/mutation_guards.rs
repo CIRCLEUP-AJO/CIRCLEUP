@@ -43,6 +43,9 @@
 //! | `stored recipient does not match rotation order` | pot transferred to wrong address | `guard_payout_recipient_must_match_rotation` |
 //! | collateral zeroed before transfer (CEI) | second withdrawal after close | `guard_collateral_zeroed_after_close_prevents_second_withdrawal` |
 //! | penalty deducted once and counted in release | penalty counted twice or refunded | `guard_collateral_penalty_and_release_counted_once` |
+//! | `circle is paused` in settle_round | settle_round bypasses pause flag | `guard_settle_round_blocked_while_paused`, `guard_settle_round_paused_leaves_no_partial_state` |
+//! | `round deadline not yet passed` in settle_round | settle_round runs before contribution window closes | `guard_settle_round_before_deadline_blocked`, `guard_settle_round_at_deadline_blocked` |
+//! | `all members have contributed` in settle_round | settle_round replaces normal payout | `guard_settle_round_blocked_when_all_contributed` |
 //!
 //! # CI budget
 //!
@@ -932,6 +935,164 @@ mod mutation_guard_tests {
         assert_eq!(released, remaining,
             "released collateral must equal penalty-reduced balance, counted exactly once");
         assert_eq!(t.circle.get_collateral(&t.dave), 0);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GUARD 19: settle_round pause check
+    //
+    // Guard: `Self::assert_not_paused(&env)` at the top of settle_round
+    // Risk if removed: settle_round becomes the only fund-moving entry-point
+    //   that ignores the pause flag.  An operator who pauses the circle to
+    //   investigate an incident would still see the round settled and
+    //   collateral penalties applied while the investigation is ongoing.
+    //   This guard was missing in the original implementation and is the
+    //   primary motivation for this test module entry.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// settle_round on a paused circle must panic with the pause message.
+    /// This is the simplest proof that the pause check fires.
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn guard_settle_round_blocked_while_paused() {
+        let t = make_setup();
+        t.activate();
+        t.advance_past_deadline();
+        // Pause the circle — only the admin can do this
+        t.circle.pause(&t.circle_admin).unwrap();
+        // Must panic — guard fires before any state mutation
+        t.circle.settle_round();
+    }
+
+    /// Removing the pause guard from settle_round allows it to run while paused.
+    /// This test demonstrates what the world looks like WITHOUT the guard,
+    /// confirming the guard is the only barrier.
+    ///
+    /// We verify by calling resume() and then settle_round() and confirming it
+    /// succeeds — proving the issue is specifically the paused state, not
+    /// any other precondition.
+    #[test]
+    fn guard_settle_round_succeeds_after_resume() {
+        let t = make_setup();
+        t.activate();
+        t.advance_past_deadline();
+
+        // Pause then immediately resume
+        t.circle.pause(&t.circle_admin).unwrap();
+        t.circle.resume(&t.circle_admin).unwrap();
+        assert!(!t.circle.is_paused(), "circle must not be paused after resume");
+
+        // settle_round must succeed after resume — proving the pause flag was the gate
+        t.circle.settle_round(); // no panic expected
+        // Circle advanced to round 1 (all defaulted → zero pot but still advances)
+        let round = t.circle.get_current_round().unwrap();
+        assert_eq!(round.round_index, 1, "circle must have advanced after settle_round");
+    }
+
+    /// After a rejected settle_round (paused), collateral and round state are unchanged.
+    /// This mirrors the adversarial test but from a mutation-guard perspective:
+    /// the guard must leave no partial state on a rejected call.
+    #[test]
+    fn guard_settle_round_paused_leaves_no_partial_state() {
+        let t = make_setup();
+        t.activate();
+        t.advance_past_deadline();
+
+        let collaterals_before: std::vec::Vec<i128> = [&t.alice, &t.bob, &t.carol, &t.dave]
+            .iter()
+            .map(|m| t.circle.get_collateral(m))
+            .collect();
+        let round_before = t.circle.get_current_round().unwrap();
+
+        t.circle.pause(&t.circle_admin).unwrap();
+        let result = t.circle.try_settle_round();
+        assert!(result.is_err(), "settle_round must be rejected while paused");
+
+        // No collateral must have changed
+        for (i, m) in [&t.alice, &t.bob, &t.carol, &t.dave].iter().enumerate() {
+            assert_eq!(
+                t.circle.get_collateral(m),
+                collaterals_before[i],
+                "member[{}] collateral must be unchanged after rejected settle_round", i
+            );
+        }
+
+        // Round state must be identical (paid_out still false, same round_index)
+        let round_after = t.circle.get_current_round().unwrap();
+        assert_eq!(round_after.round_index, round_before.round_index,
+            "round_index must not change on rejected settle_round");
+        assert_eq!(round_after.paid_out, round_before.paid_out,
+            "paid_out flag must not change on rejected settle_round");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GUARD 20: settle_round requires deadline to have passed
+    //
+    // Guard: `if !Self::deadline_passed(&env, &round) { panic! }`
+    // Risk if removed: settle_round runs before the contribution window closes,
+    //   penalising members who still have time to contribute and paying out a
+    //   partial pot before all contributions can arrive.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// settle_round before the deadline must panic.
+    #[test]
+    #[should_panic(expected = "round deadline not yet passed")]
+    fn guard_settle_round_before_deadline_blocked() {
+        let t = make_setup();
+        t.activate();
+        // Deadline has not passed — call must be rejected
+        t.circle.settle_round();
+    }
+
+    /// At exactly the deadline ledger, settle_round must still be blocked
+    /// (the deadline_passed predicate uses strict greater-than).
+    #[test]
+    #[should_panic(expected = "round deadline not yet passed")]
+    fn guard_settle_round_at_deadline_blocked() {
+        let t = make_setup();
+        t.activate();
+        let round = t.circle.get_current_round().unwrap();
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number = round.deadline_ledger as u32; // exactly at deadline
+        });
+        t.circle.settle_round();
+    }
+
+    /// At deadline + 1, settle_round must succeed (deadline has strictly passed).
+    #[test]
+    fn guard_settle_round_one_past_deadline_succeeds() {
+        let t = make_setup();
+        t.activate();
+        let round = t.circle.get_current_round().unwrap();
+        t.env.ledger().with_mut(|l| {
+            l.sequence_number = round.deadline_ledger as u32 + 1;
+        });
+        // Nobody contributed — settle_round must succeed (all defaulted)
+        t.circle.settle_round();
+        // Round advanced
+        let new_round = t.circle.get_current_round().unwrap();
+        assert_eq!(new_round.round_index, 1,
+            "circle must have advanced to round 1 after settle_round");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // GUARD 21: settle_round blocked when all members already contributed
+    //
+    // Guard: `if round.contributions_received == member_count { panic! }`
+    // Risk if removed: a caller invokes settle_round when payout() is already
+    //   valid.  settle_round applies default-event overhead and emits an
+    //   exceptional_settlement event even though no one defaulted — misleading
+    //   indexers and triggering unnecessary reputation calls.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    #[should_panic(expected = "all members have contributed")]
+    fn guard_settle_round_blocked_when_all_contributed() {
+        let t = make_setup();
+        t.activate();
+        t.contribute_all();
+        t.advance_past_deadline();
+        // All members contributed — must use payout() not settle_round()
+        t.circle.settle_round();
     }
 }
 

@@ -700,4 +700,353 @@ mod adversarial_tests {
             "admin must not change after rejected re-initialization"
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — settle_round paused
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// settle_round on a paused circle must be rejected.
+    /// Before the fix, settle_round was the only fund-moving entry-point that
+    /// skipped the pause check.  This test verifies the gap is closed.
+    #[test]
+    #[should_panic(expected = "circle is paused")]
+    fn adv_circle_settle_round_blocked_while_paused() {
+        let t = make_setup();
+        t.activate();
+
+        // Advance past the deadline so the precondition for settle_round passes
+        t.advance_past_deadline();
+
+        // Pause the circle
+        t.circle.pause(&t.circle_admin).unwrap();
+        assert!(t.circle.is_paused(), "circle must be paused before the test");
+
+        // settle_round must be blocked — if the pause check is missing this panics
+        // with a token-transfer or settlement error instead, not the expected message
+        t.circle.settle_round();
+    }
+
+    /// After a rejected settle_round (paused), no collateral changes and the
+    /// round state is unchanged.
+    #[test]
+    fn adv_circle_settle_round_paused_state_unchanged() {
+        let t = make_setup();
+        t.activate();
+        t.advance_past_deadline();
+
+        let collaterals_before: std::vec::Vec<i128> =
+            [&t.alice, &t.bob, &t.carol, &t.dave]
+                .iter()
+                .map(|m| t.circle.get_collateral(m))
+                .collect();
+        let round_before = t.circle.get_current_round().unwrap();
+
+        t.circle.pause(&t.circle_admin).unwrap();
+        let result = t.circle.try_settle_round();
+        assert!(result.is_err(), "settle_round must be rejected while paused");
+
+        // Collateral must be unchanged — no penalties applied
+        for (i, m) in [&t.alice, &t.bob, &t.carol, &t.dave].iter().enumerate() {
+            assert_eq!(
+                t.circle.get_collateral(m),
+                collaterals_before[i],
+                "member[{}] collateral must be unchanged after rejected settle_round", i
+            );
+        }
+
+        // Round state must be unchanged — paid_out still false
+        let round_after = t.circle.get_current_round().unwrap();
+        assert_eq!(
+            round_after.paid_out, round_before.paid_out,
+            "paid_out flag must not change on rejected settle_round"
+        );
+        assert_eq!(
+            round_after.round_index, round_before.round_index,
+            "round_index must not advance on rejected settle_round"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — settle_round before deadline (precondition enforcement)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// settle_round must be rejected if the deadline has not yet passed.
+    #[test]
+    #[should_panic(expected = "round deadline not yet passed")]
+    fn adv_circle_settle_round_before_deadline_rejected() {
+        let t = make_setup();
+        t.activate();
+        // Do not advance past deadline
+        t.circle.settle_round();
+    }
+
+    /// settle_round must be rejected when called on a Pending circle.
+    #[test]
+    #[should_panic(expected = "circle is not active")]
+    fn adv_circle_settle_round_on_pending_rejected() {
+        let t = make_setup();
+        // Circle is still Pending (not all members joined)
+        t.circle.join(&t.alice);
+        t.advance_past_deadline();
+        t.circle.settle_round();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — settle_round with zero contributors (all defaulted)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// settle_round with zero contributions produces a zero pot and still
+    /// advances the circle.  The recipient receives 0 tokens (no transfer call),
+    /// every member's collateral is penalised, and the round is marked paid_out.
+    #[test]
+    fn adv_circle_settle_round_zero_contributors_advances_circle() {
+        let t = make_setup();
+        t.activate();
+
+        // Nobody contributes — advance past the deadline
+        t.advance_past_deadline();
+
+        let collaterals_before: std::vec::Vec<i128> =
+            [&t.alice, &t.bob, &t.carol, &t.dave]
+                .iter()
+                .map(|m| t.circle.get_collateral(m))
+                .collect();
+        let recipient_bal_before = t.token.balance(&t.alice); // round-0 recipient
+
+        // settle_round must succeed even with zero contributions
+        t.circle.settle_round();
+
+        // Round 0 is now settled; round 1 must be active
+        let round = t.circle.get_current_round().unwrap();
+        assert_eq!(round.round_index, 1, "circle must advance to round 1");
+        assert_eq!(t.circle.get_status(), crate::CircleStatus::Active);
+
+        // Recipient must not have received any tokens (zero pot, no transfer)
+        assert_eq!(
+            t.token.balance(&t.alice),
+            recipient_bal_before,
+            "recipient must not receive tokens for a zero-pot settlement"
+        );
+
+        // All members must have incurred the standard 20% penalty
+        for (i, m) in [&t.alice, &t.bob, &t.carol, &t.dave].iter().enumerate() {
+            let expected_after = collaterals_before[i]
+                - collaterals_before[i] * crate::PENALTY_BPS / crate::BPS_DENOM;
+            assert_eq!(
+                t.circle.get_collateral(m),
+                expected_after,
+                "member[{}] must have incurred exactly one 20% penalty", i
+            );
+            assert_eq!(
+                t.circle.get_defaults(m),
+                1,
+                "member[{}] defaults counter must be 1 after zero-contribution round", i
+            );
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — close after cancel (with prior joiners)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Close on a Cancelled circle returns collateral to members who joined
+    /// before the cancellation, and releases nothing for members who never joined.
+    #[test]
+    fn adv_circle_close_after_cancel_releases_joiner_collateral() {
+        let t = make_setup();
+
+        // Only alice and bob join before the cancel
+        t.circle.join(&t.alice);
+        t.circle.join(&t.bob);
+        assert_eq!(t.circle.get_status(), crate::CircleStatus::Pending);
+
+        // Cancel the circle
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), crate::CircleStatus::Cancelled);
+
+        let alice_before = t.token.balance(&t.alice);
+        let bob_before   = t.token.balance(&t.bob);
+        let carol_before = t.token.balance(&t.carol);
+        let dave_before  = t.token.balance(&t.dave);
+
+        // Close — alice is a member and a joiner, valid caller
+        t.circle.close(&t.alice);
+
+        let expected_collateral = ROUND_AMOUNT * crate::COLLATERAL_MULTIPLIER;
+
+        // Alice and bob must have their collateral returned
+        assert_eq!(
+            t.token.balance(&t.alice) - alice_before,
+            expected_collateral,
+            "alice must receive her collateral back"
+        );
+        assert_eq!(
+            t.token.balance(&t.bob) - bob_before,
+            expected_collateral,
+            "bob must receive his collateral back"
+        );
+
+        // Carol and dave never joined — balance must be unchanged
+        assert_eq!(
+            t.token.balance(&t.carol),
+            carol_before,
+            "carol never joined; her balance must be unchanged"
+        );
+        assert_eq!(
+            t.token.balance(&t.dave),
+            dave_before,
+            "dave never joined; his balance must be unchanged"
+        );
+
+        // Circle must be closed
+        assert!(t.circle.is_closed(), "circle must be closed after close()");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — close after complete with prior defaults (penalty-reduced collateral)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// After a full lifecycle with at least one defaulted round, close releases
+    /// only the penalty-reduced collateral balances (not the original amounts).
+    #[test]
+    fn adv_circle_close_after_complete_with_defaults_releases_reduced_collateral() {
+        let t = make_setup();
+        t.activate();
+
+        let initial_collateral = t.circle.get_collateral(&t.dave);
+        let penalty = initial_collateral * crate::PENALTY_BPS / crate::BPS_DENOM;
+        let expected_dave_collateral_at_close = initial_collateral - penalty;
+
+        // Round 0: dave defaults; others contribute → settle_round advances the circle
+        t.circle.contribute(&t.alice);
+        t.circle.contribute(&t.bob);
+        t.circle.contribute(&t.carol);
+        t.advance_past_deadline();
+        t.circle.mark_default(&t.dave);
+        t.circle.settle_round();
+
+        // Verify dave's collateral was reduced
+        assert_eq!(
+            t.circle.get_collateral(&t.dave),
+            expected_dave_collateral_at_close,
+            "dave's collateral must reflect the 20% penalty before close"
+        );
+
+        // Complete remaining rounds normally (rounds 1-3)
+        for _ in 1..4 {
+            t.contribute_all();
+            t.circle.payout();
+        }
+        assert_eq!(t.circle.get_status(), crate::CircleStatus::Completed);
+
+        let dave_before = t.token.balance(&t.dave);
+
+        t.circle.close(&t.alice);
+
+        // Dave receives the penalty-reduced amount, not the original
+        assert_eq!(
+            t.token.balance(&t.dave) - dave_before,
+            expected_dave_collateral_at_close,
+            "dave must receive only the penalty-reduced collateral at close"
+        );
+
+        // Other members receive their full collateral (no defaults)
+        for m in [&t.alice, &t.bob, &t.carol] {
+            assert_eq!(
+                t.circle.get_collateral(m),
+                0,
+                "member collateral must be zero after close"
+            );
+        }
+
+        assert!(t.circle.is_closed());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — deadline boundary off-by-one: contribute/default transition
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// At exactly deadline_ledger: contribute is accepted, default is rejected.
+    /// At deadline_ledger + 1: contribute is rejected, default is accepted.
+    /// This verifies the strict greater-than boundary used by deadline_passed().
+    #[test]
+    fn adv_circle_deadline_boundary_contribute_and_default_are_non_overlapping() {
+        let t = make_setup();
+        t.activate();
+        let round = t.circle.get_current_round().unwrap();
+        let dl = round.deadline_ledger as u32;
+
+        // At exactly the deadline ledger: contribute must succeed
+        t.env.ledger().with_mut(|l| { l.sequence_number = dl; });
+        t.circle.contribute(&t.alice); // must not panic
+        assert!(t.circle.has_contributed(&t.alice, &0u32));
+
+        // mark_default must be blocked at exactly the deadline
+        let default_at_deadline = t.circle.try_mark_default(&t.carol);
+        assert!(
+            default_at_deadline.is_err(),
+            "mark_default must be blocked at exactly the deadline ledger"
+        );
+
+        // At deadline + 1: contribute must be rejected for a member who hasn't yet
+        t.env.ledger().with_mut(|l| { l.sequence_number = dl + 1; });
+        let late_contribute = t.circle.try_contribute(&t.bob);
+        assert!(
+            late_contribute.is_err(),
+            "contribute must be rejected one ledger past the deadline"
+        );
+
+        // And mark_default must now succeed for a non-contributor (carol)
+        let collateral_before = t.circle.get_collateral(&t.carol);
+        t.circle.mark_default(&t.carol);
+        assert_eq!(t.circle.get_defaults(&t.carol), 1,
+            "mark_default must succeed one ledger past the deadline");
+
+        // Carol's collateral must have been reduced by the standard penalty
+        let expected = collateral_before - collateral_before * crate::PENALTY_BPS / crate::BPS_DENOM;
+        assert_eq!(t.circle.get_collateral(&t.carol), expected,
+            "carol's collateral must be reduced by exactly the standard penalty");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Circle — mark_default idempotency (adversarial double-penalty attempt)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// An adversarial caller cannot mark the same member in default twice for
+    /// the same round, regardless of how many times they call mark_default.
+    #[test]
+    fn adv_circle_mark_default_double_penalty_blocked() {
+        let t = make_setup();
+        t.activate();
+        t.advance_past_deadline();
+
+        let collateral_before = t.circle.get_collateral(&t.dave);
+        let penalty = collateral_before * crate::PENALTY_BPS / crate::BPS_DENOM;
+
+        // First call — must succeed
+        t.circle.mark_default(&t.dave);
+        assert_eq!(t.circle.get_defaults(&t.dave), 1);
+        assert_eq!(t.circle.get_collateral(&t.dave), collateral_before - penalty);
+
+        // All subsequent calls must be rejected
+        for _ in 0..5 {
+            let result = t.circle.try_mark_default(&t.dave);
+            assert!(
+                result.is_err(),
+                "every repeated mark_default call for the same round must fail"
+            );
+        }
+
+        // Collateral must be exactly the post-first-penalty value — never compounded
+        assert_eq!(
+            t.circle.get_collateral(&t.dave),
+            collateral_before - penalty,
+            "collateral must reflect exactly one penalty deduction, never compounded"
+        );
+        assert_eq!(
+            t.circle.get_defaults(&t.dave),
+            1,
+            "defaults counter must be exactly 1 after multiple rejected attempts"
+        );
+    }
 }
