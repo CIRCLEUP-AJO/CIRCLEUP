@@ -16,61 +16,28 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Minimum and maximum number of members allowed by the contract. */
-export const MIN_MEMBERS = 2;
-export const MAX_MEMBERS = 20;
-
-/** Minimum contribution per round — 1 stroop = $0.0000001 USDC. */
-export const MIN_AMOUNT_USDC = 0.0000001;
-
-/** Maximum USDC decimal places supported by the Stellar USDC token (7 dp). */
-export const MAX_USDC_DECIMALS = 7;
-
-/** Maximum round duration in days (≈10 years in ledgers stays within u32). */
-export const MAX_ROUND_DAYS = 3650;
-
-/** Maximum characters in a circle name. */
-export const MAX_NAME_LENGTH = 64;
-
-// ─── Validation types ─────────────────────────────────────────────────────────
-
-/**
- * Per-field error map returned by {@link validateCreateForm}.
- * A field is error-free when its key is absent or the value is `undefined`.
- */
-export interface CreateFormErrors {
-  name?: string;
-  amount?: string;
-  days?: string;
-  /** Index-keyed member errors: errors[i] is the error for members[i]. */
-  members?: (string | undefined)[];
-  /** Cross-field or list-level member errors (duplicate, count). */
-  membersGeneral?: string;
-}
-
-/**
- * Validated, normalised form values ready for contract submission.
- * Only produced when {@link validateCreateForm} returns no errors.
- */
-export interface ValidatedCreateForm {
-  name: string;
-  validMembers: string[];
-  amountStroops: bigint;
-  roundDays: number;
-}
-
-// ─── Pure helpers (exported for testing) ─────────────────────────────────────
+const MIN_MEMBERS = 2;
+const MAX_MEMBERS = 20;
+/** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
+const MAX_ROUND_USDC = 1_000_000;
+/** Maximum round duration in days. */
+const MAX_ROUND_DAYS = 365;
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
   return members.map((m) => m.trim()).filter((m) => m.length > 0);
 }
 
-/** Return the first duplicate address, or null if all are unique. */
-export function findDuplicateAddress(addresses: string[]): string | null {
+/**
+ * Find duplicate addresses using case-insensitive comparison.
+ * Returns the first duplicate found, or null if all are unique.
+ */
+function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
-    if (seen.has(addr)) return addr;
-    seen.add(addr);
+    const lower = addr.toLowerCase();
+    if (seen.has(lower)) return addr;
+    seen.add(lower);
   }
   return null;
 }
@@ -254,29 +221,11 @@ export default function CreateClient() {
   const [fieldErrors,  setFieldErrors]  = useState<CreateFormErrors>({});
   const [txHash,       setTxHash]       = useState("");
   const [copied,       setCopied]       = useState(false);
-  const [validated,    setValidated]    = useState(false);
 
-  // ── Timeout reconciliation state ───────────────────────────────────────────
-  //
-  // When invokeContract times out, the tx was already broadcast to the network
-  // and may still confirm. We preserve the hash so the user can check the
-  // explorer rather than blindly resubmitting and creating a duplicate circle.
-  //
-  // timedOutTxHash — the broadcast hash from a timed-out submission.
-  // isTimedOut     — true when the last attempt ended in NETWORK_TIMEOUT with
-  //                  a hash we can offer for reconciliation.
-  const [timedOutTxHash, setTimedOutTxHash] = useState<string>("");
-  const [isTimedOut,     setIsTimedOut]     = useState(false);
-
-  // ── In-flight guard ────────────────────────────────────────────────────────
-  //
-  // A useRef is used as a synchronous lock in addition to the `loading` state.
-  // React batches state updates, so `setLoading(true)` is not visible to the
-  // next event handler invocation until after the current render — meaning two
-  // rapid clicks can both enter handleSubmit before loading flips to true.
-  // The ref is read and written synchronously on the same JS tick, so it
-  // reliably blocks concurrent submissions.
-  const submittingRef = useRef(false);
+  // Whether validation has been attempted — controls when inline errors appear.
+  // Before first submit, per-field errors are hidden so the form isn't
+  // immediately hostile. After first submit they stay visible on every change.
+  const [validated, setValidated] = useState(false);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -287,12 +236,11 @@ export default function CreateClient() {
   const membersHintId = useId();
   const submitErrId   = useId();
   const successId     = useId();
-  const timeoutId     = useId();
 
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
-  const timeoutRef     = useRef<HTMLDivElement>(null);
+  // One ref per member row for focusing the first invalid field
   const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
   const amountRef      = useRef<HTMLInputElement>(null);
@@ -305,10 +253,6 @@ export default function CreateClient() {
   useEffect(() => {
     if (txHash && successRef.current) successRef.current.focus();
   }, [txHash]);
-
-  useEffect(() => {
-    if (isTimedOut && timeoutRef.current) timeoutRef.current.focus();
-  }, [isTimedOut]);
 
   // ── Derived values ──────────────────────────────────────────────────────────
   const filledCount    = getFilledMembers(members).length;
@@ -373,111 +317,133 @@ export default function CreateClient() {
   // ── Submit ──────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-
-    // ── Synchronous in-flight guard ───────────────────────────────────────────
-    if (submittingRef.current) return;
-    submittingRef.current = true;
-
-    // ── Reset submission state ────────────────────────────────────────────────
     setSubmitError("");
     setTxHash("");
     setCopied(false);
-    setTimedOutTxHash("");
-    setIsTimedOut(false);
     setValidated(true);
 
-    // Track whether this attempt ended in a timeout needing reconciliation.
-    let pendingTimeout = false;
+    // ── Step 1: pre-flight field validation ──────────────────────────────────
+    const validation = validateCreateForm(name, members, roundUSDC, roundDays);
+    if (!validation.ok) {
+      setFieldErrors(validation.errors);
+      focusFirstError(validation.errors);
+      return; // never reach wallet
+    }
+    setFieldErrors({});
 
+    const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
+
+    // ── Step 2: wallet check ──────────────────────────────────────────────────
+    let walletAddress: string | null;
     try {
-      // ── Step 1: pre-flight field validation ────────────────────────────────
-      const validation = validateCreateForm(name, members, roundUSDC, roundDays);
-      if (!validation.ok) {
-        setFieldErrors(validation.errors);
-        focusFirstError(validation.errors);
-        return;
-      }
-      setFieldErrors({});
-
-      const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
-
-      // ── Step 2: wallet check ────────────────────────────────────────────────
-      let walletAddress: string | null;
-      try {
-        walletAddress = await getWalletAddress();
-      } catch (err) {
-        if (err instanceof WalletError && err.reason === "not_installed") {
-          setSubmitError(
-            "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
-          );
-        } else {
-          setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
-        }
-        return;
-      }
-      if (!walletAddress) {
-        setSubmitError("Connect your Freighter wallet first.");
-        return;
-      }
-
-      // ── Step 3: factory address guard ──────────────────────────────────────
-      if (!CIRCLE_FACTORY_ADDRESS) {
-        setSubmitError("Factory contract not configured. Deploy contracts first.");
-        return;
-      }
-
-      // ── Step 4: submit ──────────────────────────────────────────────────────
-      setLoading(true);
-      try {
-        const membersVec = xdr.ScVal.scvVec(
-          validMembers.map((m) => new Address(m).toScVal()),
-        );
-
-        const result = await invokeContract(
-          CIRCLE_FACTORY_ADDRESS,
-          "create_circle",
-          [
-            new Address(walletAddress).toScVal(),
-            nativeToScVal(circleName, { type: "string" }),
-            membersVec,
-            nativeToScVal(amountStroops, { type: "i128" }),
-            nativeToScVal(daysToLedgers(days), { type: "u32" }),
-          ],
-          walletAddress,
-        );
-
-        if (result.success) {
-          // Navigate only on confirmed success — never on timeout or failure.
-          setTxHash(result.txHash ?? "");
-          setTimeout(() => router.push("/"), 5000);
-          return;
-        }
-
-        const errorCode = result.typedError?.code;
-
-        if (errorCode === "NETWORK_TIMEOUT" && result.txHash) {
-          // Transaction broadcast but confirmation timed out. The tx may still
-          // confirm — preserve the hash for reconciliation and hold the lock.
-          pendingTimeout = true;
-          setTimedOutTxHash(result.txHash);
-          setIsTimedOut(true);
-          return;
-        }
-
-        if (errorCode === "WALLET_REJECTED" || result.typedError?.kind === "wallet") {
-          setSubmitError(
-            result.typedError?.message ||
-            "Transaction cancelled. You can try again when ready.",
-          );
-          return;
-        }
-
+      walletAddress = await getWalletAddress();
+    } catch (err) {
+      if (err instanceof WalletError && err.reason === "not_installed") {
         setSubmitError(
-          result.typedError?.message || result.error || "Transaction failed.",
+          "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
         );
-      } finally {
-        setLoading(false);
+      } else {
+        setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
       }
+      return;
+    }
+    if (!walletAddress) {
+      setError("Connect your Freighter wallet first.");
+      return;
+    }
+
+    const validMembers = getFilledMembers(members);
+    if (validMembers.length < MIN_MEMBERS) {
+      setError(`A circle needs at least ${MIN_MEMBERS} members.`);
+      return;
+    }
+    if (validMembers.length > MAX_MEMBERS) {
+      setError(`A circle cannot have more than ${MAX_MEMBERS} members.`);
+      return;
+    }
+
+    // Check that the creator is not also a member (self-address check)
+    const creatorLower = walletAddress.toLowerCase();
+    const isSelfMember = validMembers.some((m) => m.toLowerCase() === creatorLower);
+    if (isSelfMember) {
+      setError(
+        "Your wallet address cannot be included in the member list. " +
+          "The circle creator is automatically a member.",
+      );
+      return;
+    }
+
+    const duplicate = findDuplicateAddress(validMembers);
+    if (duplicate) {
+      setError(
+        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
+      );
+      return;
+    }
+
+    const invalidAddr = validMembers.find((m) => !isValidStellarAddress(m));
+    if (invalidAddr) {
+      setError(
+        `Invalid Stellar address: "${shortAddress(invalidAddr)}". Each address must start with G and be 56 characters long.`,
+      );
+      return;
+    }
+
+    const amount = parseFloat(roundUSDC);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Enter a valid round amount greater than zero.");
+      return;
+    }
+    if (amount > MAX_ROUND_USDC) {
+      setError(
+        `Round amount of $${amount.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`,
+      );
+      return;
+    }
+
+    const days = parseInt(roundDays, 10);
+    if (isNaN(days) || days < 1) {
+      setError("Enter a valid round duration of at least 1 day.");
+      return;
+    }
+    if (days > MAX_ROUND_DAYS) {
+      setError(`Round duration cannot exceed ${MAX_ROUND_DAYS} days.`);
+      return;
+    }
+
+    // ── Step 3: factory address guard ─────────────────────────────────────────
+    if (!CIRCLE_FACTORY_ADDRESS) {
+      setSubmitError("Factory contract not configured. Deploy contracts first.");
+      return;
+    }
+
+    // ── Step 4: submit ────────────────────────────────────────────────────────
+    setLoading(true);
+    try {
+      const membersVec = xdr.ScVal.scvVec(
+        validMembers.map((m) => new Address(m).toScVal()),
+      );
+
+      const result = await invokeContract(
+        CIRCLE_FACTORY_ADDRESS,
+        "create_circle",
+        [
+          new Address(walletAddress).toScVal(),
+          nativeToScVal(circleName, { type: "string" }),
+          membersVec,
+          nativeToScVal(amountStroops, { type: "i128" }),
+          nativeToScVal(daysToLedgers(days), { type: "u32" }),
+        ],
+        walletAddress,
+      );
+
+      if (!result.success) {
+        setSubmitError(result.typedError?.message || result.error || "Transaction failed.");
+        return;
+      }
+
+      setTxHash(result.txHash ?? "");
+      setTimeout(() => router.push("/"), 5000);
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
@@ -489,28 +455,13 @@ export default function CreateClient() {
     }
   }
 
-  // ── Timeout reset ───────────────────────────────────────────────────────────
-  function resetAfterTimeout() {
-    setTimedOutTxHash("");
-    setIsTimedOut(false);
-    setSubmitError("");
-    submittingRef.current = false;
-  }
-
-  const timedOutExplorerUrl = timedOutTxHash
-    ? getExplorerLink(ACTIVE_NETWORK, "tx", timedOutTxHash)
-    : null;
-
   const explorerTxUrl = txHash
     ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash)
     : null;
 
-  const submitBlocked = loading || !!txHash || isTimedOut;
-
   const submitDescribedBy = [
     submitError ? submitErrId : null,
     txHash      ? successId   : null,
-    isTimedOut  ? timeoutId   : null,
   ].filter(Boolean).join(" ") || undefined;
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -751,75 +702,6 @@ export default function CreateClient() {
           </ul>
         </div>
 
-        {/* ── Timeout reconciliation panel ──────────────────────────────────── */}
-        {isTimedOut && timedOutTxHash && (
-          <div
-            id={timeoutId}
-            ref={timeoutRef}
-            role="alert"
-            tabIndex={-1}
-            className="bg-amber-50 border border-amber-300 rounded-lg p-4 text-sm text-amber-800 space-y-3 focus:outline-none focus:ring-2 focus:ring-amber-400"
-          >
-            <p className="font-semibold flex items-center gap-1.5">
-              <span aria-hidden="true">⏱️</span> Transaction submitted — confirmation timed out
-            </p>
-            <p className="text-amber-700">
-              Your transaction was sent to the network but we stopped waiting for
-              confirmation after the timeout window. It may still confirm — check
-              the explorer before retrying to avoid creating a duplicate circle.
-            </p>
-            <div>
-              <p className="text-xs font-medium text-amber-700 mb-1">Transaction hash</p>
-              <div className="flex items-center gap-2 bg-white border border-amber-200 rounded-lg px-3 py-2">
-                <span className="font-mono text-xs text-slate-700 flex-1 break-all select-all min-w-0">
-                  {timedOutTxHash}
-                </span>
-                <button
-                  type="button"
-                  onClick={copyTxHash}
-                  className="text-amber-700 hover:text-amber-900 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
-                  aria-pressed={copied}
-                >
-                  {copied ? "✓ Copied" : "Copy"}
-                </button>
-              </div>
-            </div>
-            {timedOutExplorerUrl && (
-              <a
-                href={timedOutExplorerUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 underline hover:text-amber-900"
-              >
-                Check on Stellar Expert ↗
-              </a>
-            )}
-            <div className="border-t border-amber-200 pt-3 space-y-2">
-              <p className="text-xs text-amber-700 font-medium">What would you like to do?</p>
-              <div className="flex flex-wrap gap-2">
-                {timedOutExplorerUrl && (
-                  <a
-                    href={timedOutExplorerUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="px-3 py-2 text-xs font-medium rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors"
-                  >
-                    Check explorer first ↗
-                  </a>
-                )}
-                <button
-                  type="button"
-                  onClick={resetAfterTimeout}
-                  className="px-3 py-2 text-xs font-medium rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors"
-                >
-                  I&apos;ve checked — it did not confirm, let me retry
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* ── Submit-level error ────────────────────────────────────────────── */}
         {submitError && (
           <div
@@ -848,7 +730,10 @@ export default function CreateClient() {
               <span aria-hidden="true">✅</span> Circle created successfully!
             </p>
             <div>
-              <p className="text-xs text-brand-600 mb-1 font-medium" id={`${successId}-hash-label`}>
+              <p
+                className="text-xs text-brand-600 mb-1 font-medium"
+                id={`${successId}-hash-label`}
+              >
                 Transaction hash
               </p>
               <div className="flex items-center gap-2 bg-white border border-brand-200 rounded-lg px-3 py-2">
