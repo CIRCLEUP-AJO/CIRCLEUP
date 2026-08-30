@@ -50,6 +50,7 @@ import {
   DEFAULT_MAX_SNAPSHOT_AGE_MS,
   type AppStateSnapshot,
   type GateResult,
+  type GateBlocked,
   type GateBlockReason,
 } from "./gating";
 
@@ -65,20 +66,25 @@ const MEMBERS = [
 const FIXED_NOW = 1_000_000; // ms epoch — fixed so tests are deterministic
 
 function makeSnap(overrides: Partial<AppStateSnapshot> = {}): AppStateSnapshot {
-  return buildAppSnapshot(
-    overrides.status           ?? "Active",
-    overrides.currentRound     ?? 0,
-    // deadlineLedger/latestLedger are nullable: `null` is a meaningful value
-    // (unknown ledger), so honour an explicitly-provided key rather than using
-    // `??`, which would coerce `null` back to the default.
-    "deadlineLedger" in overrides ? overrides.deadlineLedger : 5000,
-    "latestLedger"   in overrides ? overrides.latestLedger   : 4000, // below deadline — not yet passed
-    overrides.memberAddresses  ?? MEMBERS,
-    overrides.hasLockedCollateral          ?? true,
-    overrides.hasContributedCurrentRound   ?? false,
-    overrides.contributionsReceived        ?? 0,
-    overrides.fetchedAtMs      ?? FIXED_NOW,
-  );
+  return {
+    ...buildAppSnapshot(
+      overrides.status           ?? "Active",
+      overrides.currentRound     ?? 0,
+      // deadlineLedger/latestLedger are nullable: `null` is a meaningful value
+      // (unknown ledger), so honour an explicitly-provided key rather than using
+      // `??`, which would coerce `null` back to the default.
+      "deadlineLedger" in overrides ? overrides.deadlineLedger : 5000,
+      "latestLedger"   in overrides ? overrides.latestLedger   : 4000, // below deadline — not yet passed
+      overrides.memberAddresses  ?? MEMBERS,
+      overrides.hasLockedCollateral          ?? true,
+      overrides.hasContributedCurrentRound   ?? false,
+      overrides.contributionsReceived        ?? 0,
+      null,            // networkCheck — always null from the base builder
+      overrides.fetchedAtMs      ?? FIXED_NOW,
+    ),
+    // Allow direct override of networkCheck after the builder sets it to null
+    ...("networkCheck" in overrides ? { networkCheck: overrides.networkCheck } : {}),
+  };
 }
 
 /** Returns a snapshot that will appear stale (older than maxAge). */
@@ -776,6 +782,105 @@ describe("Guard ordering invariants", () => {
     });
     assertBlocked("contribute", snap, "deadline_passed");
   });
+
+  test("network_mismatch is checked before wrong_status for all write actions", () => {
+    // A mismatch snapshot must block regardless of the circle status being wrong too.
+    for (const [action, status] of [
+      ["join", "Active"],        // wrong status AND mismatch → mismatch wins
+      ["contribute", "Pending"], // wrong status AND mismatch → mismatch wins
+      ["payout", "Completed"],
+      ["default", "Pending"],
+      ["close", "Active"],
+    ] as const) {
+      const snap = makeSnap({ status: status as string, networkCheck: "mismatch" } as any);
+      assertBlocked(action, snap as any, "network_mismatch");
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GUARD 10: network_mismatch — all write actions blocked on confirmed mismatch
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe("MutationGuard: network_mismatch for all write actions", () => {
+  function mismatchSnap(statusOverride?: string): AppStateSnapshot {
+    return {
+      ...makeSnap({ status: statusOverride }),
+      networkCheck: "mismatch" as const,
+    };
+  }
+
+  for (const action of ["join", "contribute", "payout", "default", "close"] as const) {
+    const statusForAction: Record<string, string> = {
+      join: "Pending",
+      contribute: "Active",
+      payout: "Active",
+      default: "Active",
+      close: "Completed",
+    };
+
+    test(`${action}: mismatch blocks the action`, () => {
+      const snap = mismatchSnap(statusForAction[action]);
+      assertBlocked(action, snap, "network_mismatch");
+    });
+
+    test(`${action}: mismatch message mentions network`, () => {
+      const snap = mismatchSnap(statusForAction[action]);
+      const result = computeActionEligibility(action, snap, { nowMs: FIXED_NOW });
+      assert.equal(result.allowed, false);
+      if (!result.allowed) {
+        assert.match(
+          result.message.toLowerCase(),
+          /network/,
+          `${action}: mismatch message must mention "network"`,
+        );
+      }
+    });
+
+    test(`${action}: match or null networkCheck does not block`, () => {
+      const matchSnap: AppStateSnapshot = {
+        ...makeSnap({ status: statusForAction[action] }),
+        networkCheck: "match" as const,
+      };
+      // match → should not block on network_mismatch reason
+      const matchResult = computeActionEligibility(action, matchSnap, { nowMs: FIXED_NOW });
+      if (!matchResult.allowed) {
+        assert.notEqual(
+          (matchResult as GateBlocked).reason,
+          "network_mismatch",
+          `${action}: match networkCheck must not produce network_mismatch`,
+        );
+      }
+
+      const nullSnap: AppStateSnapshot = {
+        ...makeSnap({ status: statusForAction[action] }),
+        networkCheck: null,
+      };
+      const nullResult = computeActionEligibility(action, nullSnap, { nowMs: FIXED_NOW });
+      if (!nullResult.allowed) {
+        assert.notEqual(
+          (nullResult as GateBlocked).reason,
+          "network_mismatch",
+          `${action}: null networkCheck must not produce network_mismatch`,
+        );
+      }
+    });
+
+    test(`${action}: unknown networkCheck does not block on network_mismatch`, () => {
+      const unknownSnap: AppStateSnapshot = {
+        ...makeSnap({ status: statusForAction[action] }),
+        networkCheck: "unknown" as const,
+      };
+      const result = computeActionEligibility(action, unknownSnap, { nowMs: FIXED_NOW });
+      if (!result.allowed) {
+        assert.notEqual(
+          (result as GateBlocked).reason,
+          "network_mismatch",
+          `${action}: unknown networkCheck must not produce network_mismatch`,
+        );
+      }
+    });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -811,19 +916,19 @@ describe("isSnapshotFresh boundary", () => {
 
 describe("buildAppSnapshot factory", () => {
   test("deadlineLedger=undefined is coerced to null in snapshot", () => {
-    const snap = buildAppSnapshot("Active", 0, undefined, undefined, [], false, false, 0, FIXED_NOW);
+    const snap = buildAppSnapshot("Active", 0, undefined, undefined, [], false, false, 0, null, FIXED_NOW);
     assert.equal(snap.deadlineLedger, null);
     assert.equal(snap.latestLedger, null);
   });
 
   test("fetchedAtMs is set to the provided nowMs value", () => {
-    const snap = buildAppSnapshot("Pending", 0, null, null, [], false, false, 0, 42_000);
+    const snap = buildAppSnapshot("Pending", 0, null, null, [], false, false, 0, null, 42_000);
     assert.equal(snap.fetchedAtMs, 42_000);
   });
 
   test("snapshot fields match provided arguments exactly", () => {
     const snap = buildAppSnapshot(
-      "Active", 2, 9000, 8000, MEMBERS, true, false, 3, FIXED_NOW,
+      "Active", 2, 9000, 8000, MEMBERS, true, false, 3, null, FIXED_NOW,
     );
     assert.equal(snap.status, "Active");
     assert.equal(snap.currentRound, 2);
@@ -834,5 +939,15 @@ describe("buildAppSnapshot factory", () => {
     assert.equal(snap.hasContributedCurrentRound, false);
     assert.equal(snap.contributionsReceived, 3);
     assert.equal(snap.fetchedAtMs, FIXED_NOW);
+  });
+
+  test("networkCheck=mismatch is preserved in snapshot", () => {
+    const snap = buildAppSnapshot("Active", 0, null, null, [], false, false, 0, "mismatch", FIXED_NOW);
+    assert.equal(snap.networkCheck, "mismatch");
+  });
+
+  test("networkCheck defaults to null when omitted", () => {
+    const snap = buildAppSnapshot("Active", 0, null, null, [], false, false, 0);
+    assert.equal(snap.networkCheck, null);
   });
 });
