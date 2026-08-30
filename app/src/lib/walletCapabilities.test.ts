@@ -1,15 +1,16 @@
 /**
- * Tests for the wallet capability adapter (app/src/lib/walletCapabilities.ts).
+ * Tests for app/src/lib/walletCapabilities.ts
  *
- * Uses node:test + node:assert (the app has no dedicated test runner; run via
- * `npx tsc --noEmit` to type-check, or compile and `node --test`). Every case
- * injects a fake provider object, so no browser, DOM, or real Freighter
- * extension is required.
+ * Uses node:test + node:assert. Every case injects a fake provider object so
+ * no browser, DOM, or real Freighter extension is required.
  *
- * Coverage: one case per capability state the acceptance criteria call out —
- * SSR (no window), provider absent, full provider, partial providers (signing
- * only / network only / listeners only), denied/partial (non-function members),
- * and the pre-signing explanation helper.
+ * Coverage:
+ *   - detectWalletCapabilities: SSR safety, provider absent, full/partial providers
+ *   - getInjectedProvider: preference order (freighter over freighterApi)
+ *   - explainUnsupportedAction: no wallet, supported/unsupported capabilities
+ *   - getProviderNetwork: getNetworkDetails path, getNetwork path, fallback, errors
+ *   - checkNetworkMismatch: match, mismatch, unknown, unsupported, provider_error
+ *   - describeNetworkMismatch: all five result kinds
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -17,6 +18,9 @@ import {
   detectWalletCapabilities,
   explainUnsupportedAction,
   getInjectedProvider,
+  getProviderNetwork,
+  checkNetworkMismatch,
+  describeNetworkMismatch,
 } from "./walletCapabilities";
 
 const fn = () => {};
@@ -33,6 +37,13 @@ const fullProvider = {
   addEventListener: fn,
   watchWalletChanges: fn,
 };
+
+const TEST_PASSPHRASE = "Test SDF Network ; September 2015";
+const MAIN_PASSPHRASE = "Public Global Stellar Network ; September 2015";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// detectWalletCapabilities
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe("detectWalletCapabilities — environment safety", () => {
   test("SSR (window undefined) returns all-unsupported and never throws", () => {
@@ -113,6 +124,10 @@ describe("detectWalletCapabilities — capability states", () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// getInjectedProvider
+// ─────────────────────────────────────────────────────────────────────────────
+
 describe("getInjectedProvider", () => {
   test("prefers window.freighter over window.freighterApi", () => {
     const a = { signTransaction: fn };
@@ -124,6 +139,10 @@ describe("getInjectedProvider", () => {
     assert.equal(getInjectedProvider(undefined), null);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// explainUnsupportedAction
+// ─────────────────────────────────────────────────────────────────────────────
 
 describe("explainUnsupportedAction", () => {
   const none = detectWalletCapabilities(undefined);
@@ -147,5 +166,199 @@ describe("explainUnsupportedAction", () => {
     assert.ok(msg && /active network/i.test(msg));
     const msg2 = explainUnsupportedAction("watchChanges", signOnly);
     assert.ok(msg2 && /account changes/i.test(msg2));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getProviderNetwork
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("getProviderNetwork", () => {
+  test("returns null when no provider is present", async () => {
+    const result = await getProviderNetwork(undefined);
+    assert.equal(result, null);
+  });
+
+  test("returns null when provider has neither getNetwork nor getNetworkDetails", async () => {
+    const result = await getProviderNetwork({ freighter: { signTransaction: fn } });
+    assert.equal(result, null);
+  });
+
+  test("reads networkPassphrase from getNetworkDetails object response", async () => {
+    const provider = {
+      getNetworkDetails: async () => ({ networkPassphrase: TEST_PASSPHRASE }),
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, TEST_PASSPHRASE);
+  });
+
+  test("getNetworkDetails takes precedence over getNetwork", async () => {
+    const provider = {
+      getNetworkDetails: async () => ({ networkPassphrase: TEST_PASSPHRASE }),
+      getNetwork: async () => MAIN_PASSPHRASE,
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, TEST_PASSPHRASE);
+  });
+
+  test("falls back to getNetwork when getNetworkDetails returns no passphrase", async () => {
+    const provider = {
+      getNetworkDetails: async () => ({ somethingElse: "value" }),
+      getNetwork: async () => MAIN_PASSPHRASE,
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, MAIN_PASSPHRASE);
+  });
+
+  test("reads passphrase from getNetwork string response", async () => {
+    const provider = {
+      getNetwork: async () => TEST_PASSPHRASE,
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, TEST_PASSPHRASE);
+  });
+
+  test("reads networkPassphrase from getNetwork object response", async () => {
+    const provider = {
+      getNetwork: async () => ({ networkPassphrase: TEST_PASSPHRASE }),
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, TEST_PASSPHRASE);
+  });
+
+  test("returns null when getNetworkDetails throws and getNetwork is absent", async () => {
+    const provider = {
+      getNetworkDetails: async () => { throw new Error("extension error"); },
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, null);
+  });
+
+  test("falls back to getNetwork when getNetworkDetails throws", async () => {
+    const provider = {
+      getNetworkDetails: async () => { throw new Error("error"); },
+      getNetwork: async () => TEST_PASSPHRASE,
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, TEST_PASSPHRASE);
+  });
+
+  test("trims whitespace from returned passphrase", async () => {
+    const provider = {
+      getNetworkDetails: async () => ({ networkPassphrase: `  ${TEST_PASSPHRASE}  ` }),
+    };
+    const result = await getProviderNetwork({ freighter: provider });
+    assert.equal(result, TEST_PASSPHRASE);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// checkNetworkMismatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("checkNetworkMismatch", () => {
+  test("returns unsupported when no provider is present", async () => {
+    const result = await checkNetworkMismatch(TEST_PASSPHRASE, undefined);
+    assert.equal(result.kind, "unsupported");
+  });
+
+  test("returns unsupported when provider cannot report the network", async () => {
+    const win = { freighter: { signTransaction: fn } };
+    const result = await checkNetworkMismatch(TEST_PASSPHRASE, win);
+    assert.equal(result.kind, "unsupported");
+  });
+
+  test("returns match when provider passphrase equals configured", async () => {
+    const win = {
+      freighter: {
+        getNetworkDetails: async () => ({ networkPassphrase: TEST_PASSPHRASE }),
+      },
+    };
+    const result = await checkNetworkMismatch(TEST_PASSPHRASE, win);
+    assert.equal(result.kind, "match");
+    if (result.kind === "match") {
+      assert.equal(result.detectedPassphrase, TEST_PASSPHRASE);
+    }
+  });
+
+  test("returns mismatch when provider passphrase differs from configured", async () => {
+    const win = {
+      freighter: {
+        getNetworkDetails: async () => ({ networkPassphrase: MAIN_PASSPHRASE }),
+      },
+    };
+    const result = await checkNetworkMismatch(TEST_PASSPHRASE, win);
+    assert.equal(result.kind, "mismatch");
+    if (result.kind === "mismatch") {
+      assert.equal(result.detectedPassphrase, MAIN_PASSPHRASE);
+      assert.equal(result.configuredPassphrase, TEST_PASSPHRASE);
+    }
+  });
+
+  test("returns unknown when provider returns null passphrase", async () => {
+    const win = {
+      freighter: {
+        getNetworkDetails: async () => ({ somethingElse: "value" }),
+      },
+    };
+    const result = await checkNetworkMismatch(TEST_PASSPHRASE, win);
+    assert.equal(result.kind, "unknown");
+  });
+
+  test("mismatch carries both detected and configured passphrases", async () => {
+    const win = {
+      freighter: {
+        getNetwork: async () => MAIN_PASSPHRASE,
+      },
+    };
+    const result = await checkNetworkMismatch(TEST_PASSPHRASE, win);
+    assert.equal(result.kind, "mismatch");
+    if (result.kind === "mismatch") {
+      assert.equal(result.detectedPassphrase, MAIN_PASSPHRASE);
+      assert.equal(result.configuredPassphrase, TEST_PASSPHRASE);
+    }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// describeNetworkMismatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("describeNetworkMismatch", () => {
+  test("match → returns null (no warning needed)", () => {
+    const result = describeNetworkMismatch({
+      kind: "match",
+      detectedPassphrase: TEST_PASSPHRASE,
+    });
+    assert.equal(result, null);
+  });
+
+  test("mismatch → returns non-null message mentioning both passphrases", () => {
+    const msg = describeNetworkMismatch({
+      kind: "mismatch",
+      detectedPassphrase: MAIN_PASSPHRASE,
+      configuredPassphrase: TEST_PASSPHRASE,
+    });
+    assert.ok(msg !== null, "mismatch must produce a non-null message");
+    assert.ok(msg!.includes(MAIN_PASSPHRASE), "message must include detected passphrase");
+    assert.ok(msg!.includes(TEST_PASSPHRASE), "message must include configured passphrase");
+  });
+
+  test("unknown → returns non-null advisory message", () => {
+    const msg = describeNetworkMismatch({ kind: "unknown" });
+    assert.ok(msg !== null);
+    assert.ok(msg!.toLowerCase().includes("network"));
+  });
+
+  test("unsupported → returns non-null advisory message", () => {
+    const msg = describeNetworkMismatch({ kind: "unsupported" });
+    assert.ok(msg !== null);
+    assert.ok(msg!.toLowerCase().includes("network"));
+  });
+
+  test("provider_error → returns non-null advisory message", () => {
+    const msg = describeNetworkMismatch({ kind: "provider_error", error: "timeout" });
+    assert.ok(msg !== null);
+    assert.ok(msg!.toLowerCase().includes("error") || msg!.toLowerCase().includes("network"));
   });
 });
