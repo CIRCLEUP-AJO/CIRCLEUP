@@ -289,9 +289,10 @@ export default function CreateClient() {
 
   // ── Copy helper ─────────────────────────────────────────────────────────────
   async function copyTxHash() {
-    if (!txHash) return;
+    const hash = txHash || timedOutTxHash;
+    if (!hash) return;
     try {
-      await navigator.clipboard.writeText(txHash);
+      await navigator.clipboard.writeText(hash);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
@@ -446,7 +447,11 @@ export default function CreateClient() {
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
-      setLoading(false);
+      // Release the lock on every path except confirmed timeout, where the user
+      // must explicitly acknowledge via resetAfterTimeout() before retrying.
+      if (!pendingTimeout) {
+        submittingRef.current = false;
+      }
     }
   }
 
@@ -724,7 +729,6 @@ export default function CreateClient() {
             <p className="font-semibold text-brand-800 flex items-center gap-1.5">
               <span aria-hidden="true">✅</span> Circle created successfully!
             </p>
-
             <div>
               <p
                 className="text-xs text-brand-600 mb-1 font-medium"
@@ -750,7 +754,6 @@ export default function CreateClient() {
                 </button>
               </div>
             </div>
-
             {explorerTxUrl && (
               <a
                 href={explorerTxUrl}
@@ -761,7 +764,6 @@ export default function CreateClient() {
                 View on Stellar Expert ↗
               </a>
             )}
-
             <p className="text-xs text-slate-500">
               Redirecting to circles list in a few seconds…
             </p>
@@ -777,13 +779,19 @@ export default function CreateClient() {
 
         <button
           type="submit"
-          disabled={loading || !!txHash}
+          disabled={submitBlocked}
           aria-busy={loading}
           aria-describedby={submitDescribedBy}
-          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 text-lg min-h-[48px]"
+          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg min-h-[48px]"
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>
+
+        {isTimedOut && (
+          <p className="text-xs text-center text-amber-700" role="status">
+            Submit is locked until you have checked the explorer and confirmed the original transaction did not go through.
+          </p>
+        )}
       </form>
     </div>
   );
