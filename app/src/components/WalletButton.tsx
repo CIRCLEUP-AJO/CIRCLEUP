@@ -2,13 +2,15 @@
 import { useState, useEffect } from "react";
 import { getWalletAddress, connectWallet, isFreighterInstalled, WalletError } from "@/lib/stellar";
 import { shortAddress } from "@/lib/config";
+import { detectWalletCapabilities, explainUnsupportedAction } from "@/lib/walletCapabilities";
 
 type ConnectionState =
   | { status: "idle" }
   | { status: "checking" }
-  | { status: "connected"; address: string }
+  | { status: "connected"; address: string; capabilities?: { canSign: boolean; canGetNetwork: boolean } }
   | { status: "connecting" }
   | { status: "not_installed" }
+  | { status: "limited"; message: string; address?: string }
   | { status: "error"; message: string };
 
 export function WalletButton() {
@@ -20,7 +22,25 @@ export function WalletButton() {
     getWalletAddress().then((address) => {
       if (cancelled) return;
       if (address) {
-        setState({ status: "connected", address });
+        // Check capabilities when connected
+        const caps = detectWalletCapabilities();
+        const signWarning = explainUnsupportedAction("sign", caps);
+        if (signWarning) {
+          setState({
+            status: "limited",
+            message: signWarning,
+            address,
+          });
+        } else {
+          setState({
+            status: "connected",
+            address,
+            capabilities: {
+              canSign: caps.canSignTransaction,
+              canGetNetwork: caps.canGetNetwork,
+            },
+          });
+        }
       } else if (!isFreighterInstalled()) {
         setState({ status: "not_installed" });
       } else {
@@ -34,7 +54,24 @@ export function WalletButton() {
     setState({ status: "connecting" });
     try {
       const address = await connectWallet();
-      setState({ status: "connected", address });
+      const caps = detectWalletCapabilities();
+      const signWarning = explainUnsupportedAction("sign", caps);
+      if (signWarning) {
+        setState({
+          status: "limited",
+          message: signWarning,
+          address,
+        });
+      } else {
+        setState({
+          status: "connected",
+          address,
+          capabilities: {
+            canSign: caps.canSignTransaction,
+            canGetNetwork: caps.canGetNetwork,
+          },
+        });
+      }
     } catch (err) {
       if (err instanceof WalletError) {
         if (err.reason === "not_installed") {
@@ -58,6 +95,34 @@ export function WalletButton() {
       <div className="flex items-center gap-2 bg-brand-50 border border-brand-200 rounded-lg px-3 py-2 text-sm">
         <span className="w-2 h-2 rounded-full bg-brand-500 inline-block" aria-hidden="true" />
         <span className="font-mono text-brand-700">{shortAddress(state.address)}</span>
+        {state.capabilities && !state.capabilities.canGetNetwork && (
+          <span className="text-xs text-amber-600" title="Wallet cannot verify network">
+            ⚠
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  // ── Limited capabilities ──────────────────────────────────────────────────
+  if (state.status === "limited") {
+    return (
+      <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-sm">
+          {state.address && (
+            <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" aria-hidden="true" />
+          )}
+          {state.address && (
+            <span className="font-mono text-amber-700">{shortAddress(state.address)}</span>
+          )}
+        </div>
+        <span
+          className="text-xs text-amber-600 max-w-[180px] truncate"
+          title={state.message}
+          aria-live="polite"
+        >
+          {state.message}
+        </span>
       </div>
     );
   }
