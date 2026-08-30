@@ -86,3 +86,14 @@ export const PORT = parsePositiveIntEnv("PORT", process.env.PORT, 3001);
 export const START_LEDGER = parseStartLedger(process.env.START_LEDGER);
 export const POLL_INTERVAL_MS = parsePositiveIntEnv("POLL_INTERVAL_MS", process.env.POLL_INTERVAL_MS, 5_000);
 export const EVENTS_LIMIT = parseEventsLimit(process.env.EVENTS_LIMIT);
+
+// Maximum milliseconds to wait for in-flight work (poll cycle + HTTP drain +
+// pool close) to finish before forcing a hard process.exit(1).  Keeping this
+// bounded prevents a hung RPC call or a slow DB write from stalling a
+// rolling deployment indefinitely.  Default: 30 s — long enough for a
+// single Soroban RPC call with retries to complete.
+export const SHUTDOWN_GRACE_PERIOD_MS = parsePositiveIntEnv(
+  "SHUTDOWN_GRACE_PERIOD_MS",
+  process.env.SHUTDOWN_GRACE_PERIOD_MS,
+  30_000,
+);
