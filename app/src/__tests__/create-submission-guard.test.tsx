@@ -124,7 +124,7 @@ async function fillValidForm() {
   fireEvent.change(daysInput, { target: { value: "30" } });
 
   // Members — default render starts with 4 blank rows; fill the first two
-  const memberInputs = screen.getAllByRole("textbox", { name: /member \d+ of \d+ — stellar address/i });
+  const memberInputs = screen.getAllByRole("textbox", { name: /member \d+ stellar address/i });
   fireEvent.change(memberInputs[0], { target: { value: MEMBER_A } });
   fireEvent.change(memberInputs[1], { target: { value: MEMBER_B } });
 

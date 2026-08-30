@@ -16,121 +16,28 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Minimum and maximum number of members allowed by the contract. */
-export const MIN_MEMBERS = 2;
-export const MAX_MEMBERS = 20;
-
-/** Minimum contribution per round — 1 stroop = $0.0000001 USDC. */
-export const MIN_AMOUNT_USDC = 0.0000001;
-
-/** Maximum USDC decimal places supported by the Stellar USDC token (7 dp). */
-export const MAX_USDC_DECIMALS = 7;
-
-/** Maximum round duration in days (≈10 years in ledgers stays within u32). */
-export const MAX_ROUND_DAYS = 3650;
-
-/** Maximum characters in a circle name. */
-export const MAX_NAME_LENGTH = 64;
-
-// ─── Member row identity ──────────────────────────────────────────────────────
-//
-// Each row in the member list carries a stable `id` that is assigned once on
-// creation and never changes.  Using `id` as the React `key` (instead of the
-// array index) means:
-//
-//   • Removing row 1 of [A, B, C] gives [A, C] — React deletes B's DOM node
-//     and keeps A and C in place.  With index keys, React would reuse B's node
-//     for C, which can leave uncontrolled input state in the wrong slot.
-//
-//   • Swapping rows (move up / move down) moves the exact DOM nodes with their
-//     focus state, input cursor position, and browser autofill intact.
-//
-// The id counter is module-level so it survives hot-reload without collisions.
-
-let _nextMemberId = 0;
-
-/**
- * A single member row: a stable `id` (never reused) and the current `value`
- * (the raw string the user has typed, including blanks).
- */
-export interface MemberRow {
-  readonly id: string;
-  readonly value: string;
-}
-
-/** Create a new MemberRow with a fresh unique id. */
-export function createMemberRow(value = ""): MemberRow {
-  return { id: `mr-${_nextMemberId++}`, value };
-}
-
-/**
- * Move the element at `fromIndex` to `toIndex`, shifting other elements to
- * fill the gap.  Returns a new array; the original is not mutated.
- *
- * Both indices must be in [0, rows.length).  If either is out of range the
- * original array is returned unchanged.
- *
- * @example
- * reorderMembers([A, B, C, D], 2, 0) // → [C, A, B, D]
- * reorderMembers([A, B, C, D], 0, 3) // → [B, C, D, A]
- */
-export function reorderMembers<T>(rows: T[], fromIndex: number, toIndex: number): T[] {
-  if (
-    fromIndex === toIndex ||
-    fromIndex < 0 || fromIndex >= rows.length ||
-    toIndex   < 0 || toIndex   >= rows.length
-  ) {
-    return rows;
-  }
-  const next = [...rows];
-  const [item] = next.splice(fromIndex, 1);
-  next.splice(toIndex, 0, item);
-  return next;
-}
-
-// ─── Validation types ─────────────────────────────────────────────────────────
-
-/**
- * Per-field error map returned by {@link validateCreateForm}.
- * A field is error-free when its key is absent or the value is `undefined`.
- */
-export interface CreateFormErrors {
-  name?: string;
-  amount?: string;
-  days?: string;
-  /**
-   * Index-keyed member errors.  errors.members[i] is the error for the row
-   * currently at position i.  The index matches the position in the rendered
-   * list, not the row's stable id.
-   */
-  members?: (string | undefined)[];
-  /** Cross-field or list-level member errors (duplicate, count). */
-  membersGeneral?: string;
-}
-
-/**
- * Validated, normalised form values ready for contract submission.
- * Only produced when {@link validateCreateForm} returns no errors.
- */
-export interface ValidatedCreateForm {
-  name: string;
-  validMembers: string[];
-  amountStroops: bigint;
-  roundDays: number;
-}
-
-// ─── Pure helpers (exported for testing) ─────────────────────────────────────
+const MIN_MEMBERS = 2;
+const MAX_MEMBERS = 20;
+/** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
+const MAX_ROUND_USDC = 1_000_000;
+/** Maximum round duration in days. */
+const MAX_ROUND_DAYS = 365;
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
   return members.map((m) => m.trim()).filter((m) => m.length > 0);
 }
 
-/** Return the first duplicate address, or null if all are unique. */
-export function findDuplicateAddress(addresses: string[]): string | null {
+/**
+ * Find duplicate addresses using case-insensitive comparison.
+ * Returns the first duplicate found, or null if all are unique.
+ */
+function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
-    if (seen.has(addr)) return addr;
-    seen.add(addr);
+    const lower = addr.toLowerCase();
+    if (seen.has(lower)) return addr;
+    seen.add(lower);
   }
   return null;
 }
@@ -152,9 +59,13 @@ export function countDecimalPlaces(value: string): number {
 /**
  * Validate and normalise all create-circle form fields.
  *
- * Accepts plain `string[]` for members so the caller (component) extracts
- * values from MemberRow objects; this keeps the validator pure and testable
- * without any dependency on the row identity type.
+ * Returns either:
+ *   `{ ok: true,  values: ValidatedCreateForm }`  — safe to submit
+ *   `{ ok: false, errors: CreateFormErrors }`      — show errors, do not submit
+ *
+ * This is the single authoritative gate that `handleSubmit` calls. The function
+ * is pure (no I/O, no side effects) so it can be tested exhaustively without a
+ * browser environment.
  */
 export function validateCreateForm(
   name: string,
@@ -185,10 +96,10 @@ export function validateCreateForm(
     } else if (amountNum === 0) {
       errors.amount = "Contribution amount must be greater than zero.";
     } else if (countDecimalPlaces(amountStr) > MAX_USDC_DECIMALS) {
-      errors.amount =
-        `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
+      errors.amount = `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
         `"${amountStr}" has ${countDecimalPlaces(amountStr)}.`;
     } else {
+      // usdcToStroops is safe here — we've already checked the decimal count
       try {
         amountStroops = usdcToStroops(amountStr);
         if (amountStroops <= 0n) {
@@ -207,23 +118,26 @@ export function validateCreateForm(
 
   if (daysStr === "") {
     errors.days = "Round duration is required.";
-  } else if (daysStr.includes(".")) {
-    errors.days = "Round duration must be a whole number of days.";
   } else {
-    const parsed = parseInt(daysStr, 10);
-    if (isNaN(parsed) || parsed < 1) {
-      errors.days = "Round duration must be at least 1 day.";
-    } else if (parsed > MAX_ROUND_DAYS) {
-      errors.days = `Round duration cannot exceed ${MAX_ROUND_DAYS} days (≈10 years).`;
+    // Reject any fractional input — ledger math only makes sense for whole days
+    if (daysStr.includes(".")) {
+      errors.days = "Round duration must be a whole number of days.";
     } else {
-      daysNum = parsed;
+      const parsed = parseInt(daysStr, 10);
+      if (isNaN(parsed) || parsed < 1) {
+        errors.days = "Round duration must be at least 1 day.";
+      } else if (parsed > MAX_ROUND_DAYS) {
+        errors.days = `Round duration cannot exceed ${MAX_ROUND_DAYS} days (≈10 years).`;
+      } else {
+        daysNum = parsed;
+      }
     }
   }
 
   // ── Members — per-field ───────────────────────────────────────────────────
   const memberErrors: (string | undefined)[] = members.map((raw, i) => {
     const trimmed = raw.trim();
-    if (trimmed.length === 0) return undefined;
+    if (trimmed.length === 0) return undefined; // blank rows are ignored
     if (!isStellarPublicKey(trimmed)) {
       return `Member ${i + 1}: must be a G-prefixed 56-character Stellar address.`;
     }
@@ -241,9 +155,7 @@ export function validateCreateForm(
   if (validMembers.length < MIN_MEMBERS) {
     errors.membersGeneral =
       `At least ${MIN_MEMBERS} members are required. ` +
-      (validMembers.length === 0
-        ? "Add member addresses below."
-        : `You have ${validMembers.length}.`);
+      `${validMembers.length === 0 ? "Add member addresses below." : `You have ${validMembers.length}.`}`;
   } else if (validMembers.length > MAX_MEMBERS) {
     errors.membersGeneral = `A circle cannot have more than ${MAX_MEMBERS} members.`;
   } else {
@@ -279,9 +191,9 @@ export function validateCreateForm(
 
 // ─── FieldError ───────────────────────────────────────────────────────────────
 //
-// Defined at module scope so React sees a stable component reference across
-// renders and never unmounts/remounts the element unnecessarily (which would
-// reset the role="alert" live-region announcement).
+// Defined outside the component so React never treats it as a new component
+// type on re-render, which would cause unnecessary unmount/remount cycles and
+// break the live-region semantics of role="alert".
 
 function FieldError({ id, message }: { id: string; message: string | undefined }) {
   if (!message) return null;
@@ -299,29 +211,21 @@ export default function CreateClient() {
 
   // ── Form state ─────────────────────────────────────────────────────────────
   const [name,      setName]      = useState("");
-  const [members,   setMembers]   = useState<MemberRow[]>(() => [
-    createMemberRow(),
-    createMemberRow(),
-    createMemberRow(),
-    createMemberRow(),
-  ]);
+  const [members,   setMembers]   = useState<string[]>(["", "", "", ""]);
   const [roundUSDC, setRoundUSDC] = useState("100");
   const [roundDays, setRoundDays] = useState("30");
 
   // ── Submission state ───────────────────────────────────────────────────────
-  const [loading,     setLoading]     = useState(false);
-  const [submitError, setSubmitError] = useState("");
-  const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
-  const [txHash,      setTxHash]      = useState("");
-  const [copied,      setCopied]      = useState(false);
-  const [validated,   setValidated]   = useState(false);
+  const [loading,      setLoading]      = useState(false);
+  const [submitError,  setSubmitError]  = useState("");
+  const [fieldErrors,  setFieldErrors]  = useState<CreateFormErrors>({});
+  const [txHash,       setTxHash]       = useState("");
+  const [copied,       setCopied]       = useState(false);
 
-  // ── Timeout reconciliation state ───────────────────────────────────────────
-  const [timedOutTxHash, setTimedOutTxHash] = useState<string>("");
-  const [isTimedOut,     setIsTimedOut]     = useState(false);
-
-  // ── In-flight guard ────────────────────────────────────────────────────────
-  const submittingRef = useRef(false);
+  // Whether validation has been attempted — controls when inline errors appear.
+  // Before first submit, per-field errors are hidden so the form isn't
+  // immediately hostile. After first submit they stay visible on every change.
+  const [validated, setValidated] = useState(false);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -332,29 +236,15 @@ export default function CreateClient() {
   const membersHintId = useId();
   const submitErrId   = useId();
   const successId     = useId();
-  const timeoutId     = useId();
 
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
-  const timeoutRef     = useRef<HTMLDivElement>(null);
+  // One ref per member row for focusing the first invalid field
+  const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
   const amountRef      = useRef<HTMLInputElement>(null);
   const daysRef        = useRef<HTMLInputElement>(null);
-
-  // Member input refs keyed by stable row id (survives reorder and remove).
-  const memberInputRefs = useRef<Map<string, HTMLInputElement | null>>(new Map());
-
-  // After a move-up/move-down the focused input changes position; we keep
-  // track of which row id should receive focus after the next render.
-  const pendingFocusId = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (pendingFocusId.current) {
-      memberInputRefs.current.get(pendingFocusId.current)?.focus();
-      pendingFocusId.current = null;
-    }
-  });
 
   useEffect(() => {
     if (submitError && submitErrorRef.current) submitErrorRef.current.focus();
@@ -364,33 +254,20 @@ export default function CreateClient() {
     if (txHash && successRef.current) successRef.current.focus();
   }, [txHash]);
 
-  useEffect(() => {
-    if (isTimedOut && timeoutRef.current) timeoutRef.current.focus();
-  }, [isTimedOut]);
-
   // ── Derived values ──────────────────────────────────────────────────────────
-  const memberValues   = members.map((r) => r.value);
-  const filledCount    = getFilledMembers(memberValues).length;
+  const filledCount    = getFilledMembers(members).length;
   const roundAmountNum = parseFloat(roundUSDC || "0");
   const potPerRound    = Number.isFinite(roundAmountNum) ? roundAmountNum * filledCount : 0;
 
-  // Live-validate after first submit attempt so errors update as the user types.
+  // Live-validate after first submit attempt so errors update as user types
   useEffect(() => {
     if (!validated) return;
-    const result = validateCreateForm(name, memberValues, roundUSDC, roundDays);
+    const result = validateCreateForm(name, members, roundUSDC, roundDays);
     setFieldErrors(result.ok ? {} : result.errors);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [validated, name, members, roundUSDC, roundDays]);
 
   // ── Member helpers ──────────────────────────────────────────────────────────
-
-  const updateMember = useCallback((id: string, val: string) => {
-    setMembers((prev) =>
-      prev.map((r) => (r.id === id ? { ...r, value: val } : r)),
-    );
-  }, []);
-
-  const addMember = useCallback(() => {
+  function updateMember(i: number, val: string) {
     setMembers((prev) => {
       if (prev.length >= MAX_MEMBERS) return prev;
       return [...prev, createMemberRow()];
@@ -420,18 +297,12 @@ export default function CreateClient() {
     memberInputRefs.current.delete(id);
   }, []);
 
-  /**
-   * Move the row at `fromIndex` to `toIndex`, then focus the moved row's input.
-   * This is the primitive used by Move Up and Move Down.
-   */
-  const moveMember = useCallback((fromIndex: number, toIndex: number) => {
-    setMembers((prev) => {
-      const next = reorderMembers(prev, fromIndex, toIndex);
-      // Schedule focus on the moved row after the DOM updates.
-      pendingFocusId.current = next[toIndex].id;
-      return next;
-    });
-  }, []);
+  function removeMember(i: number) {
+    if (members.length <= MIN_MEMBERS) return;
+    setMembers((prev) => prev.filter((_, idx) => idx !== i));
+    // Shrink the refs array to stay in sync
+    memberRefs.current = memberRefs.current.filter((_, idx) => idx !== i);
+  }
 
   // ── Copy helper ─────────────────────────────────────────────────────────────
   async function copyTxHash() {
@@ -446,73 +317,74 @@ export default function CreateClient() {
     }
   }
 
-  // ── Focus first error ─────────────────────────────────────────────────────
-
+  // ── Focus first error ────────────────────────────────────────────────────────
   function focusFirstError(errors: CreateFormErrors) {
-    if (errors.name)   { nameRef.current?.focus();   return; }
+    if (errors.name) { nameRef.current?.focus(); return; }
     if (errors.amount) { amountRef.current?.focus(); return; }
-    if (errors.days)   { daysRef.current?.focus();   return; }
+    if (errors.days) { daysRef.current?.focus(); return; }
     if (errors.members) {
       const firstIdx = errors.members.findIndex((e) => e !== undefined);
-      if (firstIdx !== -1 && members[firstIdx]) {
-        memberInputRefs.current.get(members[firstIdx].id)?.focus();
-        return;
-      }
+      if (firstIdx !== -1) { memberRefs.current[firstIdx]?.focus(); return; }
     }
-    // membersGeneral — focus the first empty member slot.
-    const firstEmpty = members.find((r) => r.value.trim() === "");
-    if (firstEmpty) {
-      memberInputRefs.current.get(firstEmpty.id)?.focus();
-    }
+    // membersGeneral — focus the first empty member slot if it exists
+    const firstEmpty = members.findIndex((m) => m.trim() === "");
+    if (firstEmpty !== -1) { memberRefs.current[firstEmpty]?.focus(); }
   }
 
   // ── Submit ──────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-
-    if (submittingRef.current) return;
-    submittingRef.current = true;
-
     setSubmitError("");
     setTxHash("");
     setCopied(false);
-    setTimedOutTxHash("");
-    setIsTimedOut(false);
     setValidated(true);
 
-    let pendingTimeout = false;
+    // ── Step 1: pre-flight field validation ──────────────────────────────────
+    const validation = validateCreateForm(name, members, roundUSDC, roundDays);
+    if (!validation.ok) {
+      setFieldErrors(validation.errors);
+      focusFirstError(validation.errors);
+      return; // never reach wallet
+    }
+    setFieldErrors({});
 
+    const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
+
+    // ── Step 2: wallet check ──────────────────────────────────────────────────
+    let walletAddress: string | null;
     try {
-      // Step 1: pre-flight field validation
-      const validation = validateCreateForm(name, memberValues, roundUSDC, roundDays);
-      if (!validation.ok) {
-        setFieldErrors(validation.errors);
-        focusFirstError(validation.errors);
-        return;
+      walletAddress = await getWalletAddress();
+    } catch (err) {
+      if (err instanceof WalletError && err.reason === "not_installed") {
+        setSubmitError(
+          "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
+        );
+      } else {
+        setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
       }
       setFieldErrors({});
 
       const { name: circleName, validMembers, amountStroops, roundDays: days } =
         validation.values;
 
-      // Step 2: wallet check
-      let walletAddress: string | null;
-      try {
-        walletAddress = await getWalletAddress();
-      } catch (err) {
-        if (err instanceof WalletError && err.reason === "not_installed") {
-          setSubmitError(
-            "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
-          );
-        } else {
-          setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
-        }
-        return;
-      }
-      if (!walletAddress) {
-        setSubmitError("Connect your Freighter wallet first.");
-        return;
-      }
+    // Check that the creator is not also a member (self-address check)
+    const creatorLower = walletAddress.toLowerCase();
+    const isSelfMember = validMembers.some((m) => m.toLowerCase() === creatorLower);
+    if (isSelfMember) {
+      setError(
+        "Your wallet address cannot be included in the member list. " +
+          "The circle creator is automatically a member.",
+      );
+      return;
+    }
+
+    const duplicate = findDuplicateAddress(validMembers);
+    if (duplicate) {
+      setError(
+        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
+      );
+      return;
+    }
 
       // Step 3: factory address guard
       if (!CIRCLE_FACTORY_ADDRESS) {
@@ -520,92 +392,82 @@ export default function CreateClient() {
         return;
       }
 
-      // Step 4: submit
-      setLoading(true);
-      try {
-        const membersVec = xdr.ScVal.scvVec(
-          validMembers.map((m) => new Address(m).toScVal()),
-        );
+    const amount = parseFloat(roundUSDC);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Enter a valid round amount greater than zero.");
+      return;
+    }
+    if (amount > MAX_ROUND_USDC) {
+      setError(
+        `Round amount of $${amount.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`,
+      );
+      return;
+    }
 
-        const result = await invokeContract(
-          CIRCLE_FACTORY_ADDRESS,
-          "create_circle",
-          [
-            new Address(walletAddress).toScVal(),
-            nativeToScVal(circleName, { type: "string" }),
-            membersVec,
-            nativeToScVal(amountStroops, { type: "i128" }),
-            nativeToScVal(daysToLedgers(days), { type: "u32" }),
-          ],
-          walletAddress,
-        );
+    const days = parseInt(roundDays, 10);
+    if (isNaN(days) || days < 1) {
+      setError("Enter a valid round duration of at least 1 day.");
+      return;
+    }
+    if (days > MAX_ROUND_DAYS) {
+      setError(`Round duration cannot exceed ${MAX_ROUND_DAYS} days.`);
+      return;
+    }
 
-        if (result.success) {
-          setTxHash(result.txHash ?? "");
-          setTimeout(() => router.push("/"), 5000);
-          return;
-        }
+    // ── Step 3: factory address guard ─────────────────────────────────────────
+    if (!CIRCLE_FACTORY_ADDRESS) {
+      setSubmitError("Factory contract not configured. Deploy contracts first.");
+      return;
+    }
 
-        const errorCode = result.typedError?.code;
+    // ── Step 4: submit ────────────────────────────────────────────────────────
+    setLoading(true);
+    try {
+      const membersVec = xdr.ScVal.scvVec(
+        validMembers.map((m) => new Address(m).toScVal()),
+      );
 
-        if (errorCode === "NETWORK_TIMEOUT" && result.txHash) {
-          pendingTimeout = true;
-          setTimedOutTxHash(result.txHash);
-          setIsTimedOut(true);
-          return;
-        }
+      const result = await invokeContract(
+        CIRCLE_FACTORY_ADDRESS,
+        "create_circle",
+        [
+          new Address(walletAddress).toScVal(),
+          nativeToScVal(circleName, { type: "string" }),
+          membersVec,
+          nativeToScVal(amountStroops, { type: "i128" }),
+          nativeToScVal(daysToLedgers(days), { type: "u32" }),
+        ],
+        walletAddress,
+      );
 
-        if (errorCode === "WALLET_REJECTED" || result.typedError?.kind === "wallet") {
-          setSubmitError(
-            result.typedError?.message ||
-            "Transaction cancelled. You can try again when ready.",
-          );
-          return;
-        }
-
-        setSubmitError(
-          result.typedError?.message || result.error || "Transaction failed.",
-        );
-      } finally {
-        setLoading(false);
+      if (!result.success) {
+        setSubmitError(result.typedError?.message || result.error || "Transaction failed.");
+        return;
       }
+
+      setTxHash(result.txHash ?? "");
+      setTimeout(() => router.push("/"), 5000);
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
+      // Release the lock on every path except confirmed timeout, where the user
+      // must explicitly acknowledge via resetAfterTimeout() before retrying.
       if (!pendingTimeout) {
         submittingRef.current = false;
       }
     }
   }
 
-  // ── Timeout reset ───────────────────────────────────────────────────────────
-  function resetAfterTimeout() {
-    setTimedOutTxHash("");
-    setIsTimedOut(false);
-    setSubmitError("");
-    submittingRef.current = false;
-  }
-
-  const timedOutExplorerUrl = timedOutTxHash
-    ? getExplorerLink(ACTIVE_NETWORK, "tx", timedOutTxHash)
-    : null;
-
   const explorerTxUrl = txHash
     ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash)
     : null;
 
-  const submitBlocked = loading || !!txHash || isTimedOut;
-
   const submitDescribedBy = [
     submitError ? submitErrId : null,
     txHash      ? successId   : null,
-    isTimedOut  ? timeoutId   : null,
-  ]
-    .filter(Boolean)
-    .join(" ") || undefined;
+  ].filter(Boolean).join(" ") || undefined;
 
   // ── Render ──────────────────────────────────────────────────────────────────
-
   return (
     <div className="max-w-xl mx-auto px-2 sm:px-0">
       <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
@@ -628,8 +490,7 @@ export default function CreateClient() {
             htmlFor={nameId}
             className="block text-sm font-medium text-slate-700 mb-1"
           >
-            Circle name{" "}
-            <span aria-hidden="true" className="text-red-500">*</span>
+            Circle name <span aria-hidden="true" className="text-red-500">*</span>
           </label>
           <input
             id={nameId}
@@ -637,7 +498,7 @@ export default function CreateClient() {
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            maxLength={MAX_NAME_LENGTH + 1}
+            maxLength={MAX_NAME_LENGTH + 1} // +1 so user can see they've gone over
             placeholder="e.g. Family savings circle"
             className={`w-full border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
               fieldErrors.name ? "border-red-400 focus:ring-red-400" : "border-slate-300"
@@ -680,17 +541,14 @@ export default function CreateClient() {
               aria-describedby={[
                 amountHintId,
                 fieldErrors.amount ? `${amountId}-err` : null,
-              ]
-                .filter(Boolean)
-                .join(" ")}
+              ].filter(Boolean).join(" ")}
               aria-label="Contribution amount in USDC"
             />
             <span className="text-slate-500 text-sm shrink-0">USDC</span>
           </div>
           <p id={amountHintId} className="text-xs text-slate-400 mt-1">
             Pot per round = ${roundUSDC || "0"} ×{" "}
-            {filledCount > 0 ? filledCount : "…"} members ={" "}
-            ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
+            {filledCount > 0 ? filledCount : "…"} members = ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
           </p>
           <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
         </div>
@@ -730,9 +588,7 @@ export default function CreateClient() {
             <legend className="text-sm font-medium text-slate-700">
               Members (Stellar addresses){" "}
               <span aria-hidden="true" className="text-red-500">*</span>{" "}
-              <span className="font-normal text-slate-500">
-                — payout order top&nbsp;→&nbsp;bottom
-              </span>
+              <span className="font-normal text-slate-500">— payout order top → bottom</span>
             </legend>
             <span
               className={`text-xs font-medium ${
@@ -745,140 +601,52 @@ export default function CreateClient() {
             </span>
           </div>
 
-          <div
-            className="space-y-2"
-            aria-describedby={membersHintId}
-            role="list"
-            aria-label="Member list — payout rotation order"
-          >
-            {members.map((row, i) => {
-              const fieldErr  = fieldErrors.members?.[i];
-              // IDs are derived from the stable row id — not the array index —
-              // so they remain correct when rows move.
-              const inputId   = `input-${row.id}`;
-              const errId     = `err-${row.id}`;
-              const isFirst   = i === 0;
-              const isLast    = i === members.length - 1;
-              const atMin     = members.length <= MIN_MEMBERS;
-              const position  = i + 1;
-              const total     = members.length;
-
+          <div className="space-y-2" aria-describedby={membersHintId}>
+            {members.map((m, i) => {
+              const fieldErr = fieldErrors.members?.[i];
+              const inputId  = `member-${i}`;
+              const errId    = `member-${i}-err`;
               return (
-                <div
-                  key={row.id}
-                  role="listitem"
-                  className="flex flex-col gap-1"
-                >
-                  <div className="flex items-center gap-1.5">
-                    {/* ── Position label ────────────────────────────────── */}
+                <div key={i}>
+                  <div className="flex items-center gap-2">
                     <span
-                      className="text-xs text-slate-400 w-5 shrink-0 text-right tabular-nums"
+                      className="text-xs text-slate-400 w-5 shrink-0 text-right"
                       aria-hidden="true"
                     >
-                      {position}.
+                      {i + 1}.
                     </span>
-
-                    {/* ── Address input ─────────────────────────────────── */}
                     <input
                       id={inputId}
-                      ref={(el) => {
-                        memberInputRefs.current.set(row.id, el);
-                      }}
+                      ref={(el) => { memberRefs.current[i] = el; }}
                       type="text"
-                      placeholder={`G… (member ${position})`}
-                      value={row.value}
-                      onChange={(e) => updateMember(row.id, e.target.value)}
+                      placeholder={`G… (member ${i + 1})`}
+                      value={m}
+                      onChange={(e) => updateMember(i, e.target.value)}
                       className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
-                        fieldErr
-                          ? "border-red-400 focus:ring-red-400"
-                          : "border-slate-300"
+                        fieldErr ? "border-red-400 focus:ring-red-400" : "border-slate-300"
                       }`}
-                      aria-label={`Member ${position} of ${total} — Stellar address (payout position ${position})`}
+                      aria-label={`Member ${i + 1} Stellar address`}
                       aria-invalid={fieldErr ? "true" : undefined}
                       aria-describedby={fieldErr ? errId : undefined}
                       autoComplete="off"
                       spellCheck={false}
                     />
-
-                    {/* ── Reorder buttons ───────────────────────────────── */}
-                    <div
-                      className="flex flex-col shrink-0"
-                      aria-label={`Reorder member ${position}`}
-                    >
+                    {members.length > MIN_MEMBERS && (
                       <button
                         type="button"
-                        onClick={() => moveMember(i, i - 1)}
-                        disabled={isFirst}
-                        className="p-0.5 text-slate-400 hover:text-slate-700 disabled:opacity-20 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-brand-400 rounded"
-                        aria-label={`Move member ${position} up`}
-                        title="Move up"
+                        onClick={() => removeMember(i)}
+                        className="p-2 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
+                        aria-label={`Remove member ${i + 1}`}
                       >
-                        <svg
-                          aria-hidden="true"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 14 14"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <polyline points="2,9 7,4 12,9" />
-                        </svg>
+                        <span aria-hidden="true">×</span>
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => moveMember(i, i + 1)}
-                        disabled={isLast}
-                        className="p-0.5 text-slate-400 hover:text-slate-700 disabled:opacity-20 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-brand-400 rounded"
-                        aria-label={`Move member ${position} down`}
-                        title="Move down"
-                      >
-                        <svg
-                          aria-hidden="true"
-                          width="14"
-                          height="14"
-                          viewBox="0 0 14 14"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <polyline points="2,5 7,10 12,5" />
-                        </svg>
-                      </button>
-                    </div>
-
-                    {/* ── Remove button ─────────────────────────────────── */}
-                    <button
-                      type="button"
-                      onClick={() => removeMember(row.id)}
-                      disabled={atMin}
-                      className="p-2 -m-1 text-slate-400 hover:text-red-500 disabled:opacity-20 disabled:cursor-not-allowed text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center focus:outline-none focus:ring-2 focus:ring-red-400 rounded"
-                      aria-label={
-                        atMin
-                          ? `Cannot remove — a circle requires at least ${MIN_MEMBERS} members`
-                          : `Remove member ${position}`
-                      }
-                      aria-disabled={atMin}
-                      title={
-                        atMin
-                          ? `Minimum ${MIN_MEMBERS} members required`
-                          : `Remove member ${position}`
-                      }
-                    >
-                      <span aria-hidden="true">×</span>
-                    </button>
+                    )}
                   </div>
-
-                  {/* ── Per-field error ──────────────────────────────────── */}
                   {fieldErr && (
                     <p
                       id={errId}
                       role="alert"
-                      className="mt-0.5 ml-7 text-xs text-red-600 flex items-center gap-1"
+                      className="mt-1 ml-7 text-xs text-red-600 flex items-center gap-1"
                     >
                       <span aria-hidden="true">⚠</span> {fieldErr}
                     </p>
@@ -909,19 +677,14 @@ export default function CreateClient() {
               + Add member
             </button>
             {members.length >= MAX_MEMBERS && (
-              <span
-                className="text-xs text-amber-600"
-                role="status"
-                aria-live="polite"
-              >
+              <span className="text-xs text-amber-600" role="status" aria-live="polite">
                 Maximum of {MAX_MEMBERS} members reached.
               </span>
             )}
           </div>
 
           <p id={membersHintId} className="text-xs text-slate-400 mt-1">
-            Minimum {MIN_MEMBERS} · maximum {MAX_MEMBERS} members. Use the arrows
-            to set payout rotation order.
+            Minimum {MIN_MEMBERS} · maximum {MAX_MEMBERS} members. At least {MIN_MEMBERS} addresses required.
           </p>
         </fieldset>
 
@@ -931,102 +694,19 @@ export default function CreateClient() {
           aria-label="Circle summary"
         >
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
-          <ul
-            className="space-y-0.5 text-slate-600"
-            aria-live="polite"
-            aria-atomic="true"
-          >
-            {name.trim() && <li>📛 {name.trim()}</li>}
-            <li>
-              👥 {filledCount} member{filledCount !== 1 ? "s" : ""}
-            </li>
+          <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
+            {name.trim() && (
+              <li>📛 {name.trim()}</li>
+            )}
+            <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
             <li>💰 ${roundUSDC} USDC / member / round</li>
-            <li>
-              🎯 Pot per round: $
-              {potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
-            </li>
+            <li>🎯 Pot per round: ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}</li>
             <li>📅 Round duration: {roundDays} days</li>
             <li>
               🔒 Collateral required: ${roundUSDC} per member (1× round amount)
             </li>
           </ul>
         </div>
-
-        {/* ── Timeout reconciliation panel ──────────────────────────────────── */}
-        {isTimedOut && timedOutTxHash && (
-          <div
-            id={timeoutId}
-            ref={timeoutRef}
-            role="alert"
-            tabIndex={-1}
-            className="bg-amber-50 border border-amber-300 rounded-lg p-4 text-sm text-amber-800 space-y-3 focus:outline-none focus:ring-2 focus:ring-amber-400"
-          >
-            <p className="font-semibold flex items-center gap-1.5">
-              <span aria-hidden="true">⏱️</span> Transaction submitted —
-              confirmation timed out
-            </p>
-            <p className="text-amber-700">
-              Your transaction was sent to the network but we stopped waiting for
-              confirmation after the timeout window. It may still confirm — check
-              the explorer before retrying to avoid creating a duplicate circle.
-            </p>
-            <div>
-              <p className="text-xs font-medium text-amber-700 mb-1">
-                Transaction hash
-              </p>
-              <div className="flex items-center gap-2 bg-white border border-amber-200 rounded-lg px-3 py-2">
-                <span className="font-mono text-xs text-slate-700 flex-1 break-all select-all min-w-0">
-                  {timedOutTxHash}
-                </span>
-                <button
-                  type="button"
-                  onClick={copyTxHash}
-                  className="text-amber-700 hover:text-amber-900 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={
-                    copied ? "Transaction hash copied" : "Copy transaction hash"
-                  }
-                  aria-pressed={copied}
-                >
-                  {copied ? "✓ Copied" : "Copy"}
-                </button>
-              </div>
-            </div>
-            {timedOutExplorerUrl && (
-              <a
-                href={timedOutExplorerUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 underline hover:text-amber-900"
-              >
-                Check on Stellar Expert ↗
-              </a>
-            )}
-            <div className="border-t border-amber-200 pt-3 space-y-2">
-              <p className="text-xs text-amber-700 font-medium">
-                What would you like to do?
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {timedOutExplorerUrl && (
-                  <a
-                    href={timedOutExplorerUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="px-3 py-2 text-xs font-medium rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors"
-                  >
-                    Check explorer first ↗
-                  </a>
-                )}
-                <button
-                  type="button"
-                  onClick={resetAfterTimeout}
-                  className="px-3 py-2 text-xs font-medium rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors"
-                >
-                  I&apos;ve checked — it did not confirm, let me retry
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* ── Submit-level error ────────────────────────────────────────────── */}
         {submitError && (
@@ -1117,8 +797,7 @@ export default function CreateClient() {
 
         {isTimedOut && (
           <p className="text-xs text-center text-amber-700" role="status">
-            Submit is locked until you have checked the explorer and confirmed
-            the original transaction did not go through.
+            Submit is locked until you have checked the explorer and confirmed the original transaction did not go through.
           </p>
         )}
       </form>

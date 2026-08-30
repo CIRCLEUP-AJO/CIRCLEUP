@@ -40,7 +40,6 @@ const STATUS_META: Record<string, StatusMeta> = {
   active: {
     label: "Active",
     description: "Rounds in progress",
-    // brand-800 is not defined in the Tailwind palette; 700 matches ReputationBadge
     chipClasses: "bg-brand-100 text-brand-700",
     dotClasses: "bg-brand-500",
   },
@@ -148,10 +147,22 @@ function safeFormatPot(stroops: string, memberCount: number): string {
 
 // ─── CircleCard ───────────────────────────────────────────────────────────────
 //
+// Responsive constraints:
+//   - The card uses a fixed minimum width on the status chip so status changes
+//     never reflow adjacent content (the chip always occupies the same inline
+//     footprint regardless of label length).
+//   - Long addresses and amounts are truncated with a visible ellipsis instead
+//     of overflowing their containers.  The full value is always available via
+//     the title / aria-label so assistive technology and power users can access
+//     it without truncation.
+//   - The card link receives an explicit focus-visible ring so keyboard users
+//     can tell which card has focus without relying on the browser default.
+//   - The three stats tiles use a fixed grid; they never reflow to two columns
+//     on narrow viewports, keeping the layout stable across status changes.
+//
 // Wrapped in React.memo so parent re-renders (e.g. Suspense boundary settling,
 // context changes) do not re-render every card in the list when their props
-// have not changed. This is most valuable when the list is long or when the
-// parent page re-renders due to router state changes.
+// have not changed.
 
 export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle }) {
   const status = getStatusMeta(circle.status);
@@ -164,7 +175,7 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
 
   // Human-readable label used both by the aria-label on the link and the
   // screen-reader-only heading inside the card, so assistive technology
-  // announces the card's purpose unambiguously. Round progress is only
+  // announces the card's purpose unambiguously.  Round progress is only
   // included when total_rounds is valid — a malformed row must not produce
   // "round 0 of 0" in the announcement.
   const cardLabel =
@@ -175,50 +186,80 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
   return (
     <Link
       href={`/circles/${circle.address}`}
-      className="block group"
+      className={clsx(
+        "block group",
+        // Explicit keyboard focus ring: visible on focus-visible so keyboard
+        // users always know which card is focused.  rounded-xl matches the
+        // inner card border-radius so the ring hugs the card outline.
+        "rounded-xl",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2",
+      )}
       aria-label={cardLabel}
     >
-      <div className="bg-white rounded-xl border border-slate-200 p-5 hover:border-brand-400 hover:shadow-md transition-all">
+      <div className="bg-white rounded-xl border border-slate-200 p-5 hover:border-brand-400 hover:shadow-md transition-all h-full">
         {/* Header */}
-        <div className="flex items-start justify-between mb-3">
-          <div>
-            <p className="font-mono text-xs text-slate-500">
+        <div className="flex items-start justify-between gap-3 mb-3">
+          {/* Left: address + amount — truncated on narrow viewports */}
+          <div className="min-w-0 flex-1">
+            <p className="font-mono text-xs text-slate-500 truncate" title={circle.address}>
               {shortAddress(circle.address)}
             </p>
-            {/* safeFormatUsdc → always 2 dp, e.g. "$10.00 / round" */}
-            <p className="text-lg font-semibold text-slate-800 mt-0.5">
+            {/*
+              max-w-[16ch] keeps amounts from pushing the status chip off-screen
+              on very narrow cards (e.g. a 2-column grid at 320 px).
+              truncate + title ensures the full value is still discoverable.
+            */}
+            <p
+              className="text-lg font-semibold text-slate-800 mt-0.5 truncate"
+              title={`$${safeFormatUsdc(circle.round_amount)} per round`}
+            >
               ${safeFormatUsdc(circle.round_amount)} / round
             </p>
           </div>
-          {/* `title` supplies the sighted tooltip, but it also wins the
-              accessible-name computation, which would make the chip announce
-              only its description ("Rounds in progress") and drop the status
-              itself. An explicit aria-label keeps both, in a fixed order. */}
+
+          {/*
+            Status chip: fixed min-width so the chip footprint never changes
+            when the status label changes between Pending / Active / Completed /
+            Cancelled.  Without min-width, a status change from "Active" to
+            "Cancelled" (a wider label) would widen the chip and shift the
+            amount text on the left, producing a jarring layout jump.
+
+            `title` supplies the sighted tooltip.  An explicit aria-label keeps
+            the accessible name unambiguous: it includes both the status label
+            and its description so screen readers announce both in one phrase.
+          */}
           <span
             className={clsx(
-              "inline-flex items-center gap-1.5 whitespace-nowrap text-xs font-medium px-2 py-1 rounded-full",
+              "inline-flex items-center gap-1.5 text-xs font-medium px-2 py-1 rounded-full",
+              "whitespace-nowrap flex-shrink-0",
+              // min-w-[6rem] is wide enough for "Cancelled" (the longest label)
+              // so all four status chips occupy the same block width.
+              "min-w-[6rem] justify-center",
               status.chipClasses,
             )}
             title={status.description}
             aria-label={`Status: ${status.label}. ${status.description}`}
           >
             <span
-              className={clsx("h-1.5 w-1.5 rounded-full", status.dotClasses)}
+              className={clsx("h-1.5 w-1.5 rounded-full flex-shrink-0", status.dotClasses)}
               aria-hidden="true"
             />
             {status.label}
           </span>
         </div>
 
-        {/* Stats */}
+        {/* Stats — fixed 3-column grid; never reflows */}
         <div className="grid grid-cols-3 gap-2 text-center text-xs mb-3">
           <div className="bg-slate-50 rounded-lg py-2">
             <p className="font-semibold text-slate-800">{circle.member_count}</p>
             <p className="text-slate-500">members</p>
           </div>
           <div className="bg-slate-50 rounded-lg py-2">
-            {/* "2/10" is announced as "two slash ten" — replace it with a
-                spoken-friendly equivalent for assistive technology. */}
+            {/*
+              "2/10" reads as "two slash ten" to screen readers which is
+              confusing.  A visually-hidden span spells it out as a full phrase,
+              and the visible slash notation is hidden from the a11y tree.
+            */}
             <p className="font-semibold text-slate-800">
               <span aria-hidden="true">
                 {currentRound}/{totalRounds}
@@ -234,8 +275,15 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
             </p>
           </div>
           <div className="bg-slate-50 rounded-lg py-2">
-            {/* safeFormatPot → pot = round_amount × member_count, 2 dp */}
-            <p className="font-semibold text-slate-800">
+            {/*
+              Pot amount may be large (e.g. "$10,000.00"); truncate with a
+              title tooltip rather than overflowing or wrapping, which would
+              break the fixed grid height.
+            */}
+            <p
+              className="font-semibold text-slate-800 truncate px-1"
+              title={`$${safeFormatPot(circle.round_amount, circle.member_count)} total pot`}
+            >
               ${safeFormatPot(circle.round_amount, circle.member_count)}
             </p>
             <p className="text-slate-500">pot</p>
@@ -259,7 +307,7 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
           </div>
         )}
 
-        <p className="text-xs text-slate-400 mt-2">
+        <p className="text-xs text-slate-400 mt-2 truncate" title={`Created by ${circle.creator}`}>
           by {shortAddress(circle.creator)}
         </p>
       </div>

@@ -128,8 +128,19 @@ function describeRpcError(err: unknown): string {
 }
 
 /**
- * Run an RPC call with exponential backoff on transient failures.
+ * Compute a jittered delay for exponential backoff.
+ * Full jitter: random value in [0, delayMs] to spread load across instances.
+ * Exported for unit tests.
+ */
+export function computeJitteredDelay(delayMs: number): number {
+  return Math.floor(Math.random() * delayMs);
+}
+
+/**
+ * Run an RPC call with capped exponential backoff + jitter on transient failures.
  * Non-transient errors (malformed request, auth, etc.) fail immediately.
+ * The delay between retries uses full jitter: a random value in [0, baseDelay * 2^(attempt-1)]
+ * to prevent thundering-herd effects when multiple indexers recover simultaneously.
  * Exported for unit tests.
  */
 export async function withRpcRetry<T>(
@@ -159,7 +170,8 @@ export async function withRpcRetry<T>(
       if (!transient || attempt === attempts) {
         break;
       }
-      const delayMs = baseDelayMs * 2 ** (attempt - 1);
+      const baseDelay = baseDelayMs * 2 ** (attempt - 1);
+      const delayMs = computeJitteredDelay(baseDelay);
       console.warn(
         `[indexer] Transient RPC failure during ${label} ` +
           `(attempt ${attempt}/${attempts}): ${describeRpcError(err)} ` +
@@ -296,13 +308,10 @@ export function detectLedgerGaps(
 /**
  * Ingest one event inside the caller's open transaction.
  *
- * Checks ingested_events for the event_key; if already present, returns false
- * without running the handler (idempotent replay path).  Otherwise records
- * the key and runs handleEvent inside the same transaction.
- *
- * Issue 28: Now includes event_index in the insert for canonical identity-based
- * deduplication. The unique constraint on (ledger, tx_hash, event_index) makes
- * duplicate delivery a silent no-op at the database layer.
+ * Uses INSERT ... ON CONFLICT DO NOTHING to atomically check for duplicates.
+ * If the insert affects 0 rows the event was already recorded (idempotent replay).
+ * The unique constraint on (event_key) and the database-level constraint on
+ * (ledger, tx_hash, event_index) make duplicate delivery a silent no-op.
  *
  * Callers should wrap this in a SAVEPOINT so a throwing handler rolls back
  * only that event's writes and not the entire ledger batch.
@@ -315,23 +324,20 @@ export async function ingestEventInTx(
   const eventKey = createEventKey(event);
   const eventIndex = parseEventIndex(event);
 
-  const existing = await client.query<{ event_key: string }>(
-    "SELECT event_key FROM ingested_events WHERE event_key = $1",
-    [eventKey],
-  );
-  if (existing.rows.length > 0) return false;
-
   const contractId = getContractIdStr(event) ?? "";
   const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
   const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
   const eventType = topic0 && topic1 ? `${topic0}:${topic1}` : topic0;
 
-  await client.query(
+  const result = await client.query(
     `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type, event_index)
      VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (event_key) DO NOTHING`,
     [eventKey, contractId, event.ledger, event.txHash, eventType, eventIndex],
   );
+
+  // If 0 rows were inserted the event was already ingested — skip the handler
+  if (result.rowCount === 0) return false;
 
   await handleEvent(client);
   return true;
@@ -630,6 +636,10 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
 
 let totalEventsProcessed = 0;
 let totalEventsFailed = 0;
+let pollCyclesCompleted = 0;
+let pollCyclesFailed = 0;
+let lastPollDurationMs = 0;
+let lastPollLedgerRange = "";
 
 interface EventLogContext {
   contractId: string | null;
@@ -896,6 +906,7 @@ const backoffState = createBackoffState();
  * after any successful poll.
  */
 async function runPollCycle(): Promise<void> {
+  const cycleStartedAt = Date.now();
   let lastLedger = await getLastLedger();
   if (lastLedger === 0) lastLedger = START_LEDGER;
 
@@ -908,6 +919,10 @@ async function runPollCycle(): Promise<void> {
   
   // Success — reset backoff so the next failure starts from the initial interval
   resetBackoff(backoffState);
+  
+  pollCyclesCompleted++;
+  lastPollDurationMs = Date.now() - cycleStartedAt;
+  lastPollLedgerRange = `${lastLedger + 1}-${toLedger}`;
 }
 
 // ─── Poller lifecycle (graceful shutdown) ─────────────────────────────────────
@@ -942,6 +957,7 @@ export async function startIndexer() {
         await runPollCycle();
       } catch (err) {
         incrementBackoff(backoffState);
+        pollCyclesFailed++;
         
         if (shouldWarnBackoff(backoffState)) {
           console.warn(
@@ -1011,5 +1027,14 @@ export function isIndexerRunning(): boolean {
 }
 
 export function getIndexerMetrics() {
-  return { totalEventsProcessed, totalEventsFailed };
+  return {
+    totalEventsProcessed,
+    totalEventsFailed,
+    pollCyclesCompleted,
+    pollCyclesFailed,
+    lastPollDurationMs,
+    lastPollLedgerRange,
+    backoffConsecutiveFailures: backoffState.consecutiveFailures,
+    backoffCurrentIntervalMs: backoffState.currentIntervalMs,
+  };
 }

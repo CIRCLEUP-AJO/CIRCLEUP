@@ -1217,13 +1217,28 @@ impl CircleContract {
     ///
     /// # Preconditions
     ///
+    /// - Circle must not be paused (`assert_not_paused` fires just like every
+    ///   other fund-moving entry-point).
     /// - Circle must be `Active`.
     /// - The round must **not** already be paid out.
     /// - The round deadline must have **strictly** passed
     ///   (`current_ledger > deadline_ledger`).
-    /// - At least one member must have contributed (an all-default round with
-    ///   zero contributions produces a zero pot; the contract still settles and
-    ///   advances but emits `pot = 0`).
+    /// - Not all members may have contributed — if they have, use `payout` instead.
+    ///   An all-contributed round passed through `settle_round` would be a logic
+    ///   error (the normal path is unblocked); the guard makes the mistake explicit.
+    ///
+    /// # Zero-pot case
+    ///
+    /// An all-default round (zero contributions, zero pot) is valid — the transfer
+    /// is skipped to avoid a no-op call to the token contract, but the circle still
+    /// settles and advances.  The `exceptional_settlement` event emits `pot = 0`
+    /// so indexers can identify the round without inferring it from missing transfers.
+    ///
+    /// # Event consistency
+    ///
+    /// All events emitted by `settle_round` include `circle_address` as their first
+    /// data field, matching the event shape of the `payout` path.  Indexers and
+    /// front-ends can use a single listener pattern for both settlement paths.
     ///
     /// # Acceptance criteria mapping
     ///
@@ -1234,9 +1249,16 @@ impl CircleContract {
     ///   partial pot; defaulting members forfeit 20 % of collateral.
     /// - Indexer consumers can identify exceptional settlement: the
     ///   `exceptional_settlement` event is emitted only by this code path.
+    /// - Pausing the circle blocks `settle_round` just like every other
+    ///   fund-moving operation — operators can halt settlement mid-lifecycle.
     ///
     /// Anyone may call this.
     pub fn settle_round(env: Env) {
+        // settle_round is a fund-moving operation (it may transfer a partial pot
+        // and applies collateral penalties).  It must respect the pause flag just
+        // like payout, mark_default, contribute, join, and close.
+        Self::assert_not_paused(&env);
+
         let config: CircleConfig = env
             .storage()
             .instance()
@@ -1353,9 +1375,12 @@ impl CircleContract {
 
         // Emit the exceptional_settlement event BEFORE the payout event so
         // indexers can distinguish this path from a normal full-contribution payout.
-        // Payload: (recipient, pot, round_index, defaulted_count)
-        // where defaulted_count = total members who did NOT contribute this round
-        // (including those already flagged via earlier mark_default calls).
+        // Payload: (circle_address, recipient, pot, round_index, defaulted_count)
+        //   circle_address  — identifies this circle in multi-circle indexer queries
+        //                     (mirrors the payout event shape so consumers need only
+        //                     one event-listener pattern for both settlement paths)
+        //   defaulted_count — total members who did NOT contribute this round
+        //                     (including those already flagged via earlier mark_default calls)
         let total_defaulted = member_count - contributed_count;
         env.events().publish(
             (
@@ -1363,6 +1388,7 @@ impl CircleContract {
                 Symbol::new(&env, "exceptional_settlement"),
             ),
             (
+                env.current_contract_address(),
                 round.recipient.clone(),
                 pot,
                 round.round_index,
@@ -1394,9 +1420,11 @@ impl CircleContract {
             .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
 
         // Emit the standard payout event (consistent with normal payout path).
+        // Includes circle_address so indexers can use a single listener pattern
+        // for both full-contribution payout and exceptional settlement.
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
-            (round.recipient.clone(), pot, round.round_index),
+            (env.current_contract_address(), round.recipient.clone(), pot, round.round_index),
         );
 
         // Advance to next round or mark the circle as completed.
@@ -1405,9 +1433,11 @@ impl CircleContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Status, &CircleStatus::Completed);
+            // Event: circle/completed — mirrors the payout path event shape.
+            // Data: (circle_address, rounds_completed)
             env.events().publish(
                 (Symbol::new(&env, "circle"), Symbol::new(&env, "completed")),
-                (),
+                (env.current_contract_address(), member_count),
             );
         } else {
             let next_recipient = config
@@ -1426,7 +1456,7 @@ impl CircleContract {
 
             env.events().publish(
                 (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
-                (next_round_index, next_recipient, next_round.deadline_ledger),
+                (env.current_contract_address(), next_round_index, next_recipient, next_round.deadline_ledger),
             );
         }
     }
