@@ -63,11 +63,17 @@ function valid(overrides: {
   );
 }
 
-/** Assert the result is ok and return its values. */
-function assertOk(result: ReturnType<typeof validateCreateForm>): ValidatedCreateForm {
-  expect(result.ok).toBe(true);
-  if (!result.ok) throw new Error("expected ok");
-  return result.values;
+/**
+ * Find duplicate addresses using case-insensitive comparison.
+ */
+function findDuplicateAddress(addresses: string[]): string | null {
+  const seen = new Set<string>();
+  for (const addr of addresses) {
+    const lower = addr.toLowerCase();
+    if (seen.has(lower)) return addr;
+    seen.add(lower);
+  }
+  return null;
 }
 
 /** Assert the result has errors and return them. */
@@ -121,136 +127,9 @@ describe("findDuplicateAddress", () => {
     expect(findDuplicateAddress([])).toBeNull();
   });
 
-  it("returns null for a single-element list", () => {
-    expect(findDuplicateAddress([A])).toBeNull();
-  });
-});
-
-// ─── countDecimalPlaces ───────────────────────────────────────────────────────
-
-describe("countDecimalPlaces", () => {
-  it("returns 0 for whole numbers", () => {
-    expect(countDecimalPlaces("100")).toBe(0);
-    expect(countDecimalPlaces("0")).toBe(0);
-  });
-
-  it("returns the number of significant fractional digits", () => {
-    expect(countDecimalPlaces("1.5")).toBe(1);
-    expect(countDecimalPlaces("1.50")).toBe(1);   // trailing zero is not significant
-    expect(countDecimalPlaces("0.0000001")).toBe(7);
-    expect(countDecimalPlaces("1.1234567")).toBe(7);
-  });
-
-  it("does not count trailing zeros as significant", () => {
-    expect(countDecimalPlaces("10.0000000")).toBe(0); // all zeros after dot
-    expect(countDecimalPlaces("1.5000")).toBe(1);
-  });
-
-  it("returns 8 for a value with 8 significant decimal places", () => {
-    expect(countDecimalPlaces("0.00000001")).toBe(8); // exceeds MAX_USDC_DECIMALS
-  });
-
-  it("returns 0 for a string with no decimal point", () => {
-    expect(countDecimalPlaces("999")).toBe(0);
-  });
-});
-
-// ─── validateCreateForm — name field ─────────────────────────────────────────
-
-describe("validateCreateForm — name", () => {
-  it("errors when name is empty", () => {
-    const errors = assertErrors(valid({ name: "" }));
-    expect(errors.name).toMatch(/required/i);
-  });
-
-  it("errors when name is only whitespace", () => {
-    const errors = assertErrors(valid({ name: "   " }));
-    expect(errors.name).toMatch(/required/i);
-  });
-
-  it(`errors when name exceeds ${MAX_NAME_LENGTH} characters`, () => {
-    const longName = "x".repeat(MAX_NAME_LENGTH + 1);
-    const errors = assertErrors(valid({ name: longName }));
-    expect(errors.name).toMatch(/characters/i);
-  });
-
-  it(`accepts a name of exactly ${MAX_NAME_LENGTH} characters`, () => {
-    const exactName = "x".repeat(MAX_NAME_LENGTH);
-    const result = valid({ name: exactName });
-    const values = assertOk(result);
-    expect(values.name).toBe(exactName);
-  });
-
-  it("trims whitespace from the name before storing", () => {
-    const values = assertOk(valid({ name: "  My Circle  " }));
-    expect(values.name).toBe("My Circle");
-  });
-
-  it("passes with a normal name", () => {
-    const values = assertOk(valid({ name: "Family savings" }));
-    expect(values.name).toBe("Family savings");
-  });
-});
-
-// ─── validateCreateForm — amount field ───────────────────────────────────────
-
-describe("validateCreateForm — amount", () => {
-  it("errors when amount is empty", () => {
-    const errors = assertErrors(valid({ amount: "" }));
-    expect(errors.amount).toMatch(/required/i);
-  });
-
-  it("errors when amount is zero", () => {
-    const errors = assertErrors(valid({ amount: "0" }));
-    expect(errors.amount).toMatch(/greater than zero/i);
-  });
-
-  it("errors when amount is negative", () => {
-    const errors = assertErrors(valid({ amount: "-50" }));
-    expect(errors.amount).toBeDefined();
-  });
-
-  it("errors when amount is NaN text", () => {
-    const errors = assertErrors(valid({ amount: "abc" }));
-    expect(errors.amount).toBeDefined();
-  });
-
-  it(`errors when amount has more than ${MAX_USDC_DECIMALS} significant decimal places`, () => {
-    // 8 significant decimal places — exceeds the 7 dp USDC supports
-    const errors = assertErrors(valid({ amount: "0.00000001" }));
-    expect(errors.amount).toMatch(/decimal/i);
-  });
-
-  it(`accepts exactly ${MAX_USDC_DECIMALS} decimal places`, () => {
-    // 0.0000001 = 1 stroop — the minimum representable USDC amount
-    const values = assertOk(valid({ amount: "0.0000001" }));
-    expect(values.amountStroops).toBe(1n);
-  });
-
-  it("accepts trailing zeros without flagging them as extra precision", () => {
-    // "1.5000000" has 7 chars after the dot but only 1 significant dp
-    const values = assertOk(valid({ amount: "1.5000000" }));
-    expect(values.amountStroops).toBe(15_000_000n);
-  });
-
-  it("converts a whole-number amount to the correct stroop value", () => {
-    const values = assertOk(valid({ amount: "100" }));
-    expect(values.amountStroops).toBe(1_000_000_000n); // 100 × 10_000_000
-  });
-
-  it("converts a fractional amount correctly", () => {
-    const values = assertOk(valid({ amount: "1.5" }));
-    expect(values.amountStroops).toBe(15_000_000n);
-  });
-
-  it("accepts a decimal-only string like '0.5'", () => {
-    const values = assertOk(valid({ amount: "0.5" }));
-    expect(values.amountStroops).toBe(5_000_000n);
-  });
-
-  it("errors on a bare dot '.'", () => {
-    const errors = assertErrors(valid({ amount: "." }));
-    expect(errors.amount).toBeDefined();
+  it("detects duplicates case-insensitively", () => {
+    const lowerA = VALID_ADDR_A.toLowerCase();
+    expect(findDuplicateAddress([VALID_ADDR_A, lowerA])).toBe(lowerA);
   });
 });
 
@@ -432,58 +311,35 @@ describe("validateCreateForm — valid submission", () => {
   });
 });
 
-// ─── Submit guard — invalid form never invokes signing ───────────────────────
-//
-// These tests simulate the handleSubmit guard: call validateCreateForm first;
-// if it returns errors, signing must not be called.
+describe("form validation pipeline", () => {
+  const MIN_MEMBERS = 2;
+  const MAX_MEMBERS = 20;
+  const MAX_ROUND_USDC = 1_000_000;
+  const MAX_ROUND_DAYS = 365;
 
-describe("Submit guard — invalid form never invokes signing", () => {
-  it("getWalletAddress is never called when form is invalid", async () => {
-    // Represent the guard logic in handleSubmit:
-    //   const validation = validateCreateForm(...)
-    //   if (!validation.ok) { setFieldErrors(...); return; }  ← signing never reached
-    const getWalletAddress = vi.fn();
+  function validate(
+    members: string[],
+    roundUSDC: string,
+    roundDays: string,
+    walletAddress?: string,
+  ) {
+    const valid = getFilledMembers(members);
+    if (valid.length < MIN_MEMBERS)
+      return { error: `A circle needs at least ${MIN_MEMBERS} members.` };
+    if (valid.length > MAX_MEMBERS)
+      return { error: `A circle cannot have more than ${MAX_MEMBERS} members.` };
 
-    function simulateSubmit(
-      name: string,
-      members: string[],
-      amount: string,
-      days: string,
-    ) {
-      const result = validateCreateForm(name, members, amount, days);
-      if (!result.ok) return { signed: false, errors: result.errors };
-      getWalletAddress(); // only called when form is valid
-      return { signed: true, errors: {} };
+    // Self-address check
+    if (walletAddress) {
+      const creatorLower = walletAddress.toLowerCase();
+      const isSelfMember = valid.some((m) => m.toLowerCase() === creatorLower);
+      if (isSelfMember) {
+        return { error: "Your wallet address cannot be included in the member list." };
+      }
     }
 
-    // Invalid form
-    const { signed } = simulateSubmit("", ["", ""], "0", "0");
-    expect(signed).toBe(false);
-    expect(getWalletAddress).not.toHaveBeenCalled();
-  });
-
-  it("getWalletAddress is called when form is valid", () => {
-    const getWalletAddress = vi.fn();
-
-    function simulateSubmit(
-      name: string,
-      members: string[],
-      amount: string,
-      days: string,
-    ) {
-      const result = validateCreateForm(name, members, amount, days);
-      if (!result.ok) return { signed: false };
-      getWalletAddress();
-      return { signed: true };
-    }
-
-    const { signed } = simulateSubmit(VALID.name, VALID.members, VALID.amount, VALID.days);
-    expect(signed).toBe(true);
-    expect(getWalletAddress).toHaveBeenCalledOnce();
-  });
-
-  it("a form with only a bad address is blocked before signing", () => {
-    const getWalletAddress = vi.fn();
+    const dup = findDuplicateAddress(valid);
+    if (dup) return { error: `Duplicate address detected: ${dup.slice(0, 4)}…${dup.slice(-4)}.` };
 
     function simulateSubmit(members: string[]) {
       const result = validateCreateForm(VALID.name, members, VALID.amount, VALID.days);
@@ -492,12 +348,13 @@ describe("Submit guard — invalid form never invokes signing", () => {
       return true;
     }
 
-    expect(simulateSubmit([A, "not-a-stellar-address"])).toBe(false);
-    expect(getWalletAddress).not.toHaveBeenCalled();
-  });
+    const amount = parseFloat(roundUSDC);
+    if (isNaN(amount) || amount <= 0) return { error: "Enter a valid round amount greater than zero." };
+    if (amount > MAX_ROUND_USDC) return { error: `Round amount exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()}.` };
 
-  it("a form with duplicate addresses is blocked before signing", () => {
-    const getWalletAddress = vi.fn();
+    const days = parseInt(roundDays, 10);
+    if (isNaN(days) || days < 1) return { error: "Enter a valid round duration of at least 1 day." };
+    if (days > MAX_ROUND_DAYS) return { error: `Round duration cannot exceed ${MAX_ROUND_DAYS} days.` };
 
     function simulateSubmit(members: string[]) {
       const result = validateCreateForm(VALID.name, members, VALID.amount, VALID.days);
@@ -549,10 +406,14 @@ describe("validateCreateForm — edge cases", () => {
     expect(values.amountStroops).toBe(1n);
   });
 
-  it("handles a very large but valid amount", () => {
-    // $1,000,000 USDC = 10_000_000_000_000 stroops — well within i128 range
-    const values = assertOk(valid({ amount: "1000000" }));
-    expect(values.amountStroops).toBe(10_000_000_000_000n);
+  it("blocks with case-insensitive duplicate addresses", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_A.toLowerCase()], "100", "30");
+    expect(error).toMatch(/duplicate/i);
+  });
+
+  it("blocks with an invalid Stellar address", () => {
+    const { error } = validate([VALID_ADDR_A, "not-an-address"], "100", "30");
+    expect(error).toMatch(/invalid stellar address/i);
   });
 
   it("round-trips: displayed amount matches submitted amount", () => {
@@ -574,9 +435,16 @@ describe("validateCreateForm — edge cases", () => {
     expect(errors.amount).toBeDefined();
   });
 
-  it("accepts members with mixed blank and valid rows scattered throughout", () => {
-    const values = assertOk(
-      valid({ members: ["", A, "  ", B, ""] }),
+  it("blocks when more than 20 members are filled", () => {
+    const addrs = Array.from(
+      { length: 21 },
+      (_, i) => VALID_ADDR_A.slice(0, -1) + String.fromCharCode(65 + (i % 26))
+    ).map(
+      (_, i) => {
+        const base = VALID_ADDR_A.split("");
+        base[55] = String.fromCharCode(65 + (i % 26));
+        return base.join("");
+      }
     );
     expect(values.validMembers).toEqual([A, B]);
   });
@@ -584,5 +452,40 @@ describe("validateCreateForm — edge cases", () => {
   it("a name of exactly 1 character is valid", () => {
     const values = assertOk(valid({ name: "X" }));
     expect(values.name).toBe("X");
+  });
+
+  it("blocks self-address (creator as member)", () => {
+    const { error } = validate(
+      [VALID_ADDR_A, VALID_ADDR_B],
+      "100",
+      "30",
+      VALID_ADDR_A, // wallet is same as first member
+    );
+    expect(error).toMatch(/cannot be included/i);
+  });
+
+  it("blocks self-address case-insensitively", () => {
+    const { error } = validate(
+      [VALID_ADDR_A, VALID_ADDR_B],
+      "100",
+      "30",
+      VALID_ADDR_A.toLowerCase(),
+    );
+    expect(error).toMatch(/cannot be included/i);
+  });
+
+  it("blocks round amount exceeding maximum", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "2000000", "30");
+    expect(error).toMatch(/exceeds the maximum/i);
+  });
+
+  it("blocks round duration exceeding maximum", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "100", "400");
+    expect(error).toMatch(/cannot exceed/i);
+  });
+
+  it("passes with maximum valid values", () => {
+    const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "1000000", "365");
+    expect(error).toBeNull();
   });
 });

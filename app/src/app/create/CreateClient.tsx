@@ -16,61 +16,28 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Minimum and maximum number of members allowed by the contract. */
-export const MIN_MEMBERS = 2;
-export const MAX_MEMBERS = 20;
-
-/** Minimum contribution per round — 1 stroop = $0.0000001 USDC. */
-export const MIN_AMOUNT_USDC = 0.0000001;
-
-/** Maximum USDC decimal places supported by the Stellar USDC token (7 dp). */
-export const MAX_USDC_DECIMALS = 7;
-
-/** Maximum round duration in days (≈10 years in ledgers stays within u32). */
-export const MAX_ROUND_DAYS = 3650;
-
-/** Maximum characters in a circle name. */
-export const MAX_NAME_LENGTH = 64;
-
-// ─── Validation types ─────────────────────────────────────────────────────────
-
-/**
- * Per-field error map returned by {@link validateCreateForm}.
- * A field is error-free when its key is absent or the value is `undefined`.
- */
-export interface CreateFormErrors {
-  name?: string;
-  amount?: string;
-  days?: string;
-  /** Index-keyed member errors: errors[i] is the error for members[i]. */
-  members?: (string | undefined)[];
-  /** Cross-field or list-level member errors (duplicate, count). */
-  membersGeneral?: string;
-}
-
-/**
- * Validated, normalised form values ready for contract submission.
- * Only produced when {@link validateCreateForm} returns no errors.
- */
-export interface ValidatedCreateForm {
-  name: string;
-  validMembers: string[];
-  amountStroops: bigint;
-  roundDays: number;
-}
-
-// ─── Pure helpers (exported for testing) ─────────────────────────────────────
+const MIN_MEMBERS = 2;
+const MAX_MEMBERS = 20;
+/** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
+const MAX_ROUND_USDC = 1_000_000;
+/** Maximum round duration in days. */
+const MAX_ROUND_DAYS = 365;
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
   return members.map((m) => m.trim()).filter((m) => m.length > 0);
 }
 
-/** Return the first duplicate address, or null if all are unique. */
-export function findDuplicateAddress(addresses: string[]): string | null {
+/**
+ * Find duplicate addresses using case-insensitive comparison.
+ * Returns the first duplicate found, or null if all are unique.
+ */
+function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
-    if (seen.has(addr)) return addr;
-    seen.add(addr);
+    const lower = addr.toLowerCase();
+    if (seen.has(lower)) return addr;
+    seen.add(lower);
   }
   return null;
 }
@@ -380,7 +347,66 @@ export default function CreateClient() {
       return;
     }
     if (!walletAddress) {
-      setSubmitError("Connect your Freighter wallet first.");
+      setError("Connect your Freighter wallet first.");
+      return;
+    }
+
+    const validMembers = getFilledMembers(members);
+    if (validMembers.length < MIN_MEMBERS) {
+      setError(`A circle needs at least ${MIN_MEMBERS} members.`);
+      return;
+    }
+    if (validMembers.length > MAX_MEMBERS) {
+      setError(`A circle cannot have more than ${MAX_MEMBERS} members.`);
+      return;
+    }
+
+    // Check that the creator is not also a member (self-address check)
+    const creatorLower = walletAddress.toLowerCase();
+    const isSelfMember = validMembers.some((m) => m.toLowerCase() === creatorLower);
+    if (isSelfMember) {
+      setError(
+        "Your wallet address cannot be included in the member list. " +
+          "The circle creator is automatically a member.",
+      );
+      return;
+    }
+
+    const duplicate = findDuplicateAddress(validMembers);
+    if (duplicate) {
+      setError(
+        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
+      );
+      return;
+    }
+
+    const invalidAddr = validMembers.find((m) => !isValidStellarAddress(m));
+    if (invalidAddr) {
+      setError(
+        `Invalid Stellar address: "${shortAddress(invalidAddr)}". Each address must start with G and be 56 characters long.`,
+      );
+      return;
+    }
+
+    const amount = parseFloat(roundUSDC);
+    if (isNaN(amount) || amount <= 0) {
+      setError("Enter a valid round amount greater than zero.");
+      return;
+    }
+    if (amount > MAX_ROUND_USDC) {
+      setError(
+        `Round amount of $${amount.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`,
+      );
+      return;
+    }
+
+    const days = parseInt(roundDays, 10);
+    if (isNaN(days) || days < 1) {
+      setError("Enter a valid round duration of at least 1 day.");
+      return;
+    }
+    if (days > MAX_ROUND_DAYS) {
+      setError(`Round duration cannot exceed ${MAX_ROUND_DAYS} days.`);
       return;
     }
 
