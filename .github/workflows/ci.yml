@@ -49,6 +49,12 @@ jobs:
       - name: Test SDK
         run: npm run test --workspace=sdk
 
+      # Issue #464: Run contract fixture tests as an explicit, named step so a
+      # signature change surfaces as "Contract fixture tests" in the CI summary
+      # rather than disappearing into the general test output.
+      - name: Contract fixture tests (Issue #464)
+        run: npm run test --workspace=sdk -- contractFixtures.test.ts contractFixtures.extended.test.ts --run
+
   # ── Indexer ─────────────────────────────────────────────────────────────────
   indexer:
     name: Indexer
