@@ -4,6 +4,7 @@ import type { Metadata } from "next";
 import { INDEXER_URL } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
+import { RetryableCirclesList } from "@/components/RetryableCirclesList";
 
 export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
@@ -194,12 +195,29 @@ function CircleListSkeleton() {
 //
 // Extracted into its own async component so it can be wrapped in Suspense.
 // The hero section renders immediately while this component fetches data.
+//
+// The error kind is forwarded to RetryableCirclesList via a data attribute on
+// the wrapping element so the client shell can show the retry banner and
+// drive re-fetches without a separate server round-trip per attempt.
 
 async function CirclesList() {
   const result = await getCircles();
 
   if (!result.ok) {
-    return <IndexerErrorBanner error={result.error} />;
+    // Render an empty fragment as the "content" slot — the error banner and
+    // retry controls are owned by the client shell (RetryableCirclesList).
+    // We use a data attribute on a hidden span to pass the error kind to the
+    // client without a separate fetch or a prop drilling chain.
+    return (
+      <>
+        <span
+          data-circles-fetch-error={result.error}
+          aria-hidden="true"
+          className="hidden"
+        />
+        <IndexerErrorBanner error={result.error} />
+      </>
+    );
   }
 
   if (result.circles.length === 0) {
@@ -225,6 +243,24 @@ async function CirclesList() {
   );
 }
 
+// ─── Error-aware list wrapper (server component) ──────────────────────────────
+//
+// Fetches the circle data once more (collapsed to the same request by cache())
+// so it can pass `initialError` to the client shell without prop-drilling
+// through the page component.  When the fetch succeeds, `initialError` is null
+// and RetryableCirclesList is a transparent pass-through.
+
+async function CirclesListWithRetry() {
+  const result = await getCircles().catch(() => null);
+  const initialError =
+    !result || !result.ok ? (result?.error ?? "network") : null;
+
+  return (
+    <RetryableCirclesList initialError={initialError}>
+      <CirclesList />
+    </RetryableCirclesList>
+  );
+}
 /**
  * Count beside the "Active Circles" heading. Omitted entirely when the fetch
  * failed, so a stale or missing number is never presented as fact — the error
@@ -462,9 +498,11 @@ export default function HomePage() {
         </Link>
       </div>
 
-      {/* Suspense boundary: hero + heading render immediately; list streams in */}
+      {/* Suspense boundary: hero + heading render immediately; list streams in.
+          CirclesListWithRetry passes initialError to the client shell so the
+          retry button appears immediately on error without a client round-trip. */}
       <Suspense fallback={<CircleListSkeleton />}>
-        <CirclesList />
+        <CirclesListWithRetry />
       </Suspense>
     </div>
   );

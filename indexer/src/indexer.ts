@@ -989,8 +989,13 @@ export async function startIndexer() {
 /**
  * Stop the event poller cleanly: clear the interval, refuse new ticks, and
  * wait for any in-flight poll cycle to finish so we don't exit mid-write.
+ *
+ * Accepts an optional AbortSignal so the caller (gracefulShutdown in index.ts)
+ * can impose its own deadline.  When the signal fires before the in-flight
+ * cycle resolves, stopIndexer rejects with an AbortError so the caller's
+ * grace-period timer can force-exit rather than hanging indefinitely.
  */
-export async function stopIndexer(): Promise<void> {
+export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   if (!indexerStarted && !pollTimer && !pollInFlight) {
     console.log("[indexer] Event poller is not running — nothing to stop");
     return;
@@ -999,7 +1004,7 @@ export async function stopIndexer(): Promise<void> {
   if (shuttingDown) {
     console.log("[indexer] Shutdown already in progress — waiting...");
     if (pollInFlight) {
-      await pollInFlight.catch(() => undefined);
+      await raceWithAbort(pollInFlight.catch(() => undefined), signal);
     }
     return;
   }
@@ -1014,11 +1019,52 @@ export async function stopIndexer(): Promise<void> {
 
   if (pollInFlight) {
     console.log("[indexer] Waiting for in-flight poll cycle to finish...");
-    await pollInFlight.catch(() => undefined);
+    // Race the in-flight cycle against the abort signal so a stuck RPC call
+    // does not block the process past the configured grace period.
+    await raceWithAbort(pollInFlight.catch(() => undefined), signal);
   }
 
   indexerStarted = false;
   console.log("[indexer] Event poller stopped cleanly");
+}
+
+/**
+ * Race a promise against an optional AbortSignal.
+ *
+ * If the signal fires before `promise` settles the returned promise rejects
+ * with an AbortError (name === "AbortError"), propagating the cancellation to
+ * the caller.  When no signal is provided the promise races against nothing
+ * and this is a transparent pass-through.
+ */
+function raceWithAbort(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(
+      Object.assign(new Error("Shutdown aborted: grace period exceeded"), {
+        name: "AbortError",
+      }),
+    );
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      reject(
+        Object.assign(new Error("Shutdown aborted: grace period exceeded"), {
+          name: "AbortError",
+        }),
+      );
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 /** Test/ops helper: whether the poller has been started and not fully stopped. */
