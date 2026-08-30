@@ -6,7 +6,7 @@ dotenv.config();
 // and throws a single clear error listing what's missing if any are unset —
 // deliberately before ./db/migrate and ./indexer run so a misconfigured
 // deploy fails on boot instead of partway through migrations or polling.
-import { PORT } from "./config";
+import { PORT, SHUTDOWN_GRACE_PERIOD_MS } from "./config";
 import { connectWithRetry, pool } from "./db/pool";
 import { runMigrations, checkMigrationHealth } from "./db/migrate";
 import { startIndexer, stopIndexer } from "./indexer";
@@ -25,14 +25,41 @@ async function gracefulShutdown(server: Server, signal: string): Promise<void> {
   shuttingDown = true;
 
   console.log(
-    `[circleup-indexer] Received ${signal} — shutting down gracefully...`,
+    `[circleup-indexer] Received ${signal} — shutting down gracefully ` +
+      `(grace period: ${SHUTDOWN_GRACE_PERIOD_MS}ms)...`,
   );
 
-  try {
-    // Stop accepting new poll ticks and wait for any in-flight ingest to finish
-    // before tearing down the HTTP server or Postgres pool.
-    await stopIndexer();
+  // Hard-kill timer: if graceful teardown hangs past the configured grace
+  // period (e.g. an RPC call stuck waiting, a slow DB write, or the HTTP
+  // server waiting for a keep-alive connection to drain), force-exit so the
+  // process never blocks a rolling deployment indefinitely.
+  //
+  // The AbortController lets us propagate the deadline into stopIndexer so a
+  // stuck in-flight poll cycle rejects early instead of silently holding open
+  // the Postgres connection that the pool.end() call below needs to close.
+  //
+  // unref() prevents the timer from keeping the event loop alive on its own —
+  // if everything closes cleanly before the deadline the process exits 0
+  // without waiting for the timer to fire.
+  const abortController = new AbortController();
+  const forceExitTimer = setTimeout(() => {
+    abortController.abort();
+    console.error(
+      `[circleup-indexer] Shutdown did not complete within ${SHUTDOWN_GRACE_PERIOD_MS}ms — forcing exit`,
+    );
+    process.exit(1);
+  }, SHUTDOWN_GRACE_PERIOD_MS);
+  forceExitTimer.unref();
 
+  try {
+    // 1. Stop the poller first: refuse new ticks and wait for any in-flight
+    //    ledger ingest to finish so we never exit mid-transaction.  Pass the
+    //    AbortSignal so a stuck RPC call does not block past the grace period.
+    await stopIndexer(abortController.signal);
+
+    // 2. Stop accepting new HTTP requests.  Existing connections are allowed
+    //    to finish (Node drains keep-alive sockets automatically when the
+    //    server is closed).
     await new Promise<void>((resolve, reject) => {
       server.close((err) => {
         if (err) reject(err);
@@ -41,9 +68,12 @@ async function gracefulShutdown(server: Server, signal: string): Promise<void> {
     });
     console.log("[circleup-indexer] HTTP server closed");
 
+    // 3. Release all Postgres connections only after both the poller and the
+    //    HTTP server have stopped issuing queries.
     await pool.end();
     console.log("[circleup-indexer] Database pool closed");
 
+    clearTimeout(forceExitTimer);
     console.log("[circleup-indexer] Shutdown complete");
     process.exit(0);
   } catch (err) {
@@ -94,16 +124,18 @@ async function main() {
     console.log(`[circleup-indexer] API listening on http://localhost:${PORT}`);
   });
 
-  // Start event indexer
-  await startIndexer();
-
-  // Docker/K8s send SIGTERM on stop; Ctrl-C sends SIGINT locally.
+  // Register signal handlers before startIndexer so a SIGTERM that races
+  // the very first poll tick is still caught and handled cleanly rather than
+  // being delivered to a process with no handler registered yet.
   process.once("SIGTERM", () => {
     void gracefulShutdown(server, "SIGTERM");
   });
   process.once("SIGINT", () => {
     void gracefulShutdown(server, "SIGINT");
   });
+
+  // Start event indexer after signal handlers are in place.
+  await startIndexer();
 }
 
 main().catch((err) => {
