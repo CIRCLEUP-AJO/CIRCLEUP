@@ -1,5 +1,5 @@
 "use client";
-import { useState, useId, useRef, useEffect } from "react";
+import { useState, useId, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
   CIRCLE_FACTORY_ADDRESS,
@@ -269,16 +269,33 @@ export default function CreateClient() {
   // ── Member helpers ──────────────────────────────────────────────────────────
   function updateMember(i: number, val: string) {
     setMembers((prev) => {
-      const next = [...prev];
-      next[i] = val;
+      if (prev.length >= MAX_MEMBERS) return prev;
+      return [...prev, createMemberRow()];
+    });
+  }, []);
+
+  /**
+   * Remove the row with the given id.  After removal, focus moves to:
+   *   - the row that took the same position, or
+   *   - the last row if the removed row was last.
+   * Focus change is deferred via pendingFocusId so the target exists in the
+   * DOM on the next render.
+   */
+  const removeMember = useCallback((id: string) => {
+    setMembers((prev) => {
+      if (prev.length <= MIN_MEMBERS) return prev;
+      const idx  = prev.findIndex((r) => r.id === id);
+      const next = prev.filter((r) => r.id !== id);
+      // Schedule focus on the row that moved into this slot (or the last row).
+      if (next.length > 0) {
+        const focusIdx  = Math.min(idx, next.length - 1);
+        pendingFocusId.current = next[focusIdx].id;
+      }
       return next;
     });
-  }
-
-  function addMember() {
-    if (members.length >= MAX_MEMBERS) return;
-    setMembers((prev) => [...prev, ""]);
-  }
+    // Clean up the ref entry for the removed row.
+    memberInputRefs.current.delete(id);
+  }, []);
 
   function removeMember(i: number) {
     if (members.length <= MIN_MEMBERS) return;
@@ -345,22 +362,10 @@ export default function CreateClient() {
       } else {
         setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
       }
-      return;
-    }
-    if (!walletAddress) {
-      setError("Connect your Freighter wallet first.");
-      return;
-    }
+      setFieldErrors({});
 
-    const validMembers = getFilledMembers(members);
-    if (validMembers.length < MIN_MEMBERS) {
-      setError(`A circle needs at least ${MIN_MEMBERS} members.`);
-      return;
-    }
-    if (validMembers.length > MAX_MEMBERS) {
-      setError(`A circle cannot have more than ${MAX_MEMBERS} members.`);
-      return;
-    }
+      const { name: circleName, validMembers, amountStroops, roundDays: days } =
+        validation.values;
 
     // Check that the creator is not also a member (self-address check)
     const creatorLower = walletAddress.toLowerCase();
@@ -381,13 +386,11 @@ export default function CreateClient() {
       return;
     }
 
-    const invalidAddr = validMembers.find((m) => !isValidStellarAddress(m));
-    if (invalidAddr) {
-      setError(
-        `Invalid Stellar address: "${shortAddress(invalidAddr)}". Each address must start with G and be 56 characters long.`,
-      );
-      return;
-    }
+      // Step 3: factory address guard
+      if (!CIRCLE_FACTORY_ADDRESS) {
+        setSubmitError("Factory contract not configured. Deploy contracts first.");
+        return;
+      }
 
     const amount = parseFloat(roundUSDC);
     if (isNaN(amount) || amount <= 0) {
@@ -470,7 +473,7 @@ export default function CreateClient() {
       <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
       <p className="text-slate-500 text-sm mb-8">
         Set up the members, contribution amount, and schedule. The rotation order
-        is the same as the member list.
+        is the same as the member list — use the arrows to adjust it.
       </p>
 
       <form
@@ -679,6 +682,7 @@ export default function CreateClient() {
               </span>
             )}
           </div>
+
           <p id={membersHintId} className="text-xs text-slate-400 mt-1">
             Minimum {MIN_MEMBERS} · maximum {MAX_MEMBERS} members. At least {MIN_MEMBERS} addresses required.
           </p>
@@ -698,7 +702,9 @@ export default function CreateClient() {
             <li>💰 ${roundUSDC} USDC / member / round</li>
             <li>🎯 Pot per round: ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}</li>
             <li>📅 Round duration: {roundDays} days</li>
-            <li>🔒 Collateral required: ${roundUSDC} per member (1× round amount)</li>
+            <li>
+              🔒 Collateral required: ${roundUSDC} per member (1× round amount)
+            </li>
           </ul>
         </div>
 
@@ -747,7 +753,9 @@ export default function CreateClient() {
                   type="button"
                   onClick={copyTxHash}
                   className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
+                  aria-label={
+                    copied ? "Transaction hash copied" : "Copy transaction hash"
+                  }
                   aria-pressed={copied}
                 >
                   {copied ? "✓ Copied" : "Copy"}
