@@ -16,12 +16,52 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Minimum and maximum number of members allowed by the contract. */
-const MIN_MEMBERS = 2;
-const MAX_MEMBERS = 20;
-/** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
+export const MIN_MEMBERS = 2;
+export const MAX_MEMBERS = 20;
+
+/** Maximum USDC decimal places supported by the contract (stroops precision). */
+export const MAX_USDC_DECIMALS = 7;
+
+/** Maximum allowed circle name length. */
+export const MAX_NAME_LENGTH = 64;
+
+/** Minimum round amount in USDC (one stroop). */
+export const MIN_AMOUNT_USDC = "0.0000001";
+
+/** Maximum round amount in USDC (sanity cap to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
+
 /** Maximum round duration in days. */
-const MAX_ROUND_DAYS = 365;
+export const MAX_ROUND_DAYS = 365;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+/** A single member row carrying a stable id and the current address value. */
+export interface MemberRow {
+  id: string;
+  value: string;
+}
+
+/** Per-field validation errors. */
+export interface CreateFormErrors {
+  name?: string;
+  amount?: string;
+  days?: string;
+  /** Per-index member errors (indices that are undefined have no error). */
+  members?: (string | undefined)[];
+  /** List-level member error (count, duplicates). */
+  membersGeneral?: string;
+}
+
+/** The normalised values returned when validation passes. */
+export interface ValidatedCreateForm {
+  name: string;
+  validMembers: string[];
+  amountStroops: bigint;
+  roundDays: number;
+}
+
+// ─── Pure helpers (exported for tests) ───────────────────────────────────────
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
@@ -32,7 +72,7 @@ export function getFilledMembers(members: string[]): string[] {
  * Find duplicate addresses using case-insensitive comparison.
  * Returns the first duplicate found, or null if all are unique.
  */
-function findDuplicateAddress(addresses: string[]): string | null {
+export function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
     const lower = addr.toLowerCase();
@@ -57,15 +97,42 @@ export function countDecimalPlaces(value: string): number {
 }
 
 /**
+ * Create a fresh member row with a unique stable id.
+ * The id is used as the React key so DOM nodes are not recycled on reorder.
+ */
+export function createMemberRow(value = ""): MemberRow {
+  return { id: `m-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, value };
+}
+
+/**
+ * Reorder an array by moving the element at fromIndex to toIndex.
+ * Returns the original array reference unchanged when from === to or either
+ * index is out of range. Never mutates the input.
+ */
+export function reorderMembers<T>(arr: T[], fromIndex: number, toIndex: number): T[] {
+  if (fromIndex === toIndex) return arr;
+  if (
+    fromIndex < 0 ||
+    fromIndex >= arr.length ||
+    toIndex < 0 ||
+    toIndex >= arr.length
+  ) {
+    return arr;
+  }
+  const next = [...arr];
+  const [item] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, item);
+  return next;
+}
+
+/**
  * Validate and normalise all create-circle form fields.
  *
  * Returns either:
  *   `{ ok: true,  values: ValidatedCreateForm }`  — safe to submit
  *   `{ ok: false, errors: CreateFormErrors }`      — show errors, do not submit
  *
- * This is the single authoritative gate that `handleSubmit` calls. The function
- * is pure (no I/O, no side effects) so it can be tested exhaustively without a
- * browser environment.
+ * Pure: no I/O, no side effects. Safe to call in tests without a browser.
  */
 export function validateCreateForm(
   name: string,
@@ -95,11 +162,13 @@ export function validateCreateForm(
       errors.amount = "Enter a valid positive amount.";
     } else if (amountNum === 0) {
       errors.amount = "Contribution amount must be greater than zero.";
+    } else if (amountNum > MAX_ROUND_USDC) {
+      errors.amount = `Round amount of $${amountNum.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`;
     } else if (countDecimalPlaces(amountStr) > MAX_USDC_DECIMALS) {
-      errors.amount = `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
+      errors.amount =
+        `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
         `"${amountStr}" has ${countDecimalPlaces(amountStr)}.`;
     } else {
-      // usdcToStroops is safe here — we've already checked the decimal count
       try {
         amountStroops = usdcToStroops(amountStr);
         if (amountStroops <= 0n) {
@@ -118,19 +187,16 @@ export function validateCreateForm(
 
   if (daysStr === "") {
     errors.days = "Round duration is required.";
+  } else if (daysStr.includes(".")) {
+    errors.days = "Round duration must be a whole number of days.";
   } else {
-    // Reject any fractional input — ledger math only makes sense for whole days
-    if (daysStr.includes(".")) {
-      errors.days = "Round duration must be a whole number of days.";
+    const parsed = parseInt(daysStr, 10);
+    if (isNaN(parsed) || parsed < 1) {
+      errors.days = "Round duration must be at least 1 day.";
+    } else if (parsed > MAX_ROUND_DAYS) {
+      errors.days = `Round duration cannot exceed ${MAX_ROUND_DAYS} days (≈10 years).`;
     } else {
-      const parsed = parseInt(daysStr, 10);
-      if (isNaN(parsed) || parsed < 1) {
-        errors.days = "Round duration must be at least 1 day.";
-      } else if (parsed > MAX_ROUND_DAYS) {
-        errors.days = `Round duration cannot exceed ${MAX_ROUND_DAYS} days (≈10 years).`;
-      } else {
-        daysNum = parsed;
-      }
+      daysNum = parsed;
     }
   }
 
@@ -155,14 +221,15 @@ export function validateCreateForm(
   if (validMembers.length < MIN_MEMBERS) {
     errors.membersGeneral =
       `At least ${MIN_MEMBERS} members are required. ` +
-      `${validMembers.length === 0 ? "Add member addresses below." : `You have ${validMembers.length}.`}`;
+      (validMembers.length === 0
+        ? "Add member addresses below."
+        : `You have ${validMembers.length}.`);
   } else if (validMembers.length > MAX_MEMBERS) {
     errors.membersGeneral = `A circle cannot have more than ${MAX_MEMBERS} members.`;
   } else {
     const dup = findDuplicateAddress(validMembers);
     if (dup) {
-      errors.membersGeneral =
-        `Duplicate address: ${shortAddress(dup)}. Each member must appear exactly once.`;
+      errors.membersGeneral = `Duplicate address: ${shortAddress(dup)}. Each member must appear exactly once.`;
     }
   }
 
@@ -190,10 +257,6 @@ export function validateCreateForm(
 }
 
 // ─── FieldError ───────────────────────────────────────────────────────────────
-//
-// Defined outside the component so React never treats it as a new component
-// type on re-render, which would cause unnecessary unmount/remount cycles and
-// break the live-region semantics of role="alert".
 
 function FieldError({ id, message }: { id: string; message: string | undefined }) {
   if (!message) return null;
@@ -211,21 +274,33 @@ export default function CreateClient() {
 
   // ── Form state ─────────────────────────────────────────────────────────────
   const [name,      setName]      = useState("");
-  const [members,   setMembers]   = useState<string[]>(["", "", "", ""]);
+  const [members,   setMembers]   = useState<MemberRow[]>(() => [
+    createMemberRow(),
+    createMemberRow(),
+    createMemberRow(),
+    createMemberRow(),
+  ]);
   const [roundUSDC, setRoundUSDC] = useState("100");
   const [roundDays, setRoundDays] = useState("30");
 
   // ── Submission state ───────────────────────────────────────────────────────
-  const [loading,      setLoading]      = useState(false);
-  const [submitError,  setSubmitError]  = useState("");
-  const [fieldErrors,  setFieldErrors]  = useState<CreateFormErrors>({});
-  const [txHash,       setTxHash]       = useState("");
-  const [copied,       setCopied]       = useState(false);
+  const [loading,     setLoading]     = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
+  const [txHash,      setTxHash]      = useState("");
+  const [copied,      setCopied]      = useState(false);
+
+  // Whether we're in the timed-out reconciliation state (hash submitted but
+  // polling timed out — user must confirm before retrying).
+  const [isTimedOut,     setIsTimedOut]     = useState(false);
+  const [timedOutTxHash, setTimedOutTxHash] = useState("");
 
   // Whether validation has been attempted — controls when inline errors appear.
-  // Before first submit, per-field errors are hidden so the form isn't
-  // immediately hostile. After first submit they stay visible on every change.
   const [validated, setValidated] = useState(false);
+
+  // Guards against concurrent submissions (rapid double-click, etc.)
+  const submittingRef = useRef(false);
+  const pendingTimeout = useRef(false);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -240,11 +315,11 @@ export default function CreateClient() {
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
-  // One ref per member row for focusing the first invalid field
-  const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
+  const memberInputRefs = useRef<Map<string, HTMLInputElement | null>>(new Map());
   const nameRef        = useRef<HTMLInputElement>(null);
   const amountRef      = useRef<HTMLInputElement>(null);
   const daysRef        = useRef<HTMLInputElement>(null);
+  const pendingFocusId = useRef<string | null>(null);
 
   useEffect(() => {
     if (submitError && submitErrorRef.current) submitErrorRef.current.focus();
@@ -254,55 +329,71 @@ export default function CreateClient() {
     if (txHash && successRef.current) successRef.current.focus();
   }, [txHash]);
 
+  // Deferred focus after member row add/remove
+  useEffect(() => {
+    if (pendingFocusId.current) {
+      const el = memberInputRefs.current.get(pendingFocusId.current);
+      if (el) el.focus();
+      pendingFocusId.current = null;
+    }
+  });
+
   // ── Derived values ──────────────────────────────────────────────────────────
-  const filledCount    = getFilledMembers(members).length;
+  const filledCount    = members.map((r) => r.value.trim()).filter((v) => v).length;
   const roundAmountNum = parseFloat(roundUSDC || "0");
   const potPerRound    = Number.isFinite(roundAmountNum) ? roundAmountNum * filledCount : 0;
 
-  // Live-validate after first submit attempt so errors update as user types
+  // Live-validate after first submit attempt so errors update as user types.
   useEffect(() => {
     if (!validated) return;
-    const result = validateCreateForm(name, members, roundUSDC, roundDays);
+    const result = validateCreateForm(
+      name,
+      members.map((r) => r.value),
+      roundUSDC,
+      roundDays,
+    );
     setFieldErrors(result.ok ? {} : result.errors);
   }, [validated, name, members, roundUSDC, roundDays]);
 
   // ── Member helpers ──────────────────────────────────────────────────────────
-  function updateMember(i: number, val: string) {
+
+  const updateMember = useCallback((id: string, val: string) => {
+    setMembers((prev) =>
+      prev.map((r) => (r.id === id ? { ...r, value: val } : r)),
+    );
+  }, []);
+
+  const addMember = useCallback(() => {
     setMembers((prev) => {
       if (prev.length >= MAX_MEMBERS) return prev;
-      return [...prev, createMemberRow()];
+      const newRow = createMemberRow();
+      pendingFocusId.current = newRow.id;
+      return [...prev, newRow];
     });
   }, []);
 
-  /**
-   * Remove the row with the given id.  After removal, focus moves to:
-   *   - the row that took the same position, or
-   *   - the last row if the removed row was last.
-   * Focus change is deferred via pendingFocusId so the target exists in the
-   * DOM on the next render.
-   */
   const removeMember = useCallback((id: string) => {
     setMembers((prev) => {
       if (prev.length <= MIN_MEMBERS) return prev;
       const idx  = prev.findIndex((r) => r.id === id);
       const next = prev.filter((r) => r.id !== id);
-      // Schedule focus on the row that moved into this slot (or the last row).
       if (next.length > 0) {
-        const focusIdx  = Math.min(idx, next.length - 1);
+        const focusIdx = Math.min(idx, next.length - 1);
         pendingFocusId.current = next[focusIdx].id;
       }
       return next;
     });
-    // Clean up the ref entry for the removed row.
     memberInputRefs.current.delete(id);
   }, []);
 
-  function removeMember(i: number) {
-    if (members.length <= MIN_MEMBERS) return;
-    setMembers((prev) => prev.filter((_, idx) => idx !== i));
-    // Shrink the refs array to stay in sync
-    memberRefs.current = memberRefs.current.filter((_, idx) => idx !== i);
-  }
+  const moveMember = useCallback((id: string, direction: "up" | "down") => {
+    setMembers((prev) => {
+      const idx = prev.findIndex((r) => r.id === id);
+      if (idx === -1) return prev;
+      const toIndex = direction === "up" ? idx - 1 : idx + 1;
+      return reorderMembers(prev, idx, toIndex);
+    });
+  }, []);
 
   // ── Copy helper ─────────────────────────────────────────────────────────────
   async function copyTxHash() {
@@ -324,23 +415,51 @@ export default function CreateClient() {
     if (errors.days) { daysRef.current?.focus(); return; }
     if (errors.members) {
       const firstIdx = errors.members.findIndex((e) => e !== undefined);
-      if (firstIdx !== -1) { memberRefs.current[firstIdx]?.focus(); return; }
+      if (firstIdx !== -1) {
+        const id = members[firstIdx]?.id;
+        if (id) memberInputRefs.current.get(id)?.focus();
+        return;
+      }
     }
-    // membersGeneral — focus the first empty member slot if it exists
-    const firstEmpty = members.findIndex((m) => m.trim() === "");
-    if (firstEmpty !== -1) { memberRefs.current[firstEmpty]?.focus(); }
+    if (errors.membersGeneral) {
+      const firstEmpty = members.findIndex((r) => r.value.trim() === "");
+      if (firstEmpty !== -1) {
+        const id = members[firstEmpty]?.id;
+        if (id) memberInputRefs.current.get(id)?.focus();
+      }
+    }
+  }
+
+  // ── Reset after timeout reconciliation ─────────────────────────────────────
+  function resetAfterTimeout() {
+    setIsTimedOut(false);
+    setTimedOutTxHash("");
+    setSubmitError("");
+    pendingTimeout.current = false;
+    submittingRef.current  = false;
   }
 
   // ── Submit ──────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+
+    // Prevent concurrent submissions (rapid double-click guard)
+    if (submittingRef.current) return;
+
     setSubmitError("");
     setTxHash("");
     setCopied(false);
+    setIsTimedOut(false);
+    setTimedOutTxHash("");
     setValidated(true);
 
-    // ── Step 1: pre-flight field validation ──────────────────────────────────
-    const validation = validateCreateForm(name, members, roundUSDC, roundDays);
+    // ── Step 1: field validation ──────────────────────────────────────────────
+    const validation = validateCreateForm(
+      name,
+      members.map((r) => r.value),
+      roundUSDC,
+      roundDays,
+    );
     if (!validation.ok) {
       setFieldErrors(validation.errors);
       focusFirstError(validation.errors);
@@ -362,55 +481,21 @@ export default function CreateClient() {
       } else {
         setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
       }
-      setFieldErrors({});
+      return;
+    }
 
-      const { name: circleName, validMembers, amountStroops, roundDays: days } =
-        validation.values;
+    if (!walletAddress) {
+      setSubmitError("Connect your Freighter wallet using the button in the top-right corner.");
+      return;
+    }
 
-    // Check that the creator is not also a member (self-address check)
+    // Self-address check — creator must not be in the member list
     const creatorLower = walletAddress.toLowerCase();
-    const isSelfMember = validMembers.some((m) => m.toLowerCase() === creatorLower);
-    if (isSelfMember) {
-      setError(
+    if (validMembers.some((m) => m.toLowerCase() === creatorLower)) {
+      setSubmitError(
         "Your wallet address cannot be included in the member list. " +
           "The circle creator is automatically a member.",
       );
-      return;
-    }
-
-    const duplicate = findDuplicateAddress(validMembers);
-    if (duplicate) {
-      setError(
-        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
-      );
-      return;
-    }
-
-      // Step 3: factory address guard
-      if (!CIRCLE_FACTORY_ADDRESS) {
-        setSubmitError("Factory contract not configured. Deploy contracts first.");
-        return;
-      }
-
-    const amount = parseFloat(roundUSDC);
-    if (isNaN(amount) || amount <= 0) {
-      setError("Enter a valid round amount greater than zero.");
-      return;
-    }
-    if (amount > MAX_ROUND_USDC) {
-      setError(
-        `Round amount of $${amount.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`,
-      );
-      return;
-    }
-
-    const days = parseInt(roundDays, 10);
-    if (isNaN(days) || days < 1) {
-      setError("Enter a valid round duration of at least 1 day.");
-      return;
-    }
-    if (days > MAX_ROUND_DAYS) {
-      setError(`Round duration cannot exceed ${MAX_ROUND_DAYS} days.`);
       return;
     }
 
@@ -421,6 +506,7 @@ export default function CreateClient() {
     }
 
     // ── Step 4: submit ────────────────────────────────────────────────────────
+    submittingRef.current = true;
     setLoading(true);
     try {
       const membersVec = xdr.ScVal.scvVec(
@@ -441,7 +527,19 @@ export default function CreateClient() {
       );
 
       if (!result.success) {
-        setSubmitError(result.typedError?.message || result.error || "Transaction failed.");
+        // Timeout with a hash: show reconciliation panel so user can check
+        // the explorer before retrying (prevents duplicate submissions).
+        const isTimeout =
+          result.typedError?.code === "NETWORK_TIMEOUT" ||
+          (result.error ?? "").toLowerCase().includes("timeout");
+
+        if (isTimeout && result.txHash) {
+          pendingTimeout.current = true;
+          setIsTimedOut(true);
+          setTimedOutTxHash(result.txHash);
+        } else {
+          setSubmitError(result.typedError?.message || result.error || "Transaction failed.");
+        }
         return;
       }
 
@@ -450,9 +548,8 @@ export default function CreateClient() {
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
-      // Release the lock on every path except confirmed timeout, where the user
-      // must explicitly acknowledge via resetAfterTimeout() before retrying.
-      if (!pendingTimeout) {
+      setLoading(false);
+      if (!pendingTimeout.current) {
         submittingRef.current = false;
       }
     }
@@ -462,9 +559,16 @@ export default function CreateClient() {
     ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash)
     : null;
 
+  const timedOutExplorerUrl = timedOutTxHash
+    ? getExplorerLink(ACTIVE_NETWORK, "tx", timedOutTxHash)
+    : null;
+
+  // Whether the submit button should be blocked (success or pending timeout)
+  const submitBlocked = loading || !!txHash || isTimedOut;
+
   const submitDescribedBy = [
-    submitError ? submitErrId : null,
-    txHash      ? successId   : null,
+    submitError  ? submitErrId : null,
+    txHash       ? successId   : null,
   ].filter(Boolean).join(" ") || undefined;
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -498,7 +602,7 @@ export default function CreateClient() {
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            maxLength={MAX_NAME_LENGTH + 1} // +1 so user can see they've gone over
+            maxLength={MAX_NAME_LENGTH + 1}
             placeholder="e.g. Family savings circle"
             className={`w-full border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
               fieldErrors.name ? "border-red-400 focus:ring-red-400" : "border-slate-300"
@@ -548,7 +652,8 @@ export default function CreateClient() {
           </div>
           <p id={amountHintId} className="text-xs text-slate-400 mt-1">
             Pot per round = ${roundUSDC || "0"} ×{" "}
-            {filledCount > 0 ? filledCount : "…"} members = ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
+            {filledCount > 0 ? filledCount : "…"} members ={" "}
+            ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
           </p>
           <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
         </div>
@@ -601,60 +706,99 @@ export default function CreateClient() {
             </span>
           </div>
 
-          <div className="space-y-2" aria-describedby={membersHintId}>
-            {members.map((m, i) => {
+          <ol
+            className="space-y-2"
+            aria-label="Member list — payout rotation order"
+            aria-describedby={membersHintId}
+          >
+            {members.map((row, i) => {
               const fieldErr = fieldErrors.members?.[i];
-              const inputId  = `member-${i}`;
-              const errId    = `member-${i}-err`;
+              const inputId  = `member-input-${row.id}`;
+              const errId    = `member-err-${row.id}`;
+              const atMin    = members.length <= MIN_MEMBERS;
               return (
-                <div key={i}>
-                  <div className="flex items-center gap-2">
+                <li key={row.id} className="flex flex-col gap-0.5">
+                  <div className="flex items-center gap-1.5">
+                    {/* Reorder: move up */}
+                    <button
+                      type="button"
+                      onClick={() => moveMember(row.id, "up")}
+                      disabled={i === 0}
+                      aria-label={`Move member ${i + 1} up`}
+                      className="p-1 text-slate-400 hover:text-slate-700 disabled:opacity-25 disabled:cursor-not-allowed min-h-[32px] min-w-[28px] flex items-center justify-center"
+                    >
+                      <span aria-hidden="true">↑</span>
+                    </button>
+                    {/* Reorder: move down */}
+                    <button
+                      type="button"
+                      onClick={() => moveMember(row.id, "down")}
+                      disabled={i === members.length - 1}
+                      aria-label={`Move member ${i + 1} down`}
+                      className="p-1 text-slate-400 hover:text-slate-700 disabled:opacity-25 disabled:cursor-not-allowed min-h-[32px] min-w-[28px] flex items-center justify-center"
+                    >
+                      <span aria-hidden="true">↓</span>
+                    </button>
+
                     <span
-                      className="text-xs text-slate-400 w-5 shrink-0 text-right"
+                      className="text-xs text-slate-400 w-5 shrink-0 text-right select-none"
                       aria-hidden="true"
                     >
                       {i + 1}.
                     </span>
+
                     <input
                       id={inputId}
-                      ref={(el) => { memberRefs.current[i] = el; }}
+                      ref={(el) => {
+                        memberInputRefs.current.set(row.id, el);
+                      }}
                       type="text"
                       placeholder={`G… (member ${i + 1})`}
-                      value={m}
-                      onChange={(e) => updateMember(i, e.target.value)}
+                      value={row.value}
+                      onChange={(e) => updateMember(row.id, e.target.value)}
                       className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
                         fieldErr ? "border-red-400 focus:ring-red-400" : "border-slate-300"
                       }`}
-                      aria-label={`Member ${i + 1} Stellar address`}
+                      aria-label={`Member ${i + 1} of ${members.length} — Stellar address (payout position ${i + 1})`}
                       aria-invalid={fieldErr ? "true" : undefined}
                       aria-describedby={fieldErr ? errId : undefined}
                       autoComplete="off"
                       spellCheck={false}
                     />
-                    {members.length > MIN_MEMBERS && (
-                      <button
-                        type="button"
-                        onClick={() => removeMember(i)}
-                        className="p-2 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
-                        aria-label={`Remove member ${i + 1}`}
-                      >
-                        <span aria-hidden="true">×</span>
-                      </button>
-                    )}
+
+                    {/* Remove button */}
+                    <button
+                      type="button"
+                      onClick={() => !atMin && removeMember(row.id)}
+                      aria-label={
+                        atMin
+                          ? `Cannot remove member ${i + 1} — circle needs at least ${MIN_MEMBERS} members`
+                          : `Remove member ${i + 1}`
+                      }
+                      aria-disabled={atMin ? "true" : undefined}
+                      className={`p-2 -m-1 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center transition-colors ${
+                        atMin
+                          ? "text-slate-200 cursor-not-allowed"
+                          : "text-slate-400 hover:text-red-500"
+                      }`}
+                    >
+                      <span aria-hidden="true">×</span>
+                    </button>
                   </div>
+
                   {fieldErr && (
                     <p
                       id={errId}
                       role="alert"
-                      className="mt-1 ml-7 text-xs text-red-600 flex items-center gap-1"
+                      className="mt-0.5 ml-[5.5rem] text-xs text-red-600 flex items-center gap-1"
                     >
                       <span aria-hidden="true">⚠</span> {fieldErr}
                     </p>
                   )}
-                </div>
+                </li>
               );
             })}
-          </div>
+          </ol>
 
           {/* List-level member error (count, duplicates) */}
           {fieldErrors.membersGeneral && (
@@ -695,16 +839,12 @@ export default function CreateClient() {
         >
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
           <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
-            {name.trim() && (
-              <li>📛 {name.trim()}</li>
-            )}
+            {name.trim() && <li>📛 {name.trim()}</li>}
             <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
             <li>💰 ${roundUSDC} USDC / member / round</li>
             <li>🎯 Pot per round: ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}</li>
             <li>📅 Round duration: {roundDays} days</li>
-            <li>
-              🔒 Collateral required: ${roundUSDC} per member (1× round amount)
-            </li>
+            <li>🔒 Collateral required: ${roundUSDC} per member (1× round amount)</li>
           </ul>
         </div>
 
@@ -718,6 +858,56 @@ export default function CreateClient() {
             className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 focus:outline-none focus:ring-2 focus:ring-red-400"
           >
             {submitError}
+          </div>
+        )}
+
+        {/* ── Timeout reconciliation panel ──────────────────────────────────── */}
+        {isTimedOut && timedOutTxHash && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="bg-amber-50 border border-amber-300 rounded-lg p-4 text-sm text-amber-800 space-y-3"
+          >
+            <p className="font-semibold">
+              <span aria-hidden="true">⏳ </span>Confirmation timed out
+            </p>
+            <p>
+              The transaction was submitted but confirmation timed out. Check
+              Stellar Expert to see whether it landed on-chain before retrying —
+              submitting again may create a duplicate circle.
+            </p>
+            <div className="flex items-center gap-2 bg-white border border-amber-200 rounded px-3 py-2">
+              <span className="font-mono text-xs text-slate-700 flex-1 break-all select-all min-w-0">
+                {timedOutTxHash}
+              </span>
+              <button
+                type="button"
+                onClick={copyTxHash}
+                className="text-amber-700 hover:text-amber-900 text-xs font-medium shrink-0 min-h-[40px] px-2"
+                aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
+                aria-pressed={copied}
+              >
+                {copied ? "✓ Copied" : "Copy"}
+              </button>
+            </div>
+            {timedOutExplorerUrl && (
+              <a
+                href={timedOutExplorerUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-medium text-amber-800 underline hover:text-amber-900"
+              >
+                View on Stellar Expert ↗
+              </a>
+            )}
+            <button
+              type="button"
+              onClick={resetAfterTimeout}
+              className="block text-xs font-medium text-amber-900 underline hover:text-amber-700"
+              aria-label="I've checked — the transaction did not confirm. Unlock the form to try again."
+            >
+              I&apos;ve checked — it did not confirm. Let me try again.
+            </button>
           </div>
         )}
 
@@ -753,9 +943,7 @@ export default function CreateClient() {
                   type="button"
                   onClick={copyTxHash}
                   className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={
-                    copied ? "Transaction hash copied" : "Copy transaction hash"
-                  }
+                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
                   aria-pressed={copied}
                 >
                   {copied ? "✓ Copied" : "Copy"}
@@ -772,18 +960,21 @@ export default function CreateClient() {
                 View on Stellar Expert ↗
               </a>
             )}
-            <p className="text-xs text-slate-500">
-              Redirecting to circles list in a few seconds…
-            </p>
+            <p className="text-xs text-slate-500">Redirecting to circles list in a few seconds…</p>
           </div>
         )}
 
         {/* Pending state announcement */}
         <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
-          {loading
-            ? "Creating circle, please wait and approve the transaction in Freighter."
-            : ""}
+          {loading ? "Creating circle, please wait and approve the transaction in Freighter." : ""}
         </p>
+
+        {isTimedOut && (
+          <p className="text-xs text-center text-amber-700" role="status">
+            Submit is locked. Check the explorer and confirm the original transaction
+            did not go through before trying again.
+          </p>
+        )}
 
         <button
           type="submit"
@@ -794,12 +985,6 @@ export default function CreateClient() {
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>
-
-        {isTimedOut && (
-          <p className="text-xs text-center text-amber-700" role="status">
-            Submit is locked until you have checked the explorer and confirmed the original transaction did not go through.
-          </p>
-        )}
       </form>
     </div>
   );
