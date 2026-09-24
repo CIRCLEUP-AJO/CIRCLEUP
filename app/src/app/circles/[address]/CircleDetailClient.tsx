@@ -4,6 +4,7 @@ import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
 import { isSorobanContractId } from "@/lib/address";
+import { parseContractError, userMessageForError } from "@/lib/contractErrors";
 import {
   buildAppSnapshot,
   computeActionEligibility,
@@ -926,6 +927,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // ── Action state ───────────────────────────────────────────────────────────
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
   const [error,        setError]        = useState<string>("");
+  // Hash of the transaction that produced the current error (set when the
+  // failure happened on-chain after submission) so the banner can link to
+  // the explorer for full diagnostics (Issue #479).
+  const [errorTxHash,  setErrorTxHash]  = useState<string | null>(null);
   const [success,      setSuccess]      = useState<SuccessState | null>(null);
   const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
