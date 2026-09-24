@@ -355,6 +355,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
       false,
       false,
       0,
+      null, // networkCheck — none in this context
       staleMs, // ← the data was fetched more than maxAge ago
     );
 
@@ -376,7 +377,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     // Simulate: data was fetched 60 seconds ago
     const dataFetchedAt = Date.now() - 60_000;
     // Correct behaviour: use dataFetchedAt as the snapshot timestamp
-    const correctSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, dataFetchedAt);
+    const correctSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, null, dataFetchedAt);
     const correctGate = computeActionEligibility("contribute", correctSnapshot);
     // 60 s > 30 s default → stale
     expect(correctGate.allowed).toBe(false);
@@ -385,7 +386,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     }
 
     // Old (broken) behaviour: use Date.now() as the snapshot timestamp
-    const brokenSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, Date.now());
+    const brokenSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, null, Date.now());
     const brokenGate = computeActionEligibility("contribute", brokenSnapshot);
     // 0 ms < 30 s → wrongly allowed
     expect(brokenGate.allowed).toBe(true);
@@ -409,6 +410,7 @@ describe("Payout gate with empty members", () => {
       false,
       false,
       0, // 0 contributions
+      null, // networkCheck — none in this context
       Date.now(),
     );
     // 0 >= 0 is true mathematically, but the gate allows it — the fix for
