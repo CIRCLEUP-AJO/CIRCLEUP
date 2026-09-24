@@ -1,5 +1,5 @@
 "use client";
-import { useState, useId, useRef, useEffect, useCallback } from "react";
+import { useState, useId, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import {
   CIRCLE_FACTORY_ADDRESS,
@@ -8,6 +8,8 @@ import {
   daysToLedgers,
   getExplorerLink,
   ACTIVE_NETWORK,
+  formatUsdc,
+  formatPot,
 } from "@/lib/config";
 import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
@@ -16,9 +18,19 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /** Minimum and maximum number of members allowed by the contract. */
-const MIN_MEMBERS = 2;
-const MAX_MEMBERS = 20;
-/** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
+export const MIN_MEMBERS = 2;
+export const MAX_MEMBERS = 20;
+
+/** Maximum USDC decimal places supported by the contract (stroops precision). */
+export const MAX_USDC_DECIMALS = 7;
+
+/** Maximum allowed circle name length. */
+export const MAX_NAME_LENGTH = 64;
+
+/** Minimum round amount in USDC (one stroop). */
+export const MIN_AMOUNT_USDC = "0.0000001";
+
+/** Maximum round amount in USDC (sanity cap to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
 /** Maximum length of a circle name. */
 const MAX_NAME_LENGTH = 100;
@@ -53,7 +65,7 @@ export function getFilledMembers(members: string[]): string[] {
  * Find duplicate addresses using case-insensitive comparison.
  * Returns the first duplicate found, or null if all are unique.
  */
-function findDuplicateAddress(addresses: string[]): string | null {
+export function findDuplicateAddress(addresses: string[]): string | null {
   const seen = new Set<string>();
   for (const addr of addresses) {
     const lower = addr.toLowerCase();
@@ -94,15 +106,75 @@ export function countDecimalPlaces(value: string): number {
 }
 
 /**
+ * Validate a single member row on the create flow.
+ *
+ * Returns `undefined` when the row is blank (unused rows are allowed and are
+ * filtered out before submission) or when the entry is a checksum-valid
+ * Stellar account address.  Otherwise returns a row-specific message that
+ * always starts with `Member N:` (1-based), so the form can render it
+ * directly beneath the offending input.
+ *
+ * Every failure mode gets its own message instead of one generic error:
+ *   1. blank row             → skipped
+ *   2. lowercase input       → base32 is case-sensitive, say so explicitly
+ *   3. C… / M… prefix        → name the namespace that was actually entered
+ *   4. shape (prefix/length/alphabet) → generic shape message
+ *   5. strkey checksum       → right shape, wrong checksum — the classic typo
+ *
+ * Check 5 is the one that matters: without it a mistyped address passes the
+ * form and only fails later, inside transaction construction, as an opaque
+ * SDK error — after the wallet prompt has already appeared.
+ *
+ * Pure (no I/O), exported for tests and reusable anywhere else the app
+ * collects member addresses.
+ */
+export function validateMemberEntry(raw: string, index: number): string | undefined {
+  const row = `Member ${index + 1}`;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+
+  const generic = `${row}: must be a G-prefixed 56-character Stellar address.`;
+  const upper = trimmed.toUpperCase();
+
+  // A lowercased address fails the shape test for a different reason than a
+  // typo does — without this hint the user "fixes" it into another wrong value.
+  if (trimmed !== upper && isStellarPublicKey(upper)) {
+    return (
+      `${row}: must be a G-prefixed 56-character Stellar address typed in ` +
+      `uppercase (Stellar addresses are case-sensitive).`
+    );
+  }
+
+  if (upper.charAt(0) === "C") {
+    return (
+      `${row}: must be a G-prefixed wallet address — contract (C…)` +
+      ` addresses cannot be circle members.`
+    );
+  }
+  if (upper.charAt(0) === "M") {
+    return (
+      `${row}: must be a G-prefixed 56-character Stellar address — muxed ` +
+      `(M…) addresses are not supported.`
+    );
+  }
+
+  if (!isStellarPublicKey(trimmed)) return generic;
+
+  if (!isValidStellarAccount(trimmed)) {
+    return `${row}: checksum failed — check for a typo or a truncated copy-paste.`;
+  }
+
+  return undefined;
+}
+
+/**
  * Validate and normalise all create-circle form fields.
  *
  * Returns either:
  *   `{ ok: true,  values: ValidatedCreateForm }`  — safe to submit
  *   `{ ok: false, errors: CreateFormErrors }`      — show errors, do not submit
  *
- * This is the single authoritative gate that `handleSubmit` calls. The function
- * is pure (no I/O, no side effects) so it can be tested exhaustively without a
- * browser environment.
+ * Pure: no I/O, no side effects. Safe to call in tests without a browser.
  */
 export function validateCreateForm(
   name: string,
@@ -132,8 +204,13 @@ export function validateCreateForm(
       errors.amount = "Enter a valid positive amount.";
     } else if (amountNum === 0) {
       errors.amount = "Contribution amount must be greater than zero.";
+    } else if (amountNum > MAX_ROUND_USDC) {
+      errors.amount =
+        `Round amount of $${amountNum.toLocaleString()} exceeds the maximum of ` +
+        `$${MAX_ROUND_USDC.toLocaleString()} USDC.`;
     } else if (countDecimalPlaces(amountStr) > MAX_USDC_DECIMALS) {
-      errors.amount = `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
+      errors.amount =
+        `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
         `"${amountStr}" has ${countDecimalPlaces(amountStr)}.`;
     } else {
       // usdcToStroops is safe here — we've already checked the decimal count
@@ -189,7 +266,9 @@ export function validateCreateForm(
   if (validMembers.length < MIN_MEMBERS) {
     errors.membersGeneral =
       `At least ${MIN_MEMBERS} members are required. ` +
-      `${validMembers.length === 0 ? "Add member addresses below." : `You have ${validMembers.length}.`}`;
+      (validMembers.length === 0
+        ? "Add member addresses below."
+        : `You have ${validMembers.length}.`);
   } else if (validMembers.length > MAX_MEMBERS) {
     errors.membersGeneral = `A circle cannot have more than ${MAX_MEMBERS} members.`;
   } else {
@@ -244,22 +323,25 @@ export default function CreateClient() {
   const router = useRouter();
 
   // ── Form state ─────────────────────────────────────────────────────────────
-  const [name,      setName]      = useState("");
-  const [members,   setMembers]   = useState<string[]>(["", "", "", ""]);
+  const [name, setName] = useState("");
+  const [members, setMembers] = useState<string[]>(["", "", "", ""]);
   const [roundUSDC, setRoundUSDC] = useState("100");
   const [roundDays, setRoundDays] = useState("30");
 
   // ── Submission state ───────────────────────────────────────────────────────
-  const [loading,      setLoading]      = useState(false);
-  const [submitError,  setSubmitError]  = useState("");
-  const [fieldErrors,  setFieldErrors]  = useState<CreateFormErrors>({});
-  const [txHash,       setTxHash]       = useState("");
-  const [copied,       setCopied]       = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+  const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
+  const [txHash, setTxHash] = useState("");
+  const [copied, setCopied] = useState(false);
 
   // Whether validation has been attempted — controls when inline errors appear.
   // Before first submit, per-field errors are hidden so the form isn't
   // immediately hostile. After first submit they stay visible on every change.
   const [validated, setValidated] = useState(false);
+
+  // Guards against concurrent submissions (rapid double-click, etc.)
+  const submittingRef = useRef(false);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -290,9 +372,23 @@ export default function CreateClient() {
   }, [txHash]);
 
   // ── Derived values ──────────────────────────────────────────────────────────
-  const filledCount    = getFilledMembers(members).length;
-  const roundAmountNum = parseFloat(roundUSDC || "0");
-  const potPerRound    = Number.isFinite(roundAmountNum) ? roundAmountNum * filledCount : 0;
+  const filledCount = getFilledMembers(members).length;
+
+  // Stroops for the currently-typed amount. `usdcToStroops` throws on invalid
+  // input; during typing we just want a displayable (possibly zero) figure, so
+  // fall back to 0n. All pot/collateral figures derive from this integer, never
+  // from floating point, so the create page shows the same 2-dp formatUsdc /
+  // formatPot values as the rest of the app (issue #493).
+  const roundStroops = (() => {
+    try {
+      return usdcToStroops(roundUSDC || "0");
+    } catch {
+      return 0n;
+    }
+  })();
+
+  const potDisplay = formatPot(roundStroops, filledCount);
+  const memberAmountDisplay = formatUsdc(roundStroops);
 
   // Live-validate after first submit attempt so errors update as user types
   useEffect(() => {
@@ -302,6 +398,7 @@ export default function CreateClient() {
   }, [validated, name, members, roundUSDC, roundDays]);
 
   // ── Member helpers ──────────────────────────────────────────────────────────
+
   function updateMember(i: number, val: string) {
     setMembers((prev) => {
       const next = [...prev];
@@ -363,33 +460,26 @@ export default function CreateClient() {
   // ── Submit ──────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setSubmitError("");
-    setTxHash("");
-    setCopied(false);
-    setValidated(true);
 
-    // ── Step 1: pre-flight field validation ──────────────────────────────────
-    const validation = validateCreateForm(name, members, roundUSDC, roundDays);
-    if (!validation.ok) {
-      setFieldErrors(validation.errors);
-      focusFirstError(validation.errors);
-      return; // never reach wallet
-    }
-    setFieldErrors({});
+    // Prevent concurrent submissions (rapid double-click guard). Armed before
+    // the first await so a second click during the wallet prompt is dropped,
+    // and disarmed in `finally` (every path, success or failure, passes
+    // through it).
+    if (submittingRef.current) return;
+    submittingRef.current = true;
 
-    const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
-
-    // ── Step 2: wallet check ──────────────────────────────────────────────────
-    let walletAddress: string | null;
     try {
-      walletAddress = await getWalletAddress();
-    } catch (err) {
-      if (err instanceof WalletError && err.reason === "not_installed") {
-        setSubmitError(
-          "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
-        );
-      } else {
-        setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
+      setSubmitError("");
+      setTxHash("");
+      setCopied(false);
+      setValidated(true);
+
+      // ── Step 1: field validation ──────────────────────────────────────────
+      const validation = validateCreateForm(name, members, roundUSDC, roundDays);
+      if (!validation.ok) {
+        setFieldErrors(validation.errors);
+        focusFirstError(validation.errors);
+        return; // never reach wallet
       }
       setFieldErrors({});
 
@@ -439,6 +529,8 @@ export default function CreateClient() {
     ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash)
     : null;
 
+  const submitBlocked = loading || !!txHash;
+
   const submitDescribedBy = [
     submitError ? submitErrId : null,
     txHash      ? successId   : null,
@@ -447,10 +539,13 @@ export default function CreateClient() {
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <div className="max-w-xl mx-auto px-2 sm:px-0">
-      <h1 className="text-2xl font-bold text-slate-900 mb-2">Create a Circle</h1>
+      <h1 className="text-xl sm:text-2xl font-bold text-slate-900 mb-2">
+        Create a Circle
+      </h1>
       <p className="text-slate-500 text-sm mb-8">
         Set up the members, contribution amount, and schedule. The rotation order
-        is the same as the member list — use the arrows to adjust it.
+        is the same as the member list — members contribute in the order listed,
+        top to bottom.
       </p>
 
       <form
@@ -491,72 +586,75 @@ export default function CreateClient() {
           </p>
         </div>
 
-        {/* ── Contribution amount ───────────────────────────────────────────── */}
-        <div>
-          <label
-            htmlFor={amountId}
-            className="block text-sm font-medium text-slate-700 mb-1"
-          >
-            Contribution per member / round (USDC){" "}
-            <span aria-hidden="true" className="text-red-500">*</span>
-          </label>
-          <div className="flex items-center gap-2">
-            <span className="text-slate-400 text-lg" aria-hidden="true">$</span>
+        {/* ── Contribution amount + round duration ────────────────────────────
+            Grouped on desktop (form-row → 2 columns ≥ sm), stacked on mobile. */}
+        <div className="form-row">
+          <div>
+            <label
+              htmlFor={amountId}
+              className="block text-sm font-medium text-slate-700 mb-1"
+            >
+              Contribution per member / round (USDC){" "}
+              <span aria-hidden="true" className="text-red-500">*</span>
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="text-slate-400 text-lg" aria-hidden="true">$</span>
+              <input
+                id={amountId}
+                ref={amountRef}
+                type="number"
+                min={MIN_AMOUNT_USDC}
+                step="0.0000001"
+                value={roundUSDC}
+                onChange={(e) => setRoundUSDC(e.target.value)}
+                className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
+                  fieldErrors.amount ? "border-red-400 focus:ring-red-400" : "border-slate-300"
+                }`}
+                aria-required="true"
+                aria-invalid={fieldErrors.amount ? "true" : undefined}
+                aria-describedby={[
+                  amountHintId,
+                  fieldErrors.amount ? `${amountId}-err` : null,
+                ].filter(Boolean).join(" ")}
+                aria-label="Contribution amount in USDC"
+              />
+              <span className="text-slate-500 text-sm shrink-0">USDC</span>
+            </div>
+            <p id={amountHintId} className="text-xs text-slate-400 mt-1">
+              Pot per round = ${memberAmountDisplay} ×{" "}
+              {filledCount > 0 ? filledCount : "…"} member
+              {filledCount !== 1 ? "s" : ""} = ${potDisplay}
+            </p>
+            <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
+          </div>
+
+          <div>
+            <label
+              htmlFor={daysId}
+              className="block text-sm font-medium text-slate-700 mb-1"
+            >
+              Round duration (days){" "}
+              <span aria-hidden="true" className="text-red-500">*</span>
+            </label>
             <input
-              id={amountId}
-              ref={amountRef}
+              id={daysId}
+              ref={daysRef}
               type="number"
-              min={MIN_AMOUNT_USDC}
-              step="0.0000001"
-              value={roundUSDC}
-              onChange={(e) => setRoundUSDC(e.target.value)}
-              className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
-                fieldErrors.amount ? "border-red-400 focus:ring-red-400" : "border-slate-300"
+              min="1"
+              max={MAX_ROUND_DAYS}
+              step="1"
+              value={roundDays}
+              onChange={(e) => setRoundDays(e.target.value)}
+              className={`w-full border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
+                fieldErrors.days ? "border-red-400 focus:ring-red-400" : "border-slate-300"
               }`}
               aria-required="true"
-              aria-invalid={fieldErrors.amount ? "true" : undefined}
-              aria-describedby={[
-                amountHintId,
-                fieldErrors.amount ? `${amountId}-err` : null,
-              ].filter(Boolean).join(" ")}
-              aria-label="Contribution amount in USDC"
+              aria-invalid={fieldErrors.days ? "true" : undefined}
+              aria-describedby={fieldErrors.days ? `${daysId}-err` : undefined}
+              aria-label="Round duration in days"
             />
-            <span className="text-slate-500 text-sm shrink-0">USDC</span>
+            <FieldError id={`${daysId}-err`} message={fieldErrors.days} />
           </div>
-          <p id={amountHintId} className="text-xs text-slate-400 mt-1">
-            Pot per round = ${roundUSDC || "0"} ×{" "}
-            {filledCount > 0 ? filledCount : "…"} members = ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}
-          </p>
-          <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
-        </div>
-
-        {/* ── Round duration ────────────────────────────────────────────────── */}
-        <div>
-          <label
-            htmlFor={daysId}
-            className="block text-sm font-medium text-slate-700 mb-1"
-          >
-            Round duration (days){" "}
-            <span aria-hidden="true" className="text-red-500">*</span>
-          </label>
-          <input
-            id={daysId}
-            ref={daysRef}
-            type="number"
-            min="1"
-            max={MAX_ROUND_DAYS}
-            step="1"
-            value={roundDays}
-            onChange={(e) => setRoundDays(e.target.value)}
-            className={`w-full border rounded-lg px-3 py-2.5 text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
-              fieldErrors.days ? "border-red-400 focus:ring-red-400" : "border-slate-300"
-            }`}
-            aria-required="true"
-            aria-invalid={fieldErrors.days ? "true" : undefined}
-            aria-describedby={fieldErrors.days ? `${daysId}-err` : undefined}
-            aria-label="Round duration in days"
-          />
-          <FieldError id={`${daysId}-err`} message={fieldErrors.days} />
         </div>
 
         {/* ── Members ───────────────────────────────────────────────────────── */}
@@ -578,16 +676,21 @@ export default function CreateClient() {
             </span>
           </div>
 
-          <div className="space-y-2" aria-describedby={membersHintId}>
+          <ol
+            className="space-y-2"
+            aria-label="Member list — payout rotation order"
+            aria-describedby={membersHintId}
+          >
             {members.map((m, i) => {
               const fieldErr = fieldErrors.members?.[i];
               const inputId  = `member-${i}`;
               const errId    = `member-${i}-err`;
+              const atMin    = members.length <= MIN_MEMBERS;
               return (
-                <div key={i}>
+                <li key={i} className="flex flex-col gap-0.5">
                   <div className="flex items-center gap-2">
                     <span
-                      className="text-xs text-slate-400 w-5 shrink-0 text-right"
+                      className="text-xs text-slate-400 w-5 shrink-0 text-right select-none"
                       aria-hidden="true"
                     >
                       {i + 1}.
@@ -602,36 +705,44 @@ export default function CreateClient() {
                       className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
                         fieldErr ? "border-red-400 focus:ring-red-400" : "border-slate-300"
                       }`}
-                      aria-label={`Member ${i + 1} Stellar address`}
+                      aria-label={`Member ${i + 1} of ${members.length} — Stellar address (payout position ${i + 1})`}
                       aria-invalid={fieldErr ? "true" : undefined}
                       aria-describedby={fieldErr ? errId : undefined}
                       autoComplete="off"
                       spellCheck={false}
                     />
-                    {members.length > MIN_MEMBERS && (
-                      <button
-                        type="button"
-                        onClick={() => removeMember(i)}
-                        className="p-2 -m-1 text-slate-400 hover:text-red-500 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
-                        aria-label={`Remove member ${i + 1}`}
-                      >
-                        <span aria-hidden="true">×</span>
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      onClick={() => !atMin && removeMember(i)}
+                      aria-label={
+                        atMin
+                          ? `Cannot remove member ${i + 1} — circle needs at least ${MIN_MEMBERS} members`
+                          : `Remove member ${i + 1}`
+                      }
+                      aria-disabled={atMin ? "true" : undefined}
+                      className={`p-2 -m-1 text-lg leading-none shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center transition-colors ${
+                        atMin
+                          ? "text-slate-200 cursor-not-allowed"
+                          : "text-slate-400 hover:text-red-500"
+                      }`}
+                    >
+                      <span aria-hidden="true">×</span>
+                    </button>
                   </div>
+
                   {fieldErr && (
                     <p
                       id={errId}
                       role="alert"
-                      className="mt-1 ml-7 text-xs text-red-600 flex items-center gap-1"
+                      className="mt-0.5 ml-7 text-xs text-red-600 flex items-center gap-1"
                     >
                       <span aria-hidden="true">⚠</span> {fieldErr}
                     </p>
                   )}
-                </div>
+                </li>
               );
             })}
-          </div>
+          </ol>
 
           {/* List-level member error (count, duplicates) */}
           {fieldErrors.membersGeneral && (
@@ -648,7 +759,7 @@ export default function CreateClient() {
               type="button"
               onClick={addMember}
               disabled={members.length >= MAX_MEMBERS}
-              className="text-sm text-brand-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline"
+              className="text-sm text-brand-600 hover:underline disabled:opacity-40 disabled:cursor-not-allowed disabled:no-underline touch-target"
               aria-disabled={members.length >= MAX_MEMBERS}
             >
               + Add member
@@ -672,15 +783,13 @@ export default function CreateClient() {
         >
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
           <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
-            {name.trim() && (
-              <li>📛 {name.trim()}</li>
-            )}
+            {name.trim() && <li>📛 {name.trim()}</li>}
             <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
-            <li>💰 ${roundUSDC} USDC / member / round</li>
-            <li>🎯 Pot per round: ${potPerRound.toFixed(7).replace(/\.?0+$/, "") || "0"}</li>
+            <li>💰 ${memberAmountDisplay} USDC / member / round</li>
+            <li>🎯 Pot per round: ${potDisplay}</li>
             <li>📅 Round duration: {roundDays} days</li>
             <li>
-              🔒 Collateral required: ${roundUSDC} per member (1× round amount)
+              🔒 Collateral required: ${memberAmountDisplay} per member (1× round amount)
             </li>
           </ul>
         </div>
@@ -730,9 +839,7 @@ export default function CreateClient() {
                   type="button"
                   onClick={copyTxHash}
                   className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={
-                    copied ? "Transaction hash copied" : "Copy transaction hash"
-                  }
+                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
                   aria-pressed={copied}
                 >
                   {copied ? "✓ Copied" : "Copy"}
@@ -771,12 +878,6 @@ export default function CreateClient() {
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>
-
-        {isTimedOut && (
-          <p className="text-xs text-center text-amber-700" role="status">
-            Submit is locked until you have checked the explorer and confirmed the original transaction did not go through.
-          </p>
-        )}
       </form>
     </div>
   );

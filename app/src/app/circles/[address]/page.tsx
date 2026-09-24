@@ -252,13 +252,15 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
     <div className="mb-8" aria-label="Circle overview">
       <div className="flex items-start gap-3 mb-2">
         <span className="text-3xl" aria-hidden="true">🔄</span>
-        <div>
-          <h1 className="text-2xl font-bold text-slate-900">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold text-slate-900 leading-snug">
             {circle
               ? `$${formatUsdc(circle.round_amount)} / round Circle`
               : "Circle"}
           </h1>
-          <p className="font-mono text-sm text-slate-500">{address}</p>
+          <p className="font-mono text-sm text-slate-500 break-all select-all">
+            {address}
+          </p>
         </div>
       </div>
 
