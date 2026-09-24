@@ -1,5 +1,4 @@
 "use client";
-"use client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
@@ -851,11 +850,35 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
         myContributedThisRound,
         data.currentRound?.contributions.length ?? 0,
+        null, // no network-mismatch data in this context — default null
         dataFetchedAtMs, // use data fetch time, not snapshot build time
       ),
       { maxSnapshotAgeMs: Infinity },
     );
   })();
+
+  // ── Contribute gate (for disabled-state display) ───────────────────────────
+  //
+  // Pre-computed with maxSnapshotAgeMs: Infinity so the "round already
+  // contributed" / "deadline passed" reason shows up under the Contribute
+  // button even when we're not about to submit. The staleness check is
+  // intentionally skipped here — it's handled by the actionsEnabled gate above.
+  const contributeGate = computeActionEligibility(
+    "contribute",
+    buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+      myContributedThisRound,
+      data.currentRound?.contributions.length ?? 0,
+      null, // no network-mismatch data in this context — default null
+      dataFetchedAtMs, // use data fetch time, not snapshot build time
+    ),
+    { maxSnapshotAgeMs: Infinity },
+  );
 
   // True when the indexed latest ledger is past the round deadline
   const deadlinePassed =
@@ -994,6 +1017,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
         myContributedThisRound,
         currentRoundContributions,
+        null, // networkCheck — no network-mismatch signal here
         dataFetchedAtMs, // ← correct: when the data was fetched, not now
       );
 
@@ -1137,6 +1161,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       false,
       targetContributed,
       data.currentRound?.contributions.length ?? 0,
+      null, // networkCheck — no network-mismatch signal here
       dataFetchedAtMs, // ← correct: use data fetch time
     );
 
@@ -1445,18 +1470,36 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           {data.circle.status === "Active" &&
             isMember &&
             !myContributedThisRound && (
-              <button
-                onClick={handleContribute}
-                disabled={loading !== null || !actionsEnabled}
-                aria-busy={loading === "contribute" ? "true" : "false"}
-                aria-disabled={!actionsEnabled}
-                title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
-                className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
-              >
-                {loading === "contribute"
-                  ? "Contributing…"
-                  : `💰 Contribute Round ${currentRound}`}
-              </button>
+              <div className="flex flex-col gap-1">
+                <button
+                  onClick={handleContribute}
+                  disabled={loading !== null || !contributeGate.allowed || !actionsEnabled}
+                  aria-busy={loading === "contribute" ? "true" : "false"}
+                  aria-describedby={!contributeGate.allowed ? "contribute-gate-reason" : undefined}
+                  aria-disabled={!actionsEnabled || !contributeGate.allowed}
+                  title={
+                    !actionsEnabled
+                      ? "Actions unavailable until circle data is fully loaded"
+                      : !contributeGate.allowed
+                      ? contributeGate.message
+                      : undefined
+                  }
+                  className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
+                >
+                  {loading === "contribute"
+                    ? "Contributing…"
+                    : `💰 Contribute Round ${currentRound}`}
+                </button>
+                {!contributeGate.allowed && actionsEnabled && (
+                  <p
+                    id="contribute-gate-reason"
+                    className="text-xs text-slate-500"
+                    role="note"
+                  >
+                    {contributeGate.message}
+                  </p>
+                )}
+              </div>
             )}
 
           {data.circle.status === "Active" && (
