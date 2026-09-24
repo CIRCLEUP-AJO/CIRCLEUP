@@ -1,7 +1,8 @@
-import { Suspense, cache } from "react";
+import { Suspense } from "react";
 import Link from "next/link";
 import type { Metadata } from "next";
-import { indexerEndpoint, INDEXER_TIMEOUT_MS } from "@/lib/config";
+import { unstable_cache } from "next/cache";
+import { INDEXER_URL } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
@@ -20,6 +21,12 @@ export const metadata: Metadata = {
     url: "/",
     type: "website",
   },
+  twitter: {
+    card: "summary",
+    title: "CircleUp — Trustless Savings Circles on Stellar",
+    description:
+      "Ajo, Esusu, Tanda, and Chama on Stellar. Everyone pays in once a round, and the contract hands the whole pot to whoever's turn it is.",
+  },
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -27,6 +34,24 @@ export const metadata: Metadata = {
 type FetchResult =
   | { ok: true; circles: Circle[] }
   | { ok: false; error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage" };
+
+// ─── URL validation ───────────────────────────────────────────────────────────
+
+/**
+ * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
+ * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
+ * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
+ * identical to a real network failure and gives no actionable guidance.
+ */
+export function isValidUrl(url: string): boolean {
+  if (!url || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
@@ -38,7 +63,8 @@ type FetchResult =
  * them into one request per render, so the hero can never advertise "Browse 3
  * open circles" over a list that renders 4.
  */
-const getCircles = cache(async function getCircles(): Promise<FetchResult> {
+const getCircles = unstable_cache(
+  async function getCircles(): Promise<FetchResult> {
   // Catch misconfiguration before attempting the network request so that
   // developers get a targeted error message rather than a cryptic network failure.
   const url = indexerEndpoint(["circles"]);
@@ -102,8 +128,11 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
     circles.push(circle);
   }
 
-  return { ok: true, circles };
-});
+    return { ok: true, circles };
+  },
+  ["circles-homepage"],
+  { revalidate: 10 },
+);
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
@@ -132,7 +161,7 @@ function IndexerErrorBanner({
       role="alert"
       className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-4 mb-6 flex items-start gap-3"
     >
-      <span className="text-xl mt-0.5" aria-hidden="true">⚠️</span>
+      <span className="text-xl mt-0.5" aria-hidden="true">!</span>
       <div>
         <p className="font-semibold text-amber-800 text-sm">
           Circles list unavailable
@@ -213,7 +242,7 @@ async function CirclesList() {
   if (result.circles.length === 0) {
     return (
       <div className="text-center py-16 text-slate-500">
-        <div className="text-4xl mb-3">🌱</div>
+        <div className="text-4xl mb-3">NEW</div>
         <p className="font-medium">No circles yet.</p>
         <p className="text-sm mt-1">
           <Link href="/create" className="text-brand-600 underline">
@@ -285,7 +314,7 @@ type BrowseState =
  *
  * @param result The circles fetch, or `null` if it threw unexpectedly.
  */
-function getBrowseState(result: FetchResult | null): BrowseState {
+export function getBrowseState(result: FetchResult | null): BrowseState {
   if (!result || !result.ok) return { kind: "unavailable" };
   if (result.circles.length === 0) return { kind: "empty" };
   return { kind: "browse", count: result.circles.length };
@@ -359,7 +388,7 @@ export default function HomePage() {
     <div>
       {/* Hero */}
       <section aria-labelledby="hero-heading" className="text-center py-12">
-        <div className="text-5xl mb-4" aria-hidden="true">🔄</div>
+        <div className="text-5xl mb-4" aria-hidden="true">SYNC</div>
         <h1
           id="hero-heading"
           className="text-3xl font-bold text-slate-900 mb-3"
@@ -398,17 +427,17 @@ export default function HomePage() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-12">
         {[
           {
-            emoji: "👥",
+            emoji: "MEMBERS",
             title: "Form a circle",
             desc: "Invite members, set the contribution amount and rotation order.",
           },
           {
-            emoji: "💰",
+            emoji: "FUNDS",
             title: "Each round, everyone contributes",
             desc: "The smart contract holds the pot. No one can withdraw early.",
           },
           {
-            emoji: "🎯",
+            emoji: "PAYOUT",
             title: "The pot rotates",
             desc: "Each member receives the full pot exactly once. Miss a round → penalty.",
           },
@@ -427,27 +456,27 @@ export default function HomePage() {
       {/* Protocol guarantees */}
       <div className="mb-12">
         <h2 className="text-xl font-bold text-slate-800 mb-4">
-          🔐 Protocol Guarantees
+          Protocol Guarantees
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {[
             {
-              emoji: "🚫",
+              emoji: "LOCKED",
               title: "No rug-pulls",
               desc: "The organizer cannot withdraw funds early. All money is locked in the Soroban smart contract until the scheduled payout.",
             },
             {
-              emoji: "🔄",
+              emoji: "ROTATE",
               title: "Deterministic rotation",
               desc: "Payout order is set on-chain at join time. The contract enforces it — no one can skip the queue or pay themselves twice.",
             },
             {
-              emoji: "⚠️",
+              emoji: "WARNING",
               title: "Collateral-backed defaults",
               desc: "Every member locks 1× the round amount as collateral. A missed contribution triggers an automatic penalty deducted from that collateral.",
             },
             {
-              emoji: "🌐",
+              emoji: "CHAIN",
               title: "On-chain reputation",
               desc: "Contribution and default history is recorded on-chain. Your reputation score is public, portable, and unforgeable.",
             },
