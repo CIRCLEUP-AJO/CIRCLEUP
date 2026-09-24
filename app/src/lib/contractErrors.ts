@@ -340,11 +340,11 @@ const USER_MESSAGES: Record<ContractErrorCode, string> = {
 
   // Network
   NETWORK_ERROR:
-    "A network error occurred. Check your connection and try again.",
+    "A network error occurred. Check your internet connection and try again.",
   NETWORK_TIMEOUT:
-    "The transaction timed out waiting for confirmation. Check Stellar Expert for your transaction status before retrying.",
+    "The transaction timed out waiting for confirmation. If you don't see the transaction on Stellar Expert, please try again.",
   NETWORK_RPC_UNAVAILABLE:
-    "The Stellar RPC is temporarily unavailable. Please try again in a moment.",
+    "The Stellar RPC is temporarily unavailable. Please try again in a moment. If the problem persists, contact support.",
 
   // Transaction execution (Issue #479)
   TX_FAILED_ON_CHAIN:

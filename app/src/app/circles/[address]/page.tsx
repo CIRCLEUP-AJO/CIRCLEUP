@@ -79,7 +79,7 @@ export async function generateMetadata({
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type FetchError = "network" | "server" | "parse" | "misconfigured";
+type FetchError = "network" | "server" | "parse" | "misconfigured" | "indexer_outage";
 
 // not_found is handled separately: the page calls notFound() which triggers
 // Next.js's built-in 404 route — CircleErrorBody is never rendered for it.
@@ -128,6 +128,9 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
 
   if (circleRes.status === 404) {
     return { ok: false, error: "not_found" };
+  }
+  if (circleRes.status === 503) {
+    return { ok: false, error: "indexer_outage" };
   }
   if (!circleRes.ok) {
     return { ok: false, error: "server" };
@@ -252,13 +255,15 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
     <div className="mb-8" aria-label="Circle overview">
       <div className="flex items-start gap-3 mb-2">
         <span className="text-3xl" aria-hidden="true">🔄</span>
-        <div>
-          <h1 className="text-2xl font-bold text-slate-900">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold text-slate-900 leading-snug">
             {circle
               ? `$${formatUsdc(circle.round_amount)} / round Circle`
               : "Circle"}
           </h1>
-          <p className="font-mono text-sm text-slate-500">{address}</p>
+          <p className="font-mono text-sm text-slate-500 break-all select-all">
+            {address}
+          </p>
         </div>
       </div>
 
@@ -293,6 +298,9 @@ function CircleErrorBody({ error }: { error: FetchError }) {
       "The indexer returned an unexpected error loading this circle.",
     parse:
       "The indexer response was malformed. This is likely temporary — try refreshing.",
+    indexer_outage:
+      "The indexer is running but currently degraded. It may be catching up with the chain or experiencing a service disruption. " +
+      "Circle details may be incomplete or temporarily unavailable. Try refreshing in a few minutes.",
   };
 
   return (

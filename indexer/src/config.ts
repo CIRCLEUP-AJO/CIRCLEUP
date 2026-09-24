@@ -19,6 +19,15 @@ const REQUIRED_ENV_VARS = [
   "USDC_ADDRESS",
 ] as const;
 
+const CONTRACT_ADDRESS_VARS = [
+  "CIRCLE_FACTORY_ADDRESS",
+  "REPUTATION_ADDRESS",
+  "USDC_ADDRESS",
+] as const;
+
+/** Soroban contract IDs are C-prefixed, 56-char base32 strings. */
+const SOROBAN_CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
 type Env = Record<string, string | undefined>;
 
 /** Returns the required keys that are missing or blank. Exported for unit testing. */
@@ -26,15 +35,45 @@ export function getMissingEnvVars(env: Env = process.env): string[] {
   return REQUIRED_ENV_VARS.filter((key) => !env[key] || env[key]!.trim() === "");
 }
 
-/** Throws a single error listing every missing variable. Exported for unit testing. */
+/**
+ * Validate that every set contract address env var is a well-formed Soroban
+ * contract ID (C-prefixed, 56 base32 chars). Returns one error string per
+ * malformed value. Exported for unit testing.
+ *
+ * An empty/unset value is not flagged here — presence is checked separately
+ * by {@link getMissingEnvVars}. This only fires when a value is present but
+ * malformed, so a typo'd address fails fast at startup with a clear message.
+ */
+export function getMalformedContractAddresses(env: Env = process.env): string[] {
+  const malformed: string[] = [];
+  for (const key of CONTRACT_ADDRESS_VARS) {
+    const value = env[key]?.trim();
+    if (value && !SOROBAN_CONTRACT_ID_RE.test(value)) {
+      malformed.push(
+        `${key} is not a valid Soroban contract ID (expected C-prefixed 56-char base32, got "${value}")`,
+      );
+    }
+  }
+  return malformed;
+}
+
+/** Throws a single error listing every missing or malformed variable. Exported for unit testing. */
 export function assertEnvVars(env: Env = process.env): void {
   const missing = getMissingEnvVars(env);
-  if (missing.length === 0) return;
+  const malformed = getMalformedContractAddresses(env);
+  const problems = [
+    ...missing.map((k) => `  • ${k} is missing or blank`),
+    ...malformed.map((m) => `  • ${m}`),
+  ];
+  if (problems.length === 0) {
+    console.log("[circleup-indexer] Environment validation passed ✓");
+    return;
+  }
 
   throw new Error(
-    `[circleup-indexer] Missing required environment variable(s):\n` +
-      missing.map((k) => `  • ${k}`).join("\n") +
-      `\n\nCopy indexer/.env.example to indexer/.env and fill in the missing values.`,
+    `[circleup-indexer] Environment variable configuration error:\n` +
+      problems.join("\n") +
+      `\n\nCopy indexer/.env.example to indexer/.env and fill in the correct values.`,
   );
 }
 
