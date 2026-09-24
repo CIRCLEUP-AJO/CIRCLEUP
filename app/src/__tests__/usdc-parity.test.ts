@@ -15,19 +15,12 @@
 
 import { describe, it, expect } from "vitest";
 
-// App copy — USDC helpers from the canonical usdc.ts module (Issue #475).
-// config.ts re-exports all of these from usdc.ts, so both import paths are
-// equivalent; we import from usdc.ts directly to test the canonical source.
+// App copy (app/src/lib/config.ts)
 import {
   usdcToStroops as appUsdcToStroops,
   stroopsToUsdc as appStroopsToUsdc,
   formatUsdc as appFormatUsdc,
   formatPot as appFormatPot,
-} from "../lib/usdc";
-
-// daysToLedgers / ledgersToDays live in config.ts (not usdc.ts) because they
-// are not money-math — they are ledger / time helpers.
-import {
   daysToLedgers as appDaysToLedgers,
   ledgersToDays as appLedgersToDays,
 } from "../lib/config";

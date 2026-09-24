@@ -120,42 +120,22 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
-// ─── Error kinds and their user-facing copy ───────────────────────────────────
-
-const INDEXER_ERROR_MESSAGES: Record<
-  "network" | "parse" | "server" | "misconfigured",
-  { title: string; body: string; hint?: string }
-> = {
-  misconfigured: {
-    title: "Indexer not configured",
-    body:
-      "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
-      "Copy app/.env.example to app/.env.local and set a valid indexer URL, then restart the server.",
-    hint: "This is an operator configuration issue. Users cannot resolve it by refreshing.",
-  },
-  network: {
-    title: "Circles list unavailable",
-    body: "The indexer is unreachable right now. Circles may not be up to date.",
-    hint: "Check that the indexer service is running and reachable, then try refreshing.",
-  },
-  server: {
-    title: "Indexer error",
-    body: "The indexer returned an unexpected error. Circles cannot be loaded at the moment.",
-    hint: "This is likely temporary. Try refreshing in a few seconds.",
-  },
-  parse: {
-    title: "Unexpected indexer response",
-    body: "The indexer response was malformed.",
-    hint: "This is likely a temporary issue — try refreshing the page.",
-  },
-};
-
 function IndexerErrorBanner({
   error,
 }: {
   error: "network" | "parse" | "server" | "misconfigured";
 }) {
-  const { title, body, hint } = INDEXER_ERROR_MESSAGES[error];
+  const messages: Record<string, string> = {
+    misconfigured:
+      "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
+      "Copy app/.env.example to app/.env.local and set a valid indexer URL, then restart the server.",
+    network:
+      "The indexer is unreachable right now. Circles may not be up to date. Check that the indexer service is running.",
+    server:
+      "The indexer returned an unexpected error. Circles cannot be loaded at the moment.",
+    parse:
+      "The indexer response was malformed. This is likely a temporary issue — try refreshing.",
+  };
 
   return (
     <div
@@ -164,11 +144,10 @@ function IndexerErrorBanner({
     >
       <span className="text-xl mt-0.5" aria-hidden="true">⚠️</span>
       <div>
-        <p className="font-semibold text-amber-800 text-sm">{title}</p>
-        <p className="text-amber-700 text-sm mt-0.5">{body}</p>
-        {hint && (
-          <p className="text-amber-600 text-xs mt-1">{hint}</p>
-        )}
+        <p className="font-semibold text-amber-800 text-sm">
+          Circles list unavailable
+        </p>
+        <p className="text-amber-700 text-sm mt-0.5">{messages[error]}</p>
       </div>
     </div>
   );
@@ -183,11 +162,9 @@ function CircleListSkeleton() {
   return (
     <div
       className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"
-      role="status"
       aria-busy="true"
       aria-label="Loading circles…"
     >
-      <span className="sr-only">Loading circles, please wait…</span>
       {Array.from({ length: 6 }).map((_, i) => (
         <div
           key={i}
@@ -245,30 +222,13 @@ async function CirclesList() {
 
   if (result.circles.length === 0) {
     return (
-      <div
-        className="text-center py-16 text-slate-500"
-        role="status"
-        aria-label="No circles found"
-      >
-        <div className="text-5xl mb-4" aria-hidden="true">🌱</div>
-        <p className="font-semibold text-slate-700 text-lg">No circles yet</p>
-        <p className="text-sm mt-2 max-w-xs mx-auto text-slate-500">
-          CircleUp is live but no savings circles have been created yet. Be the
-          first to start one — it only takes a minute.
-        </p>
-        <div className="mt-6 flex flex-col sm:flex-row gap-3 justify-center">
-          <Link
-            href="/create"
-            className="inline-block px-5 py-2.5 rounded-xl font-semibold text-sm
-              bg-brand-600 text-white hover:bg-brand-700 border border-brand-600
-              transition-colors focus-visible:outline-none focus-visible:ring-2
-              focus-visible:ring-brand-600 focus-visible:ring-offset-2"
-          >
-            Start the first circle
+      <div className="text-center py-16 text-slate-500">
+        <div className="text-4xl mb-3">🌱</div>
+        <p className="font-medium">No circles yet.</p>
+        <p className="text-sm mt-1">
+          <Link href="/create" className="text-brand-600 underline">
+            Create the first one
           </Link>
-        </div>
-        <p className="text-xs text-slate-400 mt-4">
-          You will need a Freighter wallet and at least 2 member addresses.
         </p>
       </div>
     );
