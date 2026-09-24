@@ -33,7 +33,7 @@ interface ReputationResponse {
 
 type FetchResult =
   | { ok: true; data: ReputationResponse }
-  | { ok: false; reason: "not_found" | "network" | "unknown" | "aborted" };
+  | { ok: false; reason: "not_found" | "network" | "unknown" | "aborted" | "indexer_outage" };
 
 async function fetchReputation(member: string, signal?: AbortSignal): Promise<FetchResult> {
   // Validate the route param before making any network request. A malformed
@@ -48,6 +48,7 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
       signal,
     });
     if (res.status === 404) return { ok: false, reason: "not_found" };
+    if (res.status === 503) return { ok: false, reason: "indexer_outage" };
     if (!res.ok) return { ok: false, reason: "unknown" };
     return { ok: true, data: (await res.json()) as ReputationResponse };
   } catch (err) {
@@ -129,6 +130,8 @@ export default function ReputationClient({ member }: { member: string }) {
     const errorMessages: Record<string, string> = {
       network: "The reputation service is unreachable. Check your connection and try again.",
       unknown: "An unexpected error occurred loading reputation data.",
+      indexer_outage:
+        "The indexer is running but currently degraded. Reputation data may be temporarily unavailable. Try again in a few minutes.",
     };
 
     return (

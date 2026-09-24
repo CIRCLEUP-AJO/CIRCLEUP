@@ -26,7 +26,7 @@ export const metadata: Metadata = {
 
 type FetchResult =
   | { ok: true; circles: Circle[] }
-  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" };
+  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage" };
 
 // ─── URL validation ───────────────────────────────────────────────────────────
 
@@ -80,6 +80,9 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
   }
 
   if (!res.ok) {
+    // 503 from the indexer means it's up but degraded — surface as outage
+    // rather than a generic "server" error so the UI can show a specific message.
+    if (res.status === 503) return { ok: false, error: "indexer_outage" };
     return { ok: false, error: "server" };
   }
 
@@ -123,7 +126,7 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
 function IndexerErrorBanner({
   error,
 }: {
-  error: "network" | "parse" | "server" | "misconfigured";
+  error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage";
 }) {
   const messages: Record<string, string> = {
     misconfigured:
@@ -135,6 +138,9 @@ function IndexerErrorBanner({
       "The indexer returned an unexpected error. Circles cannot be loaded at the moment.",
     parse:
       "The indexer response was malformed. This is likely a temporary issue — try refreshing.",
+    indexer_outage:
+      "The indexer is running but currently degraded (it may be catching up with the chain or experiencing a service disruption). " +
+      "Circle data may be incomplete or temporarily unavailable. Try refreshing in a few minutes.",
   };
 
   return (
