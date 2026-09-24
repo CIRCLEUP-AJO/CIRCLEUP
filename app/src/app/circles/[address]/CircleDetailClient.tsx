@@ -1,4 +1,5 @@
 "use client";
+"use client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
