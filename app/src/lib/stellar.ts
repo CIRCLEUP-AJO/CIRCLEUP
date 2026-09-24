@@ -58,7 +58,8 @@ import {
 export type WalletErrorReason =
   | "not_installed"
   | "permission_denied"
-  | "unknown";
+  | "unknown"
+  | "unsupported_capability";
 
 export class WalletError extends Error {
   constructor(
