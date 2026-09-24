@@ -443,7 +443,19 @@ function StaleDataBanner({ onRefresh, isRefreshing }: StaleDataBannerProps) {
   );
 }
 
-// ─── Workflow explanation banner ──────────────────────────────────────────────
+// ─── WorkflowBanner ───────────────────────────────────────────────────────────
+//
+// Issue #497: Inline workflow explanations for join and contribute actions.
+//
+// The banner contextualises the action buttons so users understand:
+//   • What the action does (semantics, not just the button label)
+//   • What will happen on-chain (collateral, pot pooling, rotation)
+//   • What the outcome will be for them personally
+//   • Any prerequisites they need to be aware of
+//
+// Each case is distinct and complete. The banners are intentionally verbose —
+// a savings-circle user may be new to on-chain protocols and needs more than
+// a one-liner to make an informed decision about locking real funds.
 
 interface WorkflowBannerProps {
   status: string;
@@ -474,10 +486,15 @@ function WorkflowBanner({
     return (
       <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800 flex gap-3 items-start">
         <span className="text-lg" aria-hidden="true">ℹ️</span>
-        <p>
-          <strong>Connect your wallet</strong> using the button in the top-right
-          to join or interact with this circle.
-        </p>
+        <div>
+          <p className="font-semibold mb-1">Connect your wallet to interact</p>
+          <p>
+            Use the <strong>Connect Wallet</strong> button in the top-right
+            corner to link your Freighter wallet. Once connected, you can join
+            this circle (if it is still Pending) or contribute to the current
+            round (if it is Active).
+          </p>
+        </div>
       </div>
     );
   }
@@ -487,12 +504,27 @@ function WorkflowBanner({
       <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800 flex gap-3 items-start">
         <span className="text-lg" aria-hidden="true">🔒</span>
         <div>
-          <p className="font-semibold mb-1">How to join this circle</p>
-          <p>
-            Click <strong>"Lock Collateral &amp; Join"</strong> below. This
-            locks your collateral on-chain, securing your spot in the rotation.
-            You will receive the pot when it is your turn — your payout order
-            is assigned at join time.
+          <p className="font-semibold mb-1">How joining works</p>
+          <ol className="list-decimal list-inside space-y-1 mt-1">
+            <li>
+              Click <strong>"Lock Collateral &amp; Join"</strong> below. Your
+              Freighter wallet will ask you to sign the transaction.
+            </li>
+            <li>
+              The contract locks{" "}
+              <strong>1× the round contribution</strong> from your wallet as
+              collateral. This secures your spot in the rotation and covers any
+              penalty if you miss a round.
+            </li>
+            <li>
+              Your payout order is recorded on-chain at join time and cannot be
+              changed later. The circle starts automatically once{" "}
+              <strong>all members have joined</strong>.
+            </li>
+          </ol>
+          <p className="mt-2 text-blue-700 text-xs">
+            ⚠️ Make sure your wallet has enough USDC to cover the collateral
+            before clicking Join.
           </p>
         </div>
       </div>
@@ -503,10 +535,15 @@ function WorkflowBanner({
     return (
       <div className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-brand-800 flex gap-3 items-start">
         <span className="text-lg" aria-hidden="true">✅</span>
-        <p>
-          You have joined. The circle starts automatically once all members have
-          locked their collateral.
-        </p>
+        <div>
+          <p className="font-semibold mb-1">You have joined — waiting for the circle to start</p>
+          <p>
+            Your collateral is locked on-chain. The circle will activate
+            automatically once all invited members have locked their collateral.
+            You will receive the full pot when it is your turn in the rotation —
+            no further action is needed until the circle goes Active.
+          </p>
+        </div>
       </div>
     );
   }
@@ -519,11 +556,26 @@ function WorkflowBanner({
           <p className="font-semibold mb-1">
             Round {currentRound} of {totalRounds} — your contribution is due
           </p>
-          <p>
-            Click <strong>"Contribute Round {currentRound}"</strong> to send
-            your share of the pot. All contributions are pooled and paid out to
-            the next member in the rotation. Missing a round incurs a penalty
-            deducted from your collateral.
+          <ol className="list-decimal list-inside space-y-1 mt-1">
+            <li>
+              Click <strong>"Contribute Round {currentRound}"</strong> below.
+              Your Freighter wallet will ask you to sign the transaction.
+            </li>
+            <li>
+              Your contribution is transferred to the smart contract and pooled
+              with the other members&apos; contributions. No individual — not
+              even the circle organiser — can access these funds.
+            </li>
+            <li>
+              Once <strong>all members have contributed</strong>, the full pot
+              is automatically paid out to the next member in the rotation. The
+              payout is triggered on-chain and does not require any manual step.
+            </li>
+          </ol>
+          <p className="mt-2 text-amber-700 text-xs">
+            ⚠️ <strong>Missing a round incurs a penalty</strong> deducted from
+            your locked collateral. Contribute before the round deadline shown
+            in the countdown below.
           </p>
         </div>
       </div>
@@ -534,10 +586,18 @@ function WorkflowBanner({
     return (
       <div className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-brand-800 flex gap-3 items-start">
         <span className="text-lg" aria-hidden="true">✅</span>
-        <p>
-          You have contributed to round {currentRound}. Waiting for all other
-          members to contribute before the payout triggers.
-        </p>
+        <div>
+          <p className="font-semibold mb-1">
+            Your round {currentRound} contribution is in
+          </p>
+          <p>
+            Waiting for the remaining members to contribute. Once everyone has
+            paid in, the payout will be triggered automatically. You can use the{" "}
+            <strong>"Trigger Payout"</strong> button below to initiate it
+            manually if all contributions are in but the automatic trigger has
+            not fired yet.
+          </p>
+        </div>
       </div>
     );
   }
@@ -546,11 +606,16 @@ function WorkflowBanner({
     return (
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-sm text-slate-600 flex gap-3 items-start">
         <span className="text-lg" aria-hidden="true">👀</span>
-        <p>
-          This circle is active. You are not a member, but you can watch the
-          rotation progress below. Trigger Payout is available to anyone once
-          all contributions are in.
-        </p>
+        <div>
+          <p className="font-semibold mb-1">Observing this circle</p>
+          <p>
+            This circle is active. You are not a member, but you can watch the
+            contribution and payout progress in the Rotation Order section
+            below. The <strong>Trigger Payout</strong> button is available to
+            anyone — member or not — once all contributions for the current
+            round are in.
+          </p>
+        </div>
       </div>
     );
   }
