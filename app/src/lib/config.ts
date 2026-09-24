@@ -146,7 +146,10 @@ function assertEnvVars(): void {
     ...malformed.map((m) => `  • ${m}`),
     ...conflicts.map((c) => `  • ${c}`),
   ];
-  if (problems.length === 0) return;
+  if (problems.length === 0) {
+    console.log("[CircleUp] Environment validation passed ✓");
+    return;
+  }
 
   throw new Error(
     `[CircleUp] Environment variable configuration error:\n` +

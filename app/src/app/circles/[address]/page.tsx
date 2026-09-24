@@ -79,7 +79,7 @@ export async function generateMetadata({
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type FetchError = "network" | "server" | "parse" | "misconfigured";
+type FetchError = "network" | "server" | "parse" | "misconfigured" | "indexer_outage";
 
 // not_found is handled separately: the page calls notFound() which triggers
 // Next.js's built-in 404 route — CircleErrorBody is never rendered for it.
@@ -128,6 +128,9 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
 
   if (circleRes.status === 404) {
     return { ok: false, error: "not_found" };
+  }
+  if (circleRes.status === 503) {
+    return { ok: false, error: "indexer_outage" };
   }
   if (!circleRes.ok) {
     return { ok: false, error: "server" };
@@ -293,6 +296,9 @@ function CircleErrorBody({ error }: { error: FetchError }) {
       "The indexer returned an unexpected error loading this circle.",
     parse:
       "The indexer response was malformed. This is likely temporary — try refreshing.",
+    indexer_outage:
+      "The indexer is running but currently degraded. It may be catching up with the chain or experiencing a service disruption. " +
+      "Circle details may be incomplete or temporarily unavailable. Try refreshing in a few minutes.",
   };
 
   return (
