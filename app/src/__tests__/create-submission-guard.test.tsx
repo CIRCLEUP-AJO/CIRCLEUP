@@ -46,6 +46,7 @@ vi.mock("@/lib/config", async (importOriginal) => {
 // ─── Imports after mock declarations ──────────────────────────────────────────
 
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
+import { Keypair } from "@stellar/stellar-sdk";
 import CreateClient from "../app/create/CreateClient";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
@@ -54,10 +55,11 @@ import CreateClient from "../app/create/CreateClient";
  *  They are intentionally different so the self-address guard does not fire. */
 const WALLET =
   "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const MEMBER_A =
-  "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBWHF";
-const MEMBER_B =
-  "GCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCWHF";
+/** Deterministic, checksum-valid member addresses (Issue #477). */
+const addrFor = (seed: number): string =>
+  Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();
+const MEMBER_A = addrFor(11);
+const MEMBER_B = addrFor(12);
 const TX_HASH =
   "abc123def456abc123def456abc123def456abc123def456abc123def456ab12";
 

@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Issue 477**: Address validation for every member entry on the create flow
+  (`app/src/lib/address.ts`, `app/src/app/create/CreateClient.tsx`)
+  — Added dependency-free strkey checksum verification (base32 decode +
+  CRC16/XMODEM) as `hasValidStrKeyChecksum` / `isValidStellarAccount`, plus a
+  per-row `validateMemberEntry` that `validateCreateForm` now applies to every
+  filled member row. A string that is 56 base32 characters but fails its
+  checksum — a single mistyped character or a truncated copy-paste — was
+  accepted by the form and only failed later inside transaction construction,
+  after the wallet prompt had already appeared. Each failure mode (lowercase,
+  contract `C…`, muxed `M…`, bad shape, bad checksum) now reports its own
+  `Member N:` message under the offending row. Covered by
+  `app/src/__tests__/member-address-validation.test.ts` and the updated
+  create-form, submission-guard, and member-list suites
 - **Issue 30**: Contract argument compatibility fixtures (`sdk/src/__tests__/contractFixtures.test.ts`)
   — Base64-encoded XDR fixtures for every public contract method (factory, circle,
   reputation) that verify SDK argument encoding remains compatible with contract
