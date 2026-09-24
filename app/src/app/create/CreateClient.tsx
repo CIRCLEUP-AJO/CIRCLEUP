@@ -20,8 +20,29 @@ const MIN_MEMBERS = 2;
 const MAX_MEMBERS = 20;
 /** Maximum round amount in USDC (sanity check to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
-/** Maximum round duration in days. */
-const MAX_ROUND_DAYS = 365;
+/** Maximum length of a circle name. */
+const MAX_NAME_LENGTH = 100;
+/** Minimum amount for USDC (smallest unit of stroops for USDC). */
+const MIN_AMOUNT_USDC = 0.0000001;
+/** USDC has 7 decimal places. */
+const MAX_USDC_DECIMALS = 7;
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface CreateFormErrors {
+  name?: string;
+  amount?: string;
+  days?: string;
+  members?: (string | undefined)[];
+  membersGeneral?: string;
+}
+
+interface ValidatedCreateForm {
+  name: string;
+  validMembers: string[];
+  amountStroops: bigint;
+  roundDays: number;
+}
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
@@ -40,6 +61,22 @@ function findDuplicateAddress(addresses: string[]): string | null {
     seen.add(lower);
   }
   return null;
+}
+
+/**
+ * Validate a single member entry (e.g. `G…`).
+ * Returns an error string, or undefined if valid.
+ */
+function validateMemberEntry(raw: string, i: number): string | undefined {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    // Empty entries are allowed unless the total count is too low
+    return undefined;
+  }
+  if (!isStellarPublicKey(trimmed)) {
+    return `Member ${i + 1} is not a valid Stellar public key.`;
+  }
+  return undefined;
 }
 
 /**
@@ -237,6 +274,7 @@ export default function CreateClient() {
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
+  const submittingRef  = useRef(false);
   // One ref per member row for focusing the first invalid field
   const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
@@ -266,8 +304,16 @@ export default function CreateClient() {
   // ── Member helpers ──────────────────────────────────────────────────────────
   function updateMember(i: number, val: string) {
     setMembers((prev) => {
+      const next = [...prev];
+      next[i] = val;
+      return next;
+    });
+  }
+
+  const addMember = useCallback(() => {
+    setMembers((prev) => {
       if (prev.length >= MAX_MEMBERS) return prev;
-      return [...prev, createMemberRow()];
+      return [...prev, ""];
     });
   }, []);
 
@@ -278,21 +324,7 @@ export default function CreateClient() {
    * Focus change is deferred via pendingFocusId so the target exists in the
    * DOM on the next render.
    */
-  const removeMember = useCallback((id: string) => {
-    setMembers((prev) => {
-      if (prev.length <= MIN_MEMBERS) return prev;
-      const idx  = prev.findIndex((r) => r.id === id);
-      const next = prev.filter((r) => r.id !== id);
-      // Schedule focus on the row that moved into this slot (or the last row).
-      if (next.length > 0) {
-        const focusIdx  = Math.min(idx, next.length - 1);
-        pendingFocusId.current = next[focusIdx].id;
-      }
-      return next;
-    });
-    // Clean up the ref entry for the removed row.
-    memberInputRefs.current.delete(id);
-  }, []);
+
 
   function removeMember(i: number) {
     if (members.length <= MIN_MEMBERS) return;
@@ -303,7 +335,7 @@ export default function CreateClient() {
 
   // ── Copy helper ─────────────────────────────────────────────────────────────
   async function copyTxHash() {
-    const hash = txHash || timedOutTxHash;
+    const hash = txHash;
     if (!hash) return;
     try {
       await navigator.clipboard.writeText(hash);
@@ -361,55 +393,7 @@ export default function CreateClient() {
       }
       setFieldErrors({});
 
-      const { name: circleName, validMembers, amountStroops, roundDays: days } =
-        validation.values;
 
-    // Check that the creator is not also a member (self-address check)
-    const creatorLower = walletAddress.toLowerCase();
-    const isSelfMember = validMembers.some((m) => m.toLowerCase() === creatorLower);
-    if (isSelfMember) {
-      setError(
-        "Your wallet address cannot be included in the member list. " +
-          "The circle creator is automatically a member.",
-      );
-      return;
-    }
-
-    const duplicate = findDuplicateAddress(validMembers);
-    if (duplicate) {
-      setError(
-        `Duplicate address detected: ${shortAddress(duplicate)}. Each member must be unique.`,
-      );
-      return;
-    }
-
-      // Step 3: factory address guard
-      if (!CIRCLE_FACTORY_ADDRESS) {
-        setSubmitError("Factory contract not configured. Deploy contracts first.");
-        return;
-      }
-
-    const amount = parseFloat(roundUSDC);
-    if (isNaN(amount) || amount <= 0) {
-      setError("Enter a valid round amount greater than zero.");
-      return;
-    }
-    if (amount > MAX_ROUND_USDC) {
-      setError(
-        `Round amount of $${amount.toLocaleString()} exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`,
-      );
-      return;
-    }
-
-    const days = parseInt(roundDays, 10);
-    if (isNaN(days) || days < 1) {
-      setError("Enter a valid round duration of at least 1 day.");
-      return;
-    }
-    if (days > MAX_ROUND_DAYS) {
-      setError(`Round duration cannot exceed ${MAX_ROUND_DAYS} days.`);
-      return;
-    }
 
     // ── Step 3: factory address guard ─────────────────────────────────────────
     if (!CIRCLE_FACTORY_ADDRESS) {
@@ -447,11 +431,7 @@ export default function CreateClient() {
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
-      // Release the lock on every path except confirmed timeout, where the user
-      // must explicitly acknowledge via resetAfterTimeout() before retrying.
-      if (!pendingTimeout) {
-        submittingRef.current = false;
-      }
+      submittingRef.current = false;
     }
   }
 
