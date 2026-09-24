@@ -4,6 +4,7 @@ import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
 import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
 import { isSorobanContractId } from "@/lib/address";
+import { parseContractError, userMessageForError } from "@/lib/contractErrors";
 import {
   buildAppSnapshot,
   computeActionEligibility,
@@ -691,6 +692,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // ── Action state ───────────────────────────────────────────────────────────
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
   const [error,        setError]        = useState<string>("");
+  // Hash of the transaction that produced the current error (set when the
+  // failure happened on-chain after submission) so the banner can link to
+  // the explorer for full diagnostics (Issue #479).
+  const [errorTxHash,  setErrorTxHash]  = useState<string | null>(null);
   const [success,      setSuccess]      = useState<SuccessState | null>(null);
   const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
@@ -937,6 +942,29 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     default:    "Member marked as defaulted.",
     close:      "Collateral released successfully.",
   };
+
+  /**
+   * Sets the action error banner, optionally attaching the hash of the
+   * failed transaction so the UI can offer an explorer link (Issue #479).
+   * Clears the hash whenever a new error without one replaces the old one.
+   */
+  function showActionError(message: string, txHash: string | null = null) {
+    setError(message);
+    setErrorTxHash(txHash);
+  }
+
+  /**
+   * Maps an unexpected thrown error to user-facing copy: known categories
+   * get the canonical message from `userMessageForError`; unrecognised
+   * failures keep the original message so validation hints stay visible
+   * (Issue #479).
+   */
+  function messageForThrownError(err: unknown): string {
+    const raw = err instanceof Error ? err.message : "";
+    if (!raw) return "An unexpected error occurred. Please try again.";
+    const typed = parseContractError(raw);
+    return typed.kind === "unknown" ? raw : userMessageForError(typed);
+  }
 
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
     if (!walletAddress) {
