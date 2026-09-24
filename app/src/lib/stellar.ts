@@ -227,6 +227,40 @@ export function formatContractError(raw: string | undefined): string {
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
+/**
+ * Extracts the stable XDR result-code name (e.g. `"txFailed"`, `"txBadSeq"`,
+ * `"txInsufficientFee"`) from a `xdr.TransactionResult` so
+ * {@link parseContractError} can map it to a specific user-facing message
+ * instead of a generic "unexpected error" (Issue #479).
+ *
+ * Returns `undefined` when the result is absent or cannot be inspected so
+ * callers can fall back to a marker string.
+ */
+function extractTxResultCode(
+  errorResult: xdr.TransactionResult | null | undefined,
+): string | undefined {
+  if (!errorResult) return undefined;
+  try {
+    const name = (errorResult as any)?.result?.()?.switch?.()?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Builds the typed error for a transaction that reached the network and was
+ * rejected, preferring the extracted XDR result code.  Unrecognised result
+ * codes still receive the clear on-chain rejection copy rather than the
+ * generic UNKNOWN fallback (Issue #479).
+ */
+function onChainFailureError(code: string | undefined): ContractAppError {
+  const parsed = parseContractError(code ?? "transaction failed");
+  return parsed.code === "UNKNOWN"
+    ? parseContractError("transaction failed")
+    : parsed;
+}
+
 // ─── Typed result types ────────────────────────────────────────────────────────
 
 /**
@@ -333,7 +367,23 @@ export async function simulateContractTx(
     .build();
 
   // ── Simulation ───────────────────────────────────────────────────────────
-  const simResult = await rpc.simulateTransaction(tx);
+  // RPC client failures during simulation surface as thrown exceptions —
+  // normalise them into the same typed failure result so callers always
+  // receive structured error feedback instead of an unhandled rejection
+  // (Issue #479).
+  let simResult: SorobanRpc.Api.SimulateTransactionResponse;
+  try {
+    simResult = await rpc.simulateTransaction(tx);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(txCtx, "failed", categorizeError(msg));
+    const typedError = parseContractError(msg);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
+  }
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
     // Never forward the raw simResult.error string (may contain contract
@@ -350,11 +400,27 @@ export async function simulateContractTx(
   // ── Telemetry: simulated ─────────────────────────────────────────────────
   emit(txCtx, "simulated");
 
-  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+  // ── Assembly ─────────────────────────────────────────────────────────────
+  // Malformed simulation payloads or resource-limit rejections throw here;
+  // convert them to a typed failure so the user sees a clear message rather
+  // than a raw exception (Issue #479).
+  let preparedXdr: string;
+  try {
+    preparedXdr = SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(txCtx, "failed", categorizeError(msg));
+    const typedError = parseContractError(msg);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
+  }
 
   return {
     success: true,
-    preparedXdr: preparedTx.toXDR(),
+    preparedXdr,
     simResult: simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse,
   };
 }
@@ -472,9 +538,13 @@ export async function submitContractTx(
 
   if (sendResult.status === "ERROR") {
     // The hash is available at this point; included in the return value for
-    // the user but never forwarded to telemetry.
-    const rawErr = JSON.stringify(sendResult.errorResult);
-    const typedError = parseContractError(rawErr);
+    // the user but never forwarded to telemetry.  Prefer the extracted XDR
+    // result code (e.g. "txFailed") so the user gets specific feedback for
+    // the on-chain rejection (Issue #479); fall back to the serialised
+    // result, then to the canonical "transaction failed" marker.
+    const code = extractTxResultCode(sendResult.errorResult);
+    const rawErr = code ?? JSON.stringify(sendResult.errorResult);
+    const typedError = onChainFailureError(rawErr);
     emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
@@ -506,7 +576,13 @@ export async function submitContractTx(
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      const typedError = parseContractError("transaction failed");
+      // Extract the XDR result code when available so the user sees exactly
+      // why the transaction failed on-chain (contract rule violation, low
+      // fee, sequence mismatch) instead of a generic error (Issue #479).
+      const code = extractTxResultCode(
+        (status as { errorResult?: xdr.TransactionResult }).errorResult,
+      );
+      const typedError = onChainFailureError(code);
       emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
@@ -549,17 +625,43 @@ export async function invokeContract(
 ): Promise<InvokeResult> {
   const txCtx = startTx(method);
 
-  const simOutcome = await simulateContractTx(contractId, method, args, walletAddress, txCtx);
-  if (!simOutcome.success) {
+  // Every failure path — including unexpected synchronous exceptions such as
+  // address assertions or SDK client throws — is converted to a typed
+  // InvokeResult so callers always receive structured error feedback instead
+  // of an unhandled rejection (Issue #479).  Unrecognised failures keep the
+  // original message so validation hints stay visible to the user.
+  try {
+    const simOutcome = await simulateContractTx(
+      contractId,
+      method,
+      args,
+      walletAddress,
+      txCtx,
+    );
+    if (!simOutcome.success) {
+      return {
+        txHash: "",
+        success: false,
+        error: simOutcome.error,
+        typedError: simOutcome.typedError,
+      };
+    }
+
+    return await submitContractTx(simOutcome.preparedXdr, txCtx);
+  } catch (err: unknown) {
+    const raw = err instanceof Error ? err.message : String(err);
+    const typedError = parseContractError(raw);
+    emit(txCtx, "failed", categorizeError(raw));
     return {
       txHash: "",
       success: false,
-      error: simOutcome.error,
-      typedError: simOutcome.typedError,
+      error:
+        typedError.kind === "unknown" && raw
+          ? raw
+          : userMessageForError(typedError),
+      typedError,
     };
   }
-
-  return submitContractTx(simOutcome.preparedXdr, txCtx);
 }
 
 // ─── Read-only simulation ─────────────────────────────────────────────────────
