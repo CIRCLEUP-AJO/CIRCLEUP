@@ -559,14 +559,53 @@ function WorkflowBanner({
 }
 
 // ─── getMemberContributionStatus ─────────────────────────────────────────────
+//
+// Issue #498: Improve member contribution state display in rotation order.
+//
+// The previous implementation relied solely on member.total_contributions,
+// a cumulative counter that only updates after the indexer fully processes a
+// round. This caused two display bugs:
+//
+//   1. A member who contributed in round N but whose counter hadn't been
+//      incremented yet (indexer lag) showed as "pending" incorrectly.
+//   2. A member whose counter overflowed or was reset could show as "pending"
+//      for a round they genuinely hadn't contributed to yet.
+//
+// Fix: when the authoritative currentRound.contributions list is available,
+// use it as the primary source of truth. Fall back to the total_contributions
+// counter only when currentRound is absent (partial data).
+//
+// The payout_order === currentRound check is preserved: the current recipient
+// is not expected to contribute (they receive the pot) so their row should
+// show "waiting" rather than a misleading "pending" badge.
 
 function getMemberContributionStatus(
   member: CircleMember,
   currentRound: number,
   status: string,
+  /** Authoritative contribution list for the current round (from indexer /rounds endpoint). */
+  currentRoundContributions: ContributionRecord[] | null,
 ): "contributed" | "pending" | "defaulted" | "not_applicable" {
   if (status !== "Active") return "not_applicable";
+
+  // The current recipient receives the pot — they are not a contributor this round.
   if (member.payout_order === currentRound) return "not_applicable";
+
+  // Issue #498: prefer the authoritative contributions list when available.
+  if (currentRoundContributions !== null) {
+    const hasContributed = currentRoundContributions.some(
+      (c) => c.member_address === member.member_address,
+    );
+    if (hasContributed) return "contributed";
+    // If they haven't contributed and have at least one default recorded, show
+    // "defaulted" so the organiser sees who to mark default against.
+    if (member.defaults > 0) return "defaulted";
+    return "pending";
+  }
+
+  // Fallback when currentRound data is not yet available (partial data state).
+  // total_contributions is a cumulative count; a value strictly greater than
+  // currentRound means they've contributed at least once in this round.
   if (Number(member.total_contributions) > currentRound) return "contributed";
   if (member.defaults > 0) return "defaulted";
   return "pending";
@@ -1639,6 +1678,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               member,
               currentRound,
               data.circle.status,
+              // Issue #498: pass the authoritative contribution list when available
+              // so the badge reflects real-time on-chain state rather than the
+              // potentially-lagged total_contributions counter.
+              data.currentRound?.contributions ?? null,
             );
 
             return (
