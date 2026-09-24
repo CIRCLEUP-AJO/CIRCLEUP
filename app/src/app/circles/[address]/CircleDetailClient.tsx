@@ -611,6 +611,128 @@ function getMemberContributionStatus(
   return "pending";
 }
 
+// ─── Type-safe parsers for indexer API responses (Issue #496) ────────────────
+//
+// These narrow unknown JSON objects to the correct model types before any
+// value leaves the network boundary. An `as SomeType[]` cast on an unvalidated
+// array would let malformed rows silently propagate into the render tree and
+// gate logic. Instead, each row is parsed independently — a row that fails
+// validation is dropped rather than crashing the whole page.
+//
+// Contract: every parser returns null for any input that is not a plain object
+// with the required fields. They never throw.
+
+function parseContributionRecord(raw: unknown): ContributionRecord | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
+  if (typeof r.amount !== "string") return null;
+  if (typeof r.tx_hash !== "string") return null;
+  return {
+    member_address: r.member_address,
+    amount: r.amount,
+    tx_hash: r.tx_hash,
+  };
+}
+
+function parseDefaultRecord(raw: unknown): DefaultRecord | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
+  if (typeof r.penalty !== "string") return null;
+  return {
+    member_address: r.member_address,
+    penalty: r.penalty,
+  };
+}
+
+/**
+ * Parse and validate a single CircleMember row from an unknown API value.
+ * Returns null if any required field is missing or malformed.
+ */
+function parseCircleMember(raw: unknown): CircleMember | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
+  if (typeof r.payout_order !== "number") return null;
+  if (typeof r.collateral !== "string") return null;
+  if (typeof r.defaults !== "number") return null;
+  if (typeof r.reputation_score !== "number") return null;
+  if (typeof r.total_contributions !== "number") return null;
+  return {
+    member_address: r.member_address,
+    payout_order: r.payout_order,
+    collateral: r.collateral,
+    defaults: r.defaults,
+    joined_at: typeof r.joined_at === "string" ? r.joined_at : null,
+    reputation_score: r.reputation_score,
+    total_contributions: r.total_contributions,
+  };
+}
+
+const VALID_ROUND_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
+
+/**
+ * Parse and validate a single CircleRound row from an unknown API value.
+ * Returns null if any required field is missing or malformed.
+ */
+function parseCircleRound(raw: unknown): CircleRound | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.roundIndex !== "number") return null;
+  if (typeof r.status !== "string" || !VALID_ROUND_STATUSES.has(r.status)) return null;
+  const contributions = Array.isArray(r.contributions)
+    ? r.contributions.map(parseContributionRecord).filter((c): c is ContributionRecord => c !== null)
+    : [];
+  const defaults = Array.isArray(r.defaults)
+    ? r.defaults.map(parseDefaultRecord).filter((d): d is DefaultRecord => d !== null)
+    : [];
+  return {
+    roundIndex: r.roundIndex,
+    status: r.status as CircleRound["status"],
+    recipient: typeof r.recipient === "string" ? r.recipient : null,
+    amount: typeof r.amount === "string" ? r.amount : null,
+    txHash: typeof r.txHash === "string" ? r.txHash : null,
+    contributions,
+    defaults,
+  };
+}
+
+/**
+ * Parse and validate a single CirclePendingDefault from an unknown API value.
+ * Returns null when the row is missing required fields.
+ */
+function parsePendingDefault(raw: unknown): CirclePendingDefault | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
+  if (typeof r.penalty !== "string") return null;
+  return { member_address: r.member_address, penalty: r.penalty };
+}
+
+/**
+ * Parse and validate the CircleState shape from an unknown indexer response.
+ * Returns null if the object is missing any required numeric or string field.
+ */
+function parseCircleState(raw: unknown): CircleState | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.status !== "string" || r.status.trim() === "") return null;
+  if (typeof r.current_round !== "number") return null;
+  if (typeof r.total_rounds !== "number") return null;
+  if (typeof r.round_amount !== "string") return null;
+  if (typeof r.member_count !== "number") return null;
+  return {
+    status: r.status,
+    current_round: r.current_round,
+    total_rounds: r.total_rounds,
+    round_amount: r.round_amount,
+    member_count: r.member_count,
+    deadline_ledger:
+      typeof r.deadline_ledger === "number" ? r.deadline_ledger : null,
+  };
+}
+
 // ─── fetchCircleData ──────────────────────────────────────────────────────────
 //
 // Shared fetch logic used both by the initial SSR prop and the client-side
@@ -677,24 +799,33 @@ export async function fetchCircleData(
     return { ok: false, error: "server" };
   }
 
+  // Issue #496: Use type-safe parsers instead of unsafe `as` casts.
+  // Each row is validated independently so a single malformed entry from the
+  // indexer is dropped rather than propagating incorrect data into gate logic
+  // or causing a runtime exception in the render tree.
+  const circleState = parseCircleState(circleJson.circle);
+  if (!circleState) {
+    return { ok: false, error: "server" };
+  }
+
   const members = Array.isArray(circleJson.members)
-    ? (circleJson.members as CircleMember[])
+    ? circleJson.members.map(parseCircleMember).filter((m): m is CircleMember => m !== null)
     : [];
 
   return {
     ok: true,
     fetchedAtMs: Date.now(),
     data: {
-      circle: circleJson.circle as CircleDetailData["circle"],
+      circle: circleState,
       members,
       rounds: Array.isArray(roundsJson.rounds)
-        ? (roundsJson.rounds as CircleRound[])
+        ? roundsJson.rounds.map(parseCircleRound).filter((r): r is CircleRound => r !== null)
         : [],
       openRounds: Array.isArray(roundsJson.openRounds)
-        ? (roundsJson.openRounds as CircleRound[])
+        ? roundsJson.openRounds.map(parseCircleRound).filter((r): r is CircleRound => r !== null)
         : [],
       pendingDefaults: Array.isArray(roundsJson.pendingDefaults)
-        ? (roundsJson.pendingDefaults as CirclePendingDefault[])
+        ? roundsJson.pendingDefaults.map(parsePendingDefault).filter((d): d is CirclePendingDefault => d !== null)
         : [],
       latestLedger:
         typeof circleJson.latestLedger === "number"
@@ -703,7 +834,7 @@ export async function fetchCircleData(
       currentRound:
         roundsJson.currentRound != null &&
         typeof roundsJson.currentRound === "object"
-          ? (roundsJson.currentRound as CircleRound)
+          ? parseCircleRound(roundsJson.currentRound)
           : null,
     },
   };
