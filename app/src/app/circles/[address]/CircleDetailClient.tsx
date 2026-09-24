@@ -695,6 +695,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
 
+  // Issue #499: Guard against concurrent / duplicate submissions.
+  // A ref is used (not state) because we need to read it synchronously inside
+  // the async action handler without triggering a re-render. When this is true
+  // any call to doAction or doDefault is a no-op — the button's `disabled`
+  // attribute should have prevented it, but this is defence-in-depth against
+  // rapid double-clicks, keyboard repeats, or automated test runners.
+  const submittingRef = useRef(false);
+
   // ── UI state ───────────────────────────────────────────────────────────────
   const [inviteUrl,           setInviteUrl]           = useState("");
   const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
@@ -938,12 +946,29 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     close:      "Collateral released successfully.",
   };
 
+  // Issue #499: Per-action loading labels surfaced in the spinner and aria-label.
+  // These are distinct from the button labels so the spinner text is always
+  // accurate regardless of which action is in flight.
+  const ACTION_LOADING_LABELS: Record<ActionKey, string> = {
+    join:       "Locking collateral…",
+    contribute: "Submitting contribution…",
+    payout:     "Triggering payout…",
+    default:    "Marking default…",
+    close:      "Releasing collateral…",
+  };
+
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
     }
-    if (loading !== null) return;
+
+    // Issue #499: Prevent duplicate / concurrent submissions.
+    // The buttons are disabled while loading !== null, but this ref guard
+    // is a defence-in-depth measure against rapid double-clicks or race
+    // conditions where a second invocation begins before the first has
+    // flushed the loading state.
+    if (submittingRef.current) return;
 
     if (!isSorobanContractId(circleAddress)) {
       setError(
@@ -971,6 +996,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setSuccess(null);
     setRetryAction(null);
     if (action === "contribute") setContributionReceipt(null);
+
+    submittingRef.current = true;
     setLoading(action);
 
     try {
@@ -1002,7 +1029,6 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         if (gate.reason === "stale_snapshot") {
           setRetryAction(() => () => doAction(action, args));
         }
-        setLoading(null);
         return;
       }
 
@@ -1047,6 +1073,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       }
     } finally {
       setLoading(null);
+      submittingRef.current = false;
     }
   }
 
@@ -1094,7 +1121,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       setError("Connect your wallet first.");
       return;
     }
-    if (loading !== null) return;
+
+    // Issue #499: Same duplicate-submission guard as doAction.
+    if (submittingRef.current) return;
+
     if (!isSorobanContractId(circleAddress)) {
       setError(
         `Invalid circle address "${shortAddress(circleAddress)}". ` +
@@ -1148,6 +1178,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       return;
     }
 
+    submittingRef.current = true;
     setLoading("default");
 
     try {
@@ -1179,6 +1210,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       }
     } finally {
       setLoading(null);
+      submittingRef.current = false;
     }
   }
 
@@ -1513,7 +1545,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 className="inline-block w-4 h-4 border-2 border-slate-300 border-t-brand-600 rounded-full animate-spin"
                 aria-hidden="true"
               />
-              Waiting for wallet…
+              {/* Issue #499: show the specific action in progress, not a generic message */}
+              {ACTION_LOADING_LABELS[loading]}
             </span>
           )}
         </div>
