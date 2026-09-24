@@ -52,6 +52,7 @@ vi.mock("@/lib/config", async (importOriginal) => {
 // ─── Imports after mock declarations ──────────────────────────────────────────
 
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
+import { Keypair } from "@stellar/stellar-sdk";
 import CreateClient from "../app/create/CreateClient";
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────────

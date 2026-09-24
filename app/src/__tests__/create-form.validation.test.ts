@@ -24,6 +24,7 @@ import {
   findDuplicateAddress,
   countDecimalPlaces,
   validateCreateForm,
+  validateMemberEntry,
   MIN_MEMBERS,
   MAX_MEMBERS,
   MAX_NAME_LENGTH,
@@ -35,10 +36,20 @@ import {
 
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
-/** Valid G-address: "G" + 55 identical uppercase base32 characters. */
-const A = "G" + "A".repeat(55);
-const B = "G" + "B".repeat(55);
-const C = "G" + "C".repeat(55);
+/**
+ * Deterministic, checksum-valid G-addresses (Issue #477).
+ *
+ * Generated through the Stellar SDK so they satisfy *both* halves of address
+ * validation: the base32 shape *and* the CRC16 strkey checksum.  A shape-only
+ * fake such as `"G" + "A".repeat(55)` passes a regex but is rejected by
+ * `validateCreateForm`.
+ */
+const addrFor = (seed: number): string =>
+  Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();
+
+const A = addrFor(1);
+const B = addrFor(2);
+const C = addrFor(3);
 
 /** A minimal valid form input that passes all validation rules. */
 const VALID = {
@@ -191,10 +202,7 @@ describe("validateCreateForm — members", () => {
   });
 
   it(`errors when more than ${MAX_MEMBERS} members are provided`, () => {
-    const tooMany = Array.from(
-      { length: MAX_MEMBERS + 1 },
-      (_, i) => "G" + String.fromCharCode(65 + (i % 26)).repeat(55),
-    );
+    const tooMany = Array.from({ length: MAX_MEMBERS + 1 }, (_, i) => addrFor(40 + i));
     const errors = assertErrors(valid({ members: tooMany }));
     expect(errors.membersGeneral).toMatch(/more than/i);
   });
@@ -248,6 +256,34 @@ describe("validateCreateForm — members", () => {
     if (unique.length < MAX_MEMBERS) return; // character space too small — skip
     const values = assertOk(valid({ members: maxMembers }));
     expect(values.validMembers).toHaveLength(MAX_MEMBERS);
+  });
+
+  it("errors when a member address has a valid shape but a broken checksum", () => {
+    // Same length, same alphabet, one payload character off: the regex passes,
+    // the strkey checksum does not.
+    const errors = assertErrors(valid({ members: [A, withTypo(B)] }));
+    expect(errors.members?.[1]).toMatch(/checksum/i);
+    expect(errors.members?.[0]).toBeUndefined();
+  });
+
+  it("errors when a member address is lowercase", () => {
+    const errors = assertErrors(valid({ members: [A, B.toLowerCase()] }));
+    expect(errors.members?.[1]).toMatch(/uppercase|case-sensitive/i);
+  });
+
+  it("errors when a member address is muxed (M…)", () => {
+    const errors = assertErrors(valid({ members: [A, "M" + "A".repeat(55)] }));
+    expect(errors.members?.[1]).toMatch(/muxed/i);
+  });
+
+  it("validates every member entry, not just the first", () => {
+    const rows = [A, "nope", B, withTypo(C)];
+    const errors = assertErrors(valid({ members: rows }));
+    expect(errors.members).toHaveLength(4);
+    expect(errors.members?.[0]).toBeUndefined();
+    expect(errors.members?.[1]).toMatch(/^Member 2:/);
+    expect(errors.members?.[2]).toBeUndefined();
+    expect(errors.members?.[3]).toMatch(/^Member 4:/);
   });
 });
 
@@ -487,5 +523,48 @@ describe("validateCreateForm — edge cases", () => {
   it("passes with maximum valid values", () => {
     const { error } = validate([VALID_ADDR_A, VALID_ADDR_B], "1000000", "365");
     expect(error).toBeNull();
+  });
+});
+
+// ─── validateMemberEntry — per-entry address validation (Issue #477) ──────────
+
+describe("validateMemberEntry — every member entry is validated", () => {
+  it("accepts a checksum-valid wallet address", () => {
+    expect(validateMemberEntry(A, 0)).toBeUndefined();
+  });
+
+  it("ignores blank and whitespace-only rows", () => {
+    expect(validateMemberEntry("", 0)).toBeUndefined();
+    expect(validateMemberEntry("   ", 3)).toBeUndefined();
+  });
+
+  it("trims surrounding whitespace before validating", () => {
+    expect(validateMemberEntry(`  ${A}  `, 0)).toBeUndefined();
+  });
+
+  it("rejects a well-formed address with a broken checksum", () => {
+    expect(validateMemberEntry(withTypo(A), 0)).toMatch(/checksum/i);
+  });
+
+  it("rejects a lowercase address", () => {
+    expect(validateMemberEntry(A.toLowerCase(), 0)).toMatch(/uppercase/i);
+  });
+
+  it("rejects contract addresses with a namespace-specific message", () => {
+    expect(validateMemberEntry("C" + "A".repeat(55), 0)).toMatch(/contract/i);
+  });
+
+  it("rejects muxed addresses with a namespace-specific message", () => {
+    expect(validateMemberEntry("M" + "A".repeat(55), 0)).toMatch(/muxed/i);
+  });
+
+  it("rejects short or garbled input with the generic shape message", () => {
+    expect(validateMemberEntry("not-an-address", 0)).toMatch(/G-prefixed.*56-character/i);
+    expect(validateMemberEntry("GAAA1", 0)).toMatch(/G-prefixed.*56-character/i);
+  });
+
+  it("names the 1-based row of every problem", () => {
+    expect(validateMemberEntry("nope", 0)).toMatch(/^Member 1:/);
+    expect(validateMemberEntry("nope", 4)).toMatch(/^Member 5:/);
   });
 });
