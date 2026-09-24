@@ -28,6 +28,11 @@ export async function generateMetadata({
     return {
       title: "Circle — CircleUp",
       description: "Savings circle on CircleUp.",
+      twitter: {
+        card: "summary",
+        title: "Circle — CircleUp",
+        description: "Savings circle on CircleUp.",
+      },
     };
   }
 
@@ -59,6 +64,12 @@ export async function generateMetadata({
           url: `/circles/${safeAddress}`,
           type: "website",
         },
+        twitter: {
+          card: "summary",
+          title: `${roundAmount}/round Circle (${status}) — CircleUp`,
+          description:
+            `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}.`,
+        },
       };
     }
   } catch {
@@ -73,6 +84,11 @@ export async function generateMetadata({
     description: `Savings circle at ${safeAddress} on CircleUp. Track rotation order, round progress, and contribution history.`,
     alternates: {
       canonical: `/circles/${safeAddress}`,
+    },
+    twitter: {
+      card: "summary",
+      title: `Circle ${shortAddr}… — CircleUp`,
+      description: `Savings circle at ${safeAddress} on CircleUp.`,
     },
   };
 }
