@@ -183,6 +183,64 @@ export const USDC_ADDRESS: string =
 export const INDEXER_URL: string =
   process.env.NEXT_PUBLIC_INDEXER_URL || "http://localhost:3001";
 
+// ─── Indexer endpoint resolution ──────────────────────────────────────────────
+//
+// Every indexer fetch in the app goes through `indexerEndpoint`. A misconfigured
+// NEXT_PUBLIC_INDEXER_URL must never reach fetch() as-is:
+//   • "localhost:3001" (no scheme) parses as the `localhost:` protocol and makes
+//     fetch() throw, which callers report as "indexer unreachable".
+//   • "indexer.example.com" (no scheme) is a *relative* URL in the browser, so
+//     the request goes to this Next app and 404s, which callers report as
+//     "circle not found" / "no reputation record" — silently wrong data.
+// Callers get `null` instead and show a "misconfigured" message.
+
+/** Abort server-side indexer requests after this long, so a URL pointing at an
+ *  unroutable host fails the render quickly instead of hanging it. */
+export const INDEXER_TIMEOUT_MS = 10_000;
+
+/**
+ * Normalise an indexer base URL, or return `null` when it cannot be fetched
+ * safely: empty, not absolute, not http(s), or carrying credentials, a query
+ * string, or a fragment (all of which would corrupt the joined endpoint path).
+ * Trailing slashes are stripped so `base + "/circles"` never yields `//circles`.
+ * Exported for unit testing.
+ */
+export function resolveIndexerBaseUrl(raw: string | undefined | null): string | null {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (value === "") return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+}
+
+/** The validated indexer base URL, or `null` when NEXT_PUBLIC_INDEXER_URL is misconfigured. */
+export const INDEXER_BASE_URL: string | null = resolveIndexerBaseUrl(INDEXER_URL);
+
+/**
+ * Build an indexer endpoint URL from path segments, each URL-encoded so a route
+ * param can never add path segments or a query string. Returns `null` when the
+ * base URL is misconfigured — callers must treat that as a distinct
+ * "misconfigured" state, never as "not found" or "network".
+ *
+ *   indexerEndpoint(["circles", addr, "rounds"]) → "http://localhost:3001/circles/C…/rounds"
+ */
+export function indexerEndpoint(
+  segments: readonly string[],
+  base: string | null = INDEXER_BASE_URL,
+): string | null {
+  if (base === null) return null;
+  return `${base}/${segments.map((s) => encodeURIComponent(s)).join("/")}`;
+}
+
 // ─── Network resolution & block explorer links ────────────────────────────────
 //
 // Mirror of the explorer helpers in sdk/src/constants.ts — kept in sync manually

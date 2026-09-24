@@ -2,7 +2,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
-import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
+import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
+import { parseMemberRows } from "@/lib/members";
 import { isSorobanContractId } from "@/lib/address";
 import { parseContractError, userMessageForError } from "@/lib/contractErrors";
 import {
@@ -407,6 +408,54 @@ function PartialDataBanner({ data, onRefresh, isRefreshing }: PartialDataBannerP
   );
 }
 
+// ─── Member list fallback ─────────────────────────────────────────────────────
+//
+// Rendered inside the Rotation Order card when the indexer returned no usable
+// member rows (see parseMemberRows). The indexer writes member rows when the
+// circle is created, so an empty list always means "not available", never
+// "nobody has joined". One muted placeholder row per expected member keeps
+// the card the same height it will have once the rows arrive, and nothing
+// here names an address, a payout position, or a contribution status that
+// could be mistaken for real data.
+
+/** Upper bound on placeholder rows, whatever member_count the indexer reports. */
+const MAX_PLACEHOLDER_ROWS = 20;
+
+function MemberListFallback({ memberCount }: { memberCount: number }) {
+  const rows =
+    Number.isInteger(memberCount) && memberCount > 0
+      ? Math.min(memberCount, MAX_PLACEHOLDER_ROWS)
+      : 0;
+
+  return (
+    <div>
+      <p role="status" className="text-sm text-slate-600 mb-3">
+        Member details are not available right now, so the rotation order
+        can&apos;t be shown yet.{" "}
+        {rows > 0
+          ? `This circle has ${memberCount} member${memberCount === 1 ? "" : "s"}; `
+          : ""}
+        they will appear here once the indexer has them.
+      </p>
+      {rows > 0 && (
+        <ol className="space-y-2" aria-hidden="true">
+          {Array.from({ length: rows }, (_, i) => (
+            <li
+              key={i}
+              className="flex items-center gap-2 sm:gap-3 p-2.5 sm:p-3 rounded-lg border border-dashed border-slate-200"
+            >
+              <span className="text-slate-300 text-sm w-5 shrink-0 text-right">
+                {i + 1}
+              </span>
+              <span className="text-xs text-slate-400">Member details unavailable</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 // ─── Stale data banner ────────────────────────────────────────────────────────
 //
 // Shown when the data is older than MAX_DATA_AGE_MS. Distinct from partial data:
@@ -712,30 +761,6 @@ function parseDefaultRecord(raw: unknown): DefaultRecord | null {
   };
 }
 
-/**
- * Parse and validate a single CircleMember row from an unknown API value.
- * Returns null if any required field is missing or malformed.
- */
-function parseCircleMember(raw: unknown): CircleMember | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.payout_order !== "number") return null;
-  if (typeof r.collateral !== "string") return null;
-  if (typeof r.defaults !== "number") return null;
-  if (typeof r.reputation_score !== "number") return null;
-  if (typeof r.total_contributions !== "number") return null;
-  return {
-    member_address: r.member_address,
-    payout_order: r.payout_order,
-    collateral: r.collateral,
-    defaults: r.defaults,
-    joined_at: typeof r.joined_at === "string" ? r.joined_at : null,
-    reputation_score: r.reputation_score,
-    total_contributions: r.total_contributions,
-  };
-}
-
 const VALID_ROUND_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
 
 /**
@@ -808,8 +833,11 @@ function parseCircleState(raw: unknown): CircleState | null {
 //   "not_found" — indexer returned 404 (circle does not exist).
 //   "network"   — fetch threw (offline, DNS failure, CORS).
 //   "server"    — indexer returned 5xx or non-ok non-404.
+//   "misconfigured" — NEXT_PUBLIC_INDEXER_URL is unusable; nothing was fetched.
+//                 Kept apart from "not_found": a relative URL would otherwise
+//                 hit this Next app, 404, and claim the circle was deleted.
 
-export type RefreshError = "not_found" | "network" | "server";
+export type RefreshError = "not_found" | "network" | "server" | "misconfigured";
 
 export type RefreshResult =
   | { ok: true; data: CircleDetailData; fetchedAtMs: number }
@@ -819,19 +847,19 @@ export async function fetchCircleData(
   circleAddress: string,
   signal?: AbortSignal,
 ): Promise<RefreshResult> {
+  const circleUrl = indexerEndpoint(["circles", circleAddress]);
+  const roundsUrl = indexerEndpoint(["circles", circleAddress, "rounds"]);
+  if (circleUrl === null || roundsUrl === null) {
+    return { ok: false, error: "misconfigured" };
+  }
+
   let circleRes: Response;
   let roundsRes: Response;
 
   try {
     [circleRes, roundsRes] = await Promise.all([
-      fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
-        cache: "no-store",
-        signal,
-      }),
-      fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, {
-        cache: "no-store",
-        signal,
-      }),
+      fetch(circleUrl, { cache: "no-store", signal }),
+      fetch(roundsUrl, { cache: "no-store", signal }),
     ]);
   } catch (err) {
     // AbortError is not a real failure — the component unmounted during refresh
@@ -866,17 +894,18 @@ export async function fetchCircleData(
   }
 
   // Issue #496: Use type-safe parsers instead of unsafe `as` casts.
-  // Each row is validated independently so a single malformed entry from the
-  // indexer is dropped rather than propagating incorrect data into gate logic
-  // or causing a runtime exception in the render tree.
   const circleState = parseCircleState(circleJson.circle);
   if (!circleState) {
     return { ok: false, error: "server" };
   }
 
-  const members = Array.isArray(circleJson.members)
-    ? circleJson.members.map(parseCircleMember).filter((m): m is CircleMember => m !== null)
-    : [];
+  // Members go through the shared all-or-nothing parser (lib/members.ts) that
+  // the server page also uses. A per-row filter is wrong here twice over: the
+  // indexer's /circles/:address rows carry no total_contributions and a null
+  // reputation_score for members without a reputation row, so a strict per-row
+  // check drops every real row; and dropping any single row would shift later
+  // members into the wrong payout slot.
+  const members = parseMemberRows(circleJson.members);
 
   return {
     ok: true,
@@ -1175,6 +1204,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           "Could not reach the indexer. Check your connection and try again.",
         server:
           "The indexer returned an error. This is likely temporary — try again.",
+        misconfigured:
+          "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL, so the page cannot refresh. " +
+          "Set a valid indexer URL in app/.env.local and restart the server.",
       };
       setManualRefreshError(messages[result.error]);
     }
@@ -1919,6 +1951,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       {/* Rotation view */}
       <div className="bg-white rounded-xl border border-slate-200 p-5">
         <h2 className="font-semibold text-slate-800 mb-4">🔄 Rotation Order</h2>
+        {data.members.length === 0 ? (
+          <MemberListFallback memberCount={data.circle.member_count} />
+        ) : (
+        <>
         <div className="space-y-2">
           {data.members.map((member, i) => {
             const isPaid = i < currentRound;
@@ -2015,6 +2051,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           <p className="text-xs text-slate-400 mt-3">
             Round {currentRound} · contributions shown for the current round only
           </p>
+        )}
+        </>
         )}
       </div>
 
