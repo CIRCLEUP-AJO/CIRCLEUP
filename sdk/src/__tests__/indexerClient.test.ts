@@ -79,6 +79,35 @@ describe("IndexerClient construction", () => {
     );
   });
 
+  it.each([
+    ["no scheme", "localhost:3001"],
+    ["bare host", "indexer.example.com"],
+    ["relative path", "/api/indexer"],
+    ["non-HTTP scheme", "ftp://indexer.example.com"],
+    ["query string", "http://localhost:3001?token=x"],
+    ["fragment", "http://localhost:3001#circles"],
+  ])("throws at construction for a misconfigured indexerUrl (%s)", (_label, indexerUrl) => {
+    const cfg: CircleUpConfig = { ...BASE_CONFIG, indexerUrl };
+    expect(() => new IndexerClient(cfg)).toThrow("is not a valid absolute HTTP(S) URL");
+  });
+
+  it("normalises trailing slashes and keeps a base path", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ circles: [] }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const client = new IndexerClient({
+        ...BASE_CONFIG,
+        indexerUrl: " https://api.example.com/indexer// ",
+      });
+      await client.getCircles();
+      expect(fetchMock.mock.calls[0][0]).toBe("https://api.example.com/indexer/circles");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("strips trailing slash from indexerUrl", async () => {
     const cfg: CircleUpConfig = { ...BASE_CONFIG, indexerUrl: "http://localhost:3001/" };
     const mockFetch = mockOk({ circles: [] });

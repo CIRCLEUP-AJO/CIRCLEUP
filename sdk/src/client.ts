@@ -2087,8 +2087,29 @@ export class IndexerClient {
         "Add the indexer base URL (e.g. 'http://localhost:3001') to your CircleUpConfig.",
       );
     }
+    // Reject a value fetch() cannot use as a base. "localhost:3001" (no scheme)
+    // parses as the `localhost:` protocol, and a bare host is relative in a
+    // browser, so either would only fail later as a misleading "network error"
+    // or a 404 from the wrong server. Mirrors validateCircleUpConfig.
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(config.indexerUrl.trim());
+    } catch {
+      parsed = null;
+    }
+    if (
+      parsed === null ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.search !== "" ||
+      parsed.hash !== ""
+    ) {
+      throw new Error(
+        `IndexerClient: config.indexerUrl "${config.indexerUrl}" is not a valid absolute ` +
+        "HTTP(S) URL without a query string or fragment (e.g. 'http://localhost:3001').",
+      );
+    }
     // Strip trailing slash so path concatenation is consistent
-    this.baseUrl = config.indexerUrl.replace(/\/+$/, "");
+    this.baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
   }
 
   // ── Internal fetch wrapper ────────────────────────────────────────────────

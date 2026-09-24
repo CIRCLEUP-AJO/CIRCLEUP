@@ -1,7 +1,7 @@
 import { Suspense, cache } from "react";
 import Link from "next/link";
 import type { Metadata } from "next";
-import { INDEXER_URL } from "@/lib/config";
+import { indexerEndpoint, INDEXER_TIMEOUT_MS } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
@@ -28,24 +28,6 @@ type FetchResult =
   | { ok: true; circles: Circle[] }
   | { ok: false; error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage" };
 
-// ─── URL validation ───────────────────────────────────────────────────────────
-
-/**
- * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
- * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
- * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
- * identical to a real network failure and gives no actionable guidance.
- */
-function isValidUrl(url: string): boolean {
-  if (!url || url.trim() === "") return false;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 /**
@@ -59,7 +41,8 @@ function isValidUrl(url: string): boolean {
 const getCircles = cache(async function getCircles(): Promise<FetchResult> {
   // Catch misconfiguration before attempting the network request so that
   // developers get a targeted error message rather than a cryptic network failure.
-  if (!isValidUrl(INDEXER_URL)) {
+  const url = indexerEndpoint(["circles"]);
+  if (url === null) {
     return { ok: false, error: "misconfigured" };
   }
 
@@ -72,8 +55,9 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
     // response", so the page 500s after a 60s hang and the "network" branch
     // below never reaches the user. `cache()` above already collapses this to
     // one request per render, so the only cost is the 10s cross-request cache.
-    res = await fetch(`${INDEXER_URL}/circles`, {
+    res = await fetch(url, {
       cache: "no-store",
+      signal: AbortSignal.timeout(INDEXER_TIMEOUT_MS),
     });
   } catch {
     return { ok: false, error: "network" };
