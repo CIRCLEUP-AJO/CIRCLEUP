@@ -9,7 +9,7 @@ import {
   getExplorerLink,
   ACTIVE_NETWORK,
 } from "@/lib/config";
-import { isStellarPublicKey } from "@/lib/address";
+import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
@@ -126,6 +126,68 @@ export function reorderMembers<T>(arr: T[], fromIndex: number, toIndex: number):
 }
 
 /**
+ * Validate a single member row on the create flow.
+ *
+ * Returns `undefined` when the row is blank (unused rows are allowed and are
+ * filtered out before submission) or when the entry is a checksum-valid
+ * Stellar account address.  Otherwise returns a row-specific message that
+ * always starts with `Member N:` (1-based), so the form can render it
+ * directly beneath the offending input.
+ *
+ * Every failure mode gets its own message instead of one generic error:
+ *   1. blank row             → skipped
+ *   2. lowercase input       → base32 is case-sensitive, say so explicitly
+ *   3. C… / M… prefix        → name the namespace that was actually entered
+ *   4. shape (prefix/length/alphabet) → generic shape message
+ *   5. strkey checksum       → right shape, wrong checksum — the classic typo
+ *
+ * Check 5 is the one that matters: without it a mistyped address passes the
+ * form and only fails later, inside transaction construction, as an opaque
+ * SDK error — after the wallet prompt has already appeared.
+ *
+ * Pure (no I/O), exported for tests and reusable anywhere else the app
+ * collects member addresses.
+ */
+export function validateMemberEntry(raw: string, index: number): string | undefined {
+  const row = `Member ${index + 1}`;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+
+  const generic = `${row}: must be a G-prefixed 56-character Stellar address.`;
+  const upper = trimmed.toUpperCase();
+
+  // A lowercased address fails the shape test for a different reason than a
+  // typo does — without this hint the user "fixes" it into another wrong value.
+  if (trimmed !== upper && isStellarPublicKey(upper)) {
+    return (
+      `${row}: must be a G-prefixed 56-character Stellar address typed in ` +
+      `uppercase (Stellar addresses are case-sensitive).`
+    );
+  }
+
+  if (upper.charAt(0) === "C") {
+    return (
+      `${row}: must be a G-prefixed wallet address — contract (C…)` +
+      ` addresses cannot be circle members.`
+    );
+  }
+  if (upper.charAt(0) === "M") {
+    return (
+      `${row}: must be a G-prefixed 56-character Stellar address — muxed ` +
+      `(M…) addresses are not supported.`
+    );
+  }
+
+  if (!isStellarPublicKey(trimmed)) return generic;
+
+  if (!isValidStellarAccount(trimmed)) {
+    return `${row}: checksum failed — check for a typo or a truncated copy-paste.`;
+  }
+
+  return undefined;
+}
+
+/**
  * Validate and normalise all create-circle form fields.
  *
  * Returns either:
@@ -201,14 +263,11 @@ export function validateCreateForm(
   }
 
   // ── Members — per-field ───────────────────────────────────────────────────
-  const memberErrors: (string | undefined)[] = members.map((raw, i) => {
-    const trimmed = raw.trim();
-    if (trimmed.length === 0) return undefined; // blank rows are ignored
-    if (!isStellarPublicKey(trimmed)) {
-      return `Member ${i + 1}: must be a G-prefixed 56-character Stellar address.`;
-    }
-    return undefined;
-  });
+  // Every filled row is validated on its own, so one bad entry names itself
+  // (`Member 3: …`) instead of the whole list failing later at encoding time.
+  const memberErrors: (string | undefined)[] = members.map((raw, i) =>
+    validateMemberEntry(raw, i),
+  );
 
   const hasPerMemberErrors = memberErrors.some((e) => e !== undefined);
   if (hasPerMemberErrors) {
