@@ -8,14 +8,16 @@
  *                     — remove never moves another row's value
  *                     — move-up / move-down produce the intended contract order
  *                     — reorder buttons have accessible names
- *                     — remove button has accessible name (incl. at-min state)
+ *                     — remove button has accessible name (including at-min state)
  *                     — address input has accessible name with position info
  *                     — editing a value after reorder updates the correct row
+ *
+ * Runner: vitest + @testing-library/react (jsdom, globals: true)
  */
 
 import React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 
 import {
   reorderMembers,
@@ -23,16 +25,13 @@ import {
   type MemberRow,
 } from "../app/create/CreateClient";
 
-// ─── Mocks ────────────────────────────────────────────────────────────────────
+// ─── Mock heavy dependencies so the component renders without a real wallet ──
 
 vi.mock("@/lib/stellar", () => ({
   getWalletAddress: vi.fn().mockResolvedValue(null),
-  invokeContract: vi.fn(),
+  invokeContract:   vi.fn(),
   WalletError: class WalletError extends Error {
-    constructor(
-      public reason: string,
-      message: string,
-    ) {
+    constructor(public reason: string, message: string) {
       super(message);
       this.name = "WalletError";
     }
@@ -43,8 +42,7 @@ vi.mock("@/lib/config", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/config")>();
   return {
     ...actual,
-    CIRCLE_FACTORY_ADDRESS:
-      "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+    CIRCLE_FACTORY_ADDRESS: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
     ACTIVE_NETWORK: "testnet",
     getExplorerLink: () => null,
   };
@@ -72,27 +70,21 @@ describe("reorderMembers()", () => {
     expect(reorderMembers(arr, 2, 2)).toBe(arr);
   });
 
-  it("returns original when fromIndex is out of range (negative)", () => {
+  it("returns original when fromIndex is out of range", () => {
     expect(reorderMembers(arr, -1, 0)).toBe(arr);
+    expect(reorderMembers(arr, 4,  0)).toBe(arr);
   });
 
-  it("returns original when fromIndex is out of range (too large)", () => {
-    expect(reorderMembers(arr, 4, 0)).toBe(arr);
-  });
-
-  it("returns original when toIndex is out of range (negative)", () => {
+  it("returns original when toIndex is out of range", () => {
     expect(reorderMembers(arr, 0, -1)).toBe(arr);
+    expect(reorderMembers(arr, 0,  4)).toBe(arr);
   });
 
-  it("returns original when toIndex is out of range (too large)", () => {
-    expect(reorderMembers(arr, 0, 4)).toBe(arr);
-  });
-
-  it("moves first element to last", () => {
+  it("moves first element to last (move down through list)", () => {
     expect(reorderMembers(arr, 0, 3)).toEqual(["b", "c", "d", "a"]);
   });
 
-  it("moves last element to first", () => {
+  it("moves last element to first (move up through list)", () => {
     expect(reorderMembers(arr, 3, 0)).toEqual(["d", "a", "b", "c"]);
   });
 
@@ -130,9 +122,10 @@ describe("reorderMembers()", () => {
   });
 
   it("multi-step sequence produces the expected final order", () => {
-    const step1 = reorderMembers(arr, 3, 0); // [d,a,b,c]
+    // Simulates: [A,B,C,D] → move D to 0 → [D,A,B,C] → move B to 3 → [D,A,C,B]
+    const step1 = reorderMembers(arr, 3, 0);
     expect(step1).toEqual(["d", "a", "b", "c"]);
-    const step2 = reorderMembers(step1, 2, 3); // [d,a,c,b]
+    const step2 = reorderMembers(step1, 2, 3);
     expect(step2).toEqual(["d", "a", "c", "b"]);
   });
 });
@@ -141,11 +134,13 @@ describe("reorderMembers()", () => {
 
 describe("createMemberRow()", () => {
   it("creates a row with an empty value by default", () => {
-    expect(createMemberRow().value).toBe("");
+    const row = createMemberRow();
+    expect(row.value).toBe("");
   });
 
   it("creates a row with the supplied value", () => {
-    expect(createMemberRow(A).value).toBe(A);
+    const row = createMemberRow(A);
+    expect(row.value).toBe(A);
   });
 
   it("each call produces a unique id", () => {
@@ -153,33 +148,37 @@ describe("createMemberRow()", () => {
     expect(ids.size).toBe(20);
   });
 
-  it("id is a non-empty string", () => {
+  it("id format is a non-empty string", () => {
     const row = createMemberRow();
     expect(typeof row.id).toBe("string");
     expect(row.id.length).toBeGreaterThan(0);
   });
 });
 
-// ─── Component helpers ────────────────────────────────────────────────────────
+// ─── Component: helpers ───────────────────────────────────────────────────────
 
-function getMemberInputs() {
-  return screen.getAllByRole("textbox", {
+/**
+ * Fill all four default member inputs with the given values and return the
+ * live list of member address inputs.
+ */
+function fillMembers(values: string[]) {
+  const inputs = screen.getAllByRole("textbox", {
     name: /member \d+ of \d+ — stellar address/i,
   });
-}
-
-function fillMembers(values: string[]) {
-  const inputs = getMemberInputs();
   values.forEach((v, i) => {
     if (inputs[i]) fireEvent.change(inputs[i], { target: { value: v } });
   });
+  return inputs;
 }
 
+/** Return current values of all member address inputs in DOM order. */
 function getMemberValues(): string[] {
-  return getMemberInputs().map((el) => (el as HTMLInputElement).value);
+  return screen
+    .getAllByRole("textbox", { name: /member \d+ of \d+ — stellar address/i })
+    .map((el) => (el as HTMLInputElement).value);
 }
 
-// ─── Remove behaviour ─────────────────────────────────────────────────────────
+// ─── Component: remove behaviour ─────────────────────────────────────────────
 
 describe("Member list — remove", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -188,9 +187,11 @@ describe("Member list — remove", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
+    // Remove row 2 (value B, 0-indexed position 1)
     const removeBtns = screen.getAllByRole("button", { name: /remove member/i });
-    fireEvent.click(removeBtns[1]); // removes position 2 (value B)
+    fireEvent.click(removeBtns[1]); // removes member at position 2
 
+    // Remaining values must be exactly [A, C, D] — B gone, no contamination
     expect(getMemberValues()).toEqual([A, C, D]);
   });
 
@@ -214,30 +215,24 @@ describe("Member list — remove", () => {
     expect(getMemberValues()).toEqual([A, B, C]);
   });
 
-  it("remove button is aria-disabled at minimum member count", () => {
+  it("remove button is visually disabled at minimum member count", () => {
     render(<CreateClient />);
-    // Default 4 rows — remove 2 to reach MIN_MEMBERS (2)
+    // Default starts with 4 rows; remove down to 2 (MIN_MEMBERS)
     const remove = () =>
-      screen.getAllByRole("button", {
-        name: /remove member|cannot remove/i,
-      })[0];
+      screen.getAllByRole("button", { name: /remove member|cannot remove/i })[0];
 
     fireEvent.click(remove());
     fireEvent.click(remove());
-
+    // Now at MIN_MEMBERS — button should be aria-disabled
     const btns = screen.getAllByRole("button", { name: /cannot remove/i });
     expect(btns.length).toBeGreaterThan(0);
-    btns.forEach((btn) =>
-      expect(btn).toHaveAttribute("aria-disabled", "true"),
-    );
+    btns.forEach((btn) => expect(btn).toHaveAttribute("aria-disabled", "true"));
   });
 
   it("remove button accessible name mentions minimum when at minimum", () => {
     render(<CreateClient />);
     const remove = () =>
-      screen.getAllByRole("button", {
-        name: /remove member|cannot remove/i,
-      })[0];
+      screen.getAllByRole("button", { name: /remove member|cannot remove/i })[0];
 
     fireEvent.click(remove());
     fireEvent.click(remove());
@@ -249,7 +244,7 @@ describe("Member list — remove", () => {
   });
 });
 
-// ─── Reorder behaviour ────────────────────────────────────────────────────────
+// ─── Component: reorder behaviour ────────────────────────────────────────────
 
 describe("Member list — reorder (move up / move down)", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -258,9 +253,8 @@ describe("Member list — reorder (move up / move down)", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    const moveDownBtns = screen.getAllByRole("button", {
-      name: /move member \d+ down/i,
-    });
+    // "Move member 1 down"
+    const moveDownBtns = screen.getAllByRole("button", { name: /move member \d+ down/i });
     fireEvent.click(moveDownBtns[0]);
 
     expect(getMemberValues()).toEqual([B, A, C, D]);
@@ -270,9 +264,7 @@ describe("Member list — reorder (move up / move down)", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    const moveUpBtns = screen.getAllByRole("button", {
-      name: /move member \d+ up/i,
-    });
+    const moveUpBtns = screen.getAllByRole("button", { name: /move member \d+ up/i });
     fireEvent.click(moveUpBtns[1]); // move member 2 up
 
     expect(getMemberValues()).toEqual([B, A, C, D]);
@@ -282,19 +274,16 @@ describe("Member list — reorder (move up / move down)", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    const moveDownBtns = screen.getAllByRole("button", {
-      name: /move member \d+ down/i,
-    });
-    expect(moveDownBtns[moveDownBtns.length - 1]).toBeDisabled();
+    const moveDownBtns = screen.getAllByRole("button", { name: /move member \d+ down/i });
+    const last = moveDownBtns[moveDownBtns.length - 1];
+    expect(last).toBeDisabled();
   });
 
   it("move-up on first row is disabled", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    const moveUpBtns = screen.getAllByRole("button", {
-      name: /move member \d+ up/i,
-    });
+    const moveUpBtns = screen.getAllByRole("button", { name: /move member \d+ up/i });
     expect(moveUpBtns[0]).toBeDisabled();
   });
 
@@ -302,13 +291,13 @@ describe("Member list — reorder (move up / move down)", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    // Move A down three times → [B, C, D, A]
-    for (let i = 0; i < 3; i++) {
-      const btn = screen.getAllByRole("button", {
-        name: /move member 1 down/i,
-      })[0];
-      fireEvent.click(btn);
-    }
+    // Move row 0 (A) down three times → A should end up at position 3
+    const getFirst = () =>
+      screen.getAllByRole("button", { name: /move member 1 down/i })[0];
+
+    fireEvent.click(getFirst()); // [B, A, C, D]
+    fireEvent.click(getFirst()); // [B, C, A, D]
+    fireEvent.click(getFirst()); // [B, C, D, A]
 
     expect(getMemberValues()).toEqual([B, C, D, A]);
   });
@@ -317,16 +306,20 @@ describe("Member list — reorder (move up / move down)", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    // Move C (position 3) up → [A, C, B, D]
-    const moveUpBtns = () =>
+    // Move C (position 3) up to position 1: [A, C, B, D]
+    const moveUp = () =>
       screen.getAllByRole("button", { name: /move member \d+ up/i });
-    fireEvent.click(moveUpBtns()[2]);
+
+    fireEvent.click(moveUp()[2]); // move position 3 up → [A, B, C, D] → C,B swap: [A, C, B, D]
+
     expect(getMemberValues()).toEqual([A, C, B, D]);
 
-    // Move A (still position 1) down → [C, A, B, D]
-    const moveDownBtns = () =>
+    // Move A (still position 1) down to position 2: [C, A, B, D]
+    const moveDown = () =>
       screen.getAllByRole("button", { name: /move member \d+ down/i });
-    fireEvent.click(moveDownBtns()[0]);
+
+    fireEvent.click(moveDown()[0]); // move position 1 down
+
     expect(getMemberValues()).toEqual([C, A, B, D]);
   });
 
@@ -334,12 +327,13 @@ describe("Member list — reorder (move up / move down)", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
-    const moveDown = () =>
+    const moveDownBtns = () =>
       screen.getAllByRole("button", { name: /move member \d+ down/i });
 
-    fireEvent.click(moveDown()[0]);
-    fireEvent.click(moveDown()[1]);
-    fireEvent.click(moveDown()[0]);
+    // Arbitrary sequence of moves
+    fireEvent.click(moveDownBtns()[0]);
+    fireEvent.click(moveDownBtns()[1]);
+    fireEvent.click(moveDownBtns()[0]);
 
     const vals = getMemberValues();
     expect(vals).toHaveLength(4);
@@ -350,7 +344,7 @@ describe("Member list — reorder (move up / move down)", () => {
   });
 });
 
-// ─── Editing after reorder ────────────────────────────────────────────────────
+// ─── Component: editing after reorder ────────────────────────────────────────
 
 describe("Member list — editing after reorder", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -365,10 +359,13 @@ describe("Member list — editing after reorder", () => {
     });
     fireEvent.click(moveDown[0]);
 
-    // Edit position 2 (now holds A) to D
-    const inputs = getMemberInputs();
+    // Now edit position 2 (which is A)
+    const inputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
     fireEvent.change(inputs[1], { target: { value: D } });
 
+    // Position 1 = B (unchanged), position 2 = D (edited from A), rest intact
     expect(getMemberValues()).toEqual([B, D, C, D]);
   });
 
@@ -380,33 +377,41 @@ describe("Member list — editing after reorder", () => {
     const removeBtns = screen.getAllByRole("button", { name: /remove member/i });
     fireEvent.click(removeBtns[1]);
 
-    // Edit position 1 (value A) to B
-    const inputs = getMemberInputs();
+    // Edit position 1 (value A) to something new
+    const inputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
     fireEvent.change(inputs[0], { target: { value: B } });
 
+    // Row 1 = B (edited), row 2 = C (was row 3 before remove — untouched), row 3 = D
     expect(getMemberValues()).toEqual([B, C, D]);
   });
 });
 
-// ─── Accessible names ─────────────────────────────────────────────────────────
+// ─── Component: accessible names ─────────────────────────────────────────────
 
 describe("Member list — accessible names", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("each address input has an accessible name including its position", () => {
+  it("each address input has an accessible name that includes its position", () => {
     render(<CreateClient />);
-    const inputs = getMemberInputs();
+    const inputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
+    // Default renders 4 rows
     expect(inputs.length).toBe(4);
     inputs.forEach((input, i) => {
-      expect(input.getAttribute("aria-label")).toMatch(
-        new RegExp(`member ${i + 1} of \\d+`, "i"),
-      );
+      const label = input.getAttribute("aria-label") ?? "";
+      expect(label).toMatch(new RegExp(`member ${i + 1} of \\d+`, "i"));
     });
   });
 
   it("each address input mentions payout position in its accessible name", () => {
     render(<CreateClient />);
-    getMemberInputs().forEach((input, i) => {
+    const inputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
+    inputs.forEach((input, i) => {
       expect(input.getAttribute("aria-label")).toMatch(
         new RegExp(`payout position ${i + 1}`, "i"),
       );
@@ -415,9 +420,7 @@ describe("Member list — accessible names", () => {
 
   it("each move-up button has an accessible name with the member's position", () => {
     render(<CreateClient />);
-    const upBtns = screen.getAllByRole("button", {
-      name: /move member \d+ up/i,
-    });
+    const upBtns = screen.getAllByRole("button", { name: /move member \d+ up/i });
     expect(upBtns.length).toBe(4);
     upBtns.forEach((btn, i) => {
       expect(btn.getAttribute("aria-label")).toMatch(
@@ -428,9 +431,7 @@ describe("Member list — accessible names", () => {
 
   it("each move-down button has an accessible name with the member's position", () => {
     render(<CreateClient />);
-    const downBtns = screen.getAllByRole("button", {
-      name: /move member \d+ down/i,
-    });
+    const downBtns = screen.getAllByRole("button", { name: /move member \d+ down/i });
     expect(downBtns.length).toBe(4);
     downBtns.forEach((btn, i) => {
       expect(btn.getAttribute("aria-label")).toMatch(
@@ -441,9 +442,8 @@ describe("Member list — accessible names", () => {
 
   it("each remove button has an accessible name with the member's position", () => {
     render(<CreateClient />);
-    const removeBtns = screen.getAllByRole("button", {
-      name: /remove member \d+/i,
-    });
+    // At 4 rows (> MIN_MEMBERS) all remove buttons show the position name
+    const removeBtns = screen.getAllByRole("button", { name: /remove member \d+/i });
     expect(removeBtns.length).toBe(4);
     removeBtns.forEach((btn, i) => {
       expect(btn.getAttribute("aria-label")).toMatch(
@@ -455,8 +455,11 @@ describe("Member list — accessible names", () => {
   it("accessible names update after adding a member", () => {
     render(<CreateClient />);
     fireEvent.click(screen.getByRole("button", { name: /\+ add member/i }));
-    const inputs = getMemberInputs();
+    const inputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
     expect(inputs.length).toBe(5);
+    // Last input should say "member 5 of 5"
     expect(inputs[4].getAttribute("aria-label")).toMatch(/member 5 of 5/i);
   });
 
@@ -464,10 +467,13 @@ describe("Member list — accessible names", () => {
     render(<CreateClient />);
     fillMembers([A, B, C, D]);
 
+    // Remove middle row → 3 rows remain, positions should be 1-of-3, 2-of-3, 3-of-3
     const removeBtns = screen.getAllByRole("button", { name: /remove member \d+/i });
     fireEvent.click(removeBtns[1]);
 
-    const inputs = getMemberInputs();
+    const inputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
     expect(inputs.length).toBe(3);
     expect(inputs[0].getAttribute("aria-label")).toMatch(/member 1 of 3/i);
     expect(inputs[2].getAttribute("aria-label")).toMatch(/member 3 of 3/i);
@@ -482,7 +488,7 @@ describe("Member list — accessible names", () => {
   });
 });
 
-// ─── Row key stability ────────────────────────────────────────────────────────
+// ─── Component: row identity (key stability) ──────────────────────────────────
 
 describe("Member list — row key stability", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -492,14 +498,21 @@ describe("Member list — row key stability", () => {
     fillMembers([A, B, C, D]);
 
     // Capture the DOM node for position 3 (value C) before the remove
-    const cNode = getMemberInputs()[2]; // holds C
+    const beforeInputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
+    const cNode = beforeInputs[2]; // currently holds C
 
     // Remove row 2 (holds B)
     const removeBtns = screen.getAllByRole("button", { name: /remove member/i });
     fireEvent.click(removeBtns[1]);
 
-    // The same DOM node that held C should now be at position 2 and still hold C
-    const afterInputs = getMemberInputs();
+    // After remove, "C" should now be at position 2
+    const afterInputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
+
+    // The same DOM node that held C should still hold C (not recycled)
     expect(afterInputs[1]).toBe(cNode);
     expect((afterInputs[1] as HTMLInputElement).value).toBe(C);
   });
@@ -509,16 +522,19 @@ describe("Member list — row key stability", () => {
     fillMembers([A, B, C, D]);
 
     // Capture the DOM node for position 2 (value B)
-    const bNode = getMemberInputs()[1];
+    const beforeInputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
+    const bNode = beforeInputs[1];
 
     // Move row 1 (A) down → B moves from position 2 to position 1
-    const moveDown = screen.getAllByRole("button", {
-      name: /move member 1 down/i,
-    });
+    const moveDown = screen.getAllByRole("button", { name: /move member 1 down/i });
     fireEvent.click(moveDown[0]);
 
-    // After move, position 1 should be B and it should be the SAME DOM node
-    const afterInputs = getMemberInputs();
+    // After move, position 1 should be B, and it should be the SAME DOM node
+    const afterInputs = screen.getAllByRole("textbox", {
+      name: /member \d+ of \d+ — stellar address/i,
+    });
     expect(afterInputs[0]).toBe(bNode);
     expect((afterInputs[0] as HTMLInputElement).value).toBe(B);
   });
