@@ -25,10 +25,25 @@ export const metadata: Metadata = {
   alternates: {
     canonical: "/",
   },
+  // Allow search engines to index the app and follow links. Search crawlers
+  // (e.g. Googlebot, Bingbot) use this as the baseline for every route — page
+  // routes may override it, but none of the current routes opt out.
+  robots: {
+    index: true,
+    follow: true,
+  },
   openGraph: {
     siteName: "CircleUp",
     type: "website",
     locale: "en_US",
+  },
+  // Base social card for rich link previews (Slack, Discord, X, WhatsApp).
+  // Individual page routes inherit this and enrich the title/description with
+  // route-specific values that merge in from their `metadata`/`generateMetadata`.
+  twitter: {
+    card: "summary",
+    title: "CircleUp",
+    description: "On-chain savings circles on Stellar Soroban",
   },
 };
 
