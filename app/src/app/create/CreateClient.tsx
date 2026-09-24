@@ -32,32 +32,29 @@ export const MIN_AMOUNT_USDC = "0.0000001";
 
 /** Maximum round amount in USDC (sanity cap to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
-
-/** Maximum round duration in days. */
-export const MAX_ROUND_DAYS = 365;
+/** Maximum length of a circle name. */
+const MAX_NAME_LENGTH = 100;
+/** Minimum amount for USDC (smallest unit of stroops for USDC). */
+const MIN_AMOUNT_USDC = 0.0000001;
+/** USDC has 7 decimal places. */
+const MAX_USDC_DECIMALS = 7;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-/** Per-field validation errors. */
-export interface CreateFormErrors {
+interface CreateFormErrors {
   name?: string;
   amount?: string;
   days?: string;
-  /** Per-index member errors (indices that are undefined have no error). */
   members?: (string | undefined)[];
-  /** List-level member error (count, duplicates). */
   membersGeneral?: string;
 }
 
-/** The normalised values returned when validation passes. */
-export interface ValidatedCreateForm {
+interface ValidatedCreateForm {
   name: string;
   validMembers: string[];
   amountStroops: bigint;
   roundDays: number;
 }
-
-// ─── Pure helpers (exported for tests) ───────────────────────────────────────
 
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
@@ -76,6 +73,22 @@ export function findDuplicateAddress(addresses: string[]): string | null {
     seen.add(lower);
   }
   return null;
+}
+
+/**
+ * Validate a single member entry (e.g. `G…`).
+ * Returns an error string, or undefined if valid.
+ */
+function validateMemberEntry(raw: string, i: number): string | undefined {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    // Empty entries are allowed unless the total count is too low
+    return undefined;
+  }
+  if (!isStellarPublicKey(trimmed)) {
+    return `Member ${i + 1} is not a valid Stellar public key.`;
+  }
+  return undefined;
 }
 
 /**
@@ -343,6 +356,7 @@ export default function CreateClient() {
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
+  const submittingRef  = useRef(false);
   // One ref per member row for focusing the first invalid field
   const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
@@ -386,12 +400,28 @@ export default function CreateClient() {
   // ── Member helpers ──────────────────────────────────────────────────────────
 
   function updateMember(i: number, val: string) {
-    setMembers((prev) => prev.map((m, idx) => (idx === i ? val : m)));
+    setMembers((prev) => {
+      const next = [...prev];
+      next[i] = val;
+      return next;
+    });
   }
 
-  function addMember() {
-    setMembers((prev) => (prev.length >= MAX_MEMBERS ? prev : [...prev, ""]));
-  }
+  const addMember = useCallback(() => {
+    setMembers((prev) => {
+      if (prev.length >= MAX_MEMBERS) return prev;
+      return [...prev, ""];
+    });
+  }, []);
+
+  /**
+   * Remove the row with the given id.  After removal, focus moves to:
+   *   - the row that took the same position, or
+   *   - the last row if the removed row was last.
+   * Focus change is deferred via pendingFocusId so the target exists in the
+   * DOM on the next render.
+   */
+
 
   function removeMember(i: number) {
     if (members.length <= MIN_MEMBERS) return;
@@ -453,46 +483,17 @@ export default function CreateClient() {
       }
       setFieldErrors({});
 
-      const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
 
-      // ── Step 2: wallet check ──────────────────────────────────────────────
-      let walletAddress: string | null;
-      try {
-        walletAddress = await getWalletAddress();
-      } catch (err) {
-        if (err instanceof WalletError && err.reason === "not_installed") {
-          setSubmitError(
-            "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
-          );
-        } else {
-          setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
-        }
-        return;
-      }
 
-      if (!walletAddress) {
-        setSubmitError("Connect your Freighter wallet using the button in the top-right corner.");
-        return;
-      }
+    // ── Step 3: factory address guard ─────────────────────────────────────────
+    if (!CIRCLE_FACTORY_ADDRESS) {
+      setSubmitError("Factory contract not configured. Deploy contracts first.");
+      return;
+    }
 
-      // Self-address check — creator must not be in the member list
-      const creatorLower = walletAddress.toLowerCase();
-      if (validMembers.some((m) => m.toLowerCase() === creatorLower)) {
-        setSubmitError(
-          "Your wallet address cannot be included in the member list. " +
-            "The circle creator is automatically a member.",
-        );
-        return;
-      }
-
-      // ── Step 3: factory address guard ─────────────────────────────────────
-      if (!CIRCLE_FACTORY_ADDRESS) {
-        setSubmitError("Factory contract not configured. Deploy contracts first.");
-        return;
-      }
-
-      // ── Step 4: submit ────────────────────────────────────────────────────
-      setLoading(true);
+    // ── Step 4: submit ────────────────────────────────────────────────────────
+    setLoading(true);
+    try {
       const membersVec = xdr.ScVal.scvVec(
         validMembers.map((m) => new Address(m).toScVal()),
       );
@@ -520,7 +521,6 @@ export default function CreateClient() {
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
-      setLoading(false);
       submittingRef.current = false;
     }
   }
