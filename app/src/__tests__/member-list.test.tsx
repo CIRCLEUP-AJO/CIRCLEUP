@@ -16,12 +16,20 @@
 import React from "react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
+import { Keypair } from "@stellar/stellar-sdk";
 
 import {
   reorderMembers,
   createMemberRow,
   type MemberRow,
 } from "../app/create/CreateClient";
+
+/**
+ * Deterministic, checksum-valid G-addresses (Issue #477): shape alone is not
+ * enough, every member entry must carry a valid strkey checksum.
+ */
+const addrFor = (seed: number): string =>
+  Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -54,10 +62,10 @@ import CreateClient from "../app/create/CreateClient";
 
 // ─── Address fixtures ─────────────────────────────────────────────────────────
 
-const A = "G" + "A".repeat(55);
-const B = "G" + "B".repeat(55);
-const C = "G" + "C".repeat(55);
-const D = "G" + "D".repeat(55);
+const A = addrFor(1);
+const B = addrFor(2);
+const C = addrFor(3);
+const D = addrFor(4);
 
 // ─── reorderMembers ───────────────────────────────────────────────────────────
 
