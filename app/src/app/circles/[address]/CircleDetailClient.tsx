@@ -939,7 +939,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const submittingRef = useRef(false);
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  const [inviteUrl,           setInviteUrl]           = useState("");
+  //
+  // inviteUrl is intentionally initialised to null (not "") so that components
+  // can distinguish "not yet resolved" from "resolved to an empty string".
+  // The value is only ever set inside a useEffect, which never runs during SSR,
+  // so window.location is only accessed in the browser — preventing hydration
+  // mismatches and SSR crashes caused by the window object being absent on the
+  // server.  The input placeholder handles the null state visually.
+  const [inviteUrl,           setInviteUrl]           = useState<string | null>(null);
   const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
   const [defaultConfirm,      setDefaultConfirm]      = useState<DefaultConfirmState | null>(null);
   const [inviteCopyState,     setInviteCopyState]     = useState<CopyState>("idle");
@@ -996,10 +1003,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     return () => { cancelled = true; };
   }, []);
 
+  // Build the invite URL client-side only.  useEffect never runs on the server,
+  // so window.location is guaranteed to exist here — no typeof guard needed.
+  // Keeping this in an effect (rather than useMemo) also means the URL is only
+  // computed after hydration, preventing any server/client HTML mismatch.
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
-    }
+    setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
   }, [circleAddress]);
 
   // Focus management
@@ -2065,10 +2074,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         <div className="flex gap-2">
           <input
             readOnly
-            value={inviteUrl}
+            value={inviteUrl ?? ""}
             className="flex-1 min-w-0 font-mono text-xs bg-white border border-slate-300 rounded px-3 py-2 text-slate-600 placeholder:text-slate-400"
             onClick={(e) => (e.target as HTMLInputElement).select()}
             aria-label="Invite link for this circle"
+            aria-busy={inviteUrl === null}
             placeholder="Loading invite link…"
           />
           <button

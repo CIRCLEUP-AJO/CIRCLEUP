@@ -193,13 +193,26 @@ export function ReputationBadge({ score, size = "md" }: ReputationBadgeProps) {
  * the score range and a plain-text description, so meaning is clear without
  * relying on colour alone.
  *
+ * Accessibility notes:
+ *   - The wrapping <section> is labelled via aria-labelledby pointing at the
+ *     visible heading — avoids duplicating the heading text in a separate
+ *     aria-label attribute.
+ *   - Column headers use scope="col" and are always visible to assistive
+ *     technology (not sr-only) so screen-reader users understand the table
+ *     structure before navigating rows.
+ *   - Each data row uses a <th scope="row"> for the tier name so assistive
+ *     technology announces "New — Score range 0, No completed rounds yet."
+ *     rather than reading three unrelated cells.
+ *   - The decorative colour badge inside each row is aria-hidden; the row
+ *     header already carries the tier name for AT.
+ *
  * Uses a <table> for semantic correctness: the relationship between tier name,
  * score range, and description is tabular data, not a definition list.
  */
 export function ReputationLegend() {
   return (
     <section
-      aria-label="Reputation badge legend"
+      aria-labelledby="rep-legend-heading"
       className="bg-white rounded-xl border border-slate-200 p-5"
     >
       <h2 className="font-semibold text-slate-800 mb-3" id="rep-legend-heading">
@@ -209,11 +222,26 @@ export function ReputationLegend() {
         className="w-full text-sm border-collapse"
         aria-labelledby="rep-legend-heading"
       >
-        <thead className="sr-only">
-          <tr>
-            <th scope="col">Badge</th>
-            <th scope="col">Score range</th>
-            <th scope="col">Description</th>
+        <thead>
+          <tr className="border-b border-slate-200">
+            <th
+              scope="col"
+              className="pb-2 pr-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wide"
+            >
+              Level
+            </th>
+            <th
+              scope="col"
+              className="pb-2 pr-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wide tabular-nums"
+            >
+              Score range
+            </th>
+            <th
+              scope="col"
+              className="pb-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wide"
+            >
+              Description
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -225,8 +253,16 @@ export function ReputationLegend() {
 
             return (
               <tr key={tier.label} className="border-t border-slate-100 first:border-0">
-                <td className="py-2 pr-3 align-middle">
-                  {/* Visual badge — aria-hidden because the row's th already names the tier */}
+                {/*
+                 * th scope="row": names this row for assistive technology so
+                 * screen readers announce cells relative to "New", "Starter",
+                 * etc. rather than just announcing raw cell values.
+                 */}
+                <th
+                  scope="row"
+                  className="py-2 pr-3 align-middle font-normal text-left"
+                >
+                  {/* Decorative coloured badge — aria-hidden; th carries the name */}
                   <span
                     className={`inline-flex items-center gap-1 rounded-full font-medium text-xs px-2 py-0.5 ${tier.color}`}
                     aria-hidden="true"
@@ -234,8 +270,13 @@ export function ReputationLegend() {
                     <span className="font-mono leading-none">{tier.marker}</span>
                     <span>{tier.label}</span>
                   </span>
-                </td>
-                <td className="py-2 pr-3 align-middle text-slate-500 tabular-nums whitespace-nowrap">
+                  {/* Accessible text for the tier name — visually hidden, read by AT */}
+                  <span className="sr-only">{tier.label}</span>
+                </th>
+                <td
+                  className="py-2 pr-3 align-middle text-slate-500 tabular-nums whitespace-nowrap"
+                  aria-label={`Score range: ${rangeLabel}`}
+                >
                   {rangeLabel}
                 </td>
                 <td className="py-2 align-middle text-slate-500">
