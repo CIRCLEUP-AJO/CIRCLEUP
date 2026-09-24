@@ -20,6 +20,12 @@ export const metadata: Metadata = {
     url: "/",
     type: "website",
   },
+  twitter: {
+    card: "summary",
+    title: "CircleUp — Trustless Savings Circles on Stellar",
+    description:
+      "Ajo, Esusu, Tanda, and Chama on Stellar. Everyone pays in once a round, and the contract hands the whole pot to whoever's turn it is.",
+  },
 };
 
 // ─── Types ────────────────────────────────────────────────────────────────────
