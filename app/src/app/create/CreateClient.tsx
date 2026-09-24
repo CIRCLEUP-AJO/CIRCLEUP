@@ -9,7 +9,7 @@ import {
   getExplorerLink,
   ACTIVE_NETWORK,
 } from "@/lib/config";
-import { isStellarPublicKey } from "@/lib/address";
+import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
@@ -135,14 +135,11 @@ export function validateCreateForm(
   }
 
   // ── Members — per-field ───────────────────────────────────────────────────
-  const memberErrors: (string | undefined)[] = members.map((raw, i) => {
-    const trimmed = raw.trim();
-    if (trimmed.length === 0) return undefined; // blank rows are ignored
-    if (!isStellarPublicKey(trimmed)) {
-      return `Member ${i + 1}: must be a G-prefixed 56-character Stellar address.`;
-    }
-    return undefined;
-  });
+  // Every filled row is validated on its own, so one bad entry names itself
+  // (`Member 3: …`) instead of the whole list failing later at encoding time.
+  const memberErrors: (string | undefined)[] = members.map((raw, i) =>
+    validateMemberEntry(raw, i),
+  );
 
   const hasPerMemberErrors = memberErrors.some((e) => e !== undefined);
   if (hasPerMemberErrors) {

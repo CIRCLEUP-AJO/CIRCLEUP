@@ -52,10 +52,10 @@ import CreateClient from "../app/create/CreateClient";
 
 // ─── Address fixtures ─────────────────────────────────────────────────────────
 
-const A = "G" + "A".repeat(55);
-const B = "G" + "B".repeat(55);
-const C = "G" + "C".repeat(55);
-const D = "G" + "D".repeat(55);
+const A = addrFor(1);
+const B = addrFor(2);
+const C = addrFor(3);
+const D = addrFor(4);
 
 // ─── reorderMembers ───────────────────────────────────────────────────────────
 
