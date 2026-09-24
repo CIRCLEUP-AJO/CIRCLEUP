@@ -1,13 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
-// Note: @testing-library/user-event is NOT imported here because user-event v14
-// calls `new Pointer(document)` at module evaluation time, which throws
-// `Cannot read properties of undefined (reading 'on')` under Node 24 / jsdom
-// before the pointer API is shimmed.  We use fireEvent for click simulation
-// instead — it's synchronous, has no DOM bootstrapping side-effects, and is
-// the correct choice for testing button click handlers (not pointer events).
 
-// ─── Mock @/lib/stellar ───────────────────────────────────────────────────────
+// ─── Module mocks (hoisted) ───────────────────────────────────────────────────
 
 vi.mock("@/lib/stellar", () => {
   class WalletError extends Error {
@@ -26,33 +20,18 @@ vi.mock("@/lib/stellar", () => {
   };
 });
 
-// Mock @/lib/walletCapabilities to control capability detection in tests
-vi.mock("@/lib/walletCapabilities", () => ({
-  detectWalletCapabilities: vi.fn(() => ({
-    installed: true,
-    canConnect: true,
-    canSignTransaction: true,
-    canGetNetwork: true,
-    canWatchChanges: false,
-  })),
-  explainUnsupportedAction: vi.fn(() => null),
-}));
-
-// Mock @/lib/config to avoid env-var assertions at import time
 vi.mock("@/lib/config", () => ({
-  shortAddress: (addr: string) => `${addr.slice(0, 4)}…${addr.slice(-4)}`,
+  shortAddress: (addr: string) =>
+    addr && addr.length >= 8 ? `${addr.slice(0, 4)}…${addr.slice(-4)}` : addr,
   NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
   STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
   CIRCLE_FACTORY_ADDRESS: "",
   REPUTATION_ADDRESS: "",
   USDC_ADDRESS: "",
   INDEXER_URL: "http://localhost:3001",
+  ACTIVE_NETWORK: "testnet",
+  getExplorerLink: () => null,
 }));
-
-// ─── Mock @/lib/walletCapabilities ────────────────────────────────────────────
-//
-// Default: canGetNetwork=false so the network-check path is a no-op in tests
-// that don't care about it.  Individual tests override as needed.
 
 vi.mock("@/lib/walletCapabilities", () => ({
   detectWalletCapabilities: vi.fn(() => ({
@@ -62,9 +41,12 @@ vi.mock("@/lib/walletCapabilities", () => ({
     canGetNetwork: false,
     canWatchChanges: false,
   })),
+  explainUnsupportedAction: vi.fn(() => null),
   checkNetworkMismatch: vi.fn(async () => ({ kind: "unsupported" })),
   describeNetworkMismatch: vi.fn(() => null),
 }));
+
+// ─── Imports after mocks ──────────────────────────────────────────────────────
 
 import { WalletButton } from "@/components/WalletButton";
 import * as stellar from "@/lib/stellar";
@@ -77,9 +59,11 @@ const mockStellar = stellar as {
   WalletError: new (reason: string, msg: string) => Error & { reason: string };
 };
 
-const mockWalletCaps = walletCaps as {
+const mockCaps = walletCaps as {
   detectWalletCapabilities: ReturnType<typeof vi.fn>;
   explainUnsupportedAction: ReturnType<typeof vi.fn>;
+  checkNetworkMismatch: ReturnType<typeof vi.fn>;
+  describeNetworkMismatch: ReturnType<typeof vi.fn>;
 };
 
 beforeEach(() => {
@@ -91,18 +75,18 @@ beforeEach(() => {
     canGetNetwork: false,
     canWatchChanges: false,
   });
+  mockCaps.explainUnsupportedAction.mockReturnValue(null);
   mockCaps.checkNetworkMismatch.mockResolvedValue({ kind: "unsupported" });
   mockCaps.describeNetworkMismatch.mockReturnValue(null);
 });
 
-// helper: click a button and flush effects
 async function click(el: HTMLElement) {
-  await act(async () => { fireEvent.click(el); });
+  await act(async () => {
+    fireEvent.click(el);
+  });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Idle state
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Idle state ───────────────────────────────────────────────────────────────
 
 describe("WalletButton — idle state (Freighter installed, not connected)", () => {
   it("renders Connect Freighter button", async () => {
@@ -111,7 +95,9 @@ describe("WalletButton — idle state (Freighter installed, not connected)", () 
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /connect freighter/i })).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: /connect freighter/i }),
+      ).toBeInTheDocument(),
     );
   });
 
@@ -127,9 +113,7 @@ describe("WalletButton — idle state (Freighter installed, not connected)", () 
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Connected state
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Connected state ──────────────────────────────────────────────────────────
 
 describe("WalletButton — connected state", () => {
   it("shows shortened address without a connect button", async () => {
@@ -139,12 +123,12 @@ describe("WalletButton — connected state", () => {
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByText("GAAA…AAAA")).toBeInTheDocument()
+      expect(screen.getByText("GAAA…AAAA")).toBeInTheDocument(),
     );
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("does not show a network warning when mismatch check returns null description", async () => {
+  it("does not show a network warning when mismatch returns null description", async () => {
     const addr = "G" + "A".repeat(55);
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(addr);
@@ -152,7 +136,7 @@ describe("WalletButton — connected state", () => {
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByText("GAAA…AAAA")).toBeInTheDocument()
+      expect(screen.getByText("GAAA…AAAA")).toBeInTheDocument(),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
@@ -162,8 +146,11 @@ describe("WalletButton — connected state", () => {
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(addr);
     mockCaps.detectWalletCapabilities.mockReturnValue({
-      installed: true, canConnect: true, canSignTransaction: true,
-      canGetNetwork: true, canWatchChanges: false,
+      installed: true,
+      canConnect: true,
+      canSignTransaction: true,
+      canGetNetwork: true,
+      canWatchChanges: false,
     });
     mockCaps.checkNetworkMismatch.mockResolvedValue({
       kind: "mismatch",
@@ -171,12 +158,12 @@ describe("WalletButton — connected state", () => {
       configuredPassphrase: "Test SDF Network ; September 2015",
     });
     mockCaps.describeNetworkMismatch.mockReturnValue(
-      "Your wallet is connected to a different network."
+      "Your wallet is connected to a different network.",
     );
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByRole("alert")).toBeInTheDocument()
+      expect(screen.getByRole("alert")).toBeInTheDocument(),
     );
     expect(screen.getByText(/different network/i)).toBeInTheDocument();
   });
@@ -186,8 +173,11 @@ describe("WalletButton — connected state", () => {
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(addr);
     mockCaps.detectWalletCapabilities.mockReturnValue({
-      installed: true, canConnect: true, canSignTransaction: true,
-      canGetNetwork: true, canWatchChanges: false,
+      installed: true,
+      canConnect: true,
+      canSignTransaction: true,
+      canGetNetwork: true,
+      canWatchChanges: false,
     });
     mockCaps.checkNetworkMismatch.mockResolvedValue({
       kind: "mismatch",
@@ -204,21 +194,27 @@ describe("WalletButton — connected state", () => {
   });
 });
 
+// ─── Limited capabilities ─────────────────────────────────────────────────────
+
 describe("WalletButton — limited capabilities state", () => {
   it("shows warning when wallet cannot sign transactions", async () => {
     const addr = "G" + "A".repeat(55);
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(addr);
-    mockWalletCaps.explainUnsupportedAction.mockReturnValue(
-      "Your wallet does not support the ability to sign this transaction."
+    mockCaps.explainUnsupportedAction.mockReturnValue(
+      "Your wallet does not support the ability to sign this transaction.",
     );
 
     render(<WalletButton />);
     await waitFor(() => {
-      expect(screen.getByText(/does not support the ability to sign/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/does not support the ability to sign/i),
+      ).toBeInTheDocument();
     });
   });
 });
+
+// ─── Not installed ────────────────────────────────────────────────────────────
 
 describe("WalletButton — not_installed state", () => {
   it("renders install link pointing to freighter.app", async () => {
@@ -245,9 +241,7 @@ describe("WalletButton — not_installed state", () => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Connecting flow
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Connecting flow ──────────────────────────────────────────────────────────
 
 describe("WalletButton — connecting flow", () => {
   it("shows connecting spinner then connected address on success", async () => {
@@ -261,7 +255,7 @@ describe("WalletButton — connecting flow", () => {
     await click(btn);
 
     await waitFor(() =>
-      expect(screen.getByText("GBBB…BBBB")).toBeInTheDocument()
+      expect(screen.getByText("GBBB…BBBB")).toBeInTheDocument(),
     );
   });
 
@@ -269,7 +263,10 @@ describe("WalletButton — connecting flow", () => {
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(null);
     mockStellar.connectWallet.mockRejectedValue(
-      new mockStellar.WalletError("permission_denied", "Wallet access was denied.")
+      new mockStellar.WalletError(
+        "permission_denied",
+        "Wallet access was denied.",
+      ),
     );
 
     render(<WalletButton />);
@@ -277,16 +274,23 @@ describe("WalletButton — connecting flow", () => {
     await click(btn);
 
     await waitFor(() =>
-      expect(screen.getByText(/wallet access was denied/i)).toBeInTheDocument()
+      expect(
+        screen.getByText(/wallet access was denied/i),
+      ).toBeInTheDocument(),
     );
-    expect(screen.getByRole("button", { name: /retry connection/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /retry connection/i }),
+    ).toBeInTheDocument();
   });
 
   it("transitions to not_installed when connect throws not_installed", async () => {
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(null);
     mockStellar.connectWallet.mockRejectedValue(
-      new mockStellar.WalletError("not_installed", "Freighter not installed.")
+      new mockStellar.WalletError(
+        "not_installed",
+        "Freighter not installed.",
+      ),
     );
 
     render(<WalletButton />);
@@ -294,14 +298,14 @@ describe("WalletButton — connecting flow", () => {
     await click(btn);
 
     await waitFor(() =>
-      expect(screen.getByRole("link", { name: /install freighter/i })).toBeInTheDocument()
+      expect(
+        screen.getByRole("link", { name: /install freighter/i }),
+      ).toBeInTheDocument(),
     );
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Account change / disconnect (provider events)
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Account change / disconnect ──────────────────────────────────────────────
 
 describe("WalletButton — account change and disconnect", () => {
   it("re-resolves to idle when account changes and wallet is disconnected", async () => {
@@ -322,13 +326,17 @@ describe("WalletButton — account change and disconnect", () => {
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByText("GCCC…CCCC")).toBeInTheDocument()
+      expect(screen.getByText("GCCC…CCCC")).toBeInTheDocument(),
     );
 
-    await act(async () => { accountChangedCallback?.(); });
+    await act(async () => {
+      accountChangedCallback?.();
+    });
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /connect freighter/i })).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: /connect freighter/i }),
+      ).toBeInTheDocument(),
     );
     delete (window as any).freighter;
   });
@@ -352,13 +360,15 @@ describe("WalletButton — account change and disconnect", () => {
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByText("GDDD…DDDD")).toBeInTheDocument()
+      expect(screen.getByText("GDDD…DDDD")).toBeInTheDocument(),
     );
 
-    await act(async () => { accountChangedCallback?.(); });
+    await act(async () => {
+      accountChangedCallback?.();
+    });
 
     await waitFor(() =>
-      expect(screen.getByText("GEEE…EEEE")).toBeInTheDocument()
+      expect(screen.getByText("GEEE…EEEE")).toBeInTheDocument(),
     );
     delete (window as any).freighter;
   });
@@ -368,18 +378,29 @@ describe("WalletButton — account change and disconnect", () => {
     mockStellar.getWalletAddress.mockResolvedValue(null);
 
     const removeEventListener = vi.fn();
-    const providerMock = { addEventListener: vi.fn(), removeEventListener };
+    const providerMock = {
+      addEventListener: vi.fn(),
+      removeEventListener,
+    };
     (window as any).freighter = providerMock;
 
     const { unmount } = render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /connect freighter/i })).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: /connect freighter/i }),
+      ).toBeInTheDocument(),
     );
 
     unmount();
 
-    expect(removeEventListener).toHaveBeenCalledWith("accountChanged", expect.any(Function));
-    expect(removeEventListener).toHaveBeenCalledWith("networkChanged", expect.any(Function));
+    expect(removeEventListener).toHaveBeenCalledWith(
+      "accountChanged",
+      expect.any(Function),
+    );
+    expect(removeEventListener).toHaveBeenCalledWith(
+      "networkChanged",
+      expect.any(Function),
+    );
     delete (window as any).freighter;
   });
 
@@ -388,13 +409,11 @@ describe("WalletButton — account change and disconnect", () => {
     mockStellar.getWalletAddress.mockReturnValue(new Promise(() => {}));
 
     const { unmount } = render(<WalletButton />);
-    unmount(); // no error expected
+    unmount(); // no React warning expected
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Changing state
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Changing state ───────────────────────────────────────────────────────────
 
 describe("WalletButton — changing state", () => {
   it("shows Updating spinner during the changing transition", async () => {
@@ -415,21 +434,23 @@ describe("WalletButton — changing state", () => {
 
     render(<WalletButton />);
     await waitFor(() =>
-      expect(screen.getByText("GFFF…FFFF")).toBeInTheDocument()
+      expect(screen.getByText("GFFF…FFFF")).toBeInTheDocument(),
     );
 
-    act(() => { accountChangedCallback?.(); });
+    act(() => {
+      accountChangedCallback?.();
+    });
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /updating/i })).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: /updating/i }),
+      ).toBeInTheDocument(),
     );
     delete (window as any).freighter;
   });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Accessibility
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── Accessibility ────────────────────────────────────────────────────────────
 
 describe("WalletButton — accessibility", () => {
   it("button carries aria-busy=true during connecting", async () => {
@@ -438,11 +459,15 @@ describe("WalletButton — accessibility", () => {
     mockStellar.connectWallet.mockReturnValue(new Promise(() => {}));
 
     render(<WalletButton />);
-    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    const btn = await screen.findByRole("button", {
+      name: /connect freighter/i,
+    });
     await click(btn);
 
     await waitFor(() =>
-      expect(screen.getByRole("button", { name: /connecting/i })).toHaveAttribute("aria-busy", "true")
+      expect(
+        screen.getByRole("button", { name: /connecting/i }),
+      ).toHaveAttribute("aria-busy", "true"),
     );
   });
 
@@ -450,11 +475,13 @@ describe("WalletButton — accessibility", () => {
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(null);
     mockStellar.connectWallet.mockRejectedValue(
-      new mockStellar.WalletError("unknown", "Unexpected failure")
+      new mockStellar.WalletError("unknown", "Unexpected failure"),
     );
 
     render(<WalletButton />);
-    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    const btn = await screen.findByRole("button", {
+      name: /connect freighter/i,
+    });
     await click(btn);
 
     await waitFor(() => {
@@ -467,15 +494,19 @@ describe("WalletButton — accessibility", () => {
     mockStellar.isFreighterInstalled.mockReturnValue(true);
     mockStellar.getWalletAddress.mockResolvedValue(null);
     mockStellar.connectWallet.mockRejectedValue(
-      new mockStellar.WalletError("permission_denied", "Denied.")
+      new mockStellar.WalletError("permission_denied", "Denied."),
     );
 
     render(<WalletButton />);
-    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    const btn = await screen.findByRole("button", {
+      name: /connect freighter/i,
+    });
     await click(btn);
 
     await waitFor(() => {
-      const retryBtn = screen.getByRole("button", { name: /retry connection/i });
+      const retryBtn = screen.getByRole("button", {
+        name: /retry connection/i,
+      });
       expect(retryBtn.className).toMatch(/focus-visible/);
     });
   });
