@@ -17,7 +17,20 @@ import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Minimum and maximum number of members allowed by the contract. */
+/**
+ * Member count bounds for a new circle.
+ *
+ * MIN_MEMBERS matches the contracts exactly: circle_factory rejects fewer than
+ * 2 members ("need at least 2 members") before deploying anything.
+ * MAX_MEMBERS is a product limit, deliberately tighter than the contracts'
+ * MAX_MEMBERS of 256: every member must contribute each round and the rotation
+ * runs one round per member, so a 256-member circle would last 256 rounds.
+ *
+ * Enforced in three places that must agree: the row controls (no adding past
+ * MAX_MEMBERS rows, no removing below MIN_MEMBERS rows), the live member-count
+ * status beside the list, and validateCreateForm, the gate before any wallet
+ * prompt. The last two both count members with getMemberCountStatus.
+ */
 export const MIN_MEMBERS = 2;
 export const MAX_MEMBERS = 20;
 
@@ -32,33 +45,75 @@ export const MIN_AMOUNT_USDC = "0.0000001";
 
 /** Maximum round amount in USDC (sanity cap to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
-/** Maximum length of a circle name. */
-const MAX_NAME_LENGTH = 100;
-/** Minimum amount for USDC (smallest unit of stroops for USDC). */
-const MIN_AMOUNT_USDC = 0.0000001;
-/** USDC has 7 decimal places. */
-const MAX_USDC_DECIMALS = 7;
+
+/** Maximum round duration in days. */
+export const MAX_ROUND_DAYS = 365;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface CreateFormErrors {
+/** Per-field validation errors. */
+export interface CreateFormErrors {
   name?: string;
   amount?: string;
   days?: string;
+  /** Per-index member errors (indices that are undefined have no error). */
   members?: (string | undefined)[];
+  /** List-level member error (count, duplicates). */
   membersGeneral?: string;
 }
 
-interface ValidatedCreateForm {
+/** The normalised values returned when validation passes. */
+export interface ValidatedCreateForm {
   name: string;
   validMembers: string[];
   amountStroops: bigint;
   roundDays: number;
 }
 
+// ─── Pure helpers (exported for tests) ───────────────────────────────────────
+
 /** Return trimmed non-empty member strings in order. */
 export function getFilledMembers(members: string[]): string[] {
   return members.map((m) => m.trim()).filter((m) => m.length > 0);
+}
+
+/** Where a member count sits relative to [MIN_MEMBERS, MAX_MEMBERS]. */
+export type MemberCountStatus = "too_few" | "ok" | "too_many";
+
+export function getMemberCountStatus(count: number): MemberCountStatus {
+  if (count < MIN_MEMBERS) return "too_few";
+  if (count > MAX_MEMBERS) return "too_many";
+  return "ok";
+}
+
+/** The member figures the create form displays, derived from the raw rows. */
+export interface MemberRowSummary {
+  /** Distinct filled addresses: the members that would actually be submitted. */
+  count: number;
+  /** Rows that are empty or whitespace-only. They are ignored, never counted. */
+  blankRows: number;
+  /** Filled rows that repeat an earlier address (submit is blocked until fixed). */
+  duplicateRows: number;
+  status: MemberCountStatus;
+}
+
+/**
+ * Summarise member rows for the live counter and the summary card.
+ *
+ * Blank rows are the default state of the form (it opens with four empty
+ * rows), so they must never inflate the member count, the pot, or the
+ * collateral figures. Duplicates are not counted twice either: the contract
+ * rejects them, so counting them would preview a pot that can never exist.
+ */
+export function summarizeMemberRows(values: string[]): MemberRowSummary {
+  const filled = getFilledMembers(values);
+  const distinct = new Set(filled.map((m) => m.toLowerCase())).size;
+  return {
+    count: distinct,
+    blankRows: values.length - filled.length,
+    duplicateRows: filled.length - distinct,
+    status: getMemberCountStatus(distinct),
+  };
 }
 
 /**
@@ -73,22 +128,6 @@ export function findDuplicateAddress(addresses: string[]): string | null {
     seen.add(lower);
   }
   return null;
-}
-
-/**
- * Validate a single member entry (e.g. `G…`).
- * Returns an error string, or undefined if valid.
- */
-function validateMemberEntry(raw: string, i: number): string | undefined {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) {
-    // Empty entries are allowed unless the total count is too low
-    return undefined;
-  }
-  if (!isStellarPublicKey(trimmed)) {
-    return `Member ${i + 1} is not a valid Stellar public key.`;
-  }
-  return undefined;
 }
 
 /**
@@ -261,16 +300,20 @@ export function validateCreateForm(
   }
 
   // ── Members — list-level ──────────────────────────────────────────────────
+  // Blank rows are dropped here, before any count is taken.
   const validMembers = getFilledMembers(members);
+  const countStatus = getMemberCountStatus(validMembers.length);
 
-  if (validMembers.length < MIN_MEMBERS) {
+  if (countStatus === "too_few") {
     errors.membersGeneral =
       `At least ${MIN_MEMBERS} members are required. ` +
       (validMembers.length === 0
         ? "Add member addresses below."
         : `You have ${validMembers.length}.`);
-  } else if (validMembers.length > MAX_MEMBERS) {
-    errors.membersGeneral = `A circle cannot have more than ${MAX_MEMBERS} members.`;
+  } else if (countStatus === "too_many") {
+    errors.membersGeneral =
+      `A circle cannot have more than ${MAX_MEMBERS} members. ` +
+      `You have ${validMembers.length}; remove ${validMembers.length - MAX_MEMBERS}.`;
   } else {
     const dup = findDuplicateAddress(validMembers);
     if (dup) {
@@ -356,7 +399,6 @@ export default function CreateClient() {
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
-  const submittingRef  = useRef(false);
   // One ref per member row for focusing the first invalid field
   const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
@@ -372,7 +414,10 @@ export default function CreateClient() {
   }, [txHash]);
 
   // ── Derived values ──────────────────────────────────────────────────────────
-  const filledCount = getFilledMembers(members).length;
+  // Distinct filled addresses only: blank rows and repeated addresses never
+  // reach the contract, so they must not inflate the counter, pot, or summary.
+  const memberSummary = summarizeMemberRows(members);
+  const filledCount = memberSummary.count;
 
   // Stroops for the currently-typed amount. `usdcToStroops` throws on invalid
   // input; during typing we just want a displayable (possibly zero) figure, so
@@ -400,28 +445,12 @@ export default function CreateClient() {
   // ── Member helpers ──────────────────────────────────────────────────────────
 
   function updateMember(i: number, val: string) {
-    setMembers((prev) => {
-      const next = [...prev];
-      next[i] = val;
-      return next;
-    });
+    setMembers((prev) => prev.map((m, idx) => (idx === i ? val : m)));
   }
 
-  const addMember = useCallback(() => {
-    setMembers((prev) => {
-      if (prev.length >= MAX_MEMBERS) return prev;
-      return [...prev, ""];
-    });
-  }, []);
-
-  /**
-   * Remove the row with the given id.  After removal, focus moves to:
-   *   - the row that took the same position, or
-   *   - the last row if the removed row was last.
-   * Focus change is deferred via pendingFocusId so the target exists in the
-   * DOM on the next render.
-   */
-
+  function addMember() {
+    setMembers((prev) => (prev.length >= MAX_MEMBERS ? prev : [...prev, ""]));
+  }
 
   function removeMember(i: number) {
     if (members.length <= MIN_MEMBERS) return;
@@ -483,17 +512,46 @@ export default function CreateClient() {
       }
       setFieldErrors({});
 
+      const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
 
+      // ── Step 2: wallet check ──────────────────────────────────────────────
+      let walletAddress: string | null;
+      try {
+        walletAddress = await getWalletAddress();
+      } catch (err) {
+        if (err instanceof WalletError && err.reason === "not_installed") {
+          setSubmitError(
+            "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
+          );
+        } else {
+          setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
+        }
+        return;
+      }
 
-    // ── Step 3: factory address guard ─────────────────────────────────────────
-    if (!CIRCLE_FACTORY_ADDRESS) {
-      setSubmitError("Factory contract not configured. Deploy contracts first.");
-      return;
-    }
+      if (!walletAddress) {
+        setSubmitError("Connect your Freighter wallet using the button in the top-right corner.");
+        return;
+      }
 
-    // ── Step 4: submit ────────────────────────────────────────────────────────
-    setLoading(true);
-    try {
+      // Self-address check — creator must not be in the member list
+      const creatorLower = walletAddress.toLowerCase();
+      if (validMembers.some((m) => m.toLowerCase() === creatorLower)) {
+        setSubmitError(
+          "Your wallet address cannot be included in the member list. " +
+            "The circle creator is automatically a member.",
+        );
+        return;
+      }
+
+      // ── Step 3: factory address guard ─────────────────────────────────────
+      if (!CIRCLE_FACTORY_ADDRESS) {
+        setSubmitError("Factory contract not configured. Deploy contracts first.");
+        return;
+      }
+
+      // ── Step 4: submit ────────────────────────────────────────────────────
+      setLoading(true);
       const membersVec = xdr.ScVal.scvVec(
         validMembers.map((m) => new Address(m).toScVal()),
       );
@@ -521,6 +579,7 @@ export default function CreateClient() {
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error.");
     } finally {
+      setLoading(false);
       submittingRef.current = false;
     }
   }
@@ -665,14 +724,13 @@ export default function CreateClient() {
               <span aria-hidden="true" className="text-red-500">*</span>{" "}
               <span className="font-normal text-slate-500">— payout order top → bottom</span>
             </legend>
+            {/* Counts filled, distinct addresses, not rows: a blank row is not a member. */}
             <span
               className={`text-xs font-medium ${
-                members.length >= MAX_MEMBERS ? "text-amber-600" : "text-slate-400"
+                memberSummary.status === "ok" ? "text-slate-500" : "text-amber-600"
               }`}
-              aria-live="polite"
-              aria-atomic="true"
             >
-              {members.length} / {MAX_MEMBERS}
+              {filledCount} / {MAX_MEMBERS} members
             </span>
           </div>
 
@@ -771,8 +829,24 @@ export default function CreateClient() {
             )}
           </div>
 
-          <p id={membersHintId} className="text-xs text-slate-400 mt-1">
-            Minimum {MIN_MEMBERS} · maximum {MAX_MEMBERS} members. At least {MIN_MEMBERS} addresses required.
+          {/* Live count status, so the bounds are visible before the first submit. */}
+          <p
+            id={membersHintId}
+            className={`text-xs mt-1 ${
+              memberSummary.status === "ok" ? "text-slate-400" : "text-amber-700"
+            }`}
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {memberSummary.status === "too_few"
+              ? `Add ${MIN_MEMBERS - filledCount} more address${
+                  MIN_MEMBERS - filledCount === 1 ? "" : "es"
+                }. A circle needs ${MIN_MEMBERS} to ${MAX_MEMBERS} members.`
+              : memberSummary.status === "too_many"
+              ? `Remove ${filledCount - MAX_MEMBERS} address${
+                  filledCount - MAX_MEMBERS === 1 ? "" : "es"
+                }. A circle can have at most ${MAX_MEMBERS} members.`
+              : `A circle needs ${MIN_MEMBERS} to ${MAX_MEMBERS} members. Empty rows are ignored.`}
           </p>
         </fieldset>
 
@@ -784,7 +858,12 @@ export default function CreateClient() {
           <p className="font-semibold text-brand-800 mb-1">Circle summary</p>
           <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
             {name.trim() && <li>📛 {name.trim()}</li>}
-            <li>👥 {filledCount} member{filledCount !== 1 ? "s" : ""}</li>
+            <li>
+              👥 {filledCount} member{filledCount !== 1 ? "s" : ""}
+              {memberSummary.status === "too_few" && ` (at least ${MIN_MEMBERS} needed)`}
+              {memberSummary.duplicateRows > 0 &&
+                ` · ${memberSummary.duplicateRows} duplicate${memberSummary.duplicateRows !== 1 ? "s" : ""} not counted`}
+            </li>
             <li>💰 ${memberAmountDisplay} USDC / member / round</li>
             <li>🎯 Pot per round: ${potDisplay}</li>
             <li>📅 Round duration: {roundDays} days</li>

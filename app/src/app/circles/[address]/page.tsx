@@ -1,10 +1,15 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
-import { INDEXER_URL, formatUsdc, formatPot } from "@/lib/config";
+import {
+  indexerEndpoint,
+  INDEXER_TIMEOUT_MS,
+  formatUsdc,
+  formatPot,
+} from "@/lib/config";
+import { parseMemberRows } from "@/lib/members";
 import {
   CircleDetailClient,
   type CircleDetailData,
-  type CircleMember,
   type CircleRound,
   type CirclePendingDefault,
 } from "./CircleDetailClient";
@@ -103,28 +108,14 @@ type FetchResult =
   | { ok: true; data: CircleDetailData }
   | { ok: false; error: "not_found" | FetchError };
 
-// ─── URL validation ───────────────────────────────────────────────────────────
-
-/**
- * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
- * Catches empty strings, relative paths, and placeholder values that would
- * otherwise surface as opaque TypeErrors from fetch().
- */
-function isValidUrl(url: string): boolean {
-  if (!url || url.trim() === "") return false;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 async function getCircleDetail(address: string): Promise<FetchResult> {
-  // Guard against misconfigured INDEXER_URL before touching the network.
-  if (!isValidUrl(INDEXER_URL)) {
+  // Guard against a misconfigured NEXT_PUBLIC_INDEXER_URL before touching the
+  // network (see indexerEndpoint in lib/config.ts).
+  const circleUrl = indexerEndpoint(["circles", address]);
+  const roundsUrl = indexerEndpoint(["circles", address, "rounds"]);
+  if (circleUrl === null || roundsUrl === null) {
     return { ok: false, error: "misconfigured" };
   }
 
@@ -132,11 +123,18 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
   let roundsRes: Response;
 
   try {
+    // `cache: "no-store"` rather than `next: { revalidate: 5 }`: when the
+    // indexer URL points at a port nothing listens on, Next's revalidate-cache
+    // wrapper leaves a rejected promise unawaited and the page 500s after a long
+    // hang instead of reaching the "network" branch below. Same fix as the
+    // home page. The timeout covers an unroutable host.
+    const init: RequestInit = {
+      cache: "no-store",
+      signal: AbortSignal.timeout(INDEXER_TIMEOUT_MS),
+    };
     [circleRes, roundsRes] = await Promise.all([
-      fetch(`${INDEXER_URL}/circles/${address}`, { next: { revalidate: 5 } }),
-      fetch(`${INDEXER_URL}/circles/${address}/rounds`, {
-        next: { revalidate: 5 },
-      }),
+      fetch(circleUrl, init),
+      fetch(roundsUrl, init),
     ]);
   } catch {
     return { ok: false, error: "network" };
@@ -178,11 +176,10 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
   }
 
   // Members are optional — if the indexer omits the field (e.g. during
-  // re-indexing or for very new circles) we fall back to an empty array
-  // and render the rotation view as empty rather than crashing.
-  const members: CircleMember[] = Array.isArray(circleData.members)
-    ? (circleData.members as CircleMember[])
-    : [];
+  // re-indexing or for very new circles) or sends rows we cannot trust, we
+  // fall back to an empty array and CircleDetailClient renders its "member
+  // data unavailable" fallback in the rotation view instead of crashing.
+  const members = parseMemberRows(circleData.members);
 
   return {
     ok: true,
@@ -365,21 +362,6 @@ export default async function CircleDetailPage({
         circleAddress={params.address}
         circleData={data}
       />
-
-      {/* Stable fallback notice when member data is temporarily unavailable */}
-      {data.members.length === 0 && (
-        <div
-          role="status"
-          className="mt-4 bg-slate-50 border border-slate-200 rounded-xl px-5 py-4 flex items-start gap-3 text-sm text-slate-600"
-        >
-          <span className="text-lg mt-0.5" aria-hidden="true">ℹ️</span>
-          <p>
-            Member data is not available yet. The indexer may still be
-            processing this circle — refresh in a moment to see the full
-            rotation order.
-          </p>
-        </div>
-      )}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { INDEXER_URL, shortAddress } from "@/lib/config";
+import { indexerEndpoint, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
 import { isCanonicalStellarAddress } from "@/lib/address";
 
@@ -33,7 +33,10 @@ interface ReputationResponse {
 
 type FetchResult =
   | { ok: true; data: ReputationResponse }
-  | { ok: false; reason: "not_found" | "network" | "unknown" | "aborted" | "indexer_outage" };
+  | {
+      ok: false;
+      reason: "not_found" | "network" | "unknown" | "aborted" | "indexer_outage" | "misconfigured";
+    };
 
 async function fetchReputation(member: string, signal?: AbortSignal): Promise<FetchResult> {
   // Validate the route param before making any network request. A malformed
@@ -42,8 +45,13 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
   if (!isCanonicalStellarAddress(member)) {
     return { ok: false, reason: "not_found" };
   }
+  // A misconfigured NEXT_PUBLIC_INDEXER_URL must not fall through to fetch():
+  // a scheme-less value is a relative URL here, so the request would hit this
+  // Next app, 404, and render "No reputation record found" for a real member.
+  const url = indexerEndpoint(["reputation", member]);
+  if (url === null) return { ok: false, reason: "misconfigured" };
   try {
-    const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
+    const res = await fetch(url, {
       cache: "no-store",
       signal,
     });
@@ -132,7 +140,12 @@ export default function ReputationClient({ member }: { member: string }) {
       unknown: "An unexpected error occurred loading reputation data.",
       indexer_outage:
         "The indexer is running but currently degraded. Reputation data may be temporarily unavailable. Try again in a few minutes.",
+      misconfigured:
+        "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
+        "Set a valid indexer URL in app/.env.local and restart the server.",
     };
+    // Retrying cannot fix a configuration error, so don't offer it.
+    const canRetry = result.reason !== "misconfigured";
 
     return (
       <div className="text-center py-16 text-slate-500">
@@ -141,13 +154,15 @@ export default function ReputationClient({ member }: { member: string }) {
         <p className="text-sm mt-1 text-slate-500">
           {errorMessages[result.reason] ?? errorMessages.unknown}
         </p>
-        <button
-          onClick={() => load(true)}
-          disabled={refreshing}
-          className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
-        >
-          {refreshing ? "Retrying…" : "Try again"}
-        </button>
+        {canRetry && (
+          <button
+            onClick={() => load(true)}
+            disabled={refreshing}
+            className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
+          >
+            {refreshing ? "Retrying…" : "Try again"}
+          </button>
+        )}
       </div>
     );
   }

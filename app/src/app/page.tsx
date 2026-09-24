@@ -67,7 +67,8 @@ const getCircles = unstable_cache(
   async function getCircles(): Promise<FetchResult> {
   // Catch misconfiguration before attempting the network request so that
   // developers get a targeted error message rather than a cryptic network failure.
-  if (!isValidUrl(INDEXER_URL)) {
+  const url = indexerEndpoint(["circles"]);
+  if (url === null) {
     return { ok: false, error: "misconfigured" };
   }
 
@@ -80,8 +81,9 @@ const getCircles = unstable_cache(
     // response", so the page 500s after a 60s hang and the "network" branch
     // below never reaches the user. `cache()` above already collapses this to
     // one request per render, so the only cost is the 10s cross-request cache.
-    res = await fetch(`${INDEXER_URL}/circles`, {
+    res = await fetch(url, {
       cache: "no-store",
+      signal: AbortSignal.timeout(INDEXER_TIMEOUT_MS),
     });
   } catch {
     return { ok: false, error: "network" };
