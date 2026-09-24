@@ -1,6 +1,7 @@
-import { Suspense, cache } from "react";
+import { Suspense } from "react";
 import Link from "next/link";
 import type { Metadata } from "next";
+import { unstable_cache } from "next/cache";
 import { INDEXER_URL } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
@@ -56,7 +57,8 @@ export function isValidUrl(url: string): boolean {
  * them into one request per render, so the hero can never advertise "Browse 3
  * open circles" over a list that renders 4.
  */
-const getCircles = cache(async function getCircles(): Promise<FetchResult> {
+const getCircles = unstable_cache(
+  async function getCircles(): Promise<FetchResult> {
   // Catch misconfiguration before attempting the network request so that
   // developers get a targeted error message rather than a cryptic network failure.
   if (!isValidUrl(INDEXER_URL)) {
@@ -118,8 +120,11 @@ const getCircles = cache(async function getCircles(): Promise<FetchResult> {
     circles.push(circle);
   }
 
-  return { ok: true, circles };
-});
+    return { ok: true, circles };
+  },
+  ["circles-homepage"],
+  { revalidate: 10 },
+);
 
 // ─── Error banner ─────────────────────────────────────────────────────────────
 
