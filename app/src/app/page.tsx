@@ -242,7 +242,7 @@ async function CirclesList() {
   if (result.circles.length === 0) {
     return (
       <div className="text-center py-16 text-slate-500">
-        <div className="text-4xl mb-3">NEW</div>
+        <div className="text-4xl mb-3">🌱</div>
         <p className="font-medium">No circles yet.</p>
         <p className="text-sm mt-1">
           <Link href="/create" className="text-brand-600 underline">
@@ -332,6 +332,60 @@ const CTA_BASE =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-600 " +
   "focus-visible:ring-offset-2 focus-visible:ring-offset-slate-50";
 
+// ─── Protocol guarantees ──────────────────────────────────────────────────────
+//
+// Each entry maps directly to a verifiable contract invariant.
+// See contracts/circle/src/lib.rs for the authoritative Rust source.
+//
+// Exported so tests can assert on the content without rendering the full page.
+
+/** One protocol guarantee card shown in the home-page section. */
+export interface ProtocolGuarantee {
+  emoji: string;
+  title: string;
+  desc: string;
+}
+
+/**
+ * The four on-chain guarantees CircleUp enforces at the contract level.
+ *
+ * Each entry is backed by a concrete invariant in contracts/circle/src/lib.rs:
+ *   - "No rug-pulls"           → only `payout` can release funds; no admin
+ *                                withdraw path exists; `safe_transfer` always
+ *                                routes tokens to the scheduled recipient.
+ *   - "Deterministic rotation" → recipient order frozen at `initialize` time
+ *                                in CircleConfig.members; the contract never
+ *                                reorders or skips recipients.
+ *   - "Collateral-backed"      → `join` requires COLLATERAL_MULTIPLIER ×
+ *                                round_amount locked; `mark_default` deducts
+ *                                PENALTY_BPS from that balance.
+ *   - "On-chain reputation"    → `contribute`/`mark_default` call the
+ *                                reputation contract to record history that is
+ *                                publicly readable and immutably on-chain.
+ */
+export const PROTOCOL_GUARANTEES: ProtocolGuarantee[] = [
+  {
+    emoji: "🚫",
+    title: "No rug-pulls",
+    desc: "The organizer cannot withdraw funds early. All money is locked in the Soroban smart contract until the scheduled payout.",
+  },
+  {
+    emoji: "🔄",
+    title: "Deterministic rotation",
+    desc: "Payout order is set on-chain at join time. The contract enforces it — no one can skip the queue or pay themselves twice.",
+  },
+  {
+    emoji: "⚠️",
+    title: "Collateral-backed defaults",
+    desc: "Every member locks 1× the round amount as collateral. A missed contribution triggers an automatic penalty deducted from that collateral.",
+  },
+  {
+    emoji: "🌐",
+    title: "On-chain reputation",
+    desc: "Contribution and default history is recorded on-chain. Your reputation score is public, portable, and unforgeable.",
+  },
+];
+
 /**
  * The one part of the hero that depends on the indexer: either a "Browse N open
  * circles" button, or a line explaining why there is nothing to browse. Wrapped
@@ -388,7 +442,7 @@ export default function HomePage() {
     <div>
       {/* Hero */}
       <section aria-labelledby="hero-heading" className="text-center py-12">
-        <div className="text-5xl mb-4" aria-hidden="true">SYNC</div>
+        <div className="text-5xl mb-4" aria-hidden="true">🔄</div>
         <h1
           id="hero-heading"
           className="text-3xl font-bold text-slate-900 mb-3"
@@ -427,17 +481,17 @@ export default function HomePage() {
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-12">
         {[
           {
-            emoji: "MEMBERS",
+            emoji: "👥",
             title: "Form a circle",
             desc: "Invite members, set the contribution amount and rotation order.",
           },
           {
-            emoji: "FUNDS",
+            emoji: "💰",
             title: "Each round, everyone contributes",
             desc: "The smart contract holds the pot. No one can withdraw early.",
           },
           {
-            emoji: "PAYOUT",
+            emoji: "🎯",
             title: "The pot rotates",
             desc: "Each member receives the full pot exactly once. Miss a round → penalty.",
           },
@@ -456,31 +510,10 @@ export default function HomePage() {
       {/* Protocol guarantees */}
       <div className="mb-12">
         <h2 className="text-xl font-bold text-slate-800 mb-4">
-          Protocol Guarantees
+          🔐 Protocol Guarantees
         </h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          {[
-            {
-              emoji: "LOCKED",
-              title: "No rug-pulls",
-              desc: "The organizer cannot withdraw funds early. All money is locked in the Soroban smart contract until the scheduled payout.",
-            },
-            {
-              emoji: "ROTATE",
-              title: "Deterministic rotation",
-              desc: "Payout order is set on-chain at join time. The contract enforces it — no one can skip the queue or pay themselves twice.",
-            },
-            {
-              emoji: "WARNING",
-              title: "Collateral-backed defaults",
-              desc: "Every member locks 1× the round amount as collateral. A missed contribution triggers an automatic penalty deducted from that collateral.",
-            },
-            {
-              emoji: "CHAIN",
-              title: "On-chain reputation",
-              desc: "Contribution and default history is recorded on-chain. Your reputation score is public, portable, and unforgeable.",
-            },
-          ].map((g) => (
+          {PROTOCOL_GUARANTEES.map((g) => (
             <div
               key={g.title}
               className="bg-white rounded-xl border border-slate-200 p-5 flex gap-4 items-start"
