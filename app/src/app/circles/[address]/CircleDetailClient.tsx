@@ -1522,6 +1522,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   }
 
   // ── Accessibility ──────────────────────────────────────────────────────────
+  //
+  // The progressAnnouncement feeds a sr-only live region. When status or round
+  // changes after a post-action refresh the region content changes, but a
+  // static node doesn't guarantee re-announcement in all screen readers.
+  // Using the announcement string as the element's `key` remounts the node on
+  // every change, which reliably triggers the live region in NVDA, JAWS, and
+  // VoiceOver without an extra useEffect.
 
   const totalRounds = data.circle.total_rounds;
   const progressAnnouncement =
@@ -1539,8 +1546,21 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   return (
     <div className="space-y-8">
 
-      {/* Live announcement of status / round changes */}
-      <p className="sr-only" role="status" aria-live="polite">
+      {/*
+        Live announcement of status / round changes.
+        `key={progressAnnouncement}` remounts the element whenever the text
+        changes (e.g. after a post-action refresh updates the status or round),
+        ensuring screen readers re-announce the new state reliably across NVDA,
+        JAWS, and VoiceOver — all of which require the DOM node to be (re)inserted
+        into a live region for the announcement to fire.
+      */}
+      <p
+        key={progressAnnouncement}
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
         {progressAnnouncement}
       </p>
 
