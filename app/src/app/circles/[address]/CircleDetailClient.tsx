@@ -2208,6 +2208,7 @@ function RoundCard({ round }: RoundCardProps) {
           {round.status !== "completed" && (
             <span
               className={`text-xs font-medium border rounded-full px-2 py-0.5 ${statusColor[round.status]}`}
+              aria-label={`Round status: ${statusLabel[round.status]}`}
             >
               {statusLabel[round.status]}
             </span>

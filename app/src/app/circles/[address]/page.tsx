@@ -7,6 +7,7 @@ import {
   formatPot,
 } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
+import { getStatusMeta } from "@/components/CircleCard";
 import {
   CircleDetailClient,
   type CircleDetailData,
@@ -232,9 +233,19 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
   const stats: Array<{ label: string; value: React.ReactNode }> = [
     {
       label: "Status",
-      value: circle ? (
-        <span>{circle.status}</span>
-      ) : (
+      value: circle ? (() => {
+        const s = getStatusMeta(circle.status);
+        return (
+          <span
+            className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${s.chipClasses}`}
+            title={s.description}
+            aria-label={`Status: ${s.label}. ${s.description}`}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full flex-shrink-0 ${s.dotClasses}`} aria-hidden="true" />
+            {s.label}
+          </span>
+        );
+      })() : (
         <span className="text-slate-300" aria-hidden="true">—</span>
       ),
     },

@@ -45,15 +45,24 @@ const STATUS_META: Record<string, StatusMeta> = {
   },
   completed: {
     label: "Completed",
-    description: "All rounds finished",
-    chipClasses: "bg-blue-100 text-blue-800",
-    dotClasses: "bg-blue-500",
+    description: "All rounds finished successfully",
+    chipClasses: "bg-green-100 text-green-800",
+    dotClasses: "bg-green-500",
   },
   cancelled: {
     label: "Cancelled",
     description: "Closed before all rounds completed",
     chipClasses: "bg-red-100 text-red-800",
     dotClasses: "bg-red-400",
+  },
+  // Indexer-only status: collateral has been released; circle is fully settled.
+  // Not a contract-native enum value — the contract tracks this as a boolean flag
+  // and the indexer projects it as "Closed" for query convenience.
+  closed: {
+    label: "Closed",
+    description: "Collateral released. Circle fully settled",
+    chipClasses: "bg-slate-100 text-slate-500",
+    dotClasses: "bg-slate-400",
   },
 };
 
@@ -107,9 +116,13 @@ export function parseCircleRow(raw: unknown): Circle | null {
 export function getStatusMeta(status: string): StatusMeta {
   const known = STATUS_META[status?.trim().toLowerCase()];
   if (known) return known;
+  // Explicit unknown fallback: never silent, never misleads.
+  // The raw value is preserved as the label so developers can diagnose
+  // unexpected statuses, but the description makes clear it isn't recognized.
+  const label = status?.trim() || "Unknown";
   return {
-    label: status?.trim() || "Unknown",
-    description: "Status not recognized",
+    label,
+    description: `Unrecognized status: "${label}"`,
     chipClasses: "bg-slate-100 text-slate-700",
     dotClasses: "bg-slate-400",
   };
