@@ -1,7 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+﻿import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor, act, fireEvent } from "@testing-library/react";
 
 // ─── Module mocks (hoisted) ───────────────────────────────────────────────────
+//
+// Note: @testing-library/user-event is NOT imported here because user-event v14
+// calls `new Pointer(document)` at module evaluation time, which throws
+// `Cannot read properties of undefined (reading 'on')` under Node 24 / jsdom
+// before the pointer API is shimmed. We use fireEvent for click simulation
+// instead — it's synchronous, has no DOM bootstrapping side-effects, and is
+// the correct choice for testing button click handlers (not pointer events).
 
 vi.mock("@/lib/stellar", () => {
   class WalletError extends Error {
@@ -32,6 +39,12 @@ vi.mock("@/lib/config", () => ({
   ACTIVE_NETWORK: "testnet",
   getExplorerLink: () => null,
 }));
+
+// ─── Mock @/lib/walletCapabilities ────────────────────────────────────────────
+//
+// Single mock covering every export WalletButton uses.
+// Default: canGetNetwork=false so the network-check path is a no-op in tests
+// that don't care about it. Individual tests override as needed.
 
 vi.mock("@/lib/walletCapabilities", () => ({
   detectWalletCapabilities: vi.fn(() => ({
@@ -338,7 +351,7 @@ describe("WalletButton — account change and disconnect", () => {
         screen.getByRole("button", { name: /connect freighter/i }),
       ).toBeInTheDocument(),
     );
-    delete (window as any).freighter;
+    try { Object.defineProperty(window, "freighter", { configurable: true, value: undefined }); delete (window as any).freighter; } catch { /* jsdom cleanup */ }
   });
 
   it("re-resolves to new address when account switches", async () => {
@@ -370,7 +383,7 @@ describe("WalletButton — account change and disconnect", () => {
     await waitFor(() =>
       expect(screen.getByText("GEEE…EEEE")).toBeInTheDocument(),
     );
-    delete (window as any).freighter;
+    try { Object.defineProperty(window, "freighter", { configurable: true, value: undefined }); delete (window as any).freighter; } catch { /* jsdom cleanup */ }
   });
 
   it("removes event listeners on unmount", async () => {
@@ -401,7 +414,7 @@ describe("WalletButton — account change and disconnect", () => {
       "networkChanged",
       expect.any(Function),
     );
-    delete (window as any).freighter;
+    try { Object.defineProperty(window, "freighter", { configurable: true, value: undefined }); delete (window as any).freighter; } catch { /* jsdom cleanup */ }
   });
 
   it("does not update state after unmount when probe resolves late", async () => {
@@ -446,7 +459,7 @@ describe("WalletButton — changing state", () => {
         screen.getByRole("button", { name: /updating/i }),
       ).toBeInTheDocument(),
     );
-    delete (window as any).freighter;
+    try { Object.defineProperty(window, "freighter", { configurable: true, value: undefined }); delete (window as any).freighter; } catch { /* jsdom cleanup */ }
   });
 });
 
@@ -509,5 +522,51 @@ describe("WalletButton — accessibility", () => {
       });
       expect(retryBtn.className).toMatch(/focus-visible/);
     });
+  });
+
+  it("announces wallet connected to screen readers via sr-only live region", async () => {
+    const addr = "G" + "A".repeat(55);
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(addr);
+
+    render(<WalletButton />);
+
+    await waitFor(() => {
+      const srRegion = document.querySelector("[role='status'][aria-live='polite'].sr-only");
+      expect(srRegion).toBeInTheDocument();
+      expect(srRegion?.textContent).toMatch(/wallet connected/i);
+      expect(srRegion?.textContent).toContain(addr);
+    });
+  });
+
+  it("re-announces when wallet account changes to a new address", async () => {
+    const addr1 = "G" + "A".repeat(55);
+    const addr2 = "G" + "B".repeat(55);
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress
+      .mockResolvedValueOnce(addr1)
+      .mockResolvedValueOnce(addr2);
+
+    let accountChangedCallback: (() => void) | null = null;
+    const providerMock = {
+      addEventListener: vi.fn((event: string, cb: () => void) => {
+        if (event === "accountChanged") accountChangedCallback = cb;
+      }),
+      removeEventListener: vi.fn(),
+    };
+    (window as any).freighter = providerMock;
+
+    render(<WalletButton />);
+    await waitFor(() =>
+      expect(screen.getByText("GAAA…AAAA")).toBeInTheDocument(),
+    );
+
+    await act(async () => { accountChangedCallback?.(); });
+
+    await waitFor(() => {
+      const srRegion = document.querySelector("[role='status'][aria-live='polite'].sr-only");
+      expect(srRegion?.textContent).toContain(addr2);
+    });
+    try { Object.defineProperty(window, "freighter", { configurable: true, value: undefined }); delete (window as any).freighter; } catch { /* jsdom cleanup */ }
   });
 });
