@@ -97,6 +97,37 @@ export function parseStartLedger(raw: string | undefined): number {
   return n;
 }
 
+// ── DB connection retry bounds ────────────────────────────────────────────────
+// Hard upper bounds prevent a misconfigured env var from creating an
+// indefinitely long startup stall.  The retry ceiling (50) gives plenty of
+// headroom for slow container orchestration while still terminating within a
+// reasonable time.  The delay ceiling (60 s) stops exponential backoff from
+// producing absurdly long waits on a badly-set base delay.
+const DB_CONNECT_MAX_RETRIES_MAX = 50;
+const DB_CONNECT_BASE_DELAY_MS_MAX = 60_000;
+
+/** Exported for unit testing. */
+export function parseDbConnectMaxRetries(raw: string | undefined): number {
+  const n = parsePositiveIntEnv("DB_CONNECT_MAX_RETRIES", raw, 5);
+  if (n > DB_CONNECT_MAX_RETRIES_MAX) {
+    throw new Error(
+      `[circleup-indexer] DB_CONNECT_MAX_RETRIES must be at most ${DB_CONNECT_MAX_RETRIES_MAX}, got: "${raw}"`,
+    );
+  }
+  return n;
+}
+
+/** Exported for unit testing. */
+export function parseDbConnectBaseDelayMs(raw: string | undefined): number {
+  const n = parsePositiveIntEnv("DB_CONNECT_BASE_DELAY_MS", raw, 1_000);
+  if (n > DB_CONNECT_BASE_DELAY_MS_MAX) {
+    throw new Error(
+      `[circleup-indexer] DB_CONNECT_BASE_DELAY_MS must be at most ${DB_CONNECT_BASE_DELAY_MS_MAX}, got: "${raw}"`,
+    );
+  }
+  return n;
+}
+
 // Soroban RPC's getEvents rejects a limit above 10,000, so bound it here with
 // a clear message rather than letting a typo'd env var surface as an opaque
 // RPC error on the first poll.
@@ -135,4 +166,21 @@ export const SHUTDOWN_GRACE_PERIOD_MS = parsePositiveIntEnv(
   "SHUTDOWN_GRACE_PERIOD_MS",
   process.env.SHUTDOWN_GRACE_PERIOD_MS,
   30_000,
+);
+
+// ── DB pool startup retry ─────────────────────────────────────────────────────
+// How many times connectWithRetry() will attempt to acquire the first
+// Postgres connection before aborting boot.  Each retry uses exponential
+// backoff starting at DB_CONNECT_BASE_DELAY_MS.
+// Default: 5 attempts (delays: 1 s, 2 s, 4 s, 8 s → max ~15 s total wait).
+export const DB_CONNECT_MAX_RETRIES = parseDbConnectMaxRetries(
+  process.env.DB_CONNECT_MAX_RETRIES,
+);
+
+// Base delay in milliseconds for the first retry interval.  Each subsequent
+// retry doubles this value (exponential backoff without jitter, since this
+// is a single-instance startup probe rather than a distributed load-spread
+// concern).  Default: 1000 ms.
+export const DB_CONNECT_BASE_DELAY_MS = parseDbConnectBaseDelayMs(
+  process.env.DB_CONNECT_BASE_DELAY_MS,
 );
