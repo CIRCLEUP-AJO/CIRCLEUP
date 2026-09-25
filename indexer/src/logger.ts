@@ -108,8 +108,9 @@ export type LogEventKey =
   | "migration_failed"
   | "migration_drifted"
   // HTTP API
+  | "api_request"                   // route request completed
   | "api_request_error"             // unhandled error in a route handler
-  | "api_cors_rejected";
+  | "api_cors_rejected";            // request rejected by CORS policy
 
 // ─── Per-event context types ──────────────────────────────────────────────────
 //
@@ -221,10 +222,24 @@ export interface MigrationCtx {
   summary?: string;
 }
 
+export interface ApiRequestCtx {
+  method: string;
+  path: string;
+  statusCode: number;
+  durationMs: number;
+}
+
 export interface ApiRequestErrorCtx {
   method: string;
   path: string;
+  statusCode?: number;
   error: string;
+}
+
+export interface ApiCorsRejectedCtx {
+  method: string;
+  path: string;
+  origin?: string;
 }
 
 // Generic fallback for events without a specific shape
@@ -482,3 +497,45 @@ export function logMigrationFailed(ctx: MigrationCtx): void {
   log("fatal", "migration_failed", ctx as LogContext,
     `Migration failed: ${ctx.error ?? "unknown error"}`);
 }
+
+/** A REST API request completed successfully or with a client error. */
+export function logApiRequest(ctx: ApiRequestCtx): void {
+  log(
+    ctx.statusCode >= 500 ? "error" : ctx.statusCode >= 400 ? "warn" : "info",
+    "api_request",
+    ctx as LogContext,
+    `${ctx.method} ${ctx.path} -> ${ctx.statusCode} (${ctx.durationMs}ms)`,
+  );
+}
+
+/** A REST API request failed and was converted to an HTTP error response. */
+export function logApiRequestError(ctx: ApiRequestErrorCtx): void {
+  log(
+    "error",
+    "api_request_error",
+    ctx as LogContext,
+    `${ctx.method} ${ctx.path} failed: ${ctx.error}`,
+  );
+}
+
+/** A CORS request was rejected before the route handler ran. */
+export function logApiCorsRejected(ctx: ApiCorsRejectedCtx): void {
+  log(
+    "warn",
+    "api_cors_rejected",
+    ctx as LogContext,
+    `CORS rejected for ${ctx.method} ${ctx.path}${ctx.origin ? ` from ${ctx.origin}` : ""}`,
+  );
+}
+/**
+ * Issue #463: Tests for the structured logger (indexer/src/logger.ts).
+ *
+ * Verifies that:
+ *   - Every log event produces a well-formed JSON-line entry with ts, level,
+ *     event, and msg fields.
+ *   - The minimum log level filter suppresses events below the threshold.
+ *   - Sensitive fields (contractId, txHash) are redacted before emission.
+ *   - The transport is fire-and-forget: a throwing transport never propagates.
+ *   - All named convenience wrappers emit the correct event key and level.
+ *   - configureLogger / resetLogger work correctly.
+ */
