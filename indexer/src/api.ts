@@ -20,6 +20,7 @@ import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
 import { redactAddress } from "./redact";
+import { logApiCorsRejected, logApiRequest, logApiRequestError } from "./logger";
 import type { MigrationHealth } from "./db/migrate";
 
 // ── Address validation ────────────────────────────────────────────────────────
@@ -462,12 +463,32 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   app.use(cors(buildCorsOptions()));
   app.use(express.json());
 
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
+
+    _res.on("finish", () => {
+      logApiRequest({
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode: _res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    next();
+  });
+
   // cors() calls next(err) for rejected origins instead of sending a response
   // itself — without this handler, Express's default error page would leak a
   // stack trace instead of a clean 403.
   app.use(
-    (err: Error, _req: Request, res: Response, next: express.NextFunction) => {
+    (err: Error, req: Request, res: Response, next: express.NextFunction) => {
       if (err.message.startsWith("Origin ")) {
+        logApiCorsRejected({
+          method: req.method,
+          path: req.originalUrl || req.url,
+          origin: req.headers.origin ?? undefined,
+        });
         res.status(403).json({ error: err.message });
         return;
       }
@@ -1038,9 +1059,16 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const message = getErrorMessage(err);
+    logApiRequestError({
+      method: req.method,
+      path: req.originalUrl || req.url,
+      statusCode: 500,
+      error: message,
+    });
     console.error("[api] Unhandled error", err);
-    sendError(res, 500, "Internal server error", getErrorMessage(err));
+    sendError(res, 500, "Internal server error", message);
   });
 
   return app;
