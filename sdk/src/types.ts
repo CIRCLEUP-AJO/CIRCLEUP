@@ -978,8 +978,20 @@ export function isRetryable(result: TxFailure): boolean {
 // Consumers should convert stroops strings to bigint / display strings via the
 // helpers in sdk/src/utils.ts (formatUsdc, stroopsToUsdc, usdcToStroops).
 
-/** The four lifecycle states a circle can be in, as returned by the indexer. */
-export type ApiCircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
+/**
+ * All lifecycle states a circle can be in, as returned by the indexer.
+ *
+ * The first four mirror the on-chain `CircleStatus` Rust enum.  `"Closed"` is
+ * an indexer-only projection: the contract records closure as a boolean flag
+ * (`DataKey::Closed`) and the indexer surfaces it as a status string so
+ * callers can filter or count fully-settled circles via the REST API.
+ */
+export type ApiCircleStatus =
+  | "Pending"
+  | "Active"
+  | "Completed"
+  | "Cancelled"
+  | "Closed";
 
 /**
  * A single circle row as returned by GET /circles and GET /circles/:address.
@@ -1067,9 +1079,46 @@ export interface ApiRoundRow {
 
 // ─── Indexer API response envelopes ───────────────────────────────────────────
 
+/**
+ * Query parameters accepted by `GET /circles`.
+ *
+ * All fields are optional; the indexer's defaults apply when omitted:
+ *   - `status`  — no filter (all statuses returned)
+ *   - `sort`    — `"created_ledger"`
+ *   - `order`   — `"desc"`
+ *   - `page`    — `1`
+ *   - `limit`   — `20`
+ */
+export interface GetCirclesParams {
+  /**
+   * Restrict results to circles in this lifecycle state.
+   * `"Closed"` is an indexer-only projection (not a contract enum variant).
+   */
+  status?: ApiCircleStatus;
+  /** Column to sort results by. */
+  sort?: "created_ledger" | "updated_at" | "round_amount" | "member_count" | "status";
+  /** Sort direction. */
+  order?: "asc" | "desc";
+  /** 1-based page number. */
+  page?: number;
+  /** Results per page (1–100). */
+  limit?: number;
+}
+
 /** Response body for GET /circles */
 export interface ApiCirclesListResponse {
   circles: ApiCircleRow[];
+  /**
+   * Pagination metadata returned by the indexer.
+   * Present on all responses; callers should use `total` and `totalPages` for
+   * building pagination controls.
+   */
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
 }
 
 /** Response body for GET /circles/:address */

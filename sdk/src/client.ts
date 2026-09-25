@@ -29,6 +29,7 @@ import type {
   ApiReputationResponse,
   ApiMemberContributionsResponse,
   ApiHealthResponse,
+  GetCirclesParams,
 } from "./types";
 import {
   validateCircleUpConfig,
@@ -2163,12 +2164,32 @@ export class IndexerClient {
   // ── Public API ────────────────────────────────────────────────────────────
 
   /**
-   * Fetch all circles known to the indexer, ordered newest first.
+   * Fetch circles known to the indexer, ordered newest first by default.
    *
-   * Equivalent to `GET /circles`.
+   * All parameters are optional — omitting them returns the first page of all
+   * circles sorted by `created_ledger DESC`.
+   *
+   * @example
+   * // All circles, default pagination
+   * const { circles, pagination } = await indexer.getCircles();
+   *
+   * // Only Active circles, sorted by round amount ascending
+   * const { circles } = await indexer.getCircles({ status: "Active", sort: "round_amount", order: "asc" });
+   *
+   * // Page 2 of Pending circles
+   * const { circles, pagination } = await indexer.getCircles({ status: "Pending", page: 2 });
+   *
+   * Equivalent to `GET /circles` with optional query parameters.
    */
-  async getCircles(): Promise<ApiCirclesListResponse> {
-    return this.get<ApiCirclesListResponse>("/circles");
+  async getCircles(params?: GetCirclesParams): Promise<ApiCirclesListResponse> {
+    const qs = new URLSearchParams();
+    if (params?.status != null) qs.set("status", params.status);
+    if (params?.sort != null) qs.set("sort", params.sort);
+    if (params?.order != null) qs.set("order", params.order);
+    if (params?.page != null) qs.set("page", String(params.page));
+    if (params?.limit != null) qs.set("limit", String(params.limit));
+    const query = qs.toString();
+    return this.get<ApiCirclesListResponse>(`/circles${query ? `?${query}` : ""}`);
   }
 
   /**
