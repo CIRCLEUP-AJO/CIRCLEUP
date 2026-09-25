@@ -7,6 +7,8 @@ import {
   parsePositiveIntEnv,
   parseEventsLimit,
   parseStartLedger,
+  parseDbConnectMaxRetries,
+  parseDbConnectBaseDelayMs,
 } from "./config";
 
 const VALID_CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
@@ -157,4 +159,54 @@ test("parseStartLedger defaults to 0 and accepts a custom ledger", () => {
 test("parseStartLedger rejects negative and non-integer values", () => {
   assert.throws(() => parseStartLedger("-1"), /non-negative integer/);
   assert.throws(() => parseStartLedger("abc"), /non-negative integer/);
+});
+
+// ─── parseDbConnectMaxRetries ─────────────────────────────────────────────────
+
+test("parseDbConnectMaxRetries defaults to 5 when unset", () => {
+  assert.equal(parseDbConnectMaxRetries(undefined), 5);
+  assert.equal(parseDbConnectMaxRetries(""), 5);
+});
+
+test("parseDbConnectMaxRetries accepts a valid custom retry count", () => {
+  assert.equal(parseDbConnectMaxRetries("10"), 10);
+  assert.equal(parseDbConnectMaxRetries("1"), 1);
+  assert.equal(parseDbConnectMaxRetries("50"), 50);
+});
+
+test("parseDbConnectMaxRetries rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parseDbConnectMaxRetries("0"), /positive integer/);
+  assert.throws(() => parseDbConnectMaxRetries("-1"), /positive integer/);
+  assert.throws(() => parseDbConnectMaxRetries("2.5"), /positive integer/);
+  assert.throws(() => parseDbConnectMaxRetries("abc"), /positive integer/);
+});
+
+test("parseDbConnectMaxRetries rejects a value above the upper bound of 50", () => {
+  assert.throws(() => parseDbConnectMaxRetries("51"), /at most 50/);
+  assert.throws(() => parseDbConnectMaxRetries("100"), /at most 50/);
+});
+
+// ─── parseDbConnectBaseDelayMs ────────────────────────────────────────────────
+
+test("parseDbConnectBaseDelayMs defaults to 1000 when unset", () => {
+  assert.equal(parseDbConnectBaseDelayMs(undefined), 1_000);
+  assert.equal(parseDbConnectBaseDelayMs(""), 1_000);
+});
+
+test("parseDbConnectBaseDelayMs accepts a valid custom delay", () => {
+  assert.equal(parseDbConnectBaseDelayMs("500"), 500);
+  assert.equal(parseDbConnectBaseDelayMs("2000"), 2_000);
+  assert.equal(parseDbConnectBaseDelayMs("60000"), 60_000);
+});
+
+test("parseDbConnectBaseDelayMs rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parseDbConnectBaseDelayMs("0"), /positive integer/);
+  assert.throws(() => parseDbConnectBaseDelayMs("-100"), /positive integer/);
+  assert.throws(() => parseDbConnectBaseDelayMs("1.5"), /positive integer/);
+  assert.throws(() => parseDbConnectBaseDelayMs("bad"), /positive integer/);
+});
+
+test("parseDbConnectBaseDelayMs rejects a value above the upper bound of 60000", () => {
+  assert.throws(() => parseDbConnectBaseDelayMs("60001"), /at most 60000/);
+  assert.throws(() => parseDbConnectBaseDelayMs("120000"), /at most 60000/);
 });
