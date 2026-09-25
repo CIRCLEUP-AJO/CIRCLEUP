@@ -160,10 +160,10 @@ export const STATUS_LABELS: Record<CircleLifecycleStatus, string> = {
 
 /** CSS color classes for status badges. */
 export const STATUS_COLORS: Record<CircleLifecycleStatus, string> = {
-  Pending:   "bg-slate-100 text-slate-700 border-slate-300",
-  Active:    "bg-brand-50 text-brand-700 border-brand-300",
-  Completed: "bg-green-50 text-green-700 border-green-300",
-  Cancelled: "bg-red-50 text-red-700 border-red-300",
+  Pending:   "bg-yellow-100 text-yellow-800 border-yellow-300",
+  Active:    "bg-brand-100 text-brand-700 border-brand-300",
+  Completed: "bg-green-100 text-green-800 border-green-300",
+  Cancelled: "bg-red-100 text-red-800 border-red-400",
   Closed:    "bg-slate-100 text-slate-500 border-slate-200",
 };
 
