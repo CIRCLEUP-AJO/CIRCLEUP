@@ -9,6 +9,12 @@ import {
   parseStartLedger,
   parseDbConnectMaxRetries,
   parseDbConnectBaseDelayMs,
+  parsePollIntervalMs,
+  parseRpcRetryMaxAttempts,
+  parseRpcRetryBaseDelayMs,
+  parsePollBackoffInitialMs,
+  parsePollBackoffMaxMs,
+  parsePollBackoffMultiplier,
 } from "./config";
 
 const VALID_CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
@@ -209,4 +215,163 @@ test("parseDbConnectBaseDelayMs rejects zero, negative, and non-integer values",
 test("parseDbConnectBaseDelayMs rejects a value above the upper bound of 60000", () => {
   assert.throws(() => parseDbConnectBaseDelayMs("60001"), /at most 60000/);
   assert.throws(() => parseDbConnectBaseDelayMs("120000"), /at most 60000/);
+});
+
+// ─── parsePollIntervalMs ──────────────────────────────────────────────────────
+
+test("parsePollIntervalMs defaults to 5000 when unset", () => {
+  assert.equal(parsePollIntervalMs(undefined), 5_000);
+  assert.equal(parsePollIntervalMs(""), 5_000);
+});
+
+test("parsePollIntervalMs accepts values at and above the 500ms minimum", () => {
+  assert.equal(parsePollIntervalMs("500"), 500);
+  assert.equal(parsePollIntervalMs("1000"), 1_000);
+  assert.equal(parsePollIntervalMs("30000"), 30_000);
+});
+
+test("parsePollIntervalMs rejects values below 500ms", () => {
+  assert.throws(() => parsePollIntervalMs("1"), /at least 500/);
+  assert.throws(() => parsePollIntervalMs("499"), /at least 500/);
+});
+
+test("parsePollIntervalMs rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parsePollIntervalMs("0"), /positive integer/);
+  assert.throws(() => parsePollIntervalMs("-1"), /positive integer/);
+  assert.throws(() => parsePollIntervalMs("abc"), /positive integer/);
+  assert.throws(() => parsePollIntervalMs("1.5"), /positive integer/);
+});
+
+// ─── parseRpcRetryMaxAttempts ─────────────────────────────────────────────────
+
+test("parseRpcRetryMaxAttempts defaults to 4 when unset", () => {
+  assert.equal(parseRpcRetryMaxAttempts(undefined), 4);
+  assert.equal(parseRpcRetryMaxAttempts(""), 4);
+});
+
+test("parseRpcRetryMaxAttempts accepts valid values including the boundary of 20", () => {
+  assert.equal(parseRpcRetryMaxAttempts("1"), 1);
+  assert.equal(parseRpcRetryMaxAttempts("10"), 10);
+  assert.equal(parseRpcRetryMaxAttempts("20"), 20);
+});
+
+test("parseRpcRetryMaxAttempts rejects values above the upper bound of 20", () => {
+  assert.throws(() => parseRpcRetryMaxAttempts("21"), /at most 20/);
+  assert.throws(() => parseRpcRetryMaxAttempts("100"), /at most 20/);
+});
+
+test("parseRpcRetryMaxAttempts rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parseRpcRetryMaxAttempts("0"), /positive integer/);
+  assert.throws(() => parseRpcRetryMaxAttempts("-3"), /positive integer/);
+  assert.throws(() => parseRpcRetryMaxAttempts("2.5"), /positive integer/);
+  assert.throws(() => parseRpcRetryMaxAttempts("bad"), /positive integer/);
+});
+
+// ─── parseRpcRetryBaseDelayMs ─────────────────────────────────────────────────
+
+test("parseRpcRetryBaseDelayMs defaults to 500 when unset", () => {
+  assert.equal(parseRpcRetryBaseDelayMs(undefined), 500);
+  assert.equal(parseRpcRetryBaseDelayMs(""), 500);
+});
+
+test("parseRpcRetryBaseDelayMs accepts valid values including the boundary of 30000", () => {
+  assert.equal(parseRpcRetryBaseDelayMs("100"), 100);
+  assert.equal(parseRpcRetryBaseDelayMs("1000"), 1_000);
+  assert.equal(parseRpcRetryBaseDelayMs("30000"), 30_000);
+});
+
+test("parseRpcRetryBaseDelayMs rejects values above the upper bound of 30000", () => {
+  assert.throws(() => parseRpcRetryBaseDelayMs("30001"), /at most 30000/);
+  assert.throws(() => parseRpcRetryBaseDelayMs("60000"), /at most 30000/);
+});
+
+test("parseRpcRetryBaseDelayMs rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parseRpcRetryBaseDelayMs("0"), /positive integer/);
+  assert.throws(() => parseRpcRetryBaseDelayMs("-500"), /positive integer/);
+  assert.throws(() => parseRpcRetryBaseDelayMs("1.5"), /positive integer/);
+  assert.throws(() => parseRpcRetryBaseDelayMs("abc"), /positive integer/);
+});
+
+// ─── parsePollBackoffInitialMs ────────────────────────────────────────────────
+
+test("parsePollBackoffInitialMs defaults to 1000 when unset", () => {
+  assert.equal(parsePollBackoffInitialMs(undefined), 1_000);
+  assert.equal(parsePollBackoffInitialMs(""), 1_000);
+});
+
+test("parsePollBackoffInitialMs accepts values within the valid range [100, 60000]", () => {
+  assert.equal(parsePollBackoffInitialMs("100"), 100);
+  assert.equal(parsePollBackoffInitialMs("5000"), 5_000);
+  assert.equal(parsePollBackoffInitialMs("60000"), 60_000);
+});
+
+test("parsePollBackoffInitialMs rejects values below the minimum of 100ms", () => {
+  assert.throws(() => parsePollBackoffInitialMs("99"), /at least 100/);
+  assert.throws(() => parsePollBackoffInitialMs("1"), /at least 100/);
+});
+
+test("parsePollBackoffInitialMs rejects values above the maximum of 60000ms", () => {
+  assert.throws(() => parsePollBackoffInitialMs("60001"), /at most 60000/);
+  assert.throws(() => parsePollBackoffInitialMs("120000"), /at most 60000/);
+});
+
+test("parsePollBackoffInitialMs rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parsePollBackoffInitialMs("0"), /positive integer/);
+  assert.throws(() => parsePollBackoffInitialMs("-1"), /positive integer/);
+  assert.throws(() => parsePollBackoffInitialMs("abc"), /positive integer/);
+});
+
+// ─── parsePollBackoffMaxMs ────────────────────────────────────────────────────
+
+test("parsePollBackoffMaxMs defaults to 60000 when unset", () => {
+  assert.equal(parsePollBackoffMaxMs(undefined), 60_000);
+  assert.equal(parsePollBackoffMaxMs(""), 60_000);
+});
+
+test("parsePollBackoffMaxMs accepts values up to and including the boundary of 300000", () => {
+  assert.equal(parsePollBackoffMaxMs("1000"), 1_000);
+  assert.equal(parsePollBackoffMaxMs("60000"), 60_000);
+  assert.equal(parsePollBackoffMaxMs("300000"), 300_000);
+});
+
+test("parsePollBackoffMaxMs rejects values above the upper bound of 300000", () => {
+  assert.throws(() => parsePollBackoffMaxMs("300001"), /at most 300000/);
+  assert.throws(() => parsePollBackoffMaxMs("600000"), /at most 300000/);
+});
+
+test("parsePollBackoffMaxMs rejects zero, negative, and non-integer values", () => {
+  assert.throws(() => parsePollBackoffMaxMs("0"), /positive integer/);
+  assert.throws(() => parsePollBackoffMaxMs("-1"), /positive integer/);
+  assert.throws(() => parsePollBackoffMaxMs("abc"), /positive integer/);
+});
+
+// ─── parsePollBackoffMultiplier ───────────────────────────────────────────────
+
+test("parsePollBackoffMultiplier defaults to 2.0 when unset", () => {
+  assert.equal(parsePollBackoffMultiplier(undefined), 2.0);
+  assert.equal(parsePollBackoffMultiplier(""), 2.0);
+});
+
+test("parsePollBackoffMultiplier accepts valid multipliers greater than 1", () => {
+  assert.equal(parsePollBackoffMultiplier("1.1"), 1.1);
+  assert.equal(parsePollBackoffMultiplier("2.0"), 2.0);
+  assert.equal(parsePollBackoffMultiplier("3.5"), 3.5);
+  assert.equal(parsePollBackoffMultiplier("10"), 10);
+});
+
+test("parsePollBackoffMultiplier rejects values of exactly 1 (no growth)", () => {
+  assert.throws(() => parsePollBackoffMultiplier("1"), /greater than 1/);
+  assert.throws(() => parsePollBackoffMultiplier("1.0"), /greater than 1/);
+});
+
+test("parsePollBackoffMultiplier rejects values less than or equal to 1", () => {
+  assert.throws(() => parsePollBackoffMultiplier("0.5"), /greater than 1/);
+  assert.throws(() => parsePollBackoffMultiplier("0"), /greater than 1/);
+  assert.throws(() => parsePollBackoffMultiplier("-2"), /greater than 1/);
+});
+
+test("parsePollBackoffMultiplier rejects non-numeric and non-finite values", () => {
+  assert.throws(() => parsePollBackoffMultiplier("abc"), /greater than 1/);
+  assert.throws(() => parsePollBackoffMultiplier("Infinity"), /greater than 1/);
+  assert.throws(() => parsePollBackoffMultiplier("NaN"), /greater than 1/);
 });
