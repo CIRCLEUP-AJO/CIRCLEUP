@@ -721,7 +721,6 @@ describe("Refresh recovers without full reload", () => {
   });
 });
 
-<<<<<<< HEAD
 // ─── Issue #480 — invite URL SSR safety ──────────────────────────────────────
 //
 // Validates that:
@@ -765,14 +764,10 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
 
-    // The input must exist immediately — not conditionally hidden
     const input = container.querySelector<HTMLInputElement>(
       'input[aria-label="Invite link for this circle"]',
     );
     expect(input).not.toBeNull();
-
-    // On the very first synchronous render the value must be "" (null ?? "")
-    // — never a window.location reference — so SSR and client HTML match.
     expect(input!.value).toBe("");
   });
 
@@ -803,7 +798,6 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
 
-    // After effects run, the URL should be set
     await waitFor(() => {
       const input = container.querySelector<HTMLInputElement>(
         'input[aria-label="Invite link for this circle"]',
@@ -822,9 +816,11 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
       const input = container.querySelector<HTMLInputElement>(
         'input[aria-label="Invite link for this circle"]',
       );
-      // aria-busy should be false (or absent) once the URL is populated
       expect(input!.getAttribute("aria-busy")).not.toBe("true");
-=======
+    });
+  });
+});
+
 // ─── Screen-reader announcement tests ────────────────────────────────────────
 //
 // Verify that the sr-only progressAnnouncement live region re-announces when
@@ -888,7 +884,6 @@ describe("CircleDetailClient — screen-reader status announcements", () => {
       const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
       expect(srEl).toBeInTheDocument();
       expect(srEl).toHaveAttribute("aria-atomic", "true");
->>>>>>> 7bf0185 (a11y: add screen-reader announcements for status and progress updates)
     });
   });
 });
