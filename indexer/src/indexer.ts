@@ -209,13 +209,33 @@ function getContractIdStr(event: SdkEvent): string | null {
   return null;
 }
 
+function safeScValToNative(value: unknown): unknown {
+  if (value == null) return null;
+
+  try {
+    return scValToNative(value as xdr.ScVal);
+  } catch {
+    return null;
+  }
+}
+
+function getTopicValue(event: SdkEvent, idx: number): unknown {
+  if (!Array.isArray(event.topic) || idx < 0 || idx >= event.topic.length) {
+    return null;
+  }
+
+  return safeScValToNative(event.topic[idx]);
+}
+
 function getTopicStr(event: SdkEvent, idx: number): string {
-  const val = event.topic[idx];
-  return scValToNative(val as xdr.ScVal) as string;
+  const value = getTopicValue(event, idx);
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  return String(value);
 }
 
 function getValueNative(event: SdkEvent): unknown {
-  return scValToNative(event.value as xdr.ScVal);
+  return safeScValToNative(event.value);
 }
 
 function normalizeForKey(value: unknown): string {
@@ -234,7 +254,7 @@ function normalizeForKey(value: unknown): string {
 
 export function createEventKey(event: SdkEvent): string {
   const contractId = getContractIdStr(event) ?? "";
-  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(scValToNative(topic as xdr.ScVal)));
+  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(safeScValToNative(topic)));
   return [
     event.ledger ?? 0,
     event.txHash ?? "",
@@ -621,7 +641,11 @@ async function handleCircleResumed(client: PoolClient, circleAddr: string) {
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   const score = getValueNative(event) as number;
-  const memberAddr = scValToNative(event.topic[1] as xdr.ScVal) as string;
+  const memberAddr = getTopicStr(event, 1);
+
+  if (!memberAddr) {
+    throw new Error("reputation/increment: missing or malformed member topic");
+  }
 
   await client.query(
     `INSERT INTO reputation (member_address, score, updated_at)
