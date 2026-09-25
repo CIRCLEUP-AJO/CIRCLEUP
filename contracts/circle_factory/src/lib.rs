@@ -68,6 +68,16 @@ pub enum DataKey {
     UsdcToken,
     Circles,      // Vec<Address> — deployed circle addresses in creation order
     CircleCount,  // u32 — monotonic counter; always == Circles.len()
+    /// Reentrancy guard held for the duration of `initialize`.
+    ///
+    /// Set as the very first storage write in `initialize` and cleared once
+    /// all setup fully commits.  Mirrors the same pattern used in the circle
+    /// contract (`DataKey::Initializing`) so the guard is consistent across
+    /// all three contracts in the workspace.  A reentrant call that arrives
+    /// mid-initialize sees this flag and panics immediately, before any partial
+    /// state is visible.  The `Admin` key absence alone is not a sufficient
+    /// guard because a reentrant path would also see `Admin` absent.
+    Initializing,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -185,9 +195,18 @@ impl CircleFactory {
     /// the factory is passed as `admin` to `reputation.initialize` before
     /// factory setup, making them mutually authorizing).
     ///
+    /// # Reentrancy guard
+    ///
+    /// Sets `DataKey::Initializing` as the very first storage write and clears
+    /// it once all setup commits.  This prevents a reentrant call from racing
+    /// through a second initialize mid-flight and observing partially
+    /// initialized state.  Consistent with the same guard pattern used in the
+    /// circle and reputation contracts.
+    ///
     /// # Panics
     ///
     /// - `"already initialized"` if called more than once
+    /// - `"initialize already in progress"` if a reentrant call is detected
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -198,6 +217,15 @@ impl CircleFactory {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
         }
+
+        // Reentrancy guard: set Initializing as the very first write so that
+        // any reentrant call (e.g. from a future cross-contract call added here)
+        // sees the flag and panics before it can observe or commit partial state.
+        if env.storage().instance().has(&DataKey::Initializing) {
+            panic!("initialize already in progress");
+        }
+        env.storage().instance().set(&DataKey::Initializing, &true);
+
         admin.require_auth();
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -207,6 +235,9 @@ impl CircleFactory {
         env.storage().instance().set(&DataKey::CircleCount, &0u32);
         let circles: Vec<Address> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Circles, &circles);
+
+        // Clear the reentrancy guard once all setup commits successfully.
+        env.storage().instance().remove(&DataKey::Initializing);
     }
 
     // ── Create Circle ─────────────────────────────────────────────────────────
@@ -468,6 +499,65 @@ mod tests {
         let s = setup_factory(&env);
         let admin2 = Address::generate(&env);
         s.client.initialize(&admin2, &s.wasm_hash, &Address::generate(&env), &Address::generate(&env));
+    }
+
+    /// The reentrancy guard (DataKey::Initializing) is set before any other
+    /// storage write in `initialize`.  A second call that arrives while the
+    /// first is still in progress must panic with "initialize already in
+    /// progress" rather than proceeding and observing partial state.
+    ///
+    /// In the test environment we simulate this by manually setting the
+    /// Initializing flag via `as_contract` before calling initialize on a
+    /// fresh (un-initialized) factory instance.
+    #[test]
+    #[should_panic(expected = "initialize already in progress")]
+    fn test_initialize_reentrancy_guard_fires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+
+        // Simulate a reentrant call landing mid-initialize by pre-setting the flag.
+        env.as_contract(&id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+
+        let admin = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        // Must panic: Initializing flag is already set.
+        client.initialize(&admin, &wh, &Address::generate(&env), &Address::generate(&env));
+    }
+
+    /// After a failed initialize (reentrancy panic) the Admin key must remain
+    /// absent, confirming that the guard fires before any committed state.
+    #[test]
+    fn test_initialize_reentrancy_guard_leaves_no_admin_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+
+        env.as_contract(&id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
+
+        let admin = Address::generate(&env);
+        let wh: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.try_initialize(
+            &admin, &wh, &Address::generate(&env), &Address::generate(&env),
+        );
+        assert!(result.is_err(), "initialize with Initializing flag set must fail");
+
+        // Admin key must not have been written.
+        let admin_result = client.try_get_admin();
+        assert!(
+            admin_result.is_err(),
+            "Admin key must be absent after a reentrancy-guard failure"
+        );
     }
 
     #[test]
