@@ -2,7 +2,12 @@
  * CircleUp REST API
  *
  * GET /circles                         → list circles (paginated, sortable, status-filterable)
- * GET /circles/summary                 → circle counts by status
+ *                                        ?status=  Pending|Active|Completed|Cancelled|Closed
+ *                                        ?sort=    created_ledger|updated_at|round_amount|member_count|status
+ *                                        ?order=   asc|desc  (default: desc)
+ *                                        ?page=    positive integer (default: 1)
+ *                                        ?limit=   1–100 (default: 20)
+ * GET /circles/summary                 → circle counts by status (Pending/Active/Completed/Cancelled/Closed)
  * GET /circles/:address                → circle detail + members + rounds
  * GET /circles/:address/members        → members with contribution status
  * GET /circles/:address/rounds         → all rounds (payouts + defaults)
@@ -20,6 +25,7 @@ import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
 import { redactAddress } from "./redact";
+import { logApiCorsRejected, logApiRequest, logApiRequestError } from "./logger";
 import type { MigrationHealth } from "./db/migrate";
 
 // ── Address validation ────────────────────────────────────────────────────────
@@ -244,7 +250,12 @@ const SORTABLE_FIELDS = [
 ] as const;
 type SortableField = (typeof SORTABLE_FIELDS)[number];
 
-const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const;
+// "Closed" is not a contract-enum variant — the contract records it as a
+// boolean flag (DataKey::Closed), but the indexer projects it as a status
+// string when it receives a circle/closed event.  Including it here lets
+// callers filter GET /circles?status=Closed to retrieve fully-settled circles
+// without a full scan and client-side filter.
+const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled", "Closed"] as const;
 type CircleStatus = (typeof CIRCLE_STATUSES)[number];
 
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
@@ -462,12 +473,32 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   app.use(cors(buildCorsOptions()));
   app.use(express.json());
 
+  app.use((req: Request, _res: Response, next: NextFunction) => {
+    const startedAt = Date.now();
+
+    _res.on("finish", () => {
+      logApiRequest({
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode: _res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    next();
+  });
+
   // cors() calls next(err) for rejected origins instead of sending a response
   // itself — without this handler, Express's default error page would leak a
   // stack trace instead of a clean 403.
   app.use(
-    (err: Error, _req: Request, res: Response, next: express.NextFunction) => {
+    (err: Error, req: Request, res: Response, next: express.NextFunction) => {
       if (err.message.startsWith("Origin ")) {
+        logApiCorsRejected({
+          method: req.method,
+          path: req.originalUrl || req.url,
+          origin: req.headers.origin ?? undefined,
+        });
         res.status(403).json({ error: err.message });
         return;
       }
@@ -588,6 +619,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       for (const row of rows) {
         const count = Number(row.count);
         total += count;
+        // Accept any known status, including the indexer-only "Closed" value
+        // that the contract does not expose as an enum variant.
         if ((CIRCLE_STATUSES as readonly string[]).includes(row.status)) {
           byStatus[row.status as CircleStatus] = count;
         }
@@ -1038,9 +1071,16 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const message = getErrorMessage(err);
+    logApiRequestError({
+      method: req.method,
+      path: req.originalUrl || req.url,
+      statusCode: 500,
+      error: message,
+    });
     console.error("[api] Unhandled error", err);
-    sendError(res, 500, "Internal server error", getErrorMessage(err));
+    sendError(res, 500, "Internal server error", message);
   });
 
   return app;

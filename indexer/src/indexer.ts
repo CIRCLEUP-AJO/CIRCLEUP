@@ -48,6 +48,11 @@ import {
   START_LEDGER,
   POLL_INTERVAL_MS,
   EVENTS_LIMIT,
+  RPC_RETRY_MAX_ATTEMPTS,
+  RPC_RETRY_BASE_DELAY_MS,
+  POLL_BACKOFF_INITIAL_MS,
+  POLL_BACKOFF_MAX_MS,
+  POLL_BACKOFF_MULTIPLIER,
 } from "./config";
 import { redactAddress, redactTxHash, formatAmount } from "./redact";
 
@@ -60,15 +65,9 @@ const REPUTATION = REPUTATION_ADDRESS;
 export const USDC = USDC_ADDRESS;
 
 // ─── Soroban RPC retry ───────────────────────────────────────────────────────
-
-const RPC_RETRY_MAX_ATTEMPTS = parseInt(
-  process.env.RPC_RETRY_MAX_ATTEMPTS || "4",
-  10,
-);
-const RPC_RETRY_BASE_DELAY_MS = parseInt(
-  process.env.RPC_RETRY_BASE_DELAY_MS || "500",
-  10,
-);
+// RPC_RETRY_MAX_ATTEMPTS and RPC_RETRY_BASE_DELAY_MS are validated and
+// exported by ./config (positive integer, upper-bounded) so a typo'd value
+// fails loudly at boot rather than silently altering retry behaviour.
 
 /** Error codes / substrings that are safe to retry. Exported for unit tests. */
 export function isTransientRpcError(err: unknown): boolean {
@@ -209,13 +208,33 @@ function getContractIdStr(event: SdkEvent): string | null {
   return null;
 }
 
+function safeScValToNative(value: unknown): unknown {
+  if (value == null) return null;
+
+  try {
+    return scValToNative(value as xdr.ScVal);
+  } catch {
+    return null;
+  }
+}
+
+function getTopicValue(event: SdkEvent, idx: number): unknown {
+  if (!Array.isArray(event.topic) || idx < 0 || idx >= event.topic.length) {
+    return null;
+  }
+
+  return safeScValToNative(event.topic[idx]);
+}
+
 function getTopicStr(event: SdkEvent, idx: number): string {
-  const val = event.topic[idx];
-  return scValToNative(val as xdr.ScVal) as string;
+  const value = getTopicValue(event, idx);
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  return String(value);
 }
 
 function getValueNative(event: SdkEvent): unknown {
-  return scValToNative(event.value as xdr.ScVal);
+  return safeScValToNative(event.value);
 }
 
 function normalizeForKey(value: unknown): string {
@@ -234,7 +253,7 @@ function normalizeForKey(value: unknown): string {
 
 export function createEventKey(event: SdkEvent): string {
   const contractId = getContractIdStr(event) ?? "";
-  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(scValToNative(topic as xdr.ScVal)));
+  const topicParts = (event.topic ?? []).map((topic) => normalizeForKey(safeScValToNative(topic)));
   return [
     event.ledger ?? 0,
     event.txHash ?? "",
@@ -621,7 +640,11 @@ async function handleCircleResumed(client: PoolClient, circleAddr: string) {
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   const score = getValueNative(event) as number;
-  const memberAddr = scValToNative(event.topic[1] as xdr.ScVal) as string;
+  const memberAddr = getTopicStr(event, 1);
+
+  if (!memberAddr) {
+    throw new Error("reputation/increment: missing or malformed member topic");
+  }
 
   await client.query(
     `INSERT INTO reputation (member_address, score, updated_at)
@@ -834,23 +857,19 @@ async function processEvents(fromLedger: number, toLedger: number) {
  * Temporary RPC failures should not cause a hot loop or immediate process exit.
  * This policy tracks consecutive failures and computes the next wait interval
  * with capped exponential backoff + jitter.
+ *
+ * POLL_BACKOFF_INITIAL_MS, POLL_BACKOFF_MAX_MS, and POLL_BACKOFF_MULTIPLIER
+ * are validated and exported by ./config so out-of-range values fail loudly
+ * at boot rather than silently producing unexpected backoff behaviour.
  */
 interface BackoffState {
   consecutiveFailures: number;
   currentIntervalMs: number;
 }
 
-const BACKOFF_INITIAL_MS = parseInt(
-  process.env.POLL_BACKOFF_INITIAL_MS || "1000",
-  10,
-);
-const BACKOFF_MAX_MS = parseInt(
-  process.env.POLL_BACKOFF_MAX_MS || "60000",
-  10,
-);
-const BACKOFF_MULTIPLIER = parseFloat(
-  process.env.POLL_BACKOFF_MULTIPLIER || "2.0",
-);
+const BACKOFF_INITIAL_MS = POLL_BACKOFF_INITIAL_MS;
+const BACKOFF_MAX_MS = POLL_BACKOFF_MAX_MS;
+const BACKOFF_MULTIPLIER = POLL_BACKOFF_MULTIPLIER;
 
 function createBackoffState(): BackoffState {
   return {
