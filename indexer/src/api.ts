@@ -2,7 +2,12 @@
  * CircleUp REST API
  *
  * GET /circles                         → list circles (paginated, sortable, status-filterable)
- * GET /circles/summary                 → circle counts by status
+ *                                        ?status=  Pending|Active|Completed|Cancelled|Closed
+ *                                        ?sort=    created_ledger|updated_at|round_amount|member_count|status
+ *                                        ?order=   asc|desc  (default: desc)
+ *                                        ?page=    positive integer (default: 1)
+ *                                        ?limit=   1–100 (default: 20)
+ * GET /circles/summary                 → circle counts by status (Pending/Active/Completed/Cancelled/Closed)
  * GET /circles/:address                → circle detail + members + rounds
  * GET /circles/:address/members        → members with contribution status
  * GET /circles/:address/rounds         → all rounds (payouts + defaults)
@@ -245,7 +250,12 @@ const SORTABLE_FIELDS = [
 ] as const;
 type SortableField = (typeof SORTABLE_FIELDS)[number];
 
-const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled"] as const;
+// "Closed" is not a contract-enum variant — the contract records it as a
+// boolean flag (DataKey::Closed), but the indexer projects it as a status
+// string when it receives a circle/closed event.  Including it here lets
+// callers filter GET /circles?status=Closed to retrieve fully-settled circles
+// without a full scan and client-side filter.
+const CIRCLE_STATUSES = ["Pending", "Active", "Completed", "Cancelled", "Closed"] as const;
 type CircleStatus = (typeof CIRCLE_STATUSES)[number];
 
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
@@ -609,6 +619,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       for (const row of rows) {
         const count = Number(row.count);
         total += count;
+        // Accept any known status, including the indexer-only "Closed" value
+        // that the contract does not expose as an enum variant.
         if ((CIRCLE_STATUSES as readonly string[]).includes(row.status)) {
           byStatus[row.status as CircleStatus] = count;
         }
