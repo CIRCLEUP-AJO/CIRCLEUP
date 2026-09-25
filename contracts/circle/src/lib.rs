@@ -696,10 +696,17 @@ impl CircleContract {
         //   member           — the address that just joined
         //   join_order       — 1-based position in the join queue (N triggers Active)
         //   collateral_amount — USDC stroops locked by this member
+        // Re-use the checked multiplication for the event payload so the emitted
+        // collateral_amount is always consistent with the amount actually
+        // transferred.  Using unwrap_or(0) here would silently emit 0 for any
+        // configuration that somehow reached this point with an overflowing
+        // round_amount, hiding a real invariant violation from the indexer.
+        // The initialize overflow guard makes this unreachable in practice, but
+        // the explicit panic keeps the contract's arithmetic model honest.
         let collateral_amount = config
             .round_amount
             .checked_mul(COLLATERAL_MULTIPLIER)
-            .unwrap_or(0);
+            .unwrap_or_else(|| panic!("collateral amount overflow in join event"));
         env.events().publish(
             (Symbol::new(&env, "circle"), Symbol::new(&env, "joined")),
             (env.current_contract_address(), member, join_order, collateral_amount),
@@ -1159,8 +1166,20 @@ impl CircleContract {
             panic!("member did contribute");
         }
 
-        // Deduct penalty from collateral
-        let penalty = collateral * PENALTY_BPS / BPS_DENOM;
+        // Deduct penalty from collateral.
+        //
+        // The `initialize` guard already rejects any `round_amount` that would
+        // overflow `round_amount * PENALTY_BPS`, and collateral starts as
+        // `round_amount * COLLATERAL_MULTIPLIER` (≤ round_amount for the
+        // current multiplier of 1).  Repeated penalties only reduce the balance,
+        // so `collateral` can never exceed the initial deposit.  Nevertheless,
+        // we use checked arithmetic here to make the invariant explicit and to
+        // guard against any future change to COLLATERAL_MULTIPLIER that could
+        // widen the initial deposit above the initialize-time overflow boundary.
+        let penalty = collateral
+            .checked_mul(PENALTY_BPS)
+            .unwrap_or_else(|| panic!("penalty calculation overflow"))
+            / BPS_DENOM;
         let new_collateral = collateral - penalty;
         env.storage()
             .persistent()
@@ -1326,7 +1345,16 @@ impl CircleContract {
             }
 
             // Apply the standard 20 % penalty.
-            let penalty = collateral * PENALTY_BPS / BPS_DENOM;
+            //
+            // Mirrors the checked arithmetic used in mark_default: collateral
+            // is bounded by the initial deposit (round_amount × COLLATERAL_MULTIPLIER),
+            // which was already validated against PENALTY_BPS overflow at
+            // initialize time.  The explicit checked_mul makes the invariant
+            // visible and guards against future changes to COLLATERAL_MULTIPLIER.
+            let penalty = collateral
+                .checked_mul(PENALTY_BPS)
+                .unwrap_or_else(|| panic!("penalty calculation overflow in settle_round"))
+                / BPS_DENOM;
             let new_collateral = collateral - penalty;
             env.storage()
                 .persistent()
@@ -1353,10 +1381,20 @@ impl CircleContract {
         }
 
         // Compute the partial pot: only contributions that actually arrived.
+        //
+        // `contributed_count` is a u32 in [0, member_count] — the loop above
+        // only increments it for members whose Contributed key exists.  The
+        // bounds assertion below guards against any storage inconsistency that
+        // could set contributed_count > member_count before the cast, which
+        // would produce a pot larger than the actual token balance held by the
+        // contract.  The cast to i128 is always lossless for u32 values.
+        if contributed_count > member_count {
+            panic!("settle_round: contributed_count exceeds member_count — storage inconsistency");
+        }
         let pot: i128 = config
             .round_amount
             .checked_mul(contributed_count as i128)
-            .unwrap_or_else(|| panic!("pot amount overflow"));
+            .unwrap_or_else(|| panic!("pot amount overflow in settle_round"));
 
         // ── CHECKS-EFFECTS-INTERACTIONS ───────────────────────────────────────
 
