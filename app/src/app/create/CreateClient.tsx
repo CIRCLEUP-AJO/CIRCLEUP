@@ -1,5 +1,5 @@
 "use client";
-import { useState, useId, useRef, useEffect } from "react";
+import { useState, useId, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
   CIRCLE_FACTORY_ADDRESS,
@@ -46,8 +46,8 @@ export const MIN_AMOUNT_USDC = "0.0000001";
 /** Maximum round amount in USDC (sanity cap to prevent accidental huge values). */
 const MAX_ROUND_USDC = 1_000_000;
 
-/** Maximum round duration in days. */
-export const MAX_ROUND_DAYS = 365;
+/** Maximum round duration in days (~10 years). */
+export const MAX_ROUND_DAYS = 3650;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -935,7 +935,7 @@ export default function CreateClient() {
                 View on Stellar Expert ↗
               </a>
             )}
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-slate-500" aria-live="polite" aria-atomic="true">
               Redirecting to circles list in a few seconds…
             </p>
           </div>

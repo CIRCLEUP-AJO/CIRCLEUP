@@ -76,6 +76,10 @@ export default function ReputationClient({ member }: { member: string }) {
   );
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
+  // Tracks successful manual refreshes to announce completion to screen readers.
+  // Increments on each successful manual refresh; the sr-only live region uses
+  // this as a key so it remounts (and re-announces) on every new refresh.
+  const [refreshCount, setRefreshCount] = useState(0);
 
   const load = useCallback(
     async (isManual = false, signal?: AbortSignal) => {
@@ -84,7 +88,10 @@ export default function ReputationClient({ member }: { member: string }) {
       if (signal?.aborted) return;
       setResult(fetched);
       setLastRefreshed(new Date());
-      if (isManual) setRefreshing(false);
+      if (isManual) {
+        setRefreshing(false);
+        if (fetched.ok) setRefreshCount((c) => c + 1);
+      }
     },
     [member],
   );
@@ -173,6 +180,25 @@ export default function ReputationClient({ member }: { member: string }) {
 
   return (
     <div className="max-w-xl mx-auto space-y-6">
+      {/*
+        Screen-reader announcement for manual refresh completion.
+        `key={refreshCount}` remounts the node on each successful refresh so
+        the polite live region re-announces even when the score hasn't changed.
+        Only rendered after the first manual refresh (refreshCount > 0) to
+        avoid announcing on the initial page load.
+      */}
+      {refreshCount > 0 && (
+        <span
+          key={refreshCount}
+          className="sr-only"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {`Reputation data updated. Score: ${data.score}.`}
+        </span>
+      )}
+
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>

@@ -393,7 +393,6 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
   });
 });
 
-// ─── Action gating with empty members ─────────────────────────────────────────
 //
 // Regression: 0 contributions >= 0 members → allowed by math, but wrong
 // semantically when member data is absent.
@@ -722,6 +721,7 @@ describe("Refresh recovers without full reload", () => {
   });
 });
 
+<<<<<<< HEAD
 // ─── Issue #480 — invite URL SSR safety ──────────────────────────────────────
 //
 // Validates that:
@@ -824,6 +824,71 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
       );
       // aria-busy should be false (or absent) once the URL is populated
       expect(input!.getAttribute("aria-busy")).not.toBe("true");
+=======
+// ─── Screen-reader announcement tests ────────────────────────────────────────
+//
+// Verify that the sr-only progressAnnouncement live region re-announces when
+// circle status or round changes after a post-action data refresh.
+
+describe("CircleDetailClient — screen-reader status announcements", () => {
+  const { CircleDetailClient } = require("./CircleDetailClient");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const stellarMock = require("@/lib/stellar");
+    stellarMock.getWalletAddress.mockResolvedValue(null);
+  });
+
+  test("sr-only live region contains circle status on initial render", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl).toBeInTheDocument();
+      expect(srEl?.textContent).toMatch(/circle status: active/i);
+      expect(srEl?.textContent).toMatch(/round 0 of 4/i);
+    });
+  });
+
+  test("sr-only live region reflects updated status after data changes", async () => {
+    const initialData = makeReadyData({
+      circle: { status: "Active", current_round: 0, total_rounds: 4, round_amount: "10000000", member_count: 2 },
+    });
+
+    const { rerender } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={initialData} />,
+    );
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl?.textContent).toMatch(/round 0 of 4/i);
+    });
+
+    const updatedData = makeReadyData({
+      circle: { status: "Active", current_round: 1, total_rounds: 4, round_amount: "10000000", member_count: 2 },
+      currentRound: makeCurrentRound(),
+    });
+
+    rerender(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={updatedData} />,
+    );
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl?.textContent).toMatch(/round 1 of 4/i);
+    });
+  });
+
+  test("sr-only live region has aria-atomic=true for atomic announcement", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl).toBeInTheDocument();
+      expect(srEl).toHaveAttribute("aria-atomic", "true");
+>>>>>>> 7bf0185 (a11y: add screen-reader announcements for status and progress updates)
     });
   });
 });
