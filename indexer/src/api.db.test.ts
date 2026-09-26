@@ -411,4 +411,36 @@ if (hasDb) {
       await cleanCircle(addr);
     }
   });
+
+  // ── #531 GET /indexer/state — entity counts ───────────────────────────────────
+
+  test("GET /indexer/state includes entityCounts with numeric totals and circlesByStatus", async () => {
+    const addr = "CDBTEST_STATE_ENTITY_CIRCLE";
+    await seedCircle(addr, { status: "Active" });
+
+    try {
+      const res = await request(app).get("/indexer/state");
+      assert.equal(res.status, 200);
+      const { entityCounts } = res.body as { entityCounts: Record<string, unknown> };
+      assert.ok(
+        typeof entityCounts === "object" && entityCounts !== null,
+        "entityCounts must be an object",
+      );
+      assert.equal(typeof entityCounts.circles,       "number", "entityCounts.circles must be a number");
+      assert.equal(typeof entityCounts.members,       "number", "entityCounts.members must be a number");
+      assert.equal(typeof entityCounts.contributions, "number", "entityCounts.contributions must be a number");
+      assert.equal(typeof entityCounts.payouts,       "number", "entityCounts.payouts must be a number");
+      assert.equal(typeof entityCounts.defaults,      "number", "entityCounts.defaults must be a number");
+      assert.ok(
+        typeof entityCounts.circlesByStatus === "object" && entityCounts.circlesByStatus !== null,
+        "entityCounts.circlesByStatus must be an object",
+      );
+      assert.ok(
+        (entityCounts.circles as number) >= 1,
+        "entityCounts.circles must be at least 1 after seeding",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
 }
