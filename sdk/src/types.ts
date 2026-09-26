@@ -1063,16 +1063,56 @@ export interface ApiDefaultRecord {
 }
 
 /**
- * A completed payout round as returned by GET /circles/:address/rounds.
- * `amount` is in stroops (string-serialised).
+ * Lifecycle phase of a single round as reconciled by the indexer.
+ *
+ * | Value       | Meaning |
+ * |-------------|---------|
+ * | `"completed"` | A payout row exists for this round — it has been paid out. |
+ * | `"current"`   | The active in-progress round (Active circle, no payout yet). |
+ * | `"cancelled"` | The current round of a Cancelled circle (no payout will occur). |
+ * | `"open"`      | An unpaid round that has recorded contributions and/or defaults but is not the current round (reorg / partial-ingest edge case). |
+ *
+ * Payout presence always wins: a round whose `round_index` has a payout row
+ * is always `"completed"`, regardless of the circle's `current_round` cursor.
+ *
+ * @see RoundPhase in sdk/src/types.ts (read-model section)
+ * @see groupCircleRounds in indexer/src/groupRounds.ts (status resolution)
+ */
+export type ApiRoundPhase = "completed" | "current" | "cancelled" | "open";
+
+/**
+ * A round row as returned by GET /circles/:address/rounds.
+ *
+ * Every round the indexer has observed is included exactly once, with a
+ * `status` field that identifies its lifecycle phase. Previously the `status`
+ * was computed inside the indexer but omitted from the wire format, requiring
+ * clients to infer it from context (presence of a payout, circle status, etc.).
+ * It is now part of the public API contract (issue #529).
+ *
+ * Monetary amounts are in stroops, serialised as strings.
  */
 export interface ApiRoundRow {
   roundIndex: number;
-  recipient: string;
-  /** Pot paid out, in stroops (string-serialised). */
-  amount: string;
-  txHash: string;
-  ledger?: number;
+  /**
+   * Lifecycle phase of this round.
+   *
+   * Clients should branch on this field rather than inferring phase from the
+   * presence/absence of `recipient`, `amount`, or `txHash`:
+   *   - `"completed"` — payout fields are populated.
+   *   - `"current"` / `"cancelled"` — payout fields are `null`; this is the
+   *     live round. Returned as `currentRound` in the response envelope.
+   *   - `"open"` — payout fields are `null`; unpaid round with activity.
+   *     Returned in `openRounds`.
+   */
+  status: ApiRoundPhase;
+  /** Payout recipient (G…); `null` until the round is paid out. */
+  recipient: string | null;
+  /** Pot paid out, in stroops (string-serialised); `null` until the round is paid out. */
+  amount: string | null;
+  /** Payout transaction hash; `null` until the round is paid out. */
+  txHash: string | null;
+  /** Ledger sequence of the payout; `null` until the round is paid out. */
+  ledger?: number | null;
   contributions: ApiContributionRecord[];
   defaults: ApiDefaultRecord[];
 }
@@ -1136,10 +1176,15 @@ export interface ApiMembersResponse {
 
 /** Response body for GET /circles/:address/rounds */
 export interface ApiRoundsResponse {
+  /**
+   * Completed rounds (status `"completed"`), sorted ascending by `roundIndex`.
+   * Every entry has `status: "completed"` and populated payout fields.
+   */
   rounds: ApiRoundRow[];
   /**
-   * Unpaid rounds that have contributions and/or defaults recorded but are not
-   * the circle's current round (reorg / partial-ingest edge case, issue #170).
+   * Unpaid non-current rounds that have contributions and/or defaults recorded
+   * (reorg / partial-ingest edge case, issue #170). Every entry has
+   * `status: "open"`.
    */
   openRounds: ApiRoundRow[];
   /** Defaults that belong to a round not yet paid out. */
@@ -1147,8 +1192,10 @@ export interface ApiRoundsResponse {
   /**
    * The in-progress round (status `"current"` or `"cancelled"`), returned
    * alongside the history so clients can show live contribution status without
-   * a second request. `null` when the circle is not Active or the indexer has
-   * not yet processed the current round.
+   * a second request. `null` when the circle is not Active or Cancelled, or
+   * when the indexer has not yet processed the current round.
+   *
+   * The `status` field on this object is always `"current"` or `"cancelled"`.
    */
   currentRound: ApiRoundRow | null;
 }
@@ -1165,15 +1212,23 @@ export interface ApiCircleDetailWithRoundsResponse {
   members: ApiMemberRow[];
   /** Latest ledger the indexer has processed; used for deadline countdown. */
   latestLedger: number | null;
-  /** Completed/open rounds from GET /circles/:address/rounds. */
+  /**
+   * Completed rounds (status `"completed"`) from GET /circles/:address/rounds,
+   * sorted ascending by `roundIndex`. All entries have `status: "completed"`.
+   */
   rounds: ApiRoundRow[];
-  /** Unpaid rounds with activity that are not the current round (issue #170). */
+  /**
+   * Unpaid rounds with activity that are not the current round (issue #170).
+   * All entries have `status: "open"`.
+   */
   openRounds: ApiRoundRow[];
   /** Pending defaults not yet associated with a payout round. */
   pendingDefaults: ApiDefaultRecord[];
   /**
    * The in-progress round containing live contribution data; `null` when the
-   * circle is not Active or the indexer has not yet processed this round.
+   * circle is not Active or Cancelled, or when the indexer has not yet
+   * processed this round. The `status` field is always `"current"` or
+   * `"cancelled"`.
    */
   currentRound: ApiRoundRow | null;
 }
@@ -1258,7 +1313,7 @@ export interface ApiHealthResponse {
 //   • Timestamps → ISO-8601 `string`.
 
 /** Lifecycle phase of a single round, as reconciled by the indexer. */
-export type RoundPhase = "completed" | "current" | "cancelled" | "open";
+export type RoundPhase = ApiRoundPhase;
 
 /**
  * Compact per-circle model for list views (`GET /circles`).

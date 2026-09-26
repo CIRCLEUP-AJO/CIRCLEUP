@@ -803,6 +803,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       // Single-pass grouping by round_index so contributions/defaults for
       // unpaid rounds are never silently dropped, and we avoid O(n×m)
       // filter scans per payout.
+      //
+      // Every GroupedRound carries a `status` field ("completed", "current",
+      // "cancelled", or "open") that is included in the serialised JSON so
+      // clients can branch on lifecycle phase directly rather than inferring
+      // it from the presence/absence of payout fields (issue #529).
       const { rounds, currentRound, openRounds, pendingDefaults } =
         groupCircleRounds(circle, payouts, contributions, defaults);
 
