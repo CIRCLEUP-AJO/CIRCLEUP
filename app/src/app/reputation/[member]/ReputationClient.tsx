@@ -1,39 +1,22 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { INDEXER_URL, shortAddress } from "@/lib/config";
+import { indexerEndpoint, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
 import { isCanonicalStellarAddress } from "@/lib/address";
-
-// ─── Local type definition ────────────────────────────────────────────────────
-//
-// The app package does not depend on @circleup/sdk directly; types that mirror
-// indexer API shapes are declared here. Keep in sync with:
-//   sdk/src/types.ts → ApiReputationResponse
-
-/** @see ApiReputationResponse in sdk/src/types.ts */
-interface ReputationResponse {
-  member: string;
-  /** true when a reputation row exists; false means no activity recorded yet. */
-  found: boolean;
-  score: number;
-  contributions: Array<{
-    circle_address: string;
-    contributions: number;
-    total_rounds: number;
-  }>;
-  defaults: Array<{
-    circle_address: string;
-    count: number;
-  }>;
-  updatedAt: string | null;
-}
+// Issue #513: ReputationResponse is now the shared type from circleTypes.ts.
+// parseReputationResponse validates the raw JSON at the network boundary
+// instead of the previous bare `as ReputationResponse` cast.
+import { type ReputationResponse, parseReputationResponse } from "@/lib/circleTypes";
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 type FetchResult =
   | { ok: true; data: ReputationResponse }
-  | { ok: false; reason: "not_found" | "network" | "unknown" | "aborted" };
+  | {
+      ok: false;
+      reason: "not_found" | "network" | "unknown" | "aborted" | "indexer_outage" | "misconfigured";
+    };
 
 async function fetchReputation(member: string, signal?: AbortSignal): Promise<FetchResult> {
   // Validate the route param before making any network request. A malformed
@@ -42,14 +25,25 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
   if (!isCanonicalStellarAddress(member)) {
     return { ok: false, reason: "not_found" };
   }
+  // A misconfigured NEXT_PUBLIC_INDEXER_URL must not fall through to fetch():
+  // a scheme-less value is a relative URL here, so the request would hit this
+  // Next app, 404, and render "No reputation record found" for a real member.
+  const url = indexerEndpoint(["reputation", member]);
+  if (url === null) return { ok: false, reason: "misconfigured" };
   try {
-    const res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
+    const res = await fetch(url, {
       cache: "no-store",
       signal,
     });
     if (res.status === 404) return { ok: false, reason: "not_found" };
+    if (res.status === 503) return { ok: false, reason: "indexer_outage" };
     if (!res.ok) return { ok: false, reason: "unknown" };
-    return { ok: true, data: (await res.json()) as ReputationResponse };
+    // Issue #513: validate the response shape before returning it as typed data.
+    // The bare `as ReputationResponse` cast was previously here; a malformed or
+    // unexpected response would have propagated into the render tree silently.
+    const parsed = parseReputationResponse(await res.json());
+    if (!parsed) return { ok: false, reason: "unknown" };
+    return { ok: true, data: parsed };
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
       return { ok: false, reason: "aborted" };
@@ -67,6 +61,10 @@ export default function ReputationClient({ member }: { member: string }) {
   );
   const [refreshing, setRefreshing] = useState(false);
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
+  // Tracks successful manual refreshes to announce completion to screen readers.
+  // Increments on each successful manual refresh; the sr-only live region uses
+  // this as a key so it remounts (and re-announces) on every new refresh.
+  const [refreshCount, setRefreshCount] = useState(0);
 
   const load = useCallback(
     async (isManual = false, signal?: AbortSignal) => {
@@ -75,7 +73,10 @@ export default function ReputationClient({ member }: { member: string }) {
       if (signal?.aborted) return;
       setResult(fetched);
       setLastRefreshed(new Date());
-      if (isManual) setRefreshing(false);
+      if (isManual) {
+        setRefreshing(false);
+        if (fetched.ok) setRefreshCount((c) => c + 1);
+      }
     },
     [member],
   );
@@ -129,7 +130,14 @@ export default function ReputationClient({ member }: { member: string }) {
     const errorMessages: Record<string, string> = {
       network: "The reputation service is unreachable. Check your connection and try again.",
       unknown: "An unexpected error occurred loading reputation data.",
+      indexer_outage:
+        "The indexer is running but currently degraded. Reputation data may be temporarily unavailable. Try again in a few minutes.",
+      misconfigured:
+        "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
+        "Set a valid indexer URL in app/.env.local and restart the server.",
     };
+    // Retrying cannot fix a configuration error, so don't offer it.
+    const canRetry = result.reason !== "misconfigured";
 
     return (
       <div className="text-center py-16 text-slate-500">
@@ -138,13 +146,15 @@ export default function ReputationClient({ member }: { member: string }) {
         <p className="text-sm mt-1 text-slate-500">
           {errorMessages[result.reason] ?? errorMessages.unknown}
         </p>
-        <button
-          onClick={() => load(true)}
-          disabled={refreshing}
-          className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
-        >
-          {refreshing ? "Retrying…" : "Try again"}
-        </button>
+        {canRetry && (
+          <button
+            onClick={() => load(true)}
+            disabled={refreshing}
+            className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
+          >
+            {refreshing ? "Retrying…" : "Try again"}
+          </button>
+        )}
       </div>
     );
   }
@@ -155,6 +165,25 @@ export default function ReputationClient({ member }: { member: string }) {
 
   return (
     <div className="max-w-xl mx-auto space-y-6">
+      {/*
+        Screen-reader announcement for manual refresh completion.
+        `key={refreshCount}` remounts the node on each successful refresh so
+        the polite live region re-announces even when the score hasn't changed.
+        Only rendered after the first manual refresh (refreshCount > 0) to
+        avoid announcing on the initial page load.
+      */}
+      {refreshCount > 0 && (
+        <span
+          key={refreshCount}
+          className="sr-only"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {`Reputation data updated. Score: ${data.score}.`}
+        </span>
+      )}
+
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>

@@ -355,6 +355,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
       false,
       false,
       0,
+      null, // networkCheck — none in this context
       staleMs, // ← the data was fetched more than maxAge ago
     );
 
@@ -376,7 +377,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     // Simulate: data was fetched 60 seconds ago
     const dataFetchedAt = Date.now() - 60_000;
     // Correct behaviour: use dataFetchedAt as the snapshot timestamp
-    const correctSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, dataFetchedAt);
+    const correctSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, null, dataFetchedAt);
     const correctGate = computeActionEligibility("contribute", correctSnapshot);
     // 60 s > 30 s default → stale
     expect(correctGate.allowed).toBe(false);
@@ -385,14 +386,13 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     }
 
     // Old (broken) behaviour: use Date.now() as the snapshot timestamp
-    const brokenSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, Date.now());
+    const brokenSnapshot = buildAppSnapshot("Active", 0, 5000, 4000, [MEMBER_A], false, false, 0, null, Date.now());
     const brokenGate = computeActionEligibility("contribute", brokenSnapshot);
     // 0 ms < 30 s → wrongly allowed
     expect(brokenGate.allowed).toBe(true);
   });
 });
 
-// ─── Action gating with empty members ─────────────────────────────────────────
 //
 // Regression: 0 contributions >= 0 members → allowed by math, but wrong
 // semantically when member data is absent.
@@ -409,6 +409,7 @@ describe("Payout gate with empty members", () => {
       false,
       false,
       0, // 0 contributions
+      null, // networkCheck — none in this context
       Date.now(),
     );
     // 0 >= 0 is true mathematically, but the gate allows it — the fix for
@@ -717,5 +718,172 @@ describe("Refresh recovers without full reload", () => {
 
     const secondResult = await fetchCircleData(CONTRACT);
     expect(secondResult.ok).toBe(true);
+  });
+});
+
+// ─── Issue #480 — invite URL SSR safety ──────────────────────────────────────
+//
+// Validates that:
+//   1. inviteUrl initialises to null (not "") so SSR renders a consistent
+//      placeholder rather than an empty controlled-input value.
+//   2. The input renders with aria-busy while the URL is not yet resolved.
+//   3. The copy button is disabled while inviteUrl is null.
+//   4. window.location is never accessed synchronously during the initial
+//      render — only inside useEffect (browser-only).
+//
+// These are component-level render tests rather than pure-function tests; they
+// rely on jsdom setting window.location.origin = "http://localhost" by default.
+
+vi.mock("next/link", () => ({
+  default: ({ href, children }: { href: string; children: React.ReactNode }) => (
+    <a href={href}>{children}</a>
+  ),
+}));
+
+// Minimal valid Props shape the component accepts
+function makeProps(circleAddress: string): { circleAddress: string; circleData: ReturnType<typeof makeReadyData> } {
+  return {
+    circleAddress,
+    circleData: makeReadyData(),
+  };
+}
+
+describe("Issue #480 — invite URL SSR-safe initialisation", () => {
+  // Stub wallet so the component doesn't hang waiting for a connected wallet
+  beforeEach(() => {
+    vi.mock("@/lib/stellar", () => ({
+      getWalletAddress: vi.fn().mockResolvedValue(null),
+      connectWallet:    vi.fn().mockResolvedValue(null),
+      getWalletError:   vi.fn().mockResolvedValue(null),
+    }));
+  });
+
+  test("invite input starts with empty value (null coalesced to '') on first render", async () => {
+    const { CircleDetailClient } = await import("./CircleDetailClient");
+    const { container } = render(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+
+    const input = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Invite link for this circle"]',
+    );
+    expect(input).not.toBeNull();
+    expect(input!.value).toBe("");
+  });
+
+  test("invite input shows aria-busy=true while URL not yet resolved", async () => {
+    const { CircleDetailClient } = await import("./CircleDetailClient");
+    const { container } = render(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+
+    const input = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Invite link for this circle"]',
+    );
+    expect(input).not.toBeNull();
+    expect(input!.getAttribute("aria-busy")).toBe("true");
+  });
+
+  test("copy button is disabled while invite URL is not yet resolved", async () => {
+    const { CircleDetailClient } = await import("./CircleDetailClient");
+    render(<CircleDetailClient {...makeProps(CONTRACT)} />);
+
+    const copyBtn = screen.getByRole("button", { name: /copy invite link/i });
+    expect(copyBtn).toBeDisabled();
+  });
+
+  test("invite input is populated with window.location.origin after effect fires", async () => {
+    const { CircleDetailClient } = await import("./CircleDetailClient");
+    const { container } = render(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+
+    await waitFor(() => {
+      const input = container.querySelector<HTMLInputElement>(
+        'input[aria-label="Invite link for this circle"]',
+      );
+      expect(input!.value).toContain(`/circles/${CONTRACT}`);
+    });
+  });
+
+  test("invite input aria-busy becomes false after URL is resolved", async () => {
+    const { CircleDetailClient } = await import("./CircleDetailClient");
+    const { container } = render(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+
+    await waitFor(() => {
+      const input = container.querySelector<HTMLInputElement>(
+        'input[aria-label="Invite link for this circle"]',
+      );
+      expect(input!.getAttribute("aria-busy")).not.toBe("true");
+    });
+  });
+});
+
+// ─── Screen-reader announcement tests ────────────────────────────────────────
+//
+// Verify that the sr-only progressAnnouncement live region re-announces when
+// circle status or round changes after a post-action data refresh.
+
+describe("CircleDetailClient — screen-reader status announcements", () => {
+  const { CircleDetailClient } = require("./CircleDetailClient");
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    const stellarMock = require("@/lib/stellar");
+    stellarMock.getWalletAddress.mockResolvedValue(null);
+  });
+
+  test("sr-only live region contains circle status on initial render", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl).toBeInTheDocument();
+      expect(srEl?.textContent).toMatch(/circle status: active/i);
+      expect(srEl?.textContent).toMatch(/round 0 of 4/i);
+    });
+  });
+
+  test("sr-only live region reflects updated status after data changes", async () => {
+    const initialData = makeReadyData({
+      circle: { status: "Active", current_round: 0, total_rounds: 4, round_amount: "10000000", member_count: 2 },
+    });
+
+    const { rerender } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={initialData} />,
+    );
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl?.textContent).toMatch(/round 0 of 4/i);
+    });
+
+    const updatedData = makeReadyData({
+      circle: { status: "Active", current_round: 1, total_rounds: 4, round_amount: "10000000", member_count: 2 },
+      currentRound: makeCurrentRound(),
+    });
+
+    rerender(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={updatedData} />,
+    );
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl?.textContent).toMatch(/round 1 of 4/i);
+    });
+  });
+
+  test("sr-only live region has aria-atomic=true for atomic announcement", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      const srEl = document.querySelector("[role='status'][aria-live='polite'][aria-atomic='true'].sr-only");
+      expect(srEl).toBeInTheDocument();
+      expect(srEl).toHaveAttribute("aria-atomic", "true");
+    });
   });
 });

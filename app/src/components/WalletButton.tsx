@@ -1,37 +1,49 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { getWalletAddress, connectWallet, isFreighterInstalled, WalletError } from "@/lib/stellar";
-import { shortAddress } from "@/lib/config";
-import { detectWalletCapabilities, explainUnsupportedAction } from "@/lib/walletCapabilities";
+import { shortAddress, NETWORK_PASSPHRASE } from "@/lib/config";
+import {
+  detectWalletCapabilities,
+  explainUnsupportedAction,
+  checkNetworkMismatch,
+  describeNetworkMismatch,
+  type NetworkMismatchResult,
+} from "@/lib/walletCapabilities";
+
+// ─── Connection state ─────────────────────────────────────────────────────────
+//
+// "checking"    — initial silent probe: getWalletAddress() is in flight.
+// "idle"        — extension installed but no account connected yet.
+// "connecting"  — user clicked "Connect Freighter", prompt is open.
+// "changing"    — provider fired accountChanged / networkChanged; re-probing.
+// "connected"   — address known, capabilities checked, network verified.
+// "limited"     — address known but wallet cannot sign transactions.
+// "not_installed" — Freighter extension absent.
+// "error"       — explicit connection error with a user-facing message.
 
 type ConnectionState =
   | { status: "checking" }
-  | { status: "connected"; address: string; capabilities?: { canSign: boolean; canGetNetwork: boolean } }
+  | { status: "idle" }
   | { status: "connecting" }
-  | { status: "not_installed" }
+  | { status: "changing" }
+  | { status: "connected"; address: string; networkMismatch?: NetworkMismatchResult | null; capabilities?: { canSign: boolean; canGetNetwork: boolean } }
   | { status: "limited"; message: string; address?: string }
+  | { status: "not_installed" }
   | { status: "error"; message: string };
 
 // ─── Provider event shape ─────────────────────────────────────────────────────
 //
 // Freighter v2 exposes addEventListener on the injected provider for two
-// events: "accountChanged" and "networkChanged".  The callback receives an
-// object with the new address / network details.  We only need to know
-// *that* a change happened, not the new value — we always re-probe via
-// getWalletAddress so we get the authoritative state rather than trusting
-// the event payload.
+// events: "accountChanged" and "networkChanged". The callback receives an
+// object with the new address / network details. We only need to know
+// *that* a change happened — we always re-probe via getWalletAddress so we
+// get the authoritative state rather than trusting the event payload.
 
 type FreighterEventType = "accountChanged" | "networkChanged";
 
 interface FreighterProvider {
-  addEventListener?: (
-    event: FreighterEventType,
-    callback: (detail?: unknown) => void,
-  ) => void;
-  removeEventListener?: (
-    event: FreighterEventType,
-    callback: (detail?: unknown) => void,
-  ) => void;
+  addEventListener?: (event: FreighterEventType, callback: (detail?: unknown) => void) => void;
+  removeEventListener?: (event: FreighterEventType, callback: (detail?: unknown) => void) => void;
 }
 
 function getProvider(): FreighterProvider | null {
@@ -45,76 +57,75 @@ function getProvider(): FreighterProvider | null {
 // ─── Network check helper ─────────────────────────────────────────────────────
 
 async function runNetworkCheck(): Promise<NetworkMismatchResult | null> {
-  const caps = detectWalletCapabilities();
-  if (!caps.canGetNetwork) return null;
-  try {
-    return await checkNetworkMismatch(NETWORK_PASSPHRASE);
-  } catch {
-    return null;
-  }
+  let caps;
+  try { caps = detectWalletCapabilities(); } catch { return null; }
+  if (!caps || !caps.canGetNetwork) return null;
+  try { return await checkNetworkMismatch(NETWORK_PASSPHRASE); } catch { return null; }
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function WalletButton() {
   const [state, setState] = useState<ConnectionState>({ status: "checking" });
-
-  // Tracks whether the component is still mounted so async callbacks never
-  // call setState after unmount (avoids React memory-leak warnings and
-  // prevents stale state from appearing after navigation).
   const mountedRef = useRef(true);
+
   useEffect(() => {
-    let cancelled = false;
-    getWalletAddress().then((address) => {
-      if (cancelled) return;
-      if (address) {
-        // Check capabilities when connected
-        const caps = detectWalletCapabilities();
-        const signWarning = explainUnsupportedAction("sign", caps);
-        if (signWarning) {
-          setState({
-            status: "limited",
-            message: signWarning,
-            address,
-          });
-        } else {
-          setState({
-            status: "connected",
-            address,
-            capabilities: {
-              canSign: caps.canSignTransaction,
-              canGetNetwork: caps.canGetNetwork,
-            },
-          });
-        }
-      } else if (!isFreighterInstalled()) {
-        setState({ status: "not_installed" });
-      } else {
-        setState({ status: "idle" });
-      }
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // ── Account resolution ──────────────────────────────────────────────────
+  //
+  // Runs on mount (silent probe) and whenever the provider fires an account-
+  // or network-change event. Sets the final connected/disconnected/limited
+  // state once the wallet address and capabilities are known.
+
+  const resolveAccount = useCallback(async () => {
+    let address: string | null;
+    try {
+      address = await getWalletAddress();
+    } catch {
+      if (mountedRef.current) setState({ status: "not_installed" });
       return;
     }
 
-    // Account is connected — run the network check before settling the state
+    if (!mountedRef.current) return;
+
+    if (!address) {
+      setState(isFreighterInstalled() ? { status: "idle" } : { status: "not_installed" });
+      return;
+    }
+
+    let caps;
+    try { caps = detectWalletCapabilities(); } catch { caps = null; }
+
+    let signWarning: string | null = null;
+    try { signWarning = caps ? explainUnsupportedAction("sign", caps) : null; } catch { signWarning = null; }
+
+    if (signWarning) {
+      if (mountedRef.current) setState({ status: "limited", message: signWarning, address });
+      return;
+    }
+
     const networkMismatch = await runNetworkCheck();
     if (!mountedRef.current) return;
 
-    setState({ status: "connected", address, networkMismatch });
-  }, []);
+    setState({
+      status: "connected",
+      address,
+      networkMismatch,
+      capabilities: caps
+        ? { canSign: caps.canSignTransaction, canGetNetwork: caps.canGetNetwork }
+        : undefined,
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Mount: silent probe ─────────────────────────────────────────────────
   useEffect(() => {
-    resolveAccount();
+    void resolveAccount();
   }, [resolveAccount]);
 
   // ── Provider change listeners ───────────────────────────────────────────
-  //
-  // Freighter fires "accountChanged" when the user switches accounts in the
-  // extension, and "networkChanged" when they switch networks.  Both events
-  // invalidate the current state, so we enter `changing` and re-probe.
-  //
-  // Cleanup: removeEventListener is called on unmount so the callbacks are
-  // never fired after the component has been removed from the tree.
   useEffect(() => {
     const provider = getProvider();
     if (!provider || typeof provider.addEventListener !== "function") return;
@@ -122,7 +133,7 @@ export function WalletButton() {
     const handleChange = () => {
       if (!mountedRef.current) return;
       setState({ status: "changing" });
-      resolveAccount();
+      void resolveAccount();
     };
 
     provider.addEventListener("accountChanged", handleChange);
@@ -141,38 +152,39 @@ export function WalletButton() {
     setState({ status: "connecting" });
     try {
       const address = await connectWallet();
-      const caps = detectWalletCapabilities();
-      const signWarning = explainUnsupportedAction("sign", caps);
+      if (!mountedRef.current) return;
+
+      let caps;
+      try { caps = detectWalletCapabilities(); } catch { caps = null; }
+
+      let signWarning: string | null = null;
+      try { signWarning = caps ? explainUnsupportedAction("sign", caps) : null; } catch { signWarning = null; }
+
+
       if (signWarning) {
-        setState({
-          status: "limited",
-          message: signWarning,
-          address,
-        });
-      } else {
-        setState({
-          status: "connected",
-          address,
-          capabilities: {
-            canSign: caps.canSignTransaction,
-            canGetNetwork: caps.canGetNetwork,
-          },
-        });
+        setState({ status: "limited", message: signWarning, address });
+        return;
       }
+
+      const networkMismatch = await runNetworkCheck();
+      if (!mountedRef.current) return;
+
+      setState({
+        status: "connected",
+        address,
+        networkMismatch,
+        capabilities: caps
+          ? { canSign: caps.canSignTransaction, canGetNetwork: caps.canGetNetwork }
+          : undefined,
+      });
     } catch (err) {
       if (!mountedRef.current) return;
       if (err instanceof WalletError) {
-        if (err.reason === "not_installed") {
-          setState({ status: "not_installed" });
-        } else {
-          // permission_denied or unknown — show the message but stay actionable
-          setState({ status: "error", message: err.message });
-        }
+        setState(err.reason === "not_installed"
+          ? { status: "not_installed" }
+          : { status: "error", message: err.message });
       } else {
-        setState({
-          status: "error",
-          message: (err as Error)?.message || "Failed to connect wallet.",
-        });
+        setState({ status: "error", message: (err as Error)?.message || "Failed to connect wallet." });
       }
     }
   }
@@ -185,42 +197,60 @@ export function WalletButton() {
         : null;
 
     return (
-      <div className="flex items-center gap-2 bg-brand-50 border border-brand-200 rounded-lg px-3 py-2 text-sm">
-        <span className="w-2 h-2 rounded-full bg-brand-500 inline-block" aria-hidden="true" />
-        <span className="font-mono text-brand-700">{shortAddress(state.address)}</span>
-        {state.capabilities && !state.capabilities.canGetNetwork && (
-          <span className="text-xs text-amber-600" title="Wallet cannot verify network">
-            ⚠
-          </span>
-        )}
-      </div>
+      <>
+        {/*
+          Announce connection to screen readers. `key={state.address}` remounts
+          the node on account switch so the live region re-fires for the new address.
+        */}
+        <span
+          key={state.address}
+          className="sr-only"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          {`Wallet connected: ${state.address}`}
+        </span>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 bg-brand-50 border border-brand-200 rounded-lg px-3 py-2 text-sm">
+            <span className="w-2 h-2 rounded-full bg-brand-500 inline-block" aria-hidden="true" />
+            <span className="font-mono text-brand-700">{shortAddress(state.address)}</span>
+          </div>
+          {mismatchMessage && (
+            <span
+              className="text-xs text-red-600 max-w-[180px] truncate"
+              title={mismatchMessage}
+              aria-live="polite"
+              role="alert"
+            >
+              ⚠ {mismatchMessage}
+            </span>
+          )}
+        </div>
+      </>
     );
   }
 
-  // ── Limited capabilities ──────────────────────────────────────────────────
+  // ── Render: limited capabilities ────────────────────────────────────────
   if (state.status === "limited") {
     return (
       <div className="flex items-center gap-2">
         <div className="flex items-center gap-1.5 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2 text-sm">
           {state.address && (
-            <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" aria-hidden="true" />
-          )}
-          {state.address && (
-            <span className="font-mono text-amber-700">{shortAddress(state.address)}</span>
+            <>
+              <span className="w-2 h-2 rounded-full bg-amber-500 inline-block" aria-hidden="true" />
+              <span className="font-mono text-amber-700">{shortAddress(state.address)}</span>
+            </>
           )}
         </div>
-        <span
-          className="text-xs text-amber-600 max-w-[180px] truncate"
-          title={state.message}
-          aria-live="polite"
-        >
+        <span className="text-xs text-amber-600 max-w-[180px] truncate" title={state.message} aria-live="polite">
           {state.message}
         </span>
       </div>
     );
   }
 
-  // ── Render: not installed ───────────────────────────────────────────────
+  // ── Not installed ───────────────────────────────────────────────────────
   if (state.status === "not_installed") {
     return (
       <a
@@ -236,7 +266,7 @@ export function WalletButton() {
     );
   }
 
-  // ── Render: error ───────────────────────────────────────────────────────
+  // ── Error ───────────────────────────────────────────────────────────────
   if (state.status === "error") {
     return (
       <div className="flex items-center gap-2">
@@ -251,6 +281,7 @@ export function WalletButton() {
           className="text-xs text-red-600 max-w-[180px] truncate"
           title={state.message}
           aria-live="polite"
+          role="alert"
         >
           {state.message}
         </span>
@@ -258,18 +289,16 @@ export function WalletButton() {
     );
   }
 
-  // ── Render: checking / connecting / changing / idle ─────────────────────
+  // ── Checking / Connecting / Changing / Idle ─────────────────────────────
   const isLoading =
     state.status === "checking" ||
     state.status === "connecting" ||
     state.status === "changing";
 
   const label =
-    state.status === "connecting"
-      ? "Connecting…"
-      : state.status === "changing"
-        ? "Updating…"
-        : "Connect Freighter";
+    state.status === "connecting" ? "Connecting…"
+    : state.status === "changing" ? "Updating…"
+    : "Connect Freighter";
 
   return (
     <button
@@ -280,13 +309,7 @@ export function WalletButton() {
     >
       {isLoading ? (
         <span className="flex items-center gap-1.5">
-          <svg
-            className="animate-spin h-3.5 w-3.5 text-white"
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-            aria-hidden="true"
-          >
+          <svg className="animate-spin h-3.5 w-3.5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
           </svg>

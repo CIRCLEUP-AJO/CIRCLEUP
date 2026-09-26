@@ -1,5 +1,6 @@
 import { Pool, PoolClient, QueryResultRow } from "pg";
 import * as dotenv from "dotenv";
+import { DB_CONNECT_MAX_RETRIES, DB_CONNECT_BASE_DELAY_MS } from "../config";
 
 dotenv.config();
 
@@ -13,9 +14,6 @@ export const pool = new Pool({
 pool.on("error", (err) => {
   console.error("[db] Unexpected pool error:", err);
 });
-
-const DEFAULT_MAX_RETRIES = 5;
-const DEFAULT_BASE_DELAY_MS = 1_000;
 
 // Node surfaces a refused/unreachable TCP connection (the common case while
 // Postgres is still starting) as an AggregateError whose own `.message` is
@@ -47,11 +45,16 @@ function describeConnectionError(err: unknown): string {
  * boot time), and the default single-shot `pool.connect()` would otherwise
  * fail the whole process on that first, likely-transient error. Call this
  * once at startup, before any query that assumes a live connection.
+ *
+ * The default `maxRetries` and `baseDelayMs` are read from the
+ * `DB_CONNECT_MAX_RETRIES` and `DB_CONNECT_BASE_DELAY_MS` environment
+ * variables (validated and exported by `../config`), so operators can tune
+ * retry behaviour without a code change.
  */
 export async function connectWithRetry({
   pool: targetPool = pool,
-  maxRetries = DEFAULT_MAX_RETRIES,
-  baseDelayMs = DEFAULT_BASE_DELAY_MS,
+  maxRetries = DB_CONNECT_MAX_RETRIES,
+  baseDelayMs = DB_CONNECT_BASE_DELAY_MS,
 }: {
   pool?: Pick<Pool, "connect">;
   maxRetries?: number;
