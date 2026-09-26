@@ -6,7 +6,7 @@
  *
  * Events consumed:
  *   factory/circle_created  → inserts circles + circle_members rows
- *   circle/initialized      → (no DB write; creation handled by factory event)
+ *   circle/initialized      → updates circles.member_count, total_rounds, round_amount
  *   circle/joined            → updates circle_members.joined_at
  *   circle/active            → updates circles.status = 'Active'
  *   circle/contributed       → inserts contributions row
@@ -437,6 +437,152 @@ export async function processLedger(
 // ─── Event data parsers (pure, no I/O — exported for unit tests) ─────────────
 
 /**
+ * Parse the data payload of a `circle/initialized` event.
+ *
+ * Contract data tuple (contracts/circle/src/lib.rs — `initialize` entry-point):
+ *   (circle_address: Address, member_count: u32, round_amount: i128)
+ *
+ * This event is emitted by every newly deployed circle immediately after
+ * `initialize` completes, inside the same transaction as the factory's
+ * `circle_created` event.  The indexer uses it to backfill `member_count`,
+ * `total_rounds`, and `round_amount` on the `circles` row that was created
+ * by the `factory/circle_created` handler (which has those columns set to 0
+ * as placeholders because they are not part of the factory event payload).
+ *
+ * # Invariants
+ *
+ * - `circleAddress` is a non-empty C-prefix contract address.
+ * - `memberCount` is in `[2, 256]` (enforced by `initialize`).
+ * - `roundAmount > 0` (enforced by `initialize`).
+ * - `memberCount` equals `totalRounds` — each member receives exactly one
+ *   round payout over the circle's lifetime.
+ *
+ * @throws `Error` with a descriptive message when the payload is malformed or
+ *   any field has an unexpected type/value.
+ */
+export function parseInitializedEvent(value: unknown): {
+  circleAddress: string;
+  memberCount: number;
+  roundAmount: bigint;
+} {
+  if (!Array.isArray(value) || value.length < 3) {
+    throw new Error(
+      `circle/initialized: expected data tuple [circle_address, member_count, round_amount] ` +
+        `but received ${JSON.stringify(value)}`,
+    );
+  }
+  const [circleAddress, memberCount, roundAmount] = value as [
+    string,
+    number,
+    bigint | number,
+  ];
+
+  if (typeof circleAddress !== "string" || circleAddress.length === 0) {
+    throw new Error(
+      `circle/initialized: circle_address must be a non-empty string, got ${JSON.stringify(circleAddress)}`,
+    );
+  }
+  if (
+    typeof memberCount !== "number" ||
+    !Number.isInteger(memberCount) ||
+    memberCount < 2 ||
+    memberCount > 256
+  ) {
+    throw new Error(
+      `circle/initialized: member_count must be an integer in [2, 256], got ${JSON.stringify(memberCount)}`,
+    );
+  }
+
+  let roundAmountBig: bigint;
+  if (typeof roundAmount === "bigint") {
+    roundAmountBig = roundAmount;
+  } else if (typeof roundAmount === "number" && Number.isInteger(roundAmount) && roundAmount > 0) {
+    roundAmountBig = BigInt(roundAmount);
+  } else {
+    throw new Error(
+      `circle/initialized: round_amount must be a positive bigint or integer, got ${JSON.stringify(roundAmount)}`,
+    );
+  }
+  if (roundAmountBig <= 0n) {
+    throw new Error(
+      `circle/initialized: round_amount must be > 0, got ${roundAmountBig}`,
+    );
+  }
+
+  return { circleAddress, memberCount, roundAmount: roundAmountBig };
+}
+
+/**
+ * Parse the data payload of a `circle/joined` event.
+ *
+ * Contract data tuple (contracts/circle/src/lib.rs — `join` entry-point):
+ *   (circle_address: Address, member: Address, join_order: u32, collateral: i128)
+ *
+ * Invariants:
+ *   - `join_order` is in `[1, member_count]` (1-based join-queue position).
+ *   - When `join_order == member_count` the circle transitions to Active and
+ *     a `circle/active` event follows in the same transaction.
+ *   - `collateral` equals `round_amount × COLLATERAL_MULTIPLIER` (always ≥ 0).
+ *
+ * @throws `Error` with a descriptive message when the payload is malformed or
+ *   any field has an unexpected type/value.
+ */
+export function parseJoinedEvent(value: unknown): {
+  circleAddress: string;
+  member: string;
+  joinOrder: number;
+  collateral: bigint;
+} {
+  if (!Array.isArray(value) || value.length < 4) {
+    throw new Error(
+      `circle/joined: expected data tuple [circle_address, member, join_order, collateral] ` +
+        `but received ${JSON.stringify(value)}`,
+    );
+  }
+  const [circleAddress, member, joinOrder, collateral] = value as [
+    string,
+    string,
+    number,
+    bigint | number,
+  ];
+
+  if (typeof circleAddress !== "string" || circleAddress.length === 0) {
+    throw new Error(
+      `circle/joined: circle_address must be a non-empty string, got ${JSON.stringify(circleAddress)}`,
+    );
+  }
+  if (typeof member !== "string" || member.length === 0) {
+    throw new Error(
+      `circle/joined: member must be a non-empty string, got ${JSON.stringify(member)}`,
+    );
+  }
+  if (typeof joinOrder !== "number" || !Number.isInteger(joinOrder) || joinOrder < 1) {
+    throw new Error(
+      `circle/joined: join_order must be a positive integer (≥ 1), got ${JSON.stringify(joinOrder)}`,
+    );
+  }
+  // collateral is i128 → bigint after scValToNative; accept plain numbers too
+  // (narrower integer types on older SDK versions).
+  let collateralBig: bigint;
+  if (typeof collateral === "bigint") {
+    if (collateral < 0n) {
+      throw new Error(
+        `circle/joined: collateral must be a non-negative bigint or integer, got ${JSON.stringify(collateral.toString())}`,
+      );
+    }
+    collateralBig = collateral;
+  } else if (typeof collateral === "number" && Number.isInteger(collateral) && collateral >= 0) {
+    collateralBig = BigInt(collateral);
+  } else {
+    throw new Error(
+      `circle/joined: collateral must be a non-negative bigint or integer, got ${JSON.stringify(collateral)}`,
+    );
+  }
+
+  return { circleAddress, member, joinOrder, collateral: collateralBig };
+}
+
+/**
  * Parse the data payload of a `factory/circle_created` event.
  *
  * Contract data tuple (contracts/circle_factory/src/lib.rs):
@@ -510,16 +656,50 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
 
 async function handleCircleJoined(client: PoolClient, circleAddr: string, event: SdkEvent) {
   // Event data: (circle_address, member, join_order, collateral_amount)
-  // circle_address is topic-level but also first data element; member is at index [1]
-  const value = getValueNative(event);
-  const memberAddr = Array.isArray(value) ? String(value[1]) : String(value);
+  // Parsed via the typed parseJoinedEvent function — any shape mismatch throws
+  // immediately instead of silently writing wrong data.
+  const { member, joinOrder, collateral } = parseJoinedEvent(getValueNative(event));
 
   await client.query(
-    `UPDATE circle_members SET joined_at = NOW()
-     WHERE circle_address = $1 AND member_address = $2`,
-    [circleAddr, memberAddr],
+    `UPDATE circle_members
+        SET joined_at   = NOW(),
+            join_order  = $3,
+            collateral  = $4
+      WHERE circle_address = $1 AND member_address = $2`,
+    [circleAddr, member, joinOrder, collateral.toString()],
   );
-  console.log(`[indexer] Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
+  console.log(
+    `[indexer] Member joined: ${redactAddress(member)} → ${redactAddress(circleAddr)} ` +
+      `(order=${joinOrder}, collateral=${collateral})`,
+  );
+}
+
+async function handleCircleInitialized(client: PoolClient, circleAddr: string, event: SdkEvent) {
+  // Event data: (circle_address, member_count, round_amount)
+  //
+  // The `factory/circle_created` handler inserts the circles row with
+  // round_amount=0, member_count=0, total_rounds=0 as placeholders because
+  // those fields are not part of the factory event payload.  This handler
+  // backfills the real values once the circle publishes its own initialized
+  // event (which fires inside the same factory transaction, after deploy+init).
+  //
+  // Using ON CONFLICT DO UPDATE ensures idempotency: if the row was somehow
+  // already written with the correct values this is a no-op.
+  const { memberCount, roundAmount } = parseInitializedEvent(getValueNative(event));
+
+  await client.query(
+    `UPDATE circles
+        SET member_count  = $2,
+            total_rounds  = $2,
+            round_amount  = $3,
+            updated_at    = NOW()
+      WHERE address = $1`,
+    [circleAddr, memberCount, roundAmount.toString()],
+  );
+  console.log(
+    `[indexer] Circle initialized: ${redactAddress(circleAddr)} ` +
+      `members=${memberCount} round_amount=${roundAmount}`,
+  );
 }
 
 async function handleCircleActive(client: PoolClient, circleAddr: string) {
@@ -788,6 +968,7 @@ async function processEvents(fromLedger: number, toLedger: number) {
 
     let handler: ((client: PoolClient) => Promise<void>) | null = null;
     switch (t1) {
+      case "initialized": handler = (c) => handleCircleInitialized(c, contractId, event); break;
       case "joined":      handler = (c) => handleCircleJoined(c, contractId, event); break;
       case "active":      handler = (c) => handleCircleActive(c, contractId); break;
       case "contributed": handler = (c) => handleCircleContributed(c, contractId, event); break;

@@ -1,4 +1,8 @@
 // ─── SDK Types ────────────────────────────────────────────────────────────────
+//
+// Public API invariants for every type and helper in this module are documented
+// in docs/API_INVARIANTS.md (section 9 — SDK type-safety invariants).
+// The invariant identifiers (S1, S2, …) used in JSDoc below refer to that table.
 
 export type NetworkPassphrase =
   | "Test SDF Network ; September 2015"
@@ -280,6 +284,26 @@ export interface RawRoundState {
 
 export type CircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
 
+/**
+ * Decoded configuration of a deployed circle contract.
+ *
+ * Returned by `CircleClient.getConfig()`.  All values are read from on-chain
+ * storage via `get_config` simulation and decoded through `mapRawConfig`.
+ *
+ * # Invariants
+ *
+ * - `members.length` is in `[2, 256]` (enforced by `initialize`).
+ * - Every address in `members` is a distinct Stellar account or contract address.
+ * - The order of `members` determines the payout rotation: round `i` pays
+ *   `members[i]`.  This order is fixed at `initialize` time and **never**
+ *   changes regardless of join order.
+ * - `roundAmount > 0n` (enforced by `initialize`).
+ * - `roundAmount × members.length` fits in `i128` (overflow-checked at
+ *   initialize time by the contract).
+ * - `roundDeadlineLedgers` is in `[100, 1_036_800]`.
+ * - `usdcToken` and `reputationContract` are distinct addresses and neither
+ *   equals the circle's own contract address.
+ */
 export interface CircleConfig {
   members: string[];
   roundAmount: bigint;       // in stroops (1 USDC = 10_000_000n)
@@ -288,6 +312,26 @@ export interface CircleConfig {
   roundDeadlineLedgers: number;
 }
 
+/**
+ * Decoded state of the current (or most recent) round.
+ *
+ * Returned by `CircleClient.getCurrentRound()`.
+ *
+ * # Invariants
+ *
+ * - Only readable when `status === "Active"` — throws `ContractError.CircleNotActive`
+ *   otherwise (surfaced as a `ReadFailure` by `getCurrentRoundResult`).
+ * - `roundIndex` is in `[0, member_count - 1]` and strictly increases across
+ *   rounds; it never decrements.
+ * - `recipient` equals `config.members[roundIndex]` — the rotation is position-
+ *   based, not join-order-based.
+ * - `contributionsReceived` is in `[0, member_count]`; it reaches `member_count`
+ *   exactly once per round (the trigger for payout).
+ * - `deadlineLedger` is set at the ledger the circle goes Active (round 0) and
+ *   at each `payout` call for subsequent rounds.
+ * - `paidOut` starts `false`; set to `true` atomically with the pot transfer
+ *   and never reverts (single-use CEI guard).
+ */
 export interface RoundState {
   roundIndex: number;
   recipient: string;
@@ -296,6 +340,17 @@ export interface RoundState {
   paidOut: boolean;
 }
 
+/**
+ * Aggregate snapshot of a circle's on-chain state.
+ *
+ * # Invariants
+ *
+ * - `status` is always one of the four `CircleStatus` variants; the SDK
+ *   throws if the contract returns an unrecognised value.
+ * - `currentRound` is only valid when `status === "Active"`.  For all other
+ *   statuses it is absent or carries a zero-valued sentinel; use
+ *   `CircleClient.getCurrentRoundResult()` to handle this gracefully.
+ */
 export interface CircleState {
   address: string;
   config: CircleConfig;
@@ -303,6 +358,20 @@ export interface CircleState {
   currentRound: RoundState;
 }
 
+/**
+ * Per-member view combining on-chain collateral, defaults, reputation, and
+ * contribution state for the current round.
+ *
+ * # Invariants
+ *
+ * - `collateral ≥ 0n` — the contract clamps penalty deductions to 0.
+ * - `defaults` is the total number of rounds this member has missed across
+ *   the circle's lifetime.  It never decreases.
+ * - `reputationScore` is the member's global reputation score across all
+ *   circles — not circle-scoped.  It is monotonically non-decreasing.
+ * - `hasContributedThisRound` reflects on-chain `has_contributed(member, current_round_index)`;
+ *   it resets to `false` at the start of each new round.
+ */
 export interface MemberState {
   address: string;
   collateral: bigint;
@@ -401,6 +470,12 @@ function describeValue(value: unknown): string {
  * fail loudly at the boundary instead of letting `NaN` or `undefined` flow
  * into domain code.
  *
+ * # Invariant S2
+ *
+ * Throws `TypeError` when the value is not an in-range u32.  The error message
+ * includes `label` (the call-site context) so the source of the bad wire value
+ * is always identifiable without a stack trace.
+ *
  * @param label Call-site context included in the error message,
  *              e.g. `"getDefaults"` or `"mapRawRoundState.round_index"`.
  * @throws `TypeError` when the value is not an in-range u32.
@@ -428,6 +503,12 @@ export function decodeU32(value: unknown, label: string): number {
  * accepted too — a narrower integer type on the contract side is not a
  * correctness problem — but only when it is a safe integer, because beyond
  * 2^53 the conversion would silently round a monetary amount.
+ *
+ * # Invariant S2
+ *
+ * Throws `TypeError` when the value cannot be represented losslessly.  This
+ * prevents silent monetary rounding when a financial field (e.g. `round_amount`,
+ * `collateral`) arrives as an unsafe number.
  *
  * @param label Call-site context included in the error message.
  * @throws `TypeError` when the value cannot be represented losslessly.
@@ -1023,10 +1104,27 @@ export interface ApiCircleRow {
  * A member record as returned by GET /circles/:address and
  * GET /circles/:address/members.
  * `collateral` is in stroops (string-serialised).
+ *
+ * # Invariants
+ *
+ * - `payout_order` is the 0-based position in the configured rotation order.
+ *   Round `i` pays the member with `payout_order === i`.  This is fixed at
+ *   circle creation time and never changes.
+ * - `join_order` is the 1-based position in the actual join sequence (who
+ *   joined first, second, etc.).  `null` for circles indexed before migration
+ *   004 (the field is nullable by design for backward compatibility).
+ * - `collateral` is the USDC amount locked at join time in stroops.  `"0"` for
+ *   members who have not yet joined (pre-join placeholder rows).
+ * - `defaults` is the total number of rounds this member has missed.
  */
 export interface ApiMemberRow {
   member_address: string;
   payout_order: number;
+  /**
+   * 1-based position in the join queue (1 = first to join, N = last / triggers Active).
+   * `null` for rows created before migration 004 or members who have not joined.
+   */
+  join_order: number | null;
   /** Locked collateral, in stroops (string-serialised). */
   collateral: string;
   defaults: number;

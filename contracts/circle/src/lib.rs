@@ -67,6 +67,8 @@ mod event_namespace_tests; // event namespace consistency (issue #566)
 mod error_path_tests; // no swallowed errors / defaulted counters (issue #567)
 #[cfg(test)]
 mod transfer_failure_tests; // failed token transfer handling (issue #573)
+#[cfg(test)]
+mod test_support_tests; // type-safe builder API tests (issue #574)
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
