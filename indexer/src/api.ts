@@ -467,6 +467,7 @@ interface EventTypeCountRow {
   count: string;
 }
 
+
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
@@ -722,10 +723,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           `SELECT cm.member_address, cm.payout_order, cm.collateral,
                   cm.defaults, cm.joined_at,
                   r.score as reputation_score,
-                  (
-                    SELECT COUNT(*) FROM contributions c2
-                    WHERE c2.circle_address = cm.circle_address
-                      AND c2.member_address = cm.member_address
+                  COALESCE(
+                    (SELECT COUNT(*) FROM contributions c2
+                     WHERE c2.circle_address = cm.circle_address
+                       AND c2.member_address = cm.member_address),
+                    0
                   ) as total_contributions
            FROM circle_members cm
            LEFT JOIN reputation r ON r.member_address = cm.member_address
@@ -753,7 +755,10 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       ]);
 
       res.json({
-        members,
+        members: members.map((m) => ({
+          ...m,
+          total_contributions: Number(m.total_contributions),
+        })),
         totals: {
           memberCount: Number(totals.member_count),
           totalCollateral: totals.total_collateral,
