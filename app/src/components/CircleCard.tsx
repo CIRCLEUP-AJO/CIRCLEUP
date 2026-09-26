@@ -2,25 +2,12 @@
 import { memo } from "react";
 import Link from "next/link";
 import { shortAddress, formatUsdc, formatPot } from "@/lib/config";
-import { isCanonicalStellarAddress } from "@/lib/address";
 import clsx from "clsx";
-
-/** Indexer list shape for a circle. Mirrors ApiCircleRow in sdk/src/types.ts.
- *  Keep in sync when the indexer schema changes. */
-export interface Circle {
-  address: string;
-  creator: string;
-  /** Per-member round contribution, in stroops */
-  round_amount: string;
-  member_count: number;
-  /** Canonical values from the contract's CircleStatus enum:
-   *  "Pending" | "Active" | "Completed" | "Cancelled". Kept as string
-   *  because the value arrives from the indexer/RPC untyped. */
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  created_ledger: number;
-}
+// Re-export the shared type and parser so existing imports from this file
+// continue to resolve.  The canonical definitions now live in circleTypes.ts.
+export type { Circle } from "@/lib/circleTypes";
+export { parseCircleRow } from "@/lib/circleTypes";
+import type { Circle } from "@/lib/circleTypes";
 
 interface StatusMeta {
   label: string;
@@ -68,50 +55,9 @@ const STATUS_META: Record<string, StatusMeta> = {
 
 // ─── Row validation ───────────────────────────────────────────────────────────
 //
-// The indexer response consumed by page.tsx is untyped JSON. Casting it
-// straight to Circle[] would let a single malformed row — a missing field, a
-// non-canonical address, a negative count — propagate into rendering as a
-// broken link, a NaN-derived amount, or a thrown exception that takes the
-// whole list down with it. parseCircleRow is the one place raw JSON is
-// allowed to become a Circle; page.tsx drops whatever this rejects instead of
-// passing an unchecked cast across the card boundary.
-
-function isFiniteNonNegativeInt(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-/** Validates and narrows an unknown JSON value to a {@link Circle}, or returns
- *  `null` for a malformed row (never throws). */
-export function parseCircleRow(raw: unknown): Circle | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const row = raw as Record<string, unknown>;
-
-  const { address, creator, round_amount, member_count, status, current_round, total_rounds, created_ledger } =
-    row;
-
-  // address / creator: circles are Soroban contracts (C…); creator may be a
-  // wallet (G…) or, for multisig-created circles, a contract (C…) — accept
-  // either canonical form so a broken/empty value never reaches a Link href.
-  if (typeof address !== "string" || !isCanonicalStellarAddress(address)) return null;
-  if (typeof creator !== "string" || !isCanonicalStellarAddress(creator)) return null;
-  if (typeof round_amount !== "string" || !/^\d+$/.test(round_amount.trim())) return null;
-  if (!isFiniteNonNegativeInt(member_count)) return null;
-  if (typeof status !== "string" || status.trim() === "") return null;
-  if (!isFiniteNonNegativeInt(current_round)) return null;
-  if (!isFiniteNonNegativeInt(total_rounds)) return null;
-  if (!isFiniteNonNegativeInt(created_ledger)) return null;
-
-  return {
-    address,
-    creator,
-    round_amount,
-    member_count,
-    status,
-    current_round,
-    total_rounds,
-    created_ledger,
-  };
-}
+// parseCircleRow is now the shared validator exported from @/lib/circleTypes.
+// The re-export above keeps existing `import { parseCircleRow } from
+// "@/components/CircleCard"` call sites working without changes.
 
 export function getStatusMeta(status: string): StatusMeta {
   const known = STATUS_META[status?.trim().toLowerCase()];

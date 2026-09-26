@@ -4,30 +4,10 @@ import { useState, useEffect, useCallback } from "react";
 import { indexerEndpoint, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
 import { isCanonicalStellarAddress } from "@/lib/address";
-
-// ─── Local type definition ────────────────────────────────────────────────────
-//
-// The app package does not depend on @circleup/sdk directly; types that mirror
-// indexer API shapes are declared here. Keep in sync with:
-//   sdk/src/types.ts → ApiReputationResponse
-
-/** @see ApiReputationResponse in sdk/src/types.ts */
-interface ReputationResponse {
-  member: string;
-  /** true when a reputation row exists; false means no activity recorded yet. */
-  found: boolean;
-  score: number;
-  contributions: Array<{
-    circle_address: string;
-    contributions: number;
-    total_rounds: number;
-  }>;
-  defaults: Array<{
-    circle_address: string;
-    count: number;
-  }>;
-  updatedAt: string | null;
-}
+// Issue #513: ReputationResponse is now the shared type from circleTypes.ts.
+// parseReputationResponse validates the raw JSON at the network boundary
+// instead of the previous bare `as ReputationResponse` cast.
+import { type ReputationResponse, parseReputationResponse } from "@/lib/circleTypes";
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
@@ -58,7 +38,12 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
     if (res.status === 404) return { ok: false, reason: "not_found" };
     if (res.status === 503) return { ok: false, reason: "indexer_outage" };
     if (!res.ok) return { ok: false, reason: "unknown" };
-    return { ok: true, data: (await res.json()) as ReputationResponse };
+    // Issue #513: validate the response shape before returning it as typed data.
+    // The bare `as ReputationResponse` cast was previously here; a malformed or
+    // unexpected response would have propagated into the render tree silently.
+    const parsed = parseReputationResponse(await res.json());
+    if (!parsed) return { ok: false, reason: "unknown" };
+    return { ok: true, data: parsed };
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
       return { ok: false, reason: "aborted" };
