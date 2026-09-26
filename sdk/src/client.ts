@@ -224,6 +224,123 @@ function validatePollConfig(cfg: Required<PollConfig>): void {
   }
 }
 
+// ─── Stale-state message formatter ───────────────────────────────────────────
+
+/**
+ * Build a single human-readable sentence summarising all the state fields that
+ * diverged between what the caller expected and what was found on-chain.
+ *
+ * Used by {@link CircleClient.preflight} to populate {@link PreflightStale.message}.
+ */
+function formatMismatchMessage(mismatches: readonly import("./types").StateMismatch[]): string {
+  if (mismatches.length === 0) return "State is fresh.";
+  const parts = mismatches.map(
+    (m) => `${m.field} changed from ${JSON.stringify(m.expected)} to ${JSON.stringify(m.actual)}`,
+  );
+  return `On-chain state has changed since you last loaded this page: ${parts.join("; ")}. Refresh and try again.`;
+}
+
+// ─── Transient RPC retry ──────────────────────────────────────────────────────
+
+/**
+ * Return true when `err` is a transient network or rate-limit condition that
+ * is safe to retry.  Non-transient errors (auth, bad request, simulation
+ * errors) propagate immediately so the caller gets feedback right away.
+ *
+ * Exported for unit testing.
+ */
+export function isTransientRpcError(err: unknown): boolean {
+  if (err == null) return false;
+
+  const code =
+    typeof err === "object" && err !== null && "code" in err
+      ? String((err as { code?: unknown }).code)
+      : "";
+  const status =
+    typeof err === "object" && err !== null && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  const message = err instanceof Error ? err.message : String(err);
+  const lower = message.toLowerCase();
+
+  if (
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND" ||
+    code === "EAI_AGAIN" ||
+    code === "EPIPE" ||
+    code === "EHOSTUNREACH"
+  ) {
+    return true;
+  }
+
+  if (status === 429 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+
+  return (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up") ||
+    lower.includes("network") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("fetch failed") ||
+    lower.includes("temporarily unavailable") ||
+    lower.includes("service unavailable") ||
+    lower.includes("bad gateway") ||
+    lower.includes("gateway timeout")
+  );
+}
+
+/**
+ * Run a single Soroban RPC call with capped exponential backoff + full jitter
+ * on transient failures.
+ *
+ * - Transient errors (network blips, rate-limits, gateway errors) are retried
+ *   up to `maxAttempts` times.
+ * - Non-transient errors propagate immediately, preserving fast failure for
+ *   bad requests and auth errors.
+ *
+ * Full jitter: delay for attempt N is random in [0, baseDelayMs × 2^(N-1)].
+ *
+ * Exported for unit testing.
+ *
+ * @param label       Short human-readable name used in error messages.
+ * @param fn          The RPC call to execute.
+ * @param maxAttempts Total attempts (first try + retries). Default: 3.
+ * @param baseDelayMs Base delay in ms for the first retry. Default: 400.
+ * @param sleep       Injectable sleep for testing.
+ */
+export async function withRpcRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+  baseDelayMs = 400,
+  sleep: (ms: number) => Promise<void> = (ms) =>
+    new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  let lastErr: unknown;
+  const attempts = Math.max(1, maxAttempts);
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientRpcError(err) || attempt === attempts) break;
+      const ceiling = baseDelayMs * 2 ** (attempt - 1);
+      const delayMs = Math.floor(Math.random() * ceiling);
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastErr;
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /** Build a typed failure result. */
@@ -655,6 +772,21 @@ export interface WriteOptions {
    * idempotency key — see {@link TxMetadata}.
    */
   metadata?: TxMetadata;
+  /**
+   * Opt-in stale-write preflight for mutations that support it.
+   *
+   * When supplied, the mutation force-refreshes the on-chain state, compares
+   * it against the expectations declared here, and returns a {@link TxFailure}
+   * with `errorCode: "stale_state"` if anything has moved.
+   *
+   * Only `markDefault` currently honours this field.  Other mutations accept
+   * it silently (ignored) for API consistency so callers can pass a uniform
+   * options object to all write methods without branching on the method name.
+   *
+   * Prefer {@link CircleClient.preflight} when you need full stale-state
+   * checking across all mutation methods.
+   */
+  expected?: ExpectedState;
 }
 
 /**
@@ -841,7 +973,9 @@ export class CircleUpClient {
 
     let account: Awaited<ReturnType<typeof this.rpc.getAccount>>;
     try {
-      account = await this.rpc.getAccount(sourceKeypair.publicKey());
+      account = await withRpcRetry("getAccount", () =>
+        this.rpc.getAccount(sourceKeypair.publicKey()),
+      );
     } catch (err: any) {
       const msg = err?.message ?? "network error";
       // HTTP 404 from getAccount means the account has never been funded.
@@ -878,10 +1012,14 @@ export class CircleUpClient {
       );
     }
 
-    // Simulate first to get footprint + fee
+    // Simulate first to get footprint + fee.
+    // withRpcRetry absorbs transient network blips before escalating to the
+    // typed TxFailure path.
     let simResult: Awaited<ReturnType<typeof this.rpc.simulateTransaction>>;
     try {
-      simResult = await this.rpc.simulateTransaction(tx);
+      simResult = await withRpcRetry("simulateTransaction", () =>
+        this.rpc.simulateTransaction(tx),
+      );
     } catch (err: any) {
       return txFailure(
         "",
@@ -918,7 +1056,12 @@ export class CircleUpClient {
 
     let sendResult: Awaited<ReturnType<typeof this.rpc.sendTransaction>>;
     try {
-      sendResult = await this.rpc.sendTransaction(preparedTx);
+      // withRpcRetry only retries transient errors (connection reset, rate-limit).
+      // An "ERROR" status means the transaction was network-rejected and must
+      // NOT be retried — resubmission would attempt a duplicate.
+      sendResult = await withRpcRetry("sendTransaction", () =>
+        this.rpc.sendTransaction(preparedTx),
+      );
     } catch (err: any) {
       return txFailure(
         "",
@@ -1150,7 +1293,9 @@ export class CircleUpClient {
 
     let simResult: Awaited<ReturnType<typeof this.rpc.simulateTransaction>>;
     try {
-      simResult = await this.rpc.simulateTransaction(tx);
+      simResult = await withRpcRetry("simulateTransaction(read)", () =>
+        this.rpc.simulateTransaction(tx),
+      );
     } catch (err: any) {
       return {
         ok: false,
@@ -1448,6 +1593,10 @@ export class CircleClient extends CircleUpClient {
   }
 
   async contribute(member: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const stale = await this.preflightGuard(
+      options?.expected ? { expected: options.expected } : undefined,
+    );
+    if (stale) return stale;
     const result = await this.encodeAndSend(
       member,
       this.circleAddress,
@@ -1460,6 +1609,10 @@ export class CircleClient extends CircleUpClient {
   }
 
   async payout(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const stale = await this.preflightGuard(
+      options?.expected ? { expected: options.expected } : undefined,
+    );
+    if (stale) return stale;
     const result = await this.buildAndSend(
       caller,
       this.circleAddress,
@@ -1493,7 +1646,9 @@ export class CircleClient extends CircleUpClient {
         sanitizeTxMetadata(options?.metadata),
       );
     }
-    const stale = await this.preflightGuard(preflight);
+    const stale = await this.preflightGuard(
+      options?.expected ? { expected: options.expected } : undefined,
+    );
     if (stale) return stale;
     const result = await this.encodeAndSend(
       caller,
@@ -1507,6 +1662,10 @@ export class CircleClient extends CircleUpClient {
   }
 
   async close(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const stale = await this.preflightGuard(
+      options?.expected ? { expected: options.expected } : undefined,
+    );
+    if (stale) return stale;
     const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
