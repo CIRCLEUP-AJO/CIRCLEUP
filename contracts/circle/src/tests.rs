@@ -980,9 +980,9 @@ mod circle_tests {
 
     // ── circle.joined event ───────────────────────────────────────────────────
     //
-    // The `joined` event data is a tuple `(Address, u32)` where the first
-    // element is the joining member's address and the second is their 1-based
-    // position in the join queue (1 = first to join, N = last / activating join).
+    // The `joined` event data is `(circle_address, member, join_order,
+    // collateral_amount)`.  `join_order` is the member's 1-based position in
+    // the join queue (1 = first to join, N = last / activating join).
     // These tests act as a contract-level API guarantee for the event shape.
 
     #[test]
@@ -995,10 +995,10 @@ mod circle_tests {
         let joined = events_named(&t.env, "joined");
         assert_eq!(joined.len(), 1, "expected exactly one 'joined' event");
 
-        // The data payload is `(member: Address, order: u32)`.
+        // The data payload is `(circle_address, member, join_order, collateral)`.
         // Decode via the tuple IntoVal / FromVal round-trip.
         let data_val = joined[0].clone();
-        let (member, order): (Address, u32) =
+        let (_circle, member, order, _collateral): (Address, Address, u32, i128) =
             soroban_sdk::FromVal::from_val(&t.env, &data_val);
         assert_eq!(member, t.alice, "event member must be the joining address");
         assert_eq!(order, 1u32, "alice is the first to join — order must be 1");
@@ -1018,7 +1018,7 @@ mod circle_tests {
 
         let expected_members = [&t.alice, &t.bob, &t.carol, &t.dave];
         for (i, (val, &expected_member)) in joined.iter().zip(expected_members.iter()).enumerate() {
-            let (member, order): (Address, u32) =
+            let (_circle, member, order, _collateral): (Address, Address, u32, i128) =
                 soroban_sdk::FromVal::from_val(&t.env, val);
             assert_eq!(
                 member, *expected_member,
@@ -1042,7 +1042,7 @@ mod circle_tests {
 
         // The final join (dave) should carry order == 4 == total member count.
         let last_val = joined.last().unwrap().clone();
-        let (member, order): (Address, u32) =
+        let (_circle, member, order, _collateral): (Address, Address, u32, i128) =
             soroban_sdk::FromVal::from_val(&t.env, &last_val);
         assert_eq!(member, t.dave);
         assert_eq!(
