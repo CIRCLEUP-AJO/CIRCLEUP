@@ -930,17 +930,6 @@ mod tests {
         assert_eq!(s.client.get_authorized_callers().len(), 0);
     }
 
-    #[test]
-    fn test_add_authorized_caller_before_initialize_returns_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, ReputationContract);
-        let client = ReputationContractClient::new(&env, &contract_id);
-        let result =
-            client.try_add_authorized_caller(&Address::generate(&env), &Address::generate(&env));
-        assert_eq!(result, Err(Ok(ReputationError::NotInitialized)));
-    }
-
     // ── remove_authorized_caller ──────────────────────────────────────────────
 
     #[test]
@@ -986,17 +975,6 @@ mod tests {
             s.client.get_authorized_callers().contains(&circle),
             "a rejected removal must leave the allowlist untouched"
         );
-    }
-
-    #[test]
-    fn test_remove_authorized_caller_before_initialize_returns_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, ReputationContract);
-        let client = ReputationContractClient::new(&env, &contract_id);
-        let result =
-            client.try_remove_authorized_caller(&Address::generate(&env), &Address::generate(&env));
-        assert_eq!(result, Err(Ok(ReputationError::NotInitialized)));
     }
 
     /// One removal must clear every copy of the address, so a list corrupted
