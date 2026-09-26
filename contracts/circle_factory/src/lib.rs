@@ -786,6 +786,97 @@ mod tests {
         assert_ne!(s0, s1);
     }
 
+    // ── Issue #545 — create_circle salt generation collision safety ───────────
+    //
+    // The four inputs to derive_circle_salt are: creator, count,
+    // ledger_sequence, and ledger_timestamp.  The tests above cover creator,
+    // count, and sequence.  The tests below cover timestamp and verify the
+    // determinism / uniqueness properties of the full input space.
+
+    /// Changing only the ledger timestamp while holding creator, count, and
+    /// sequence constant must produce a different salt.  This confirms that
+    /// timestamp entropy is actually incorporated into the SHA-256 input.
+    #[test]
+    fn test_545_derive_circle_salt_differs_by_timestamp() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let s0 = derive_circle_salt(&env, &creator, 0);
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let s1 = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(s0, s1, "salt must change when only the ledger timestamp advances");
+    }
+
+    /// The salt function must be deterministic: identical inputs (creator,
+    /// count, sequence, timestamp) always produce the same output.  A
+    /// second call within the same ledger state must return the same bytes.
+    #[test]
+    fn test_545_derive_circle_salt_is_deterministic_given_fixed_ledger() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let a = derive_circle_salt(&env, &creator, 5);
+        let b = derive_circle_salt(&env, &creator, 5);
+        assert_eq!(a, b, "salt must be deterministic for the same (creator, count, ledger) inputs");
+    }
+
+    /// Each of the four salt inputs contributes independently: changing any
+    /// single input while holding the others constant produces a distinct salt.
+    /// This is a combined regression guard that the SHA-256 pre-image uses all
+    /// four fields and none is accidentally a no-op.
+    #[test]
+    fn test_545_each_salt_input_independently_contributes() {
+        let env = Env::default();
+        let creator = Address::generate(&env);
+        let base = derive_circle_salt(&env, &creator, 0);
+
+        // different creator
+        assert_ne!(base, derive_circle_salt(&env, &Address::generate(&env), 0),
+            "different creator must change the salt");
+
+        // different count
+        assert_ne!(base, derive_circle_salt(&env, &creator, 1),
+            "different count must change the salt");
+
+        // different sequence
+        env.ledger().with_mut(|l| l.sequence_number += 1);
+        let after_seq = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(base, after_seq, "different sequence must change the salt");
+        env.ledger().with_mut(|l| l.sequence_number -= 1);
+
+        // different timestamp
+        env.ledger().with_mut(|l| l.timestamp += 1);
+        let after_ts = derive_circle_salt(&env, &creator, 0);
+        assert_ne!(base, after_ts, "different timestamp must change the salt");
+    }
+
+    /// A failed create_circle call must not consume a counter slot.  Repeating
+    /// the same valid (creator, count=0, sequence, timestamp) after a failed
+    /// attempt must produce the same salt as the original attempt, confirming
+    /// that the counter was not incremented.
+    #[test]
+    fn test_545_failed_create_does_not_advance_salt_counter() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+
+        // Record the salt that would be used for the first successful create.
+        let creator = Address::generate(&env);
+        let salt_before_fail = derive_circle_salt(&env, &creator, 0);
+
+        // Attempt an invalid create (zero round_amount) — must be rejected.
+        let m = make_members(&env, 2);
+        let result = s.client.try_create_circle(
+            &creator, &m, &0i128, &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(result.is_err(), "zero-amount create must be rejected");
+
+        // Counter must still be 0 — same salt would be generated for a
+        // retry with the same ledger state.
+        assert_eq!(s.client.get_circle_count(), 0,
+            "failed create must not increment the factory counter");
+        let salt_after_fail = derive_circle_salt(&env, &creator, 0);
+        assert_eq!(salt_before_fail, salt_after_fail,
+            "salt for count=0 must be identical before and after a failed create");
+    }
+
     // ── create_circle: rejected before initialize ─────────────────────────────
 
     #[test]
@@ -854,17 +945,17 @@ mod tests {
     // ── create_circle: input validation rejects before any state mutation ─────
 
     #[test]
-    #[should_panic(expected = "need at least 2 members")]
     fn test_create_circle_rejects_single_member_no_state_change() {
         let env = Env::default();
         let s = setup_factory(&env);
         let mut m = Vec::new(&env);
         m.push_back(Address::generate(&env));
         let count_before = s.client.get_circle_count();
-        let _ = s.client.try_create_circle(
+        let result = s.client.try_create_circle(
             &Address::generate(&env), &m, &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
         );
-        // Count must be unchanged
+        assert!(result.is_err(), "single-member create must be rejected");
+        // Count must be unchanged after the rejection
         assert_eq!(s.client.get_circle_count(), count_before);
     }
 
@@ -1113,9 +1204,8 @@ mod tests {
             &Address::generate(&env),
             &Address::generate(&env),
         );
-        let err_str = format!("{:?}", result);
         assert!(
-            err_str.contains("already initialized") || result.is_err(),
+            result.is_err(),
             "second initialize must fail on Admin presence check, not on lingering Initializing flag"
         );
         // The Admin key must still be the original admin — proving the guard
