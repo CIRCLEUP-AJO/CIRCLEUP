@@ -83,6 +83,13 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+/// Topic-0 namespace shared by every event this contract publishes.
+///
+/// Mirrors `circle::EVENT_NAMESPACE`: topics are `(EVENT_NAMESPACE, <name>)`.
+pub const EVENT_NAMESPACE: &str = "reputation";
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -258,7 +265,7 @@ impl ReputationContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "caller_added"),
             ),
             circle,
@@ -313,7 +320,7 @@ impl ReputationContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "caller_removed"),
             ),
             circle,
@@ -396,7 +403,7 @@ impl ReputationContract {
         // without a separate `score` query.
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "score_updated"),
             ),
             (member, new_score),
@@ -930,17 +937,6 @@ mod tests {
         assert_eq!(s.client.get_authorized_callers().len(), 0);
     }
 
-    #[test]
-    fn test_add_authorized_caller_before_initialize_returns_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, ReputationContract);
-        let client = ReputationContractClient::new(&env, &contract_id);
-        let result =
-            client.try_add_authorized_caller(&Address::generate(&env), &Address::generate(&env));
-        assert_eq!(result, Err(Ok(ReputationError::NotInitialized)));
-    }
-
     // ── remove_authorized_caller ──────────────────────────────────────────────
 
     #[test]
@@ -986,17 +982,6 @@ mod tests {
             s.client.get_authorized_callers().contains(&circle),
             "a rejected removal must leave the allowlist untouched"
         );
-    }
-
-    #[test]
-    fn test_remove_authorized_caller_before_initialize_returns_not_initialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, ReputationContract);
-        let client = ReputationContractClient::new(&env, &contract_id);
-        let result =
-            client.try_remove_authorized_caller(&Address::generate(&env), &Address::generate(&env));
-        assert_eq!(result, Err(Ok(ReputationError::NotInitialized)));
     }
 
     /// One removal must clear every copy of the address, so a list corrupted

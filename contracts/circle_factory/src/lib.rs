@@ -86,6 +86,13 @@ pub enum DataKey {
     Initializing,
 }
 
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+/// Topic-0 namespace shared by every event this contract publishes.
+///
+/// Mirrors `circle::EVENT_NAMESPACE`: topics are `(EVENT_NAMESPACE, <name>)`.
+pub const EVENT_NAMESPACE: &str = "factory";
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Reject member lists that contain the same address more than once.
@@ -309,11 +316,20 @@ impl CircleFactory {
         // The counter is mixed into the deploy salt. It is only incremented
         // after the full deploy+init+register sequence succeeds, so a failed
         // create never burns a counter slot.
+        // Both registry keys are written by `initialize`.  Treat a missing key
+        // as a storage inconsistency instead of defaulting it: a defaulted
+        // counter would reuse salts, and a defaulted empty list would wipe
+        // every previously registered circle on the write in step 7.
         let count: u32 = env
             .storage()
             .instance()
             .get(&DataKey::CircleCount)
-            .unwrap_or(0);
+            .unwrap_or_else(|| panic!("factory: CircleCount missing — storage inconsistency"));
+        let mut circles: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circles)
+            .unwrap_or_else(|| panic!("factory: Circles registry missing — storage inconsistency"));
 
         let salt = derive_circle_salt(&env, &creator, count);
 
@@ -364,11 +380,6 @@ impl CircleFactory {
         // ── 7. Commit registry state (only reached on full success) ──────────
         // Both writes happen together; they are the only factory state mutations
         // in create_circle. count + 1 always equals circles.len() after this.
-        let mut circles: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circles)
-            .unwrap_or(Vec::new(&env));
         circles.push_back(circle_address.clone());
         env.storage().instance().set(&DataKey::Circles, &circles);
         env.storage().instance().set(&DataKey::CircleCount, &(count + 1));
@@ -402,7 +413,7 @@ impl CircleFactory {
         // Stability: topics and field order are stable (see docs/EVENTS.md).
         // A future change that adds fields must append them and update EVENTS.md.
         env.events().publish(
-            (Symbol::new(&env, "factory"), Symbol::new(&env, "circle_created")),
+            (Symbol::new(&env, EVENT_NAMESPACE), Symbol::new(&env, "circle_created")),
             (circle_address.clone(), creator, count),
         );
 
@@ -791,6 +802,53 @@ mod tests {
             &1_000_000i128,
             &MIN_ROUND_DEADLINE_LEDGERS,
         );
+    }
+
+    // ── create_circle: registry keys must exist (issue #567) ─────────────────
+    //
+    // A missing counter or list on an initialized factory is a storage
+    // inconsistency.  Defaulting them would reuse deploy salts or overwrite
+    // the registry with only the new circle, so both are rejected before the
+    // deploy step.
+
+    #[test]
+    #[should_panic(expected = "factory: Circles registry missing")]
+    fn test_create_circle_rejects_missing_circles_registry() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+        env.as_contract(&s.client.address, || {
+            env.storage().instance().remove(&DataKey::Circles);
+        });
+        s.client.create_circle(
+            &Address::generate(&env), &make_members(&env, 2), &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "factory: CircleCount missing")]
+    fn test_create_circle_rejects_missing_circle_count() {
+        let env = Env::default();
+        let s = setup_factory(&env);
+        env.as_contract(&s.client.address, || {
+            env.storage().instance().remove(&DataKey::CircleCount);
+        });
+        s.client.create_circle(
+            &Address::generate(&env), &make_members(&env, 2), &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+    }
+
+    // ── Event namespaces (issue #566) ─────────────────────────────────────────
+
+    /// The indexer routes events by topic 0; the three contracts must each
+    /// own a distinct, stable namespace.
+    #[test]
+    fn test_event_namespaces_are_stable_and_distinct() {
+        assert_eq!(EVENT_NAMESPACE, "factory");
+        assert_eq!(circle::EVENT_NAMESPACE, "circle");
+        assert_eq!(reputation::EVENT_NAMESPACE, "reputation");
+        assert_ne!(EVENT_NAMESPACE, circle::EVENT_NAMESPACE);
+        assert_ne!(EVENT_NAMESPACE, reputation::EVENT_NAMESPACE);
+        assert_ne!(circle::EVENT_NAMESPACE, reputation::EVENT_NAMESPACE);
     }
 
     // ── create_circle: input validation rejects before any state mutation ─────
