@@ -83,6 +83,13 @@
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+/// Topic-0 namespace shared by every event this contract publishes.
+///
+/// Mirrors `circle::EVENT_NAMESPACE`: topics are `(EVENT_NAMESPACE, <name>)`.
+pub const EVENT_NAMESPACE: &str = "reputation";
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -258,7 +265,7 @@ impl ReputationContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "caller_added"),
             ),
             circle,
@@ -313,7 +320,7 @@ impl ReputationContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "caller_removed"),
             ),
             circle,
@@ -396,7 +403,7 @@ impl ReputationContract {
         // without a separate `score` query.
         env.events().publish(
             (
-                Symbol::new(&env, "reputation"),
+                Symbol::new(&env, EVENT_NAMESPACE),
                 Symbol::new(&env, "score_updated"),
             ),
             (member, new_score),

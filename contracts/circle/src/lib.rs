@@ -57,6 +57,16 @@ mod prop_tests; // property-based / fuzz-style harness (issue #167)
 mod mutation_guards; // explicit guard-removal / mutation tests
 #[cfg(test)]
 mod adversarial_tests; // adversarial authorization tests (issue #87)
+#[cfg(test)]
+mod test_support; // shared fixture for the issue-scoped modules below
+#[cfg(test)]
+mod join_order_tests; // join order and address mismatches (issue #572)
+#[cfg(test)]
+mod event_namespace_tests; // event namespace consistency (issue #566)
+#[cfg(test)]
+mod error_path_tests; // no swallowed errors / defaulted counters (issue #567)
+#[cfg(test)]
+mod transfer_failure_tests; // failed token transfer handling (issue #573)
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
@@ -253,6 +263,25 @@ pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
 /// transfers collateral to every member).
 pub const MAX_MEMBERS: u32 = 256;
 
+// ─── Events ───────────────────────────────────────────────────────────────────
+
+/// Topic-0 namespace shared by every event this contract publishes.
+///
+/// Every circle event is published with topics `(EVENT_NAMESPACE, <name>)`
+/// and carries the emitting `circle_address` as its **first data field**, so
+/// indexers can filter on one topic and attribute each event to its circle
+/// from the payload alone.  The factory and reputation contracts follow the
+/// same convention with their own namespaces (`"factory"`, `"reputation"`).
+///
+/// Build topics with [`event_topics`] instead of spelling the namespace
+/// inline, so a typo cannot silently route an event past the indexer.
+pub const EVENT_NAMESPACE: &str = "circle";
+
+/// Topics tuple `(EVENT_NAMESPACE, name)` for a circle event.
+fn event_topics(env: &Env, name: &str) -> (Symbol, Symbol) {
+    (Symbol::new(env, EVENT_NAMESPACE), Symbol::new(env, name))
+}
+
 // ─── Protocol params struct ───────────────────────────────────────────────────
 
 /// A snapshot of all tunable protocol constants for this contract.
@@ -317,6 +346,20 @@ impl CircleContract {
     /// failure (insufficient balance, missing trustline, frozen account,
     /// deauthorized asset, etc.) surfaces as a clear, contextual panic
     /// message instead of an opaque trap propagated from the token contract.
+    ///
+    /// # Failure semantics
+    ///
+    /// Only `Ok(Ok(()))` counts as success.  Any other outcome — a token
+    /// contract error, a host-level invoke error, or a return value that does
+    /// not decode as `()` — panics.  The panic rolls back the whole invocation,
+    /// including every storage write the caller made before the transfer
+    /// (reserved collateral slots, `paid_out` flags, `Closed`, …), so a failed
+    /// transfer can never leave a half-applied state change behind and the
+    /// operation can be retried once the underlying cause is fixed.
+    ///
+    /// A non-positive `amount` is rejected before calling the token: every
+    /// caller moves a strictly positive amount, so zero or negative here means
+    /// an upstream accounting bug rather than a legitimate no-op.
     fn safe_transfer(
         token_client: &token::Client,
         from: &Address,
@@ -324,12 +367,58 @@ impl CircleContract {
         amount: &i128,
         context: &str,
     ) {
-        if token_client.try_transfer(from, to, amount).is_err() {
+        if *amount <= 0 {
             panic!(
-                "USDC transfer failed during {}: check balance, trustline, and authorization",
+                "USDC transfer rejected during {}: amount must be positive",
                 context
             );
         }
+        match token_client.try_transfer(from, to, amount) {
+            Ok(Ok(())) => {}
+            _ => panic!(
+                "USDC transfer failed during {}: check balance, trustline, and authorization",
+                context
+            ),
+        }
+    }
+
+    /// Award one reputation point to `recipient` via the configured
+    /// reputation contract.
+    ///
+    /// Every non-success outcome panics (rolling back the settlement — see the
+    /// reputation failure policy on `payout`).  The typed `ReputationError`, when
+    /// available, is included in the message so operators can tell an
+    /// unregistered circle (`UnauthorizedCaller`) from an uninitialized
+    /// reputation contract (`NotInitialized`) without replaying the trace.
+    fn award_reputation(env: &Env, reputation_contract: &Address, recipient: &Address) {
+        let rep_client = reputation::ReputationContractClient::new(env, reputation_contract);
+        match rep_client.try_increment(&env.current_contract_address(), recipient) {
+            Ok(Ok(())) => {}
+            Err(Ok(err)) => panic!(
+                "circle: reputation increment failed ({:?}) — ensure this circle is registered as an authorized caller on the reputation contract",
+                err
+            ),
+            _ => panic!(
+                "circle: reputation increment failed — reputation contract returned an invalid response"
+            ),
+        }
+    }
+
+    /// Increment `RoundsCompleted` by one.
+    ///
+    /// The counter is written at `initialize`, so a missing key on a settling
+    /// circle is a storage inconsistency.  Defaulting it to 0 would silently
+    /// restart the count and make `close` misreport how many rounds were paid.
+    fn bump_rounds_completed(env: &Env) {
+        let completed: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoundsCompleted)
+            .unwrap_or_else(|| panic!("circle: RoundsCompleted missing — storage inconsistency"));
+        let next = completed
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("circle: RoundsCompleted overflow"));
+        env.storage().instance().set(&DataKey::RoundsCompleted, &next);
     }
 
     /// Panics with a clear message if the circle is currently paused.
@@ -569,7 +658,7 @@ impl CircleContract {
         //   member_count   — number of members configured (equals total rounds)
         //   round_amount   — USDC stroops each member contributes per round
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "initialized")),
+            event_topics(&env, "initialized"),
             (env.current_contract_address(), member_count, round_amount),
         );
     }
@@ -639,13 +728,17 @@ impl CircleContract {
             .persistent()
             .set(&collateral_key, &collateral_amount);
 
-        // Transfer collateral from member to this contract
+        // Transfer collateral from member to this contract.  Transfer exactly
+        // the amount just recorded so stored collateral always equals the
+        // tokens actually locked.  If the transfer fails, safe_transfer panics
+        // and the reserved Collateral slot above is rolled back with it, so the
+        // member can retry once funded.
         let token_client = token::Client::new(&env, &config.usdc_token);
         Self::safe_transfer(
             &token_client,
             &member,
             &env.current_contract_address(),
-            &config.round_amount,
+            &collateral_amount,
             "join collateral deposit",
         );
 
@@ -685,7 +778,7 @@ impl CircleContract {
             //                     countdown timers without polling get_current_round
             env.events()
                 .publish(
-                    (Symbol::new(&env, "circle"), Symbol::new(&env, "active")),
+                    event_topics(&env, "active"),
                     (env.current_contract_address(), round.deadline_ledger),
                 );
         }
@@ -695,20 +788,10 @@ impl CircleContract {
         //   circle_address   — identifies this circle for multi-circle indexer queries
         //   member           — the address that just joined
         //   join_order       — 1-based position in the join queue (N triggers Active)
-        //   collateral_amount — USDC stroops locked by this member
-        // Re-use the checked multiplication for the event payload so the emitted
-        // collateral_amount is always consistent with the amount actually
-        // transferred.  Using unwrap_or(0) here would silently emit 0 for any
-        // configuration that somehow reached this point with an overflowing
-        // round_amount, hiding a real invariant violation from the indexer.
-        // The initialize overflow guard makes this unreachable in practice, but
-        // the explicit panic keeps the contract's arithmetic model honest.
-        let collateral_amount = config
-            .round_amount
-            .checked_mul(COLLATERAL_MULTIPLIER)
-            .unwrap_or_else(|| panic!("collateral amount overflow in join event"));
+        //   collateral_amount — USDC stroops locked by this member (the same
+        //                       value stored and transferred above)
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "joined")),
+            event_topics(&env, "joined"),
             (env.current_contract_address(), member, join_order, collateral_amount),
         );
     }
@@ -756,7 +839,7 @@ impl CircleContract {
         //   caller         — member who triggered cancellation
         //   ledger         — ledger sequence at cancellation time
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "cancelled")),
+            event_topics(&env, "cancelled"),
             (env.current_contract_address(), caller, env.ledger().sequence()),
         );
     }
@@ -838,7 +921,7 @@ impl CircleContract {
         //   round_index    — which round this contribution belongs to
         //   amount         — USDC stroops transferred (= round_amount)
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "contributed")),
+            event_topics(&env, "contributed"),
             (env.current_contract_address(), member, round.round_index, config.round_amount),
         );
     }
@@ -992,14 +1075,7 @@ impl CircleContract {
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
         // Effect: bump the completed-round counter.
-        let completed: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RoundsCompleted)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::RoundsCompleted, &(completed + 1));
+        Self::bump_rounds_completed(&env);
 
         // Interaction 1: transfer pot to the canonical recipient.
         let token_client = token::Client::new(&env, &config.usdc_token);
@@ -1025,11 +1101,7 @@ impl CircleContract {
         //   harder to recover from than a clean rollback.  Rollback is the
         //   safe default; operators who prefer fire-and-forget reputation
         //   should wrap the retry at the SDK layer.
-        let rep_client =
-            reputation::ReputationContractClient::new(&env, &config.reputation_contract);
-        let _ = rep_client
-            .try_increment(&env.current_contract_address(), &round.recipient)
-            .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
+        Self::award_reputation(&env, &config.reputation_contract, &round.recipient);
 
         // Event: circle/payout
         // Data: (circle_address, recipient, amount, round_index)
@@ -1038,7 +1110,7 @@ impl CircleContract {
         //   amount         — total USDC stroops paid out (= round_amount × member_count)
         //   round_index    — which round was settled
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
+            event_topics(&env, "payout"),
             (env.current_contract_address(), round.recipient.clone(), pot, round.round_index),
         );
 
@@ -1053,7 +1125,7 @@ impl CircleContract {
             //   circle_address   — identifies this circle for replay
             //   rounds_completed — total rounds that ran (equals member_count)
             env.events().publish(
-                (Symbol::new(&env, "circle"), Symbol::new(&env, "completed")),
+                event_topics(&env, "completed"),
                 (env.current_contract_address(), member_count),
             );
         } else {
@@ -1084,7 +1156,7 @@ impl CircleContract {
             //   recipient       — address scheduled to receive the pot this round
             //   deadline_ledger — ledger after which contributions are rejected
             env.events().publish(
-                (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
+                event_topics(&env, "round_started"),
                 (env.current_contract_address(), next_round_index, next_recipient, next_round.deadline_ledger),
             );
         }
@@ -1206,7 +1278,7 @@ impl CircleContract {
         //   round_index     — round in which the default occurred
         //   new_collateral  — member's collateral balance after penalty
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
+            event_topics(&env, "default"),
             (env.current_contract_address(), member, penalty, round.round_index, new_collateral),
         );
     }
@@ -1372,9 +1444,12 @@ impl CircleContract {
 
             // Emit the standard `default` event for each newly penalised member
             // so existing indexers that listen for `circle/default` still work.
+            // The payload must match `mark_default` field-for-field, including
+            // the leading circle_address: the indexer decodes both paths with
+            // one handler that reads `member` from index 1.
             env.events().publish(
-                (Symbol::new(&env, "circle"), Symbol::new(&env, "default")),
-                (member.clone(), penalty, round.round_index, new_collateral),
+                event_topics(&env, "default"),
+                (env.current_contract_address(), member.clone(), penalty, round.round_index, new_collateral),
             );
 
             defaulted_members.push_back(member);
@@ -1402,14 +1477,7 @@ impl CircleContract {
         round.paid_out = true;
         env.storage().instance().set(&DataKey::CurrentRound, &round);
 
-        let completed: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RoundsCompleted)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::RoundsCompleted, &(completed + 1));
+        Self::bump_rounds_completed(&env);
 
         // Emit the exceptional_settlement event BEFORE the payout event so
         // indexers can distinguish this path from a normal full-contribution payout.
@@ -1421,10 +1489,7 @@ impl CircleContract {
         //                     (including those already flagged via earlier mark_default calls)
         let total_defaulted = member_count - contributed_count;
         env.events().publish(
-            (
-                Symbol::new(&env, "circle"),
-                Symbol::new(&env, "exceptional_settlement"),
-            ),
+            event_topics(&env, "exceptional_settlement"),
             (
                 env.current_contract_address(),
                 round.recipient.clone(),
@@ -1451,17 +1516,13 @@ impl CircleContract {
         // Interaction 2: increment reputation for the recipient even in an
         // exceptional settlement — they were available to receive; the default
         // was caused by other members, not by them.
-        let rep_client =
-            reputation::ReputationContractClient::new(&env, &config.reputation_contract);
-        let _ = rep_client
-            .try_increment(&env.current_contract_address(), &round.recipient)
-            .unwrap_or_else(|_| panic!("circle: reputation increment failed — ensure this circle is registered as an authorized caller on the reputation contract"));
+        Self::award_reputation(&env, &config.reputation_contract, &round.recipient);
 
         // Emit the standard payout event (consistent with normal payout path).
         // Includes circle_address so indexers can use a single listener pattern
         // for both full-contribution payout and exceptional settlement.
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "payout")),
+            event_topics(&env, "payout"),
             (env.current_contract_address(), round.recipient.clone(), pot, round.round_index),
         );
 
@@ -1474,7 +1535,7 @@ impl CircleContract {
             // Event: circle/completed — mirrors the payout path event shape.
             // Data: (circle_address, rounds_completed)
             env.events().publish(
-                (Symbol::new(&env, "circle"), Symbol::new(&env, "completed")),
+                event_topics(&env, "completed"),
                 (env.current_contract_address(), member_count),
             );
         } else {
@@ -1493,7 +1554,7 @@ impl CircleContract {
             env.storage().instance().set(&DataKey::CurrentRound, &next_round);
 
             env.events().publish(
-                (Symbol::new(&env, "circle"), Symbol::new(&env, "round_started")),
+                event_topics(&env, "round_started"),
                 (env.current_contract_address(), next_round_index, next_recipient, next_round.deadline_ledger),
             );
         }
@@ -1596,7 +1657,7 @@ impl CircleContract {
                 .storage()
                 .instance()
                 .get(&DataKey::RoundsCompleted)
-                .unwrap_or(0);
+                .unwrap_or_else(|| panic!("circle: RoundsCompleted missing — storage inconsistency"));
             if rounds_completed != config.members.len() {
                 panic!("circle: Completed status set but not all rounds paid out — storage inconsistency");
             }
@@ -1673,10 +1734,7 @@ impl CircleContract {
                 //   member         — recipient of the released collateral
                 //   amount         — USDC stroops returned to this member
                 env.events().publish(
-                    (
-                        Symbol::new(&env, "circle"),
-                        Symbol::new(&env, "collateral_released"),
-                    ),
+                    event_topics(&env, "collateral_released"),
                     (env.current_contract_address(), member, collateral),
                 );
             }
@@ -1710,7 +1768,7 @@ impl CircleContract {
         //   reason                   — Symbol "completed" or "cancelled"
         //   total_expected − total_released = total penalties forfeited (auditable)
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "closed")),
+            event_topics(&env, "closed"),
             (env.current_contract_address(), closer, total_released, total_expected_collateral, reason),
         );
     }
@@ -1780,7 +1838,7 @@ impl CircleContract {
         //   admin          — address that triggered the pause
         //   ledger         — ledger sequence at pause time
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "paused")),
+            event_topics(&env, "paused"),
             (env.current_contract_address(), admin, env.ledger().sequence()),
         );
 
@@ -1836,7 +1894,7 @@ impl CircleContract {
         //   admin          — address that triggered the resume
         //   ledger         — ledger sequence at resume time
         env.events().publish(
-            (Symbol::new(&env, "circle"), Symbol::new(&env, "resumed")),
+            event_topics(&env, "resumed"),
             (env.current_contract_address(), admin, env.ledger().sequence()),
         );
 
