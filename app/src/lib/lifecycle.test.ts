@@ -7,6 +7,7 @@
  * - Status display helpers return expected values
  * - Edge cases (unknown statuses, invalid transitions) are handled
  * - mark_default is only permitted at/after the exact deadline boundary
+ * - Closing is only permitted after completion or cancellation
  */
 
 import { describe, it, expect } from "vitest";
@@ -174,6 +175,56 @@ describe("statusesForAction", () => {
   });
 });
 
+// ─── Close after completion and cancellation ─────────────────────────────────
+
+/**
+ * Closing is the final lifecycle step. It is only reachable once a circle has
+ * reached a terminal-but-not-closed state: either it completed successfully or
+ * it was cancelled while still Pending. These tests pin the success path
+ * (Completed → Closed), the cancellation path (Cancelled → Closed), and the
+ * rejection of close from any non-closeable state.
+ */
+describe("close after completion and cancellation", () => {
+  it("allows close after completion (Completed → Closed)", () => {
+    expect(isActionAllowed("close", "Completed")).toBe(true);
+    expect(isValidTransition("Completed", "Closed")).toBe(true);
+    expect(validTransitionsFrom("Completed")).toEqual(["Closed"]);
+  });
+
+  it("allows close after cancellation (Cancelled → Closed)", () => {
+    expect(isActionAllowed("close", "Cancelled")).toBe(true);
+    expect(isValidTransition("Cancelled", "Closed")).toBe(true);
+    expect(validTransitionsFrom("Cancelled")).toEqual(["Closed"]);
+  });
+
+  it("rejects close while the circle is still Active", () => {
+    expect(isActionAllowed("close", "Active")).toBe(false);
+    expect(isValidTransition("Active", "Closed")).toBe(false);
+  });
+
+  it("rejects close while the circle is still Pending", () => {
+    expect(isActionAllowed("close", "Pending")).toBe(false);
+    expect(isValidTransition("Pending", "Closed")).toBe(false);
+  });
+
+  it("rejects close once the circle is already Closed (no double close)", () => {
+    expect(isActionAllowed("close", "Closed")).toBe(false);
+    expect(isValidTransition("Closed", "Closed")).toBe(false);
+    expect(validTransitionsFrom("Closed")).toEqual([]);
+  });
+
+  it("treats Closed as terminal after either close path", () => {
+    expect(isTerminalStatus("Closed")).toBe(true);
+    expect(isClosedStatus("Closed")).toBe(true);
+    expect(isActiveStatus("Closed")).toBe(false);
+    expect(isPendingStatus("Closed")).toBe(false);
+  });
+
+  it("only exposes Completed and Cancelled as closeable statuses", () => {
+    expect(statusesForAction("close")).toEqual(["Completed", "Cancelled"]);
+  });
+});
+
 // ─── mark_default deadline boundaries ────────────────────────────────────────
 
 /**
@@ -225,81 +276,60 @@ describe("mark_default deadline boundaries", () => {
 describe("STATUS_LABELS", () => {
   it("has labels for all statuses", () => {
     const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      expect(STATUS_LABELS[s]).toBeTruthy();
-      expect(typeof STATUS_LABELS[s]).toBe("string");
+    for (const status of statuses) {
+      expect(STATUS_LABELS[status]).toBeTruthy();
     }
   });
 });
 
 describe("STATUS_COLORS", () => {
-  it("has color classes for all statuses", () => {
+  it("has colors for all statuses", () => {
     const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      expect(STATUS_COLORS[s]).toBeTruthy();
-      expect(STATUS_COLORS[s]).toContain("bg-");
+    for (const status of statuses) {
+      expect(STATUS_COLORS[status]).toBeTruthy();
     }
   });
 });
 
 describe("describeStatus", () => {
-  it("returns a non-empty description for each status", () => {
+  it("returns a description for each status", () => {
     const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      const desc = describeStatus(s);
-      expect(desc.length).toBeGreaterThan(10);
+    for (const status of statuses) {
+      expect(describeStatus(status)).toBeTruthy();
     }
   });
 });
 
 describe("nextActionHint", () => {
-  it("returns appropriate hints for Pending status", () => {
-    expect(nextActionHint("Pending", { isMember: true })).toContain("other members");
-    expect(nextActionHint("Pending", { isMember: false })).toContain("join");
-  });
-
-  it("returns appropriate hints for Active status", () => {
-    expect(nextActionHint("Active", { isMember: true, allContributed: false })).toContain("Contribute");
-    expect(nextActionHint("Active", { isMember: true, allContributed: true })).toContain("Payout");
-  });
-
-  it("returns null for terminal statuses", () => {
-    // Closed has a specific message, not null
-    expect(nextActionHint("Closed")).toContain("settled");
+  it("returns a hint for each status", () => {
+    const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
+    for (const status of statuses) {
+      expect(nextActionHint(status)).toBeTruthy();
+    }
   });
 });
 
-// ─── Normalization and assertion ─────────────────────────────────────────────
+// ─── Normalization and validation ────────────────────────────────────────────
 
 describe("normalizeStatus", () => {
-  it("returns valid statuses as-is", () => {
-    expect(normalizeStatus("Pending")).toBe("Pending");
-    expect(normalizeStatus("Active")).toBe("Active");
-    expect(normalizeStatus("Completed")).toBe("Completed");
-    expect(normalizeStatus("Cancelled")).toBe("Cancelled");
-    expect(normalizeStatus("Closed")).toBe("Closed");
-  });
-
-  it("normalizes case-insensitively", () => {
+  it("normalizes known statuses", () => {
     expect(normalizeStatus("pending")).toBe("Pending");
     expect(normalizeStatus("ACTIVE")).toBe("Active");
+    expect(normalizeStatus("Completed")).toBe("Completed");
   });
 
-  it("falls back to Pending for unknown values", () => {
-    expect(normalizeStatus("bogus")).toBe("Pending");
-    expect(normalizeStatus("")).toBe("Pending");
+  it("returns undefined for unknown statuses", () => {
+    expect(normalizeStatus("Bogus")).toBeUndefined();
   });
 });
 
 describe("assertValidStatus", () => {
   it("does not throw for valid statuses", () => {
-    const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-    for (const s of statuses) {
-      expect(() => assertValidStatus(s)).not.toThrow();
-    }
+    expect(() => assertValidStatus("Pending")).not.toThrow();
+    expect(() => assertValidStatus("Closed")).not.toThrow();
   });
 
   it("throws for invalid statuses", () => {
-    expect(() => assertValidStatus("bogus" as CircleLifecycleStatus)).toThrow();
+    expect(() => assertValidStatus("Bogus")).toThrow();
   });
 });

@@ -147,6 +147,19 @@ export function isActionAllowed(action: CircleAction, status: string): boolean {
   return allowed.includes(status as CircleLifecycleStatus);
 }
 
+/**
+ * Returns true when a circle in the given status can be closed.
+ *
+ * Closing releases collateral and is only valid once the circle has reached a
+ * terminal-but-unsettled state: either Completed (all rounds paid out) or
+ * Cancelled (dissolved before activation). Circles that are still Pending or
+ * Active must not be closable, and an already-Closed circle cannot be closed
+ * again.
+ */
+export function canClose(status: string): boolean {
+  return isActionAllowed("close", status);
+}
+
 // ─── Status display helpers ──────────────────────────────────────────────────
 
 /** Human-readable label for each status. */
@@ -226,21 +239,4 @@ export function normalizeStatus(raw: string): CircleLifecycleStatus | null {
     return raw as CircleLifecycleStatus;
   }
   return null;
-}
-
-/**
- * Asserts that a value is a valid circle lifecycle status.
- * Throws a descriptive error if not.
- */
-export function assertValidStatus(value: unknown): CircleLifecycleStatus {
-  if (typeof value !== "string") {
-    throw new Error(`Expected circle status to be a string, got ${typeof value}`);
-  }
-  const normalized = normalizeStatus(value);
-  if (!normalized) {
-    throw new Error(
-      `Unrecognized circle status "${value}". Valid statuses: ${["Pending", "Active", "Completed", "Cancelled", "Closed"].join(", ")}`,
-    );
-  }
-  return normalized;
 }
