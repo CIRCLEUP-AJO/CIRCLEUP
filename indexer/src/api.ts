@@ -390,6 +390,7 @@ interface CircleMemberRow {
   circle_address: string;
   member_address: string;
   payout_order: number;
+  join_order: number | null;
   collateral: string;
   defaults: number;
   joined_at: string | null;
@@ -719,7 +720,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
       const [members, [totals]] = await Promise.all([
         query<CircleMemberWithContributionsRow>(
-          `SELECT cm.member_address, cm.payout_order, cm.collateral,
+          `SELECT cm.member_address, cm.payout_order, cm.join_order, cm.collateral,
                   cm.defaults, cm.joined_at,
                   r.score as reputation_score,
                   (
