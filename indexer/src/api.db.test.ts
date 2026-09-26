@@ -375,4 +375,40 @@ if (hasDb) {
     const res = await request(app).get("/circles?order=sideways");
     assert.equal(res.status, 400);
   });
+
+  // ── #530 GET /circles/:address/members — stable totals for empty contributions ─
+
+  test("GET /circles/:address/members returns numeric totalContributions=0 when no contributions are seeded", async () => {
+    const addr   = "CDBTEST_EMPTY_CONTRIB_CIRCLE";
+    const member = "GDBTEST_EMPTY_CONTRIB_MEMBER";
+    await seedCircle(addr);
+    await seedMember(addr, member, 0);
+
+    try {
+      const res = await request(app).get(`/circles/${addr}/members`);
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.body.totals.totalContributions,
+        0,
+        "totalContributions must be 0 when no contributions are seeded",
+      );
+      assert.equal(
+        typeof res.body.totals.totalContributions,
+        "number",
+        "totalContributions must be a number, not null or a string",
+      );
+      assert.equal(
+        res.body.members[0].total_contributions,
+        0,
+        "per-member total_contributions must be 0 (number) when no contributions exist",
+      );
+      assert.equal(
+        typeof res.body.members[0].total_contributions,
+        "number",
+        "per-member total_contributions must be a number, not a string",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
 }
