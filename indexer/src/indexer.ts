@@ -54,7 +54,19 @@ import {
   POLL_BACKOFF_MAX_MS,
   POLL_BACKOFF_MULTIPLIER,
 } from "./config";
-import { redactAddress, redactTxHash, formatAmount } from "./redact";
+import { redactAddress, formatAmount } from "./redact";
+import {
+  log,
+  logIndexerStarted,
+  logIndexerStopped,
+  logTickSkipped,
+  logPollCompleted,
+  logPollFailed,
+  logPollBackoff,
+  logLedgerProcessed,
+  logEventHandlerError,
+  logRpcRetry,
+} from "./logger";
 
 export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
   allowHttp: true,
@@ -171,11 +183,13 @@ export async function withRpcRetry<T>(
       }
       const baseDelay = baseDelayMs * 2 ** (attempt - 1);
       const delayMs = computeJitteredDelay(baseDelay);
-      console.warn(
-        `[indexer] Transient RPC failure during ${label} ` +
-          `(attempt ${attempt}/${attempts}): ${describeRpcError(err)} ` +
-          `— retrying in ${delayMs}ms`,
-      );
+      logRpcRetry({
+        label,
+        attempt,
+        maxAttempts: attempts,
+        delayMs,
+        error: describeRpcError(err),
+      });
       await sleep(delayMs);
     }
   }
@@ -381,9 +395,11 @@ export async function processLedger(
   ledger: number,
   items: EventHandler[],
 ): Promise<{ processed: number; failed: number }> {
+  const ledgerStartedAt = Date.now();
   return withTransaction(async (client) => {
     let processed = 0;
     let failed = 0;
+    let skipped = 0;
 
     for (const { event, handler } of items) {
       const contractId = getContractIdStr(event);
@@ -397,18 +413,21 @@ export async function processLedger(
         if (ingested) {
           processed++;
           totalEventsProcessed++;
+        } else {
+          skipped++;
+          totalEventsSkipped++;
         }
       } catch (err) {
         await client.query("ROLLBACK TO SAVEPOINT sp_event");
         failed++;
         totalEventsFailed++;
-        console.error(
-          `[indexer] Failed to process ${topic0}/${topic1} event ` +
-            `(contract=${redactAddress(contractId ?? "unknown")}, ledger=${ledger}` +
-            (event.txHash ? `, tx=${redactTxHash(event.txHash)}` : "") +
-            "):",
-          err,
-        );
+        logEventHandlerError({
+          ledger,
+          eventType: topic0 && topic1 ? `${topic0}/${topic1}` : topic0 || "unknown",
+          contractId: contractId ?? "unknown",
+          txHash: event.txHash,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 
@@ -430,6 +449,8 @@ export async function processLedger(
       [ledger, processed, failed],
     );
 
+    const latencyMs = Date.now() - ledgerStartedAt;
+    logLedgerProcessed({ ledger, processed, failed, skipped, latencyMs });
     return { processed, failed };
   });
 }
@@ -503,9 +524,12 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
      ON CONFLICT (address) DO NOTHING`,
     [circleAddress, creator, event.ledger],
   );
-  console.log(
-    `[indexer] New circle created: ${redactAddress(circleAddress)} by ${redactAddress(creator)} (factory index: ${circleIndex})`,
-  );
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "factory/circle_created",
+    contractId: circleAddress,
+    txHash: event.txHash,
+  }, `New circle created by ${redactAddress(creator)} (factory index: ${circleIndex})`);
 }
 
 async function handleCircleJoined(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -519,7 +543,12 @@ async function handleCircleJoined(client: PoolClient, circleAddr: string, event:
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/joined",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleActive(client: PoolClient, circleAddr: string) {
@@ -527,7 +556,10 @@ async function handleCircleActive(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET status = 'Active', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle active: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/active",
+    contractId: circleAddr,
+  }, `Circle active: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleContributed(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -543,7 +575,12 @@ async function handleCircleContributed(client: PoolClient, circleAddr: string, e
      ON CONFLICT (circle_address, member_address, round_index) DO NOTHING`,
     [circleAddr, memberAddr, roundIndex, amount, event.txHash, event.ledger],
   );
-  console.log(`[indexer] Contribution: ${redactAddress(memberAddr)} round ${roundIndex} → ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/contributed",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Contribution: ${redactAddress(memberAddr)} round ${roundIndex} → ${redactAddress(circleAddr)}`);
 }
 
 async function handleCirclePayout(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -564,7 +601,12 @@ async function handleCirclePayout(client: PoolClient, circleAddr: string, event:
     `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
     [roundIndex + 1, circleAddr],
   );
-  console.log(`[indexer] Payout: ${redactAddress(recipient)} ${formatAmount(pot)} round ${roundIndex} from ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/payout",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Payout: ${redactAddress(recipient)} ${formatAmount(pot)} round ${roundIndex} from ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleDefault(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -585,7 +627,12 @@ async function handleCircleDefault(client: PoolClient, circleAddr: string, event
      WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, memberAddr],
   );
-  console.log(`[indexer] Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/default",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
@@ -593,7 +640,10 @@ async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET status = 'Completed', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle completed: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/completed",
+    contractId: circleAddr,
+  }, `Circle completed: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleCancelled(client: PoolClient, circleAddr: string) {
@@ -602,7 +652,10 @@ async function handleCircleCancelled(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET status = 'Cancelled', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle cancelled: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/cancelled",
+    contractId: circleAddr,
+  }, `Circle cancelled: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleClosed(client: PoolClient, circleAddr: string, event: SdkEvent) {
@@ -617,7 +670,12 @@ async function handleCircleClosed(client: PoolClient, circleAddr: string, event:
      WHERE address = $1`,
     [circleAddr, totalReleased, reason],
   );
-  console.log(`[indexer] Circle closed: ${redactAddress(circleAddr)} reason=${reason} released=${totalReleased}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "circle/closed",
+    contractId: circleAddr,
+    txHash: event.txHash,
+  }, `Circle closed: ${redactAddress(circleAddr)} reason=${reason} released=${totalReleased}`);
 }
 
 async function handleCirclePaused(client: PoolClient, circleAddr: string) {
@@ -626,7 +684,10 @@ async function handleCirclePaused(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET paused = TRUE, updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle paused: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/paused",
+    contractId: circleAddr,
+  }, `Circle paused: ${redactAddress(circleAddr)}`);
 }
 
 async function handleCircleResumed(client: PoolClient, circleAddr: string) {
@@ -635,7 +696,10 @@ async function handleCircleResumed(client: PoolClient, circleAddr: string) {
     "UPDATE circles SET paused = FALSE, updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle resumed: ${redactAddress(circleAddr)}`);
+  log("info", "event_ingested", {
+    eventType: "circle/resumed",
+    contractId: circleAddr,
+  }, `Circle resumed: ${redactAddress(circleAddr)}`);
 }
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
@@ -652,13 +716,19 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
      ON CONFLICT (member_address) DO UPDATE SET score = $2, updated_at = NOW()`,
     [memberAddr, score],
   );
-  console.log(`[indexer] Reputation: ${redactAddress(memberAddr)} → score ${score}`);
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "reputation/increment",
+    contractId: memberAddr,
+    txHash: event.txHash,
+  }, `Reputation: ${redactAddress(memberAddr)} → score ${score}`);
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────
 
 let totalEventsProcessed = 0;
 let totalEventsFailed = 0;
+let totalEventsSkipped = 0;
 let pollCyclesCompleted = 0;
 let pollCyclesFailed = 0;
 let lastPollDurationMs = 0;
@@ -686,13 +756,13 @@ export async function runEventHandler(
     return true;
   } catch (err) {
     totalEventsFailed++;
-    console.error(
-      `[indexer] Failed to process ${ctx.topic} event ` +
-        `(contract=${redactAddress(ctx.contractId ?? "unknown")}, ledger=${ctx.ledger}` +
-        (ctx.txHash ? `, tx=${redactTxHash(ctx.txHash)}` : "") +
-        "):",
-      err,
-    );
+    logEventHandlerError({
+      ledger: ctx.ledger,
+      eventType: ctx.topic,
+      contractId: ctx.contractId ?? "unknown",
+      txHash: ctx.txHash,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return false;
   }
 }
@@ -842,11 +912,13 @@ async function processEvents(fromLedger: number, toLedger: number) {
   }
 
   const durationMs = Date.now() - startedAt;
-  console.log(
-    `[indexer] Processed ledgers ${fromLedger}-${toLedger}: ` +
-      `${totalSeen} event(s), ${totalFailed} failed, ${durationMs}ms` +
-      (totalEventsFailed > 0 ? ` (${totalEventsFailed} failed since start)` : ""),
-  );
+  logPollCompleted({
+    fromLedger,
+    toLedger,
+    eventsProcessed: totalSeen,
+    eventsFailed: totalFailed,
+    durationMs,
+  });
 }
 
 // ─── Backoff policy (Issue 29) ────────────────────────────────────────────────
@@ -956,10 +1028,11 @@ export async function startIndexer() {
     throw new Error("[indexer] Event poller is already running");
   }
 
-  console.log(
-    `[indexer] Starting CircleUp event indexer ` +
-      `(poll interval: ${POLL_INTERVAL_MS}ms, events per page: ${EVENTS_LIMIT})...`,
-  );
+  logIndexerStarted({
+    pollIntervalMs: POLL_INTERVAL_MS,
+    eventsLimit: EVENTS_LIMIT,
+    startLedger: START_LEDGER,
+  });
 
   shuttingDown = false;
   indexerStarted = true;
@@ -967,7 +1040,7 @@ export async function startIndexer() {
   const tick = () => {
     if (shuttingDown) return;
     if (pollInFlight) {
-      console.warn("[indexer] Previous poll still in flight — skipping overlapping tick");
+      logTickSkipped();
       return;
     }
 
@@ -979,17 +1052,17 @@ export async function startIndexer() {
         pollCyclesFailed++;
         
         if (shouldWarnBackoff(backoffState)) {
-          console.warn(
-            `[indexer] Poll has failed ${backoffState.consecutiveFailures} consecutive times. ` +
-            `Current backoff interval: ${Math.floor(backoffState.currentIntervalMs / 1000)}s. ` +
-            `Check RPC connectivity and logs.`,
-          );
+          logPollBackoff({
+            consecutiveFailures: backoffState.consecutiveFailures,
+            currentIntervalMs: backoffState.currentIntervalMs,
+          });
         }
         
-        console.error(
-          `[indexer] Poll error (will retry after backoff):`,
-          err,
-        );
+        logPollFailed({
+          error: err instanceof Error ? err.message : String(err),
+          consecutiveFailures: backoffState.consecutiveFailures,
+          backoffMs: backoffState.currentIntervalMs,
+        });
         
         // Apply jittered backoff before the next tick
         const waitMs = computeJitteredWait(backoffState);
@@ -1016,12 +1089,12 @@ export async function startIndexer() {
  */
 export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   if (!indexerStarted && !pollTimer && !pollInFlight) {
-    console.log("[indexer] Event poller is not running — nothing to stop");
+    log("info", "indexer_stopped", {}, "Event poller is not running — nothing to stop");
     return;
   }
 
   if (shuttingDown) {
-    console.log("[indexer] Shutdown already in progress — waiting...");
+    log("info", "indexer_stopped", {}, "Shutdown already in progress — waiting...");
     if (pollInFlight) {
       await raceWithAbort(pollInFlight.catch(() => undefined), signal);
     }
@@ -1029,7 +1102,7 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   }
 
   shuttingDown = true;
-  console.log("[indexer] Graceful shutdown requested — stopping event poller...");
+  log("info", "indexer_stopped", {}, "Graceful shutdown requested — stopping event poller...");
 
   if (pollTimer) {
     clearInterval(pollTimer);
@@ -1037,14 +1110,14 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   }
 
   if (pollInFlight) {
-    console.log("[indexer] Waiting for in-flight poll cycle to finish...");
+    log("info", "indexer_stopped", {}, "Waiting for in-flight poll cycle to finish...");
     // Race the in-flight cycle against the abort signal so a stuck RPC call
     // does not block the process past the configured grace period.
     await raceWithAbort(pollInFlight.catch(() => undefined), signal);
   }
 
   indexerStarted = false;
-  console.log("[indexer] Event poller stopped cleanly");
+  logIndexerStopped();
 }
 
 /**
@@ -1095,6 +1168,7 @@ export function getIndexerMetrics() {
   return {
     totalEventsProcessed,
     totalEventsFailed,
+    totalEventsSkipped,
     pollCyclesCompleted,
     pollCyclesFailed,
     lastPollDurationMs,

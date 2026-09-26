@@ -646,7 +646,14 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -713,7 +720,14 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -781,7 +795,14 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -866,7 +887,13 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           [circleFilter],
         );
         if (!circle) {
-          res.status(404).json({ error: `Circle '${circleFilter}' not found` });
+          res.status(404).json({
+            error: "Circle not found",
+            detail:
+              `No circle with address '${circleFilter}' has been indexed yet. ` +
+              `The ?circle= filter must reference an address that exists in the indexer.`,
+            address: circleFilter,
+          });
           return;
         }
       }
@@ -975,6 +1002,16 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       res.json({
         member,
         found: row != null,
+        // When `found` is false, the member has no recorded reputation activity
+        // yet. This means either no reputation/increment event has been emitted
+        // for this wallet address, or the indexer has not yet processed it.
+        // A score of 0 is returned in either case; clients can use `found` to
+        // distinguish an untracked wallet from one with an explicit zero score.
+        detail: row == null
+          ? `Member '${member}' has no reputation record in the indexer. ` +
+            `This address has not completed any circle rounds yet, or the ` +
+            `reputation/increment event has not been indexed.`
+          : undefined,
         score: row?.score ?? 0,
         contributions: contributions.map((c) => ({
           circle_address: c.circle_address,
@@ -1051,6 +1088,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         events: {
           processed: metrics.totalEventsProcessed,
           failed: metrics.totalEventsFailed,
+          skipped: metrics.totalEventsSkipped,
         },
         pollCycles: {
           completed: metrics.pollCyclesCompleted,
