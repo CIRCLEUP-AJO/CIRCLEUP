@@ -66,6 +66,28 @@ function buildQueries(circleAddress: string, memberAddress: string) {
             FROM defaults WHERE member_address = $1 GROUP BY circle_address`,
       params: [memberAddress],
     },
+    {
+      label: "GET /circles?status=... (status filter + created_ledger sort)",
+      sql: `SELECT address, creator, round_amount, member_count, status,
+                   current_round, total_rounds, created_ledger, updated_at
+            FROM circles WHERE status = $1 ORDER BY created_ledger DESC`,
+      params: ["Active"],
+    },
+    {
+      label: "GET /circles/summary (status aggregate)",
+      sql: `SELECT status, COUNT(*) as count FROM circles GROUP BY status`,
+      params: [] as unknown[],
+    },
+    {
+      label: "GET /members/:member/contributions?circle=... (circle filter)",
+      sql: `SELECT c.circle_address, c.member_address, c.round_index, c.amount::text as amount,
+                   c.tx_hash, c.ledger, c.created_at
+            FROM contributions c
+            WHERE c.member_address = $1 AND c.circle_address = $2
+            ORDER BY c.ledger DESC, c.round_index DESC, c.created_at DESC
+            LIMIT $3 OFFSET $4`,
+      params: [memberAddress, circleAddress, 20, 0],
+    },
   ];
 }
 

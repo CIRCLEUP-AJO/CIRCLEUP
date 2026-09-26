@@ -13,7 +13,8 @@
  * GET /circles/:address/rounds         → all rounds (payouts + defaults)
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
- * GET /indexer/state                   → indexer audit: last ledger + event counts
+ * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
+ * GET /indexer/schema                  → schema versioning and migration status diagnostics
  * GET /health                          → health check (db + RPC status)
  */
 
@@ -467,6 +468,20 @@ interface EventTypeCountRow {
   count: string;
 }
 
+interface EntityCountsSingleRow {
+  circles: string;
+  members: string;
+  contributions: string;
+  payouts: string;
+  defaults: string;
+}
+
+interface CircleStatusCountRow {
+  status: string;
+  count: string;
+}
+
+
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
@@ -722,10 +737,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           `SELECT cm.member_address, cm.payout_order, cm.collateral,
                   cm.defaults, cm.joined_at,
                   r.score as reputation_score,
-                  (
-                    SELECT COUNT(*) FROM contributions c2
-                    WHERE c2.circle_address = cm.circle_address
-                      AND c2.member_address = cm.member_address
+                  COALESCE(
+                    (SELECT COUNT(*) FROM contributions c2
+                     WHERE c2.circle_address = cm.circle_address
+                       AND c2.member_address = cm.member_address),
+                    0
                   ) as total_contributions
            FROM circle_members cm
            LEFT JOIN reputation r ON r.member_address = cm.member_address
@@ -753,7 +769,10 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       ]);
 
       res.json({
-        members,
+        members: members.map((m) => ({
+          ...m,
+          total_contributions: Number(m.total_contributions),
+        })),
         totals: {
           memberCount: Number(totals.member_count),
           totalCollateral: totals.total_collateral,
@@ -1000,12 +1019,23 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // /health (which only checks connectivity, not indexing progress).
   app.get("/indexer/state", detailRateLimiter, async (_req: Request, res: Response) => {
     try {
-      const [stateRows, eventCountRows] = await Promise.all([
+      const [stateRows, eventCountRows, [entityCounts], statusRows] = await Promise.all([
         query<IndexerStateAuditRow>(
           `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
         ),
         query<EventTypeCountRow>(
           `SELECT event_type, COUNT(*) as count FROM ingested_events GROUP BY event_type`,
+        ),
+        query<EntityCountsSingleRow>(
+          `SELECT
+             (SELECT COUNT(*) FROM circles)::text AS circles,
+             (SELECT COUNT(*) FROM circle_members)::text AS members,
+             (SELECT COUNT(*) FROM contributions)::text AS contributions,
+             (SELECT COUNT(*) FROM payouts)::text AS payouts,
+             (SELECT COUNT(*) FROM defaults)::text AS defaults`,
+        ),
+        query<CircleStatusCountRow>(
+          `SELECT status, COUNT(*) as count FROM circles GROUP BY status`,
         ),
       ]);
 
@@ -1023,11 +1053,24 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         eventCounts[row.event_type ?? "unknown"] = count;
       }
 
+      const circlesByStatus: Record<string, number> = {};
+      for (const row of statusRows) {
+        circlesByStatus[row.status] = Number(row.count);
+      }
+
       res.json({
         lastLedger: Number(state.last_ledger),
         updatedAt: state.updated_at,
         totalEvents,
         eventCounts,
+        entityCounts: {
+          circles: Number(entityCounts?.circles ?? 0),
+          members: Number(entityCounts?.members ?? 0),
+          contributions: Number(entityCounts?.contributions ?? 0),
+          payouts: Number(entityCounts?.payouts ?? 0),
+          defaults: Number(entityCounts?.defaults ?? 0),
+          circlesByStatus,
+        },
       });
     } catch (err) {
       console.error("[api] Failed to load indexer state", err);
@@ -1068,6 +1111,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     } catch (err) {
       console.error("[api] Failed to load indexer health", err);
       sendError(res, 500, "Failed to load indexer health", getErrorMessage(err));
+    }
+  });
+
+  // Exposes the full migration history for ops and diagnostics: which migrations
+  // have been applied, which are pending, and whether the schema is clean.
+  app.get("/indexer/schema", detailRateLimiter, async (_req: Request, res: Response) => {
+    try {
+      const { checkMigrationHealth } = await import("./db/migrate");
+      const health = await checkMigrationHealth();
+      res.json({
+        state: health.state,
+        summary: health.summary,
+        canStartSafely: health.canStartSafely,
+        currentVersion: health.status.currentVersion,
+        applied: health.status.applied,
+        pending: health.status.pending,
+        missingOnDisk: health.status.missingOnDisk,
+        modified: health.status.modified,
+      });
+    } catch (err) {
+      console.error("[api] Failed to load schema status", err);
+      sendError(res, 500, "Failed to load schema status", getErrorMessage(err));
     }
   });
 
