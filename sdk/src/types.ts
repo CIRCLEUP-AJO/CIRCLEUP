@@ -1137,8 +1137,45 @@ export interface ApiMembersResponse {
 /** Response body for GET /circles/:address/rounds */
 export interface ApiRoundsResponse {
   rounds: ApiRoundRow[];
+  /**
+   * Unpaid rounds that have contributions and/or defaults recorded but are not
+   * the circle's current round (reorg / partial-ingest edge case, issue #170).
+   */
+  openRounds: ApiRoundRow[];
   /** Defaults that belong to a round not yet paid out. */
   pendingDefaults: ApiDefaultRecord[];
+  /**
+   * The in-progress round (status `"current"` or `"cancelled"`), returned
+   * alongside the history so clients can show live contribution status without
+   * a second request. `null` when the circle is not Active or the indexer has
+   * not yet processed the current round.
+   */
+  currentRound: ApiRoundRow | null;
+}
+
+/**
+ * Composite response body for the circle detail page, merging
+ * `GET /circles/:address` and `GET /circles/:address/rounds` into a single
+ * typed contract. Used by the app's server component and client refresh path.
+ */
+export interface ApiCircleDetailWithRoundsResponse {
+  /** Core circle state and member roster from GET /circles/:address. */
+  circle: ApiCircleRow;
+  /** Member roster from GET /circles/:address. */
+  members: ApiMemberRow[];
+  /** Latest ledger the indexer has processed; used for deadline countdown. */
+  latestLedger: number | null;
+  /** Completed/open rounds from GET /circles/:address/rounds. */
+  rounds: ApiRoundRow[];
+  /** Unpaid rounds with activity that are not the current round (issue #170). */
+  openRounds: ApiRoundRow[];
+  /** Pending defaults not yet associated with a payout round. */
+  pendingDefaults: ApiDefaultRecord[];
+  /**
+   * The in-progress round containing live contribution data; `null` when the
+   * circle is not Active or the indexer has not yet processed this round.
+   */
+  currentRound: ApiRoundRow | null;
 }
 
 /** Response body for GET /reputation/:member */
