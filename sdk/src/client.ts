@@ -29,6 +29,7 @@ import type {
   ApiReputationResponse,
   ApiMemberContributionsResponse,
   ApiHealthResponse,
+  ApiAuditEventsResponse,
   GetCirclesParams,
 } from "./types";
 import {
@@ -61,6 +62,27 @@ import type {
   GateResult,
   StateSnapshot,
 } from "./gating";
+
+// ─── Stale-state mismatch message formatter ───────────────────────────────────
+
+/**
+ * Build a human-readable summary of which on-chain fields diverged during a
+ * stale-write preflight check.
+ *
+ * The message is designed for display in a UI toast or error banner — it lists
+ * every mismatch on its own line so the user can see exactly what changed and
+ * why their action was blocked.
+ */
+function formatMismatchMessage(mismatches: readonly StateMismatch[]): string {
+  const lines = mismatches.map(
+    (m) => `  • ${m.field}: expected ${JSON.stringify(m.expected)}, got ${JSON.stringify(m.actual)}`,
+  );
+  return (
+    `The circle state changed since your last update. ` +
+    `The following fields no longer match:\n${lines.join("\n")}\n` +
+    `Refresh and try again.`
+  );
+}
 
 // ─── Polling configuration ────────────────────────────────────────────────────
 
@@ -470,6 +492,129 @@ function formatRpcError(raw: string, rpcUrl: string): string {
   return raw.length <= 200 ? raw : raw.slice(0, 197) + "...";
 }
 
+// ─── Config-absent normalisation ─────────────────────────────────────────────
+//
+// The contract's `get_config` view returns `ContractError::NotInitialized` (code 1)
+// when the `Config` storage key is absent — i.e. the circle contract has been
+// deployed but `initialize` has not been called yet (or failed midway).
+//
+// The raw simulation error string contains one of:
+//   "Contract error code 1"               (from extractSimulationError priority 3)
+//   "NotInitialized"                       (from the contract's debug log)
+//   "Value(MissingValue)"                  (underlying Soroban host error)
+//   "already initialized" is the *opposite* case (Config key IS present)
+//
+// `normalizeNotInitializedError` maps any of these forms to a single canonical
+// message so `getConfigResult` callers need only check for one substring.
+
+/**
+ * Returns `true` when a `ReadResult.error` string indicates the circle has not
+ * been initialized yet (the `Config` storage key is absent).
+ *
+ * Use this after `getConfigResult` to branch on the not-initialized case
+ * without parsing arbitrary error strings:
+ *
+ * ```ts
+ * const r = await client.getConfigResult();
+ * if (!r.ok && isConfigAbsent(r.error)) {
+ *   showBanner("Circle not initialized");
+ * }
+ * ```
+ */
+export function isConfigAbsent(error: string): boolean {
+  const lower = error.toLowerCase();
+  return (
+    lower.includes("not initialized") ||
+    lower.includes("notinitialized") ||
+    lower.includes("contract error code 1") ||
+    // Soroban host error for a missing storage entry on a read-only view
+    lower.includes("storage(missingvalue)")
+  );
+}
+
+/**
+ * Normalise a raw simulation error string into a clear, consistent message
+ * when it indicates the circle's `Config` storage key is absent.
+ *
+ * If the string does not match the not-initialized pattern it is returned
+ * unchanged, preserving the original message for other error kinds.
+ */
+function normalizeNotInitializedError(raw: string): string {
+  if (isConfigAbsent(raw)) {
+    return (
+      "Circle contract is not initialized: the Config storage key is absent. " +
+      "The circle may have been deployed but `initialize` has not been called yet, " +
+      "or initialization failed. Call `initialize` before reading config."
+    );
+  }
+  return raw;
+}
+
+// ─── CircleNotActive normalisation ───────────────────────────────────────────
+//
+// The contract's `get_current_round` view returns `ContractError::CircleNotActive`
+// (code 2) when the circle is in a terminal state (Completed or Cancelled) —
+// i.e. there is no in-progress round to return.
+//
+// The raw simulation error string contains one of:
+//   "Contract error code 2"               (from extractSimulationError priority 3)
+//   "CircleNotActive"                      (from the contract's debug log)
+//   "circle is not active"                 (contract panic message in older builds)
+//
+// `normalizeCircleNotActiveError` maps any of these forms to a single canonical
+// message so `getCurrentRoundResult` callers need only check for one substring.
+
+/**
+ * Returns `true` when a `ReadResult.error` string from `getCurrentRoundResult`
+ * indicates the circle is not in an active state (Completed or Cancelled) —
+ * meaning there is no current round to read, not that a network error occurred.
+ *
+ * Use this to branch on the "no active round" case without comparing the full
+ * error message string:
+ *
+ * ```ts
+ * const r = await client.getCurrentRoundResult();
+ * if (!r.ok && isCircleNotActive(r.error)) {
+ *   showCompletedCircleSummary();   // expected — no round in progress
+ * } else if (!r.ok) {
+ *   showNetworkError(r.error);      // unexpected — transient failure
+ * }
+ * ```
+ *
+ * This correctly handles all error message forms produced by different
+ * versions of the Soroban RPC and the contract's debug log.
+ */
+export function isCircleNotActive(error: string): boolean {
+  const lower = error.toLowerCase();
+  return (
+    lower.includes("circle not active") ||
+    lower.includes("circlenotactive") ||
+    lower.includes("contract error code 2") ||
+    // Contract panic message in older builds / test environments
+    lower.includes("circle is not active") ||
+    // The canonical normalised message written by normalizeCircleNotActiveError
+    lower.includes("no active round")
+  );
+}
+
+/**
+ * Normalise a raw simulation error string into a clear, consistent message
+ * when it indicates `ContractError::CircleNotActive` (code 2).
+ *
+ * If the string does not match the not-active pattern it is returned unchanged,
+ * preserving the original message for other error kinds.
+ */
+function normalizeCircleNotActiveError(raw: string): string {
+  if (isCircleNotActive(raw)) {
+    return (
+      "No active round: the circle is not in an Active or Pending state. " +
+      "The circle may be Completed or Cancelled — inspect get_status and " +
+      "use the indexer's round history instead of get_current_round."
+    );
+  }
+  return raw;
+}
+
 // ─── Contract argument helpers ────────────────────────────────────────────────
 //
 // Building Soroban contract arguments requires three layers of boilerplate:
@@ -655,6 +800,30 @@ export interface WriteOptions {
    * idempotency key — see {@link TxMetadata}.
    */
   metadata?: TxMetadata;
+  /**
+   * Optional stale-write preflight: the on-chain state the caller expected
+   * when they decided to act.  If supplied, `preflightGuard` force-refreshes
+   * the full circle state before submitting and returns a `stale_state`
+   * {@link TxFailure} if any pinned field has moved.
+   *
+   * Only the fields you pin are compared — omit a field to skip its check.
+   * See {@link PreflightOptions.expected} and {@link ExpectedState} for the
+   * full list of pinnable fields.
+   *
+   * A read failure during the preflight check is treated as "pass" so a
+   * transient RPC issue never blocks a write the contract would accept.
+   *
+   * @example
+   * // Block the contribute if the round advanced since the UI rendered:
+   * await client.contribute(keypair, { expected: { roundIndex: 2 } });
+   */
+  expected?: ExpectedState;
+  /**
+   * Optional member address used by the preflight guard to resolve the
+   * `hasContributed` field when `expected.hasContributed` is pinned.
+   * Ignored when `expected` is not supplied.
+   */
+  memberAddress?: string;
 }
 
 /**
@@ -1448,6 +1617,11 @@ export class CircleClient extends CircleUpClient {
   }
 
   async contribute(member: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const preflight = options?.expected
+      ? { expected: options.expected, memberAddress: options.memberAddress }
+      : undefined;
+    const stale = await this.preflightGuard(preflight);
+    if (stale) return stale;
     const result = await this.encodeAndSend(
       member,
       this.circleAddress,
@@ -1460,6 +1634,11 @@ export class CircleClient extends CircleUpClient {
   }
 
   async payout(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const preflight = options?.expected
+      ? { expected: options.expected, memberAddress: options.memberAddress }
+      : undefined;
+    const stale = await this.preflightGuard(preflight);
+    if (stale) return stale;
     const result = await this.buildAndSend(
       caller,
       this.circleAddress,
@@ -1493,7 +1672,11 @@ export class CircleClient extends CircleUpClient {
         sanitizeTxMetadata(options?.metadata),
       );
     }
-    const stale = await this.preflightGuard(preflight);
+    const stale = await this.preflightGuard(
+      options?.expected
+        ? { expected: options.expected, memberAddress: options.memberAddress }
+        : undefined,
+    );
     if (stale) return stale;
     const result = await this.encodeAndSend(
       caller,
@@ -1507,6 +1690,11 @@ export class CircleClient extends CircleUpClient {
   }
 
   async close(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
+    const preflight = options?.expected
+      ? { expected: options.expected, memberAddress: options.memberAddress }
+      : undefined;
+    const stale = await this.preflightGuard(preflight);
+    if (stale) return stale;
     const result = await this.encodeAndSend(
       caller,
       this.circleAddress,
@@ -1632,6 +1820,14 @@ export class CircleClient extends CircleUpClient {
    * Fetch and decode the circle's configuration from the contract.
    *
    * **Throws** a descriptive `Error` on any simulation or decode failure.
+   *
+   * When the contract has not been initialized yet (the `Config` storage key
+   * is absent) the simulation returns `ContractError::NotInitialized` (code 1).
+   * This surfaces here as a thrown `Error` whose message contains
+   * `"NotInitialized"` or `"Contract error code 1"`.  Callers that need to
+   * distinguish the not-initialized case from a network error should use the
+   * non-throwing {@link getConfigResult} and inspect `result.ok` / `result.error`.
+   *
    * For a non-throwing alternative that returns a discriminated union instead
    * of throwing, use {@link getConfigResult}.
    */
@@ -1648,22 +1844,39 @@ export class CircleClient extends CircleUpClient {
    * Non-throwing variant of {@link getConfig}.
    *
    * Returns a `ReadResult<CircleConfig>` discriminated union instead of
-   * throwing, so callers can handle failures inline without try/catch:
+   * throwing, so callers can handle the not-initialized case and network
+   * failures inline without try/catch:
    *
-   * @example
+   * ```ts
    * const r = await client.getConfigResult();
    * if (r.ok) {
    *   console.log(r.value.roundAmount);
+   * } else if (isConfigAbsent(r.error)) {
+   *   showBanner("This circle has not been initialized yet.");
    * } else {
-   *   showError(r.error); // human-readable string
+   *   showError(r.error); // network or decode error
    * }
+   * ```
+   *
+   * The `error` string contains `"not initialized"` (case-insensitive) when
+   * the contract's `Config` storage key is absent, letting callers detect
+   * this specific case without parsing arbitrary error messages:
+   *
+   * ```ts
+   * if (!r.ok && r.error.toLowerCase().includes("not initialized")) { … }
+   * ```
    */
   async getConfigResult(): Promise<ReadResult<CircleConfig>> {
     try {
       const value = await this.getConfig();
       return { ok: true, value };
     } catch (err: any) {
-      return { ok: false, error: err?.message ?? "getConfig failed" };
+      const raw: string = err?.message ?? "getConfig failed";
+      // Normalise the ContractError::NotInitialized code (1) into a clear,
+      // consistent message so callers can detect the absent-config case with
+      // a simple string check rather than parsing opaque error codes.
+      const normalised = normalizeNotInitializedError(raw);
+      return { ok: false, error: normalised };
     }
   }
 
@@ -1715,37 +1928,53 @@ export class CircleClient extends CircleUpClient {
    * **Throws** on simulation failure or when the circle is not Active/Pending.
    */
   async getCurrentRound(): Promise<RoundState> {
-    const raw = await this.simulateAndReadOrThrow(
-      this.circleAddress,
-      "get_current_round",
-      [],
-    );
-    return mapRawRoundState(raw);
+    try {
+      const raw = await this.simulateAndReadOrThrow(
+        this.circleAddress,
+        "get_current_round",
+        [],
+      );
+      return mapRawRoundState(raw);
+    } catch (err: any) {
+      const raw: string = err?.message ?? "getCurrentRound failed";
+      throw new Error(normalizeCircleNotActiveError(raw));
+    }
   }
 
   /**
    * Non-throwing variant of {@link getCurrentRound}.
    *
    * This is the preferred method for UI components that need to handle
-   * `Completed` and `Cancelled` circles gracefully — the contract returns an
-   * error for those states, which surfaces here as `{ ok: false, error: "…" }`
-   * rather than an uncaught exception.
+   * `Completed` and `Cancelled` circles gracefully — the contract returns
+   * `ContractError::CircleNotActive` (code 2) for those states, which surfaces
+   * here as `{ ok: false, error: "…" }` rather than an uncaught exception.
    *
-   * @example
+   * Use {@link isCircleNotActive} on the error string to distinguish the
+   * "circle is in a terminal state" case from a genuine network or decode
+   * error, without parsing arbitrary error messages:
+   *
+   * ```ts
    * const r = await client.getCurrentRoundResult();
    * if (r.ok) {
    *   showRoundProgress(r.value);
+   * } else if (isCircleNotActive(r.error)) {
+   *   showHistory(); // circle is Completed or Cancelled — show history instead
    * } else {
-   *   // circle is Completed or Cancelled — show history instead
-   *   showHistory();
+   *   showNetworkError(r.error); // transient RPC/decode failure
    * }
+   * ```
    */
   async getCurrentRoundResult(): Promise<ReadResult<RoundState>> {
     try {
       const value = await this.getCurrentRound();
       return { ok: true, value };
     } catch (err: any) {
-      return { ok: false, error: err?.message ?? "getCurrentRound failed" };
+      const raw: string = err?.message ?? "getCurrentRound failed";
+      // Normalise ContractError::CircleNotActive (code 2) into a clear,
+      // consistent message so callers can detect the inactive-circle case
+      // with a simple string check rather than parsing opaque error codes.
+      const normalised = normalizeCircleNotActiveError(raw);
+      return { ok: false, error: normalised };
     }
   }
 
@@ -1852,10 +2081,27 @@ export class CircleClient extends CircleUpClient {
 
     // Fetch config and status in parallel; current round is fetched separately
     // because its result depends on status (Completed/Cancelled → no round).
-    const [config, status] = await Promise.all([
-      this.getConfig(),
+    //
+    // Config absence (ContractError::NotInitialized) is a legitimate state for
+    // a freshly deployed circle that hasn't been initialized by the factory yet.
+    // We fetch config via the non-throwing variant and re-throw only when the
+    // error is NOT the not-initialized case, so getFullState never crashes a
+    // UI render cycle for a valid but un-configured circle address.
+    const [configResult, status] = await Promise.all([
+      this.getConfigResult(),
       this.getStatus(),
     ]);
+
+    if (!configResult.ok) {
+      // Re-throw with a clear message. Callers that want non-throwing behaviour
+      // should use getConfigResult() directly; getFullState throwing here
+      // preserves the contract that it either returns a complete state or throws.
+      throw new Error(
+        `Failed to load circle config for ${this.circleAddress}: ${configResult.error}`,
+      );
+    }
+
+    const config = configResult.value;
 
     // currentRound is only meaningful for Active and Pending circles.
     // For terminal states (Completed / Cancelled) we store null rather than
@@ -2288,6 +2534,35 @@ export class IndexerClient {
     return this.get<ApiMemberContributionsResponse>(
       `/members/${encodeURIComponent(member)}/contributions${qs ? `?${qs}` : ""}`,
     );
+  }
+
+  /**
+   * Fetch structured audit records for a circle's terminal lifecycle transitions
+   * (`cancelled` and `closed`).
+   *
+   * Unlike the summarised status row in {@link getCircleDetail}, the audit
+   * records carry the full event payload: who triggered the transition, amounts
+   * released, penalties forfeited, and the on-chain ledger sequence — providing
+   * a durable, queryable audit trail without replaying the full event log.
+   *
+   * Returns `{ events: [] }` (not a 404) when no audit records exist yet — this
+   * is normal for circles that have not reached a terminal state, or during a
+   * brief indexer lag after the on-chain event fires.
+   *
+   * Use `total_expected_collateral - total_released` on a `"closed"` row to
+   * compute the total collateral forfeited to penalties:
+   * ```ts
+   * const [closed] = resp.events.filter(e => e.event_type === "closed");
+   * const forfeited = BigInt(closed.total_expected_collateral ?? "0")
+   *                 - BigInt(closed.total_released ?? "0");
+   * ```
+   *
+   * Equivalent to `GET /circles/:address/audit`.
+   *
+   * @param address On-chain contract address of the circle.
+   */
+  async getCircleAuditEvents(address: string): Promise<ApiAuditEventsResponse> {
+    return this.get<ApiAuditEventsResponse>(`/circles/${encodeURIComponent(address)}/audit`);
   }
 
   /**

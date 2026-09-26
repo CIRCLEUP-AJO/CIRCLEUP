@@ -472,6 +472,31 @@ export function formatPot(
   return formatUsdc(n * BigInt(memberCount));
 }
 
+// ─── Config-absent detection (mirrors sdk/src/client.ts isConfigAbsent) ──────
+//
+// The app does not depend on @circleup/sdk directly. This helper mirrors the
+// SDK's `isConfigAbsent` so app-layer fetch paths can distinguish "circle not
+// initialized" from any other indexer/network error and show clear UI feedback.
+
+/**
+ * Returns true when an error string from a config fetch indicates the circle
+ * contract has not been initialized (its `Config` storage key is absent).
+ *
+ * Use after any failed `get_config` simulation or after `fetchCircleData`
+ * returns `{ ok: false, error: "server" }` alongside a 500 body whose message
+ * mentions initialization, to give users a clear "not initialized yet" message
+ * rather than a generic "server error" banner.
+ */
+export function isConfigAbsent(error: string): boolean {
+  const lower = error.toLowerCase();
+  return (
+    lower.includes("not initialized") ||
+    lower.includes("notinitialized") ||
+    lower.includes("contract error code 1") ||
+    lower.includes("storage(missingvalue)")
+  );
+}
+
 // ─── Address helpers ──────────────────────────────────────────────────────────
 
 export function shortAddress(addr: string): string {

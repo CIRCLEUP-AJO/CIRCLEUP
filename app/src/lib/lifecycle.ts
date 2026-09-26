@@ -20,11 +20,17 @@
  *                (tracked as a boolean flag in the contract, projected as a
  *                status string by the indexer for query convenience)
  *
- * Lifecycle:
- *   Pending → Active    (when all members join)
- *   Pending → Cancelled (when a member cancels before full membership)
- *   Active  → Completed (when all rounds are paid out)
- *   Completed/Cancelled → Closed (when close() releases collateral)
+ * Lifecycle (all transitions, including sub-round events):
+ *   Pending    → Active       (when all members join, via circle/active)
+ *   Pending    → Cancelled    (when a member cancels, via circle/cancelled)
+ *   Active     → Active       (round_started: new round opened; no status change)
+ *   Active     → Completed    (all rounds paid out, via circle/completed)
+ *   Completed  → Closed       (close() releases collateral, via circle/closed)
+ *   Cancelled  → Closed       (close() releases collateral, via circle/closed)
+ *
+ * Sub-round lifecycle events (no status change, tracked by the indexer):
+ *   circle/round_started          — new contribution window opened
+ *   circle/exceptional_settlement — round settled via settle_round() after deadline
  */
 
 // ─── Status definitions ──────────────────────────────────────────────────────
@@ -48,6 +54,51 @@ export type ActiveStatus = "Active";
 
 /** Pre-active statuses — the circle is not yet operational. */
 export type PreActiveStatus = "Pending";
+
+// ─── Sub-round event types ────────────────────────────────────────────────────
+//
+// These events do not change the circle's lifecycle status; they represent
+// activity *within* a status. They are tracked by the indexer but do not
+// appear in VALID_TRANSITIONS.
+
+/**
+ * Events that happen within a lifecycle status without triggering a status
+ * change. The indexer records them; the UI uses them to update round displays.
+ *
+ * - `"round_started"`          — a new contribution window has opened
+ * - `"exceptional_settlement"` — a round was settled via settle_round() after
+ *                                the deadline, with some members defaulting
+ * - `"collateral_released"`    — a member's collateral was returned by close()
+ *                                (individual per-member event, aggregated by
+ *                                the circle/closed event total)
+ */
+export type CircleSubRoundEvent =
+  | "round_started"
+  | "exceptional_settlement"
+  | "collateral_released";
+
+/**
+ * Returns true when an event name is a sub-round event — i.e. it happens
+ * within a lifecycle status and does not trigger a status change.
+ *
+ * Use this to distinguish status-changing transitions from within-status
+ * activity events when processing the indexer's event stream:
+ *
+ * ```ts
+ * if (isSubRoundEvent(eventName)) {
+ *   updateRoundDisplay(eventData);
+ * } else {
+ *   updateCircleStatus(newStatus);
+ * }
+ * ```
+ */
+export function isSubRoundEvent(event: string): event is CircleSubRoundEvent {
+  return (
+    event === "round_started" ||
+    event === "exceptional_settlement" ||
+    event === "collateral_released"
+  );
+}
 
 // ─── Transition rules ────────────────────────────────────────────────────────
 

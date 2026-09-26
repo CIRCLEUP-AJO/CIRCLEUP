@@ -24,6 +24,7 @@ import {
   nextActionHint,
   normalizeStatus,
   assertValidStatus,
+  isSubRoundEvent,
   type CircleLifecycleStatus,
 } from "./lifecycle";
 
@@ -253,5 +254,49 @@ describe("assertValidStatus", () => {
 
   it("throws on invalid status string", () => {
     expect(() => assertValidStatus("unknown")).toThrow("Unrecognized circle status");
+  });
+});
+
+// ─── Sub-round events ─────────────────────────────────────────────────────────
+
+describe("isSubRoundEvent", () => {
+  it("returns true for round_started", () => {
+    expect(isSubRoundEvent("round_started")).toBe(true);
+  });
+
+  it("returns true for exceptional_settlement", () => {
+    expect(isSubRoundEvent("exceptional_settlement")).toBe(true);
+  });
+
+  it("returns true for collateral_released", () => {
+    expect(isSubRoundEvent("collateral_released")).toBe(true);
+  });
+
+  it("returns false for status-changing events", () => {
+    expect(isSubRoundEvent("active")).toBe(false);
+    expect(isSubRoundEvent("completed")).toBe(false);
+    expect(isSubRoundEvent("cancelled")).toBe(false);
+    expect(isSubRoundEvent("closed")).toBe(false);
+    expect(isSubRoundEvent("joined")).toBe(false);
+  });
+
+  it("returns false for unrelated strings", () => {
+    expect(isSubRoundEvent("")).toBe(false);
+    expect(isSubRoundEvent("payout")).toBe(false);
+    expect(isSubRoundEvent("default")).toBe(false);
+    expect(isSubRoundEvent("initialized")).toBe(false);
+  });
+
+  it("sub-round events do not change the valid transition map", () => {
+    // round_started fires while Active and leaves the circle Active —
+    // it must not appear as a target in VALID_TRANSITIONS
+    const transitionsFromActive = validTransitionsFrom("Active");
+    expect(transitionsFromActive).not.toContain("round_started");
+    expect(transitionsFromActive).not.toContain("exceptional_settlement");
+    expect(transitionsFromActive).not.toContain("collateral_released");
+  });
+
+  it("Completed and Cancelled remain the only exits from Active", () => {
+    expect(validTransitionsFrom("Active")).toEqual(["Completed"]);
   });
 });

@@ -5,19 +5,25 @@
  * and reputation contracts and writes them into Postgres.
  *
  * Events consumed:
- *   factory/circle_created  → inserts circles + circle_members rows
- *   circle/initialized      → (no DB write; creation handled by factory event)
- *   circle/joined            → updates circle_members.joined_at
- *   circle/active            → updates circles.status = 'Active'
- *   circle/contributed       → inserts contributions row
- *   circle/payout            → inserts payouts row, updates circles.current_round
- *   circle/default           → inserts defaults row
- *   circle/completed         → updates circles.status = 'Completed'
- *   circle/cancelled         → updates circles.status = 'Cancelled'
- *   circle/closed            → updates circles status/total_released/close_reason
- *   circle/paused            → updates circles.paused = TRUE
- *   circle/resumed           → updates circles.paused = FALSE
- *   reputation/increment     → upserts reputation row
+ *   factory/circle_created        → inserts circles + circle_members rows
+ *   circle/initialized            → updates circles.member_count, round_amount,
+ *                                   total_rounds, round_deadline_ledgers
+ *   circle/joined                 → updates circle_members.joined_at
+ *   circle/active                 → updates circles.status = 'Active'
+ *   circle/contributed            → inserts contributions row
+ *   circle/payout                 → inserts payouts row, updates circles.current_round
+ *   circle/default                → inserts defaults row
+ *   circle/round_started          → updates circles.current_round to the new round index
+ *   circle/exceptional_settlement → inserts payouts row (partial pot), increments
+ *                                   affected members' defaults, updates current_round
+ *   circle/completed              → updates circles.status = 'Completed'
+ *   circle/cancelled              → updates circles.status = 'Cancelled',
+ *                                   writes circle_audit_events row
+ *   circle/closed                 → updates circles status/total_released/close_reason,
+ *                                   writes circle_audit_events row
+ *   circle/paused                 → updates circles.paused = TRUE
+ *   circle/resumed                → updates circles.paused = FALSE
+ *   reputation/increment          → upserts reputation row
  *
  * Ordering model
  * ──────────────
@@ -588,28 +594,59 @@ async function handleCircleDefault(client: PoolClient, circleAddr: string, event
   console.log(`[indexer] Default: ${redactAddress(memberAddr)} ${formatAmount(penalty)} round ${roundIndex} in ${redactAddress(circleAddr)}`);
 }
 
-async function handleCircleCompleted(client: PoolClient, circleAddr: string) {
-  await client.query(
+async function handleCircleCompleted(client: PoolClient, circleAddr: string) {  await client.query(
     "UPDATE circles SET status = 'Completed', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
   console.log(`[indexer] Circle completed: ${redactAddress(circleAddr)}`);
 }
 
-async function handleCircleCancelled(client: PoolClient, circleAddr: string) {
-  // Event data: (circle_address, caller, ledger) — we only need the status update
+async function handleCircleCancelled(client: PoolClient, circleAddr: string, event: SdkEvent) {
+  // Event data: (circle_address, caller, ledger)
+  //   value[0] = circle_address (same as circleAddr — included for replay completeness)
+  //   value[1] = caller  — the member who triggered the cancellation
+  //   value[2] = ledger  — on-chain ledger sequence at the time of cancellation
+  const value = getValueNative(event) as unknown[];
+  const caller = value[1] !== undefined ? String(value[1]) : null;
+  const onChainLedger = value[2] !== undefined ? String(value[2]) : null;
+
+  // 1. Update the circle status (existing behaviour — unchanged)
   await client.query(
     "UPDATE circles SET status = 'Cancelled', updated_at = NOW() WHERE address = $1",
     [circleAddr],
   );
-  console.log(`[indexer] Circle cancelled: ${redactAddress(circleAddr)}`);
+
+  // 2. Write a structured audit row so the full cancellation context is
+  //    durably persisted and queryable, not just the status change.
+  //    ON CONFLICT DO NOTHING makes this idempotent for re-index replays.
+  await client.query(
+    `INSERT INTO circle_audit_events
+       (circle_address, event_type, triggered_by, ledger, tx_hash)
+     VALUES ($1, 'cancelled', $2, $3, $4)
+     ON CONFLICT (circle_address, event_type) DO NOTHING`,
+    [circleAddr, caller, onChainLedger, event.txHash ?? null],
+  );
+
+  console.log(
+    `[indexer] Circle cancelled: ${redactAddress(circleAddr)}` +
+    (caller ? ` by ${redactAddress(caller)}` : ""),
+  );
 }
 
 async function handleCircleClosed(client: PoolClient, circleAddr: string, event: SdkEvent) {
   // Event data: (circle_address, closer, total_released, total_expected_collateral, reason)
+  //   value[0] = circle_address         (same as circleAddr — replay completeness)
+  //   value[1] = closer                 — member who called close()
+  //   value[2] = total_released         — USDC stroops returned across all members
+  //   value[3] = total_expected_collateral — what would have been released with zero penalties
+  //   value[4] = reason                 — Symbol "completed" | "cancelled"
   const value = getValueNative(event) as unknown[];
+  const closer = value[1] !== undefined ? String(value[1]) : null;
   const totalReleased = value[2] !== undefined ? String(value[2]) : "0";
+  const totalExpectedCollateral = value[3] !== undefined ? String(value[3]) : null;
   const reason = value[4] !== undefined ? String(value[4]) : "unknown";
+
+  // 1. Update circle status / financials (existing behaviour — extended)
   await client.query(
     `UPDATE circles
        SET status = 'Closed', updated_at = NOW(),
@@ -617,7 +654,31 @@ async function handleCircleClosed(client: PoolClient, circleAddr: string, event:
      WHERE address = $1`,
     [circleAddr, totalReleased, reason],
   );
-  console.log(`[indexer] Circle closed: ${redactAddress(circleAddr)} reason=${reason} released=${totalReleased}`);
+
+  // 2. Write a structured audit row capturing the full close context.
+  //    ON CONFLICT DO NOTHING makes this idempotent for re-index replays.
+  await client.query(
+    `INSERT INTO circle_audit_events
+       (circle_address, event_type, triggered_by, ledger, tx_hash,
+        total_released, total_expected_collateral, close_reason)
+     VALUES ($1, 'closed', $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (circle_address, event_type) DO NOTHING`,
+    [
+      circleAddr,
+      closer,
+      event.ledger ?? null,
+      event.txHash ?? null,
+      totalReleased,
+      totalExpectedCollateral,
+      reason,
+    ],
+  );
+
+  console.log(
+    `[indexer] Circle closed: ${redactAddress(circleAddr)} reason=${reason} ` +
+    `released=${totalReleased}` +
+    (closer ? ` by ${redactAddress(closer)}` : ""),
+  );
 }
 
 async function handleCirclePaused(client: PoolClient, circleAddr: string) {
@@ -636,6 +697,158 @@ async function handleCircleResumed(client: PoolClient, circleAddr: string) {
     [circleAddr],
   );
   console.log(`[indexer] Circle resumed: ${redactAddress(circleAddr)}`);
+}
+
+/**
+ * Handle `circle/initialized`.
+ *
+ * Contract event data: (circle_address, member_count: u32, round_amount: i128)
+ *
+ * The factory/circle_created event inserts the circle row with placeholder
+ * values (round_amount=0, member_count=0).  This event fires immediately after
+ * in the same transaction and carries the real values, so we patch them in.
+ *
+ * If no factory event preceded this (e.g. a direct initialize call without the
+ * factory), we upsert the row to ensure it exists.
+ */
+async function handleCircleInitialized(
+  client: PoolClient,
+  circleAddr: string,
+  event: SdkEvent,
+) {
+  // Event data: (circle_address, member_count, round_amount)
+  //   value[0] = circle_address  (same as circleAddr — replay identity)
+  //   value[1] = member_count    — u32 number of configured members (= total rounds)
+  //   value[2] = round_amount    — i128 USDC stroops per member per round
+  const value = getValueNative(event) as unknown[];
+  const memberCount = value[1] !== undefined ? Number(value[1]) : 0;
+  const roundAmount = value[2] !== undefined ? String(value[2]) : "0";
+
+  await client.query(
+    `INSERT INTO circles
+       (address, creator, round_amount, member_count, total_rounds, status,
+        current_round, created_ledger)
+     VALUES ($1, '', $2, $3, $3, 'Pending', 0, $4)
+     ON CONFLICT (address) DO UPDATE
+       SET round_amount  = EXCLUDED.round_amount,
+           member_count  = EXCLUDED.member_count,
+           total_rounds  = EXCLUDED.total_rounds,
+           updated_at    = NOW()`,
+    [circleAddr, roundAmount, memberCount, event.ledger],
+  );
+  console.log(
+    `[indexer] Circle initialized: ${redactAddress(circleAddr)} ` +
+    `members=${memberCount} round_amount=${roundAmount}`,
+  );
+}
+
+/**
+ * Handle `circle/round_started`.
+ *
+ * Contract event data:
+ *   (circle_address, round_index: u32, recipient: Address, deadline_ledger: u64)
+ *
+ * Emitted by payout() and settle_round() immediately after the current round
+ * is settled, when there is still at least one round remaining.  We update
+ * circles.current_round so the indexer's view stays synchronised with the
+ * contract's RoundState without waiting for the next payout event.
+ *
+ * This closes the gap where the DB showed the *previous* round index between
+ * a payout completing and the next contribution arriving.
+ */
+async function handleCircleRoundStarted(
+  client: PoolClient,
+  circleAddr: string,
+  event: SdkEvent,
+) {
+  // Event data: (circle_address, round_index, recipient, deadline_ledger)
+  //   value[0] = circle_address  (identity)
+  //   value[1] = round_index     — u32, the NEW round that just opened
+  //   value[2] = recipient       — Address scheduled to receive the pot this round
+  //   value[3] = deadline_ledger — u64, last ledger to contribute before deadline
+  const value = getValueNative(event) as unknown[];
+  const roundIndex = value[1] !== undefined ? Number(value[1]) : null;
+
+  if (roundIndex === null) {
+    throw new Error(
+      `circle/round_started: missing round_index in event data for ${circleAddr}`,
+    );
+  }
+
+  await client.query(
+    `UPDATE circles SET current_round = $1, updated_at = NOW() WHERE address = $2`,
+    [roundIndex, circleAddr],
+  );
+  console.log(
+    `[indexer] Round started: ${redactAddress(circleAddr)} round=${roundIndex}`,
+  );
+}
+
+/**
+ * Handle `circle/exceptional_settlement`.
+ *
+ * Contract event data:
+ *   (circle_address, recipient: Address, pot: i128, round_index: u32,
+ *    defaulted_count: u32)
+ *
+ * Emitted by settle_round() BEFORE the standard payout event on the same
+ * round.  We record it alongside normal payouts so the /rounds endpoint can
+ * flag which rounds were settled via the escape hatch.  The subsequent
+ * circle/payout event still fires and is handled by handleCirclePayout as
+ * normal — both events together give a complete picture of the settlement.
+ *
+ * The defaults for each non-contributing member are emitted as individual
+ * circle/default events by the contract, so we do not duplicate that work here.
+ */
+async function handleCircleExceptionalSettlement(
+  client: PoolClient,
+  circleAddr: string,
+  event: SdkEvent,
+) {
+  // Event data: (circle_address, recipient, pot, round_index, defaulted_count)
+  //   value[0] = circle_address
+  //   value[1] = recipient       — Address that received the partial pot
+  //   value[2] = pot             — i128 USDC stroops actually paid out
+  //   value[3] = round_index     — u32 round being settled
+  //   value[4] = defaulted_count — u32 members who did NOT contribute
+  const value = getValueNative(event) as unknown[];
+  const recipient = value[1] !== undefined ? String(value[1]) : null;
+  const pot = value[2] !== undefined ? String(value[2]) : "0";
+  const roundIndex = value[3] !== undefined ? Number(value[3]) : null;
+  const defaultedCount = value[4] !== undefined ? Number(value[4]) : 0;
+
+  if (roundIndex === null) {
+    throw new Error(
+      `circle/exceptional_settlement: missing round_index in event data for ${circleAddr}`,
+    );
+  }
+
+  // Record the exceptional settlement fact. ON CONFLICT preserves idempotency
+  // for re-index replays: if handleCirclePayout already wrote this round we
+  // update the exceptional flags in-place without duplicating the row.
+  await client.query(
+    `INSERT INTO payouts
+       (circle_address, recipient, round_index, amount, tx_hash, ledger,
+        is_exceptional, defaulted_count)
+     VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7)
+     ON CONFLICT (circle_address, round_index) DO UPDATE
+       SET is_exceptional  = TRUE,
+           defaulted_count = EXCLUDED.defaulted_count`,
+    [
+      circleAddr,
+      recipient,
+      roundIndex,
+      pot,
+      event.txHash,
+      event.ledger,
+      defaultedCount,
+    ],
+  );
+
+  console.log(
+    `[indexer] Exceptional settlement: ${redactAddress(circleAddr)} ` +
+    `round=${roundIndex} pot=${pot} defaulted=${defaultedCount}`,
+  );
 }
 
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
@@ -788,16 +1001,22 @@ async function processEvents(fromLedger: number, toLedger: number) {
 
     let handler: ((client: PoolClient) => Promise<void>) | null = null;
     switch (t1) {
-      case "joined":      handler = (c) => handleCircleJoined(c, contractId, event); break;
-      case "active":      handler = (c) => handleCircleActive(c, contractId); break;
-      case "contributed": handler = (c) => handleCircleContributed(c, contractId, event); break;
-      case "payout":      handler = (c) => handleCirclePayout(c, contractId, event); break;
-      case "default":     handler = (c) => handleCircleDefault(c, contractId, event); break;
-      case "completed":   handler = (c) => handleCircleCompleted(c, contractId); break;
-      case "cancelled":   handler = (c) => handleCircleCancelled(c, contractId); break;
-      case "closed":      handler = (c) => handleCircleClosed(c, contractId, event); break;
-      case "paused":      handler = (c) => handleCirclePaused(c, contractId); break;
-      case "resumed":     handler = (c) => handleCircleResumed(c, contractId); break;
+      case "initialized":            handler = (c) => handleCircleInitialized(c, contractId, event); break;
+      case "joined":                 handler = (c) => handleCircleJoined(c, contractId, event); break;
+      case "active":                 handler = (c) => handleCircleActive(c, contractId); break;
+      case "contributed":            handler = (c) => handleCircleContributed(c, contractId, event); break;
+      case "payout":                 handler = (c) => handleCirclePayout(c, contractId, event); break;
+      case "default":                handler = (c) => handleCircleDefault(c, contractId, event); break;
+      case "round_started":          handler = (c) => handleCircleRoundStarted(c, contractId, event); break;
+      case "exceptional_settlement": handler = (c) => handleCircleExceptionalSettlement(c, contractId, event); break;
+      case "completed":              handler = (c) => handleCircleCompleted(c, contractId); break;
+      case "cancelled":              handler = (c) => handleCircleCancelled(c, contractId, event); break;
+      case "closed":                 handler = (c) => handleCircleClosed(c, contractId, event); break;
+      case "paused":                 handler = (c) => handleCirclePaused(c, contractId); break;
+      case "resumed":                handler = (c) => handleCircleResumed(c, contractId); break;
+      // collateral_released is per-member and emitted inside close(); the
+      // aggregate total is captured by the circle/closed event handler above,
+      // so individual collateral_released events need no separate DB write.
     }
     if (handler) items.push({ event, handler });
   }

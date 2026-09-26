@@ -1367,3 +1367,88 @@ export interface PayoutHistory {
   /** Payout records, oldest-first by round index. */
   payouts: PayoutRecord[];
 }
+
+// ─── Audit events (Issue: add audit events for close and cancelled transitions) ──
+
+/**
+ * Event type for a circle's terminal lifecycle audit row.
+ *
+ * - `"cancelled"` — emitted when a circle is cancelled while Pending
+ *   (`circle/cancelled` event).
+ * - `"closed"` — emitted when collateral is settled and released
+ *   (`circle/closed` event, triggered after Completed or Cancelled).
+ */
+export type AuditEventType = "cancelled" | "closed";
+
+/**
+ * A single structured audit record for a terminal lifecycle transition.
+ *
+ * Stored in the `circle_audit_events` table by the indexer's
+ * `handleCircleCancelled` and `handleCircleClosed` handlers.  The fields
+ * carry the full event payload so the close/cancel context (who triggered it,
+ * amounts involved, penalties forfeited) is durable and queryable without
+ * replaying the event log.
+ *
+ * Monetary amounts are string-serialised stroops to preserve precision.
+ */
+export interface AuditEvent {
+  /** Auto-increment PK from the database. */
+  id: number;
+  /** Circle contract address (C…). */
+  circle_address: string;
+  /** Type of the terminal transition that produced this record. */
+  event_type: AuditEventType;
+  /**
+   * Address that triggered the transition.
+   * - For `"cancelled"`: the member who called `cancel()`.
+   * - For `"closed"`: the member who called `close()`.
+   * `null` if the event payload did not include a caller field.
+   */
+  triggered_by: string | null;
+  /**
+   * On-chain ledger sequence at the time of the transition.
+   * Serialised as a string because ledger sequences are u64 on-chain and can
+   * exceed `Number.MAX_SAFE_INTEGER` at very high ledger counts.
+   * `null` when the indexer could not extract the ledger from the event.
+   */
+  ledger: string | null;
+  /**
+   * Transaction hash that produced the event.
+   * `null` when not available from the RPC event response.
+   */
+  tx_hash: string | null;
+  /**
+   * Total USDC stroops returned to members at close time (string).
+   * `null` for `"cancelled"` rows (no amounts are released at cancellation —
+   * they are released when `close()` is subsequently called).
+   */
+  total_released: string | null;
+  /**
+   * What total_released would have been with zero penalties (string).
+   * Used to compute forfeited collateral: `total_expected - total_released`.
+   * `null` for `"cancelled"` rows and when the event payload omitted the field.
+   */
+  total_expected_collateral: string | null;
+  /**
+   * Close reason symbol — `"completed"` or `"cancelled"` — copied from the
+   * contract event.  Tells the indexer and UI whether the collateral was
+   * released after a successful completion or an abandoned circle.
+   * `null` for `"cancelled"` event rows (no reason is recorded at cancel time;
+   * only the subsequent `close` carries the reason).
+   */
+  close_reason: string | null;
+  /** ISO-8601 timestamp of when this audit record was written to the database. */
+  created_at: string;
+}
+
+/** Response body for `GET /circles/:address/audit`. */
+export interface ApiAuditEventsResponse {
+  /** Circle contract address the audit records belong to (C…). */
+  circle_address: string;
+  /**
+   * Audit records for terminal lifecycle transitions, ordered by `created_at`
+   * ascending (oldest first).  An empty array means no terminal transitions
+   * have been indexed yet for this circle.
+   */
+  events: AuditEvent[];
+}
