@@ -13,106 +13,31 @@ import {
 } from "@/lib/gating";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import clsx from "clsx";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Shared response contracts (Issue #513) ────────────────────────────────────
 //
-// These shapes mirror the canonical API model types defined in
-// sdk/src/types.ts (ApiMemberRow, ApiRoundRow, ApiDefaultRecord, etc.).
-// They are re-declared here because the app package does not take a direct
-// dependency on @circleup/sdk; keep them in sync when the indexer schema
-// changes and update sdk/src/types.ts as the source of truth.
+// All circle API types and runtime parsers now live in lib/circleTypes.ts,
+// which is the single source of truth for the app layer. They mirror the
+// canonical Api* types in sdk/src/types.ts.
+import {
+  type CircleMember,
+  type ContributionRecord,
+  type DefaultRecord,
+  type CircleRound,
+  type CircleState,
+  type CircleDetailData,
+  parseCircleState,
+  parseCircleRound,
+  parsePendingDefault,
+  parseRoundsResponse,
+} from "@/lib/circleTypes";
 
-/** @see ApiMemberRow in sdk/src/types.ts */
-export interface CircleMember {
-  member_address: string;
-  payout_order: number;
-  collateral: string;
-  defaults: number;
-  joined_at: string | null;
-  reputation_score: number;
-  total_contributions: number;
-}
-
-/** @see ApiContributionRecord in sdk/src/types.ts */
-export interface ContributionRecord {
-  member_address: string;
-  amount: string;
-  tx_hash: string;
-}
-
-/** @see ApiDefaultRecord in sdk/src/types.ts */
-export interface DefaultRecord {
-  member_address: string;
-  penalty: string;
-}
-
-/** @see ApiRoundRow in sdk/src/types.ts */
-export interface CircleRound {
-  roundIndex: number;
-  /**
-   * "completed" — payout row exists for this round.
-   * "current"   — the active in-progress round (no payout yet).
-   * "cancelled" — the current round of a Cancelled circle.
-   * "open"      — unpaid round with activity that is not the current round
-   *               (reorg / partial-ingest edge case; was previously invisible).
-   */
-  status: "completed" | "current" | "cancelled" | "open";
-  /** null when the round has not been paid out yet. */
-  recipient: string | null;
-  /** null when the round has not been paid out yet. */
-  amount: string | null;
-  /** null when the round has not been paid out yet. */
-  txHash: string | null;
-  contributions: ContributionRecord[];
-  defaults: DefaultRecord[];
-}
-
-/** Pending default — a DefaultRecord not yet associated with a payout round.
- *  @see ApiDefaultRecord in sdk/src/types.ts */
-export interface CirclePendingDefault {
-  member_address: string;
-  penalty: string;
-}
-
-/** Subset of ApiCircleRow fields used by the detail view.
- *  @see ApiCircleRow in sdk/src/types.ts */
-export interface CircleState {
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  round_amount: string;
-  member_count: number;
-  /** Computed deadline ledger for the current active round (null if unknown) */
-  deadline_ledger?: number | null;
-}
-
-/** Composite data object for the circle detail page.
- *  @see ApiCircleDetailResponse + ApiRoundsResponse in sdk/src/types.ts */
-export interface CircleDetailData {
-  circle: CircleState;
-  members: CircleMember[];
-  /**
-   * Completed rounds only (status === "completed"), sorted by roundIndex.
-   * Returned by the indexer's /rounds endpoint as the `rounds` field.
-   */
-  rounds: CircleRound[];
-  /**
-   * Unpaid rounds that have contributions and/or defaults recorded but are
-   * not the circle's current round — previously dropped silently (issue #170).
-   * Returned by the indexer's /rounds endpoint as the `openRounds` field.
-   */
-  openRounds: CircleRound[];
-  pendingDefaults: CirclePendingDefault[];
-  /** Latest ledger the indexer has processed (used for countdown math) */
-  latestLedger?: number | null;
-  /**
-   * The in-progress round returned by the indexer's /rounds endpoint.
-   * Contains the actual contributions list for the current round, used to
-   * determine whether the connected wallet has already contributed this round.
-   * Null when the circle is not Active or the indexer hasn't processed it yet.
-   */
-  currentRound?: CircleRound | null;
-}
+// Re-export the types that page.tsx and test files import directly from this module.
+export type { CircleMember, ContributionRecord, DefaultRecord, CircleRound, CircleState, CircleDetailData };
+// CirclePendingDefault was a distinct interface in the old code; it is now
+// identical to DefaultRecord (both are { member_address, penalty }) and unified
+// under PendingDefault in circleTypes.ts. The alias keeps downstream imports
+// building without changes.
+export type { PendingDefault as CirclePendingDefault } from "@/lib/circleTypes";
 
 interface Props {
   circleAddress: string;
@@ -726,103 +651,12 @@ function getMemberContributionStatus(
   return "pending";
 }
 
-// ─── Type-safe parsers for indexer API responses (Issue #496) ────────────────
+// ─── Type-safe parsers for indexer API responses (Issue #496, #513) ──────────
 //
-// These narrow unknown JSON objects to the correct model types before any
-// value leaves the network boundary. An `as SomeType[]` cast on an unvalidated
-// array would let malformed rows silently propagate into the render tree and
-// gate logic. Instead, each row is parsed independently — a row that fails
-// validation is dropped rather than crashing the whole page.
-//
-// Contract: every parser returns null for any input that is not a plain object
-// with the required fields. They never throw.
-
-function parseContributionRecord(raw: unknown): ContributionRecord | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.amount !== "string") return null;
-  if (typeof r.tx_hash !== "string") return null;
-  return {
-    member_address: r.member_address,
-    amount: r.amount,
-    tx_hash: r.tx_hash,
-  };
-}
-
-function parseDefaultRecord(raw: unknown): DefaultRecord | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.penalty !== "string") return null;
-  return {
-    member_address: r.member_address,
-    penalty: r.penalty,
-  };
-}
-
-const VALID_ROUND_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
-
-/**
- * Parse and validate a single CircleRound row from an unknown API value.
- * Returns null if any required field is missing or malformed.
- */
-function parseCircleRound(raw: unknown): CircleRound | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.roundIndex !== "number") return null;
-  if (typeof r.status !== "string" || !VALID_ROUND_STATUSES.has(r.status)) return null;
-  const contributions = Array.isArray(r.contributions)
-    ? r.contributions.map(parseContributionRecord).filter((c): c is ContributionRecord => c !== null)
-    : [];
-  const defaults = Array.isArray(r.defaults)
-    ? r.defaults.map(parseDefaultRecord).filter((d): d is DefaultRecord => d !== null)
-    : [];
-  return {
-    roundIndex: r.roundIndex,
-    status: r.status as CircleRound["status"],
-    recipient: typeof r.recipient === "string" ? r.recipient : null,
-    amount: typeof r.amount === "string" ? r.amount : null,
-    txHash: typeof r.txHash === "string" ? r.txHash : null,
-    contributions,
-    defaults,
-  };
-}
-
-/**
- * Parse and validate a single CirclePendingDefault from an unknown API value.
- * Returns null when the row is missing required fields.
- */
-function parsePendingDefault(raw: unknown): CirclePendingDefault | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.penalty !== "string") return null;
-  return { member_address: r.member_address, penalty: r.penalty };
-}
-
-/**
- * Parse and validate the CircleState shape from an unknown indexer response.
- * Returns null if the object is missing any required numeric or string field.
- */
-function parseCircleState(raw: unknown): CircleState | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.status !== "string" || r.status.trim() === "") return null;
-  if (typeof r.current_round !== "number") return null;
-  if (typeof r.total_rounds !== "number") return null;
-  if (typeof r.round_amount !== "string") return null;
-  if (typeof r.member_count !== "number") return null;
-  return {
-    status: r.status,
-    current_round: r.current_round,
-    total_rounds: r.total_rounds,
-    round_amount: r.round_amount,
-    member_count: r.member_count,
-    deadline_ledger:
-      typeof r.deadline_ledger === "number" ? r.deadline_ledger : null,
-  };
-}
+// All parsers (parseContributionRecord, parseDefaultRecord, parseCircleRound,
+// parsePendingDefault, parseCircleState) have been moved to lib/circleTypes.ts
+// and are imported above. This ensures a single implementation is shared by
+// both the server page and this client component.
 
 // ─── fetchCircleData ──────────────────────────────────────────────────────────
 //
@@ -893,13 +727,13 @@ export async function fetchCircleData(
     return { ok: false, error: "server" };
   }
 
-  // Issue #496: Use type-safe parsers instead of unsafe `as` casts.
+  // Issue #496 / #513: Use type-safe parsers instead of unsafe `as` casts.
   const circleState = parseCircleState(circleJson.circle);
   if (!circleState) {
     return { ok: false, error: "server" };
   }
 
-  // Members go through the shared all-or-nothing parser (lib/members.ts) that
+  // Members go through the shared all-or-nothing parser (lib/circleTypes.ts) that
   // the server page also uses. A per-row filter is wrong here twice over: the
   // indexer's /circles/:address rows carry no total_contributions and a null
   // reputation_score for members without a reputation row, so a strict per-row
@@ -907,30 +741,25 @@ export async function fetchCircleData(
   // members into the wrong payout slot.
   const members = parseMemberRows(circleJson.members);
 
+  // parseRoundsResponse handles all four fields (rounds, openRounds,
+  // pendingDefaults, currentRound) with the same null-safe, drop-malformed-rows
+  // strategy used by every other parser.
+  const roundsPayload = parseRoundsResponse(roundsJson);
+
   return {
     ok: true,
     fetchedAtMs: Date.now(),
     data: {
       circle: circleState,
       members,
-      rounds: Array.isArray(roundsJson.rounds)
-        ? roundsJson.rounds.map(parseCircleRound).filter((r): r is CircleRound => r !== null)
-        : [],
-      openRounds: Array.isArray(roundsJson.openRounds)
-        ? roundsJson.openRounds.map(parseCircleRound).filter((r): r is CircleRound => r !== null)
-        : [],
-      pendingDefaults: Array.isArray(roundsJson.pendingDefaults)
-        ? roundsJson.pendingDefaults.map(parsePendingDefault).filter((d): d is CirclePendingDefault => d !== null)
-        : [],
+      rounds: roundsPayload.rounds,
+      openRounds: roundsPayload.openRounds,
+      pendingDefaults: roundsPayload.pendingDefaults,
       latestLedger:
         typeof circleJson.latestLedger === "number"
           ? circleJson.latestLedger
           : null,
-      currentRound:
-        roundsJson.currentRound != null &&
-        typeof roundsJson.currentRound === "object"
-          ? parseCircleRound(roundsJson.currentRound)
-          : null,
+      currentRound: roundsPayload.currentRound,
     },
   };
 }

@@ -8,11 +8,15 @@ import {
 } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
 import { getStatusMeta } from "@/components/CircleCard";
+// Issue #513: use shared parsers — eliminates the unsafe `as CircleRound[]`
+// and `as CircleDetailData["circle"]` casts that were previously here.
+import {
+  parseCircleState,
+  parseRoundsResponse,
+} from "@/lib/circleTypes";
 import {
   CircleDetailClient,
   type CircleDetailData,
-  type CircleRound,
-  type CirclePendingDefault,
 } from "./CircleDetailClient";
 
 export async function generateMetadata({
@@ -168,11 +172,19 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
     roundsData = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
   }
 
-  // Validate the shape we depend on to avoid runtime errors in the render tree
+  // Validate the shape we depend on to avoid runtime errors in the render tree.
+  // Issue #513: parseCircleState replaces the bare `as CircleDetailData["circle"]`
+  // cast — if the indexer returns a malformed object, we return a parse error
+  // rather than letting a broken value propagate into the render tree.
   if (
     typeof circleData.circle !== "object" ||
     circleData.circle === null
   ) {
+    return { ok: false, error: "parse" };
+  }
+
+  const circleState = parseCircleState(circleData.circle);
+  if (!circleState) {
     return { ok: false, error: "parse" };
   }
 
@@ -182,23 +194,23 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
   // data unavailable" fallback in the rotation view instead of crashing.
   const members = parseMemberRows(circleData.members);
 
+  // Issue #513: parseRoundsResponse replaces the four inline `as CircleRound[]`
+  // and `as CirclePendingDefault[]` casts — validates rounds, openRounds,
+  // pendingDefaults and currentRound, dropping malformed rows rather than
+  // surfacing them in the render tree.
+  const roundsPayload = parseRoundsResponse(roundsData);
+
   return {
     ok: true,
     data: {
-      circle: circleData.circle as CircleDetailData["circle"],
+      circle: circleState,
       members,
-      rounds: Array.isArray(roundsData.rounds)
-        ? (roundsData.rounds as CircleRound[])
-        : [],
+      rounds: roundsPayload.rounds,
       // openRounds: unpaid rounds with activity that are not the current round.
       // Previously invisible to the client because the old /rounds endpoint
       // only iterated payouts (issue #170).
-      openRounds: Array.isArray(roundsData.openRounds)
-        ? (roundsData.openRounds as CircleRound[])
-        : [],
-      pendingDefaults: Array.isArray(roundsData.pendingDefaults)
-        ? (roundsData.pendingDefaults as CirclePendingDefault[])
-        : [],
+      openRounds: roundsPayload.openRounds,
+      pendingDefaults: roundsPayload.pendingDefaults,
       latestLedger:
         typeof circleData.latestLedger === "number"
           ? circleData.latestLedger
@@ -206,11 +218,7 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
       // currentRound from the /rounds response contains the actual
       // contributions list for the in-progress round — used by
       // CircleDetailClient to accurately gate the Contribute button.
-      currentRound:
-        roundsData.currentRound != null &&
-        typeof roundsData.currentRound === "object"
-          ? (roundsData.currentRound as CircleRound)
-          : null,
+      currentRound: roundsPayload.currentRound,
     },
   };
 }
