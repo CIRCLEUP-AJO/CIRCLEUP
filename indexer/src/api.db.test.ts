@@ -443,4 +443,36 @@ if (hasDb) {
       await cleanCircle(addr);
     }
   });
+
+  // ── #532 GET /indexer/schema — migration status diagnostics ──────────────────
+
+  test("GET /indexer/schema returns schema state and full migration details", async () => {
+    const res = await request(app).get("/indexer/schema");
+    assert.equal(res.status, 200);
+    assert.equal(typeof res.body.state,          "string",  "state must be a string");
+    assert.equal(typeof res.body.summary,        "string",  "summary must be a string");
+    assert.equal(typeof res.body.canStartSafely, "boolean", "canStartSafely must be a boolean");
+    assert.ok(Array.isArray(res.body.applied),             "applied must be an array");
+    assert.ok(Array.isArray(res.body.pending),             "pending must be an array");
+    assert.ok(Array.isArray(res.body.missingOnDisk),       "missingOnDisk must be an array");
+    assert.ok(Array.isArray(res.body.modified),            "modified must be an array");
+    assert.equal(
+      res.body.state,
+      "clean",
+      "schema state must be clean after running all migrations in before()",
+    );
+    assert.equal(res.body.canStartSafely, true, "canStartSafely must be true when state is clean");
+  });
+
+  // ── #533 GET /indexer/schema — 004 migration applied ─────────────────────────
+
+  test("GET /indexer/schema — 004_query_plan_indexes migration is listed as applied", async () => {
+    const res = await request(app).get("/indexer/schema");
+    assert.equal(res.status, 200);
+    const applied = res.body.applied as string[];
+    assert.ok(
+      applied.some((f: string) => f.startsWith("004")),
+      "004_query_plan_indexes migration must appear in the applied list",
+    );
+  });
 }

@@ -14,6 +14,7 @@
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
  * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
+ * GET /indexer/schema                  → schema versioning and migration status diagnostics
  * GET /health                          → health check (db + RPC status)
  */
 
@@ -1110,6 +1111,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     } catch (err) {
       console.error("[api] Failed to load indexer health", err);
       sendError(res, 500, "Failed to load indexer health", getErrorMessage(err));
+    }
+  });
+
+  // Exposes the full migration history for ops and diagnostics: which migrations
+  // have been applied, which are pending, and whether the schema is clean.
+  app.get("/indexer/schema", detailRateLimiter, async (_req: Request, res: Response) => {
+    try {
+      const { checkMigrationHealth } = await import("./db/migrate");
+      const health = await checkMigrationHealth();
+      res.json({
+        state: health.state,
+        summary: health.summary,
+        canStartSafely: health.canStartSafely,
+        currentVersion: health.status.currentVersion,
+        applied: health.status.applied,
+        pending: health.status.pending,
+        missingOnDisk: health.status.missingOnDisk,
+        modified: health.status.modified,
+      });
+    } catch (err) {
+      console.error("[api] Failed to load schema status", err);
+      sendError(res, 500, "Failed to load schema status", getErrorMessage(err));
     }
   });
 
