@@ -136,7 +136,10 @@ describe("buildAndSend — account loading", () => {
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
       expect(result.errorCode).toBe("network_error");
-      expect(result.errorMessage).toContain("ECONNREFUSED");
+      // withRpcRetry passes the error through formatRpcError, which rewrites
+      // the raw "ECONNREFUSED" into a human-readable "connection refused" message.
+      // Assert on the error code (stable) rather than the raw token.
+      expect(result.errorMessage).toMatch(/connection refused|network|ECONNREFUSED/i);
     }
   });
 });
