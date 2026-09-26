@@ -504,6 +504,7 @@ mod adversarial_tests {
         new_members.push_back(Address::generate(&t.env));
 
         let result = t.circle.try_initialize(
+            &Address::generate(&t.env),
             &new_members,
             &(ROUND_AMOUNT * 2),
             &Address::generate(&t.env),
@@ -718,7 +719,7 @@ mod adversarial_tests {
         t.advance_past_deadline();
 
         // Pause the circle
-        t.circle.pause(&t.circle_admin).unwrap();
+        t.circle.pause(&t.circle_admin);
         assert!(t.circle.is_paused(), "circle must be paused before the test");
 
         // settle_round must be blocked — if the pause check is missing this panics
@@ -739,9 +740,9 @@ mod adversarial_tests {
                 .iter()
                 .map(|m| t.circle.get_collateral(m))
                 .collect();
-        let round_before = t.circle.get_current_round().unwrap();
+        let round_before = t.circle.get_current_round();
 
-        t.circle.pause(&t.circle_admin).unwrap();
+        t.circle.pause(&t.circle_admin);
         let result = t.circle.try_settle_round();
         assert!(result.is_err(), "settle_round must be rejected while paused");
 
@@ -755,7 +756,7 @@ mod adversarial_tests {
         }
 
         // Round state must be unchanged — paid_out still false
-        let round_after = t.circle.get_current_round().unwrap();
+        let round_after = t.circle.get_current_round();
         assert_eq!(
             round_after.paid_out, round_before.paid_out,
             "paid_out flag must not change on rejected settle_round"
@@ -817,7 +818,7 @@ mod adversarial_tests {
         t.circle.settle_round();
 
         // Round 0 is now settled; round 1 must be active
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         assert_eq!(round.round_index, 1, "circle must advance to round 1");
         assert_eq!(t.circle.get_status(), crate::CircleStatus::Active);
 
@@ -973,7 +974,7 @@ mod adversarial_tests {
     fn adv_circle_deadline_boundary_contribute_and_default_are_non_overlapping() {
         let t = make_setup();
         t.activate();
-        let round = t.circle.get_current_round().unwrap();
+        let round = t.circle.get_current_round();
         let dl = round.deadline_ledger as u32;
 
         // At exactly the deadline ledger: contribute must succeed

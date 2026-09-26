@@ -694,6 +694,7 @@ mod circle_tests {
         let circle_lo = t.env.register_contract(None, CircleContract);
         let client_lo = CircleContractClient::new(&t.env, &circle_lo);
         client_lo.initialize(
+            &Address::generate(&t.env),
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -708,6 +709,7 @@ mod circle_tests {
         let circle_hi = t.env.register_contract(None, CircleContract);
         let client_hi = CircleContractClient::new(&t.env, &circle_hi);
         client_hi.initialize(
+            &Address::generate(&t.env),
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -3367,6 +3369,7 @@ mod circle_tests {
 
         // Attempt the invalid initialize — it panics.
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &circle_id,
@@ -3427,6 +3430,7 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3486,6 +3490,7 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3556,6 +3561,7 @@ mod circle_tests {
 
         // First attempt: reputation == usdc_token (invalid)
         let bad_result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3597,6 +3603,7 @@ mod circle_tests {
         let mut members = Vec::new(&env);
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
+        let circle_admin = Address::generate(&env);
 
         circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
         // Second call must be rejected.
@@ -3613,6 +3620,7 @@ mod circle_tests {
 
         let mut members = Vec::new(&env);
         members.push_back(Address::generate(&env));
+        let circle_admin = Address::generate(&env);
 
         circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
@@ -4497,6 +4505,7 @@ mod circle_tests {
 
         // First attempt: invalid token — must fail.
         let bad = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &not_a_token,
