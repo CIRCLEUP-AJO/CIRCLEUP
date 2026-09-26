@@ -13,7 +13,7 @@
  * GET /circles/:address/rounds         → all rounds (payouts + defaults)
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
- * GET /indexer/state                   → indexer audit: last ledger + event counts
+ * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
  * GET /health                          → health check (db + RPC status)
  */
 
@@ -464,6 +464,19 @@ interface IndexerStateAuditRow {
 
 interface EventTypeCountRow {
   event_type: string | null;
+  count: string;
+}
+
+interface EntityCountsSingleRow {
+  circles: string;
+  members: string;
+  contributions: string;
+  payouts: string;
+  defaults: string;
+}
+
+interface CircleStatusCountRow {
+  status: string;
   count: string;
 }
 
@@ -1005,12 +1018,23 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // /health (which only checks connectivity, not indexing progress).
   app.get("/indexer/state", detailRateLimiter, async (_req: Request, res: Response) => {
     try {
-      const [stateRows, eventCountRows] = await Promise.all([
+      const [stateRows, eventCountRows, [entityCounts], statusRows] = await Promise.all([
         query<IndexerStateAuditRow>(
           `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
         ),
         query<EventTypeCountRow>(
           `SELECT event_type, COUNT(*) as count FROM ingested_events GROUP BY event_type`,
+        ),
+        query<EntityCountsSingleRow>(
+          `SELECT
+             (SELECT COUNT(*) FROM circles)::text AS circles,
+             (SELECT COUNT(*) FROM circle_members)::text AS members,
+             (SELECT COUNT(*) FROM contributions)::text AS contributions,
+             (SELECT COUNT(*) FROM payouts)::text AS payouts,
+             (SELECT COUNT(*) FROM defaults)::text AS defaults`,
+        ),
+        query<CircleStatusCountRow>(
+          `SELECT status, COUNT(*) as count FROM circles GROUP BY status`,
         ),
       ]);
 
@@ -1028,11 +1052,24 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         eventCounts[row.event_type ?? "unknown"] = count;
       }
 
+      const circlesByStatus: Record<string, number> = {};
+      for (const row of statusRows) {
+        circlesByStatus[row.status] = Number(row.count);
+      }
+
       res.json({
         lastLedger: Number(state.last_ledger),
         updatedAt: state.updated_at,
         totalEvents,
         eventCounts,
+        entityCounts: {
+          circles: Number(entityCounts?.circles ?? 0),
+          members: Number(entityCounts?.members ?? 0),
+          contributions: Number(entityCounts?.contributions ?? 0),
+          payouts: Number(entityCounts?.payouts ?? 0),
+          defaults: Number(entityCounts?.defaults ?? 0),
+          circlesByStatus,
+        },
       });
     } catch (err) {
       console.error("[api] Failed to load indexer state", err);
