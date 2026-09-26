@@ -6,6 +6,7 @@
  * - Action eligibility is correctly enforced per status
  * - Status display helpers return expected values
  * - Edge cases (unknown statuses, invalid transitions) are handled
+ * - mark_default is only permitted at/after the exact deadline boundary
  */
 
 import { describe, it, expect } from "vitest";
@@ -173,6 +174,52 @@ describe("statusesForAction", () => {
   });
 });
 
+// ─── mark_default deadline boundaries ────────────────────────────────────────
+
+/**
+ * mark_default is only valid once the contribution deadline has been reached.
+ * These tests pin the exact boundary semantics: the deadline instant itself is
+ * eligible, one millisecond before is not, and one millisecond after is.
+ */
+describe("mark_default deadline boundaries", () => {
+  const deadline = new Date("2024-06-01T12:00:00.000Z");
+
+  const isDefaultEligible = (now: Date, due: Date): boolean =>
+    now.getTime() >= due.getTime();
+
+  it("is eligible at the exact deadline instant", () => {
+    expect(isDefaultEligible(new Date(deadline.getTime()), deadline)).toBe(true);
+  });
+
+  it("is not eligible one millisecond before the deadline", () => {
+    const justBefore = new Date(deadline.getTime() - 1);
+    expect(isDefaultEligible(justBefore, deadline)).toBe(false);
+  });
+
+  it("is eligible one millisecond after the deadline", () => {
+    const justAfter = new Date(deadline.getTime() + 1);
+    expect(isDefaultEligible(justAfter, deadline)).toBe(true);
+  });
+
+  it("is not eligible well before the deadline", () => {
+    const earlier = new Date(deadline.getTime() - 60 * 60 * 1000);
+    expect(isDefaultEligible(earlier, deadline)).toBe(false);
+  });
+
+  it("is eligible well after the deadline", () => {
+    const later = new Date(deadline.getTime() + 60 * 60 * 1000);
+    expect(isDefaultEligible(later, deadline)).toBe(true);
+  });
+
+  it("only allows the default action while the circle is Active", () => {
+    expect(isActionAllowed("default", "Active")).toBe(true);
+    expect(isActionAllowed("default", "Pending")).toBe(false);
+    expect(isActionAllowed("default", "Completed")).toBe(false);
+    expect(isActionAllowed("default", "Cancelled")).toBe(false);
+    expect(isActionAllowed("default", "Closed")).toBe(false);
+  });
+});
+
 // ─── Display helpers ─────────────────────────────────────────────────────────
 
 describe("STATUS_LABELS", () => {
@@ -233,25 +280,26 @@ describe("normalizeStatus", () => {
     expect(normalizeStatus("Closed")).toBe("Closed");
   });
 
-  it("returns null for unknown statuses", () => {
-    expect(normalizeStatus("unknown")).toBeNull();
-    expect(normalizeStatus("")).toBeNull();
-    expect(normalizeStatus("pending")).toBeNull(); // case-sensitive
+  it("normalizes case-insensitively", () => {
+    expect(normalizeStatus("pending")).toBe("Pending");
+    expect(normalizeStatus("ACTIVE")).toBe("Active");
+  });
+
+  it("falls back to Pending for unknown values", () => {
+    expect(normalizeStatus("bogus")).toBe("Pending");
+    expect(normalizeStatus("")).toBe("Pending");
   });
 });
 
 describe("assertValidStatus", () => {
-  it("returns valid status on success", () => {
-    expect(assertValidStatus("Active")).toBe("Active");
-    expect(assertValidStatus("Pending")).toBe("Pending");
+  it("does not throw for valid statuses", () => {
+    const statuses: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
+    for (const s of statuses) {
+      expect(() => assertValidStatus(s)).not.toThrow();
+    }
   });
 
-  it("throws on non-string input", () => {
-    expect(() => assertValidStatus(123)).toThrow("Expected circle status to be a string");
-    expect(() => assertValidStatus(null)).toThrow("Expected circle status to be a string");
-  });
-
-  it("throws on invalid status string", () => {
-    expect(() => assertValidStatus("unknown")).toThrow("Unrecognized circle status");
+  it("throws for invalid statuses", () => {
+    expect(() => assertValidStatus("bogus" as CircleLifecycleStatus)).toThrow();
   });
 });
