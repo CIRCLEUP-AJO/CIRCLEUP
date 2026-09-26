@@ -364,9 +364,138 @@ if (hasDb) {
     assert.ok(typeof res.body.updatedAt === "string",   "updatedAt must be a string");
   });
 
-  // ── Validation edge cases ────────────────────────────────────────────────────
+  // ── GET /circles/:address/rounds ─────────────────────────────────────────────
 
-  test("GET /circles returns 400 for invalid sort field", async () => {
+  test("GET /circles/:address/rounds returns 200 with status metadata on every round (issue #529)", async () => {
+    const addr    = "CDBTEST_ROUNDS_STATUS";
+    const member1 = "GDBTEST_ROUNDS_STATUS_M1";
+    const member2 = "GDBTEST_ROUNDS_STATUS_M2";
+    const VALID_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
+
+    // Active 2-member circle: round 0 paid out, round 1 in progress
+    await seedCircle(addr, {
+      status:       "Active",
+      currentRound: 1,
+      totalRounds:  2,
+    });
+    await seedMember(addr, member1, 0);
+    await seedMember(addr, member2, 1);
+
+    // Seed contributions for round 0
+    await seedContribution(addr, member1, 0, 1001);
+    await seedContribution(addr, member2, 0, 1002);
+
+    // Seed the payout for round 0
+    await pool.query(
+      `INSERT INTO payouts
+         (circle_address, recipient, round_index, amount, tx_hash, ledger)
+       VALUES ($1, $2, 0, 200, 'dbtest-payout-tx-0', 1010)
+       ON CONFLICT DO NOTHING`,
+      [addr, member1],
+    );
+
+    // Seed a contribution for round 1 (current)
+    await seedContribution(addr, member1, 1, 1020);
+
+    try {
+      const res = await request(app).get(`/circles/${addr}/rounds`);
+      assert.equal(res.status, 200, "rounds endpoint must return 200");
+
+      const { rounds, currentRound, openRounds } = res.body as {
+        rounds: Array<Record<string, unknown>>;
+        currentRound: Record<string, unknown> | null;
+        openRounds: Array<Record<string, unknown>>;
+      };
+
+      assert.ok(Array.isArray(rounds), "rounds must be an array");
+      assert.ok(Array.isArray(openRounds), "openRounds must be an array");
+
+      // Every completed round must carry status: "completed"
+      assert.ok(rounds.length >= 1, "at least one completed round expected");
+      for (const round of rounds) {
+        assert.ok(
+          "status" in round,
+          `rounds[${round.roundIndex}] is missing the status field (issue #529)`,
+        );
+        assert.ok(
+          VALID_STATUSES.has(String(round.status)),
+          `rounds[${round.roundIndex}].status has invalid value "${round.status}"`,
+        );
+        assert.equal(
+          round.status,
+          "completed",
+          `rounds[${round.roundIndex}].status must be "completed" for a paid-out round`,
+        );
+      }
+
+      // currentRound must carry status: "current" for an Active circle
+      assert.ok(currentRound !== null, "currentRound must be present for Active circle");
+      assert.ok(
+        "status" in currentRound!,
+        "currentRound is missing the status field (issue #529)",
+      );
+      assert.ok(
+        VALID_STATUSES.has(String(currentRound!.status)),
+        `currentRound.status has invalid value "${currentRound!.status}"`,
+      );
+      assert.equal(
+        currentRound!.status,
+        "current",
+        "currentRound.status must be 'current' for an Active circle",
+      );
+
+      // openRounds, if any, must each carry status: "open"
+      for (const round of openRounds) {
+        assert.ok(
+          "status" in round,
+          `openRounds[${round.roundIndex}] is missing the status field`,
+        );
+        assert.equal(round.status, "open");
+      }
+    } finally {
+      await pool.query("DELETE FROM payouts WHERE circle_address = $1", [addr]);
+      await cleanCircle(addr);
+    }
+  });
+
+  test("GET /circles/:address/rounds returns status='cancelled' for currentRound of a Cancelled circle (issue #529)", async () => {
+    const addr   = "CDBTEST_ROUNDS_CANCELLED";
+    const member = "GDBTEST_ROUNDS_CANCELLED_M";
+
+    await seedCircle(addr, {
+      status:       "Cancelled",
+      currentRound: 0,
+      totalRounds:  2,
+    });
+    await seedMember(addr, member, 0);
+
+    try {
+      const res = await request(app).get(`/circles/${addr}/rounds`);
+      assert.equal(res.status, 200);
+
+      const { currentRound } = res.body as {
+        currentRound: Record<string, unknown> | null;
+      };
+
+      assert.ok(currentRound !== null, "currentRound must be present for a Cancelled circle");
+      assert.ok(
+        "status" in currentRound!,
+        "currentRound is missing the status field (issue #529)",
+      );
+      assert.equal(
+        currentRound!.status,
+        "cancelled",
+        "currentRound.status must be 'cancelled' for a Cancelled circle",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
+  test("GET /circles/:address/rounds: 404 for unknown circle", async () => {
+    const res = await request(app).get("/circles/CDBTEST_NO_ROUNDS_CIRCLE/rounds");
+    assert.equal(res.status, 404);
+  });
     const res = await request(app).get("/circles?sort=nonexistent_field");
     assert.equal(res.status, 400);
   });
