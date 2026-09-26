@@ -2391,8 +2391,13 @@ export class IndexerClient {
   }
 
   /**
-   * Fetch all completed payout rounds for a circle, including per-round
-   * contributions and defaults.
+   * Fetch all rounds for a circle — completed payouts, the in-progress round,
+   * open rounds, and pending defaults.
+   *
+   * Every round row includes a `status` field (`"completed"`, `"current"`,
+   * `"cancelled"`, or `"open"`) so callers can branch on lifecycle phase
+   * without inferring it from the presence or absence of payout fields
+   * (issue #529).
    *
    * `pendingDefaults` contains defaults that have been recorded but belong to
    * a round that has not yet been paid out.
