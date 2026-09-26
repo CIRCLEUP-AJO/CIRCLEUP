@@ -978,8 +978,20 @@ export function isRetryable(result: TxFailure): boolean {
 // Consumers should convert stroops strings to bigint / display strings via the
 // helpers in sdk/src/utils.ts (formatUsdc, stroopsToUsdc, usdcToStroops).
 
-/** The four lifecycle states a circle can be in, as returned by the indexer. */
-export type ApiCircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
+/**
+ * All lifecycle states a circle can be in, as returned by the indexer.
+ *
+ * The first four mirror the on-chain `CircleStatus` Rust enum.  `"Closed"` is
+ * an indexer-only projection: the contract records closure as a boolean flag
+ * (`DataKey::Closed`) and the indexer surfaces it as a status string so
+ * callers can filter or count fully-settled circles via the REST API.
+ */
+export type ApiCircleStatus =
+  | "Pending"
+  | "Active"
+  | "Completed"
+  | "Cancelled"
+  | "Closed";
 
 /**
  * A single circle row as returned by GET /circles and GET /circles/:address.
@@ -1067,9 +1079,46 @@ export interface ApiRoundRow {
 
 // ─── Indexer API response envelopes ───────────────────────────────────────────
 
+/**
+ * Query parameters accepted by `GET /circles`.
+ *
+ * All fields are optional; the indexer's defaults apply when omitted:
+ *   - `status`  — no filter (all statuses returned)
+ *   - `sort`    — `"created_ledger"`
+ *   - `order`   — `"desc"`
+ *   - `page`    — `1`
+ *   - `limit`   — `20`
+ */
+export interface GetCirclesParams {
+  /**
+   * Restrict results to circles in this lifecycle state.
+   * `"Closed"` is an indexer-only projection (not a contract enum variant).
+   */
+  status?: ApiCircleStatus;
+  /** Column to sort results by. */
+  sort?: "created_ledger" | "updated_at" | "round_amount" | "member_count" | "status";
+  /** Sort direction. */
+  order?: "asc" | "desc";
+  /** 1-based page number. */
+  page?: number;
+  /** Results per page (1–100). */
+  limit?: number;
+}
+
 /** Response body for GET /circles */
 export interface ApiCirclesListResponse {
   circles: ApiCircleRow[];
+  /**
+   * Pagination metadata returned by the indexer.
+   * Present on all responses; callers should use `total` and `totalPages` for
+   * building pagination controls.
+   */
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
 }
 
 /** Response body for GET /circles/:address */
@@ -1088,8 +1137,45 @@ export interface ApiMembersResponse {
 /** Response body for GET /circles/:address/rounds */
 export interface ApiRoundsResponse {
   rounds: ApiRoundRow[];
+  /**
+   * Unpaid rounds that have contributions and/or defaults recorded but are not
+   * the circle's current round (reorg / partial-ingest edge case, issue #170).
+   */
+  openRounds: ApiRoundRow[];
   /** Defaults that belong to a round not yet paid out. */
   pendingDefaults: ApiDefaultRecord[];
+  /**
+   * The in-progress round (status `"current"` or `"cancelled"`), returned
+   * alongside the history so clients can show live contribution status without
+   * a second request. `null` when the circle is not Active or the indexer has
+   * not yet processed the current round.
+   */
+  currentRound: ApiRoundRow | null;
+}
+
+/**
+ * Composite response body for the circle detail page, merging
+ * `GET /circles/:address` and `GET /circles/:address/rounds` into a single
+ * typed contract. Used by the app's server component and client refresh path.
+ */
+export interface ApiCircleDetailWithRoundsResponse {
+  /** Core circle state and member roster from GET /circles/:address. */
+  circle: ApiCircleRow;
+  /** Member roster from GET /circles/:address. */
+  members: ApiMemberRow[];
+  /** Latest ledger the indexer has processed; used for deadline countdown. */
+  latestLedger: number | null;
+  /** Completed/open rounds from GET /circles/:address/rounds. */
+  rounds: ApiRoundRow[];
+  /** Unpaid rounds with activity that are not the current round (issue #170). */
+  openRounds: ApiRoundRow[];
+  /** Pending defaults not yet associated with a payout round. */
+  pendingDefaults: ApiDefaultRecord[];
+  /**
+   * The in-progress round containing live contribution data; `null` when the
+   * circle is not Active or the indexer has not yet processed this round.
+   */
+  currentRound: ApiRoundRow | null;
 }
 
 /** Response body for GET /reputation/:member */

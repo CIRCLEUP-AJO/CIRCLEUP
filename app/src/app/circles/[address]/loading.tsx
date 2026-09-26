@@ -1,16 +1,18 @@
 /**
- * Streaming loading skeleton for the circle detail page (Issue #473).
+ * Streaming loading skeleton for the circle detail page (Issue #489).
  *
  * Shown by Next.js while the async CircleDetailPage server component is
  * fetching data. Mirrors the exact layout the real page renders so there is
  * zero layout shift when the content streams in.
  *
  * Layout sections (top to bottom):
- *   1. CircleHeader skeleton  — address + 4 stat tiles
- *   2. Actions panel skeleton — action button placeholder
- *   3. Round deadline skeleton
- *   4. Rotation order skeleton — 4 member rows
- *   5. Round history skeleton  — 2 past-round cards
+ *   1. Header skeleton         — circle name + address + 4 stat tiles
+ *   2. Workflow banner skeleton
+ *   3. Actions panel skeleton  — action button placeholder
+ *   4. Round deadline skeleton
+ *   5. Rotation order skeleton — member rows
+ *   6. Round history skeleton  — past-round cards
+ *   7. Invite link skeleton
  */
 
 function SkeletonTile() {
@@ -58,14 +60,14 @@ function SkeletonRoundCard() {
 
 export default function CircleDetailLoading() {
   return (
-    <div aria-label="Loading circle details…" aria-busy="true">
-      {/* ── Circle header ────────────────────────────────────────────── */}
+    <div role="status" aria-label="Loading circle details…" aria-busy="true">
+      {/* ── Header ─────────────────────────────────────────────────────── */}
       <div className="mb-8 animate-pulse">
         <div className="flex items-start gap-3 mb-2">
           <span className="text-3xl" aria-hidden="true">🔄</span>
-          <div className="space-y-2 flex-1">
+          <div className="min-w-0 flex-1 space-y-2">
             <div className="h-7 bg-slate-200 rounded w-56" />
-            <div className="h-4 bg-slate-100 rounded w-80" />
+            <div className="h-4 bg-slate-100 rounded w-3/4 max-w-80" />
           </div>
         </div>
 
@@ -76,12 +78,12 @@ export default function CircleDetailLoading() {
         </div>
       </div>
 
-      {/* ── Workflow banner ──────────────────────────────────────────── */}
+      {/* ── Workflow banner ────────────────────────────────────────────── */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-6 animate-pulse">
         <div className="h-4 bg-slate-200 rounded w-2/3" />
       </div>
 
-      {/* ── Actions panel ────────────────────────────────────────────── */}
+      {/* ── Actions panel ──────────────────────────────────────────────── */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
         <div className="h-5 bg-slate-200 rounded w-20 mb-4 animate-pulse" />
         <div className="flex gap-3 flex-wrap">
@@ -89,7 +91,7 @@ export default function CircleDetailLoading() {
         </div>
       </div>
 
-      {/* ── Round deadline ────────────────────────────────────────────── */}
+      {/* ── Round deadline ─────────────────────────────────────────────── */}
       <div
         className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-6 flex items-center gap-3 animate-pulse"
         aria-hidden="true"
@@ -102,7 +104,7 @@ export default function CircleDetailLoading() {
         </div>
       </div>
 
-      {/* ── Rotation order ───────────────────────────────────────────── */}
+      {/* ── Rotation order ─────────────────────────────────────────────── */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
         <div className="h-5 bg-slate-200 rounded w-40 mb-4 animate-pulse" />
         <div className="space-y-2">
@@ -113,7 +115,7 @@ export default function CircleDetailLoading() {
         <div className="h-2.5 bg-slate-100 rounded w-48 mt-3 animate-pulse" />
       </div>
 
-      {/* ── Round history ─────────────────────────────────────────────── */}
+      {/* ── Round history ──────────────────────────────────────────────── */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-6">
         <div className="h-5 bg-slate-200 rounded w-36 mb-4 animate-pulse" />
         <div className="space-y-4">
@@ -122,7 +124,7 @@ export default function CircleDetailLoading() {
         </div>
       </div>
 
-      {/* ── Invite link ──────────────────────────────────────────────── */}
+      {/* ── Invite link ────────────────────────────────────────────────── */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 animate-pulse">
         <div className="h-4 bg-slate-200 rounded w-24 mb-2" />
         <div className="h-3 bg-slate-100 rounded w-64 mb-3" />
