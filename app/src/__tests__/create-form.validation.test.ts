@@ -521,3 +521,282 @@ describe("validateMemberEntry — every member entry is validated", () => {
     expect(validateMemberEntry("nope", 4)).toMatch(/^Member 5:/);
   });
 });
+
+// ─── validMembers contract — centralized validation (Gaps 1 & 2) ──────────────
+//
+// These tests pin down the two invariants introduced when validMembers was
+// changed from getFilledMembers(members) (all filled rows) to the
+// address-validated-only subset:
+//
+//   Invariant 1 (Gap 1): values.validMembers never contains an address that
+//     failed validateMemberEntry. Invalid-but-filled rows are excluded.
+//
+//   Invariant 2 (Gap 2): membersGeneral count messages (too_few / too_many /
+//     duplicate) are computed from the valid-only subset, not the raw filled
+//     count.  A row with a bad address is not a "member you have".
+//
+// Self-address check (Gap 7d): that guard lives inside handleSubmit, not
+// validateCreateForm, and is already exercised in create-submission-guard.test.tsx.
+// There is nothing to add here; a pure unit test cannot mock the wallet call.
+
+describe("validateCreateForm — validMembers excludes per-field-invalid entries (Gap 1)", () => {
+  // ── ok:true path — validMembers is always address-clean ──────────────────
+
+  it("validMembers contains only the rows that passed validateMemberEntry", () => {
+    // All valid — all three should appear.
+    const values = assertOk(valid({ members: [A, B, C] }));
+    expect(values.validMembers).toEqual([A, B, C]);
+  });
+
+  it("blank rows are excluded from validMembers", () => {
+    const values = assertOk(valid({ members: [A, "", B, "  "] }));
+    expect(values.validMembers).toEqual([A, B]);
+  });
+
+  it("whitespace-padded valid addresses are trimmed and included", () => {
+    const values = assertOk(valid({ members: [`  ${A}  `, B] }));
+    expect(values.validMembers).toEqual([A, B]);
+  });
+
+  // ── ok:false path — validMembers still excludes invalid rows ─────────────
+  //
+  // When the form has errors the function returns ok:false and the caller
+  // never sees validMembers, but the filtering still runs correctly (it is
+  // used to build membersGeneral).  These tests reach that path via a
+  // deliberately broken name field so we can inspect the member subset
+  // indirectly through membersGeneral.
+
+  it("a checksum-invalid address does not appear in the submittable set", () => {
+    // [A, withTypo(B)] — A is valid, withTypo(B) fails the checksum check.
+    // membersGeneral should reflect 1 valid member (too_few), not 2 filled.
+    const result = validateCreateForm(
+      VALID.name,
+      [A, withTypo(B)],
+      VALID.amount,
+      VALID.days,
+    );
+    // The form must be invalid (per-field error on row 2, and only 1 valid
+    // member which is too_few).
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // Per-field error present on the bad row
+    expect(result.errors.members?.[1]).toMatch(/checksum/i);
+    // membersGeneral counts only the valid row
+    expect(result.errors.membersGeneral).toMatch(/You have 1/);
+  });
+
+  it("a contract-prefix address does not appear in the submittable set", () => {
+    const contractAddr = "C" + "A".repeat(55);
+    const result = validateCreateForm(
+      VALID.name,
+      [A, contractAddr],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.members?.[1]).toMatch(/contract/i);
+    // Only A is submittable — too_few
+    expect(result.errors.membersGeneral).toMatch(/You have 1/);
+  });
+
+  it("a muxed-prefix address does not appear in the submittable set", () => {
+    const muxedAddr = "M" + "A".repeat(55);
+    const result = validateCreateForm(
+      VALID.name,
+      [A, muxedAddr],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.members?.[1]).toMatch(/muxed/i);
+    expect(result.errors.membersGeneral).toMatch(/You have 1/);
+  });
+
+  it("a garbled address does not appear in the submittable set", () => {
+    const result = validateCreateForm(
+      VALID.name,
+      [A, "not-an-address"],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.members?.[1]).toMatch(/G-prefixed/i);
+    expect(result.errors.membersGeneral).toMatch(/You have 1/);
+  });
+
+  it("all-invalid filled rows produce an 'Add member addresses below' message", () => {
+    // Both rows fail validateMemberEntry — validMembers is empty.
+    const result = validateCreateForm(
+      VALID.name,
+      ["not-an-address", withTypo(B)],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.membersGeneral).toMatch(/Add member addresses below/i);
+  });
+
+  it("a mix of valid, invalid, and blank rows yields only the valid subset", () => {
+    // [A, "bad", "", C, withTypo(B)] → valid = [A, C]
+    const result = validateCreateForm(
+      VALID.name,
+      [A, "bad", "", C, withTypo(B)],
+      VALID.amount,
+      VALID.days,
+    );
+    // 2 valid members + per-field errors on rows 2 and 5 → ok:false
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.members?.[0]).toBeUndefined();    // A — valid
+    expect(result.errors.members?.[1]).toMatch(/G-prefixed/i); // "bad"
+    expect(result.errors.members?.[2]).toBeUndefined();    // blank — skipped
+    expect(result.errors.members?.[4]).toMatch(/checksum/i);   // withTypo(B)
+    // membersGeneral is absent — 2 valid members is within [MIN, MAX]
+    // (the per-field errors already make the form invalid)
+    expect(result.errors.membersGeneral).toBeUndefined();
+  });
+});
+
+// ─── membersGeneral count uses valid-only members (Gap 2) ────────────────────
+
+describe("validateCreateForm — membersGeneral reflects the valid-only count (Gap 2)", () => {
+  it("reports too_few based on valid rows, not filled rows", () => {
+    // 3 filled rows, only 1 passes validation → too_few (need 2)
+    const result = validateCreateForm(
+      VALID.name,
+      [A, "bad1", "bad2"],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.membersGeneral).toMatch(/at least/i);
+    expect(result.errors.membersGeneral).toMatch(/You have 1/);
+  });
+
+  it("does not report too_few when exactly MIN_MEMBERS valid rows exist alongside invalid rows", () => {
+    // [A, B, "bad"] — 2 valid (meets minimum), 1 invalid
+    const result = validateCreateForm(
+      VALID.name,
+      [A, B, "bad"],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // Per-field error on "bad", but membersGeneral is NOT too_few
+    expect(result.errors.members?.[2]).toBeDefined();
+    expect(result.errors.membersGeneral).toBeUndefined();
+  });
+
+  it("reports too_many based only on valid rows beyond MAX_MEMBERS", () => {
+    // MAX_MEMBERS + 1 valid rows, all checksum-valid
+    const tooMany = Array.from({ length: MAX_MEMBERS + 1 }, (_, i) => addrFor(40 + i));
+    const result = validateCreateForm(VALID.name, tooMany, VALID.amount, VALID.days);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.membersGeneral).toMatch(/more than/i);
+    expect(result.errors.membersGeneral).toMatch(
+      new RegExp(`You have ${MAX_MEMBERS + 1}; remove 1`),
+    );
+  });
+
+  it("invalid rows mixed with MAX_MEMBERS valid rows do not trigger too_many", () => {
+    // Exactly MAX_MEMBERS valid + 2 invalid: valid count = MAX_MEMBERS (ok)
+    const exactMax = Array.from({ length: MAX_MEMBERS }, (_, i) => addrFor(20 + i));
+    const result = validateCreateForm(
+      VALID.name,
+      [...exactMax, "bad1", "bad2"],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // Per-field errors on the 2 invalid rows
+    expect(result.errors.members?.[MAX_MEMBERS]).toBeDefined();
+    expect(result.errors.members?.[MAX_MEMBERS + 1]).toBeDefined();
+    // membersGeneral is NOT too_many — valid count is exactly MAX_MEMBERS
+    expect(result.errors.membersGeneral).toBeUndefined();
+  });
+
+  it("empty membersGeneral message when per-field errors exist but valid count is in range", () => {
+    // [A, B, "bad"] — valid count 2 is in [MIN, MAX], no dup → no list-level error
+    const result = validateCreateForm(
+      VALID.name,
+      [A, B, "bad"],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.membersGeneral).toBeUndefined();
+  });
+
+  it("duplicate detection uses the valid-only subset", () => {
+    // A appears twice; "bad" is invalid and excluded before dup check
+    const result = validateCreateForm(
+      VALID.name,
+      [A, A, "bad"],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    // Per-field error on "bad"
+    expect(result.errors.members?.[2]).toBeDefined();
+    // Duplicate detected in the valid subset [A, A]
+    expect(result.errors.membersGeneral).toMatch(/duplicate/i);
+  });
+
+  it("no false-positive duplicate when only one valid row appears multiple times as invalid", () => {
+    // [A, withTypo(A), withTypo(A)] — only A passes; the typos are distinct
+    // invalid strings, not duplicates of A.  Valid subset = [A] → too_few.
+    const result = validateCreateForm(
+      VALID.name,
+      [A, withTypo(A), withTypo(A)],
+      VALID.amount,
+      VALID.days,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.membersGeneral).toMatch(/You have 1/);
+    // Must NOT say "duplicate" — only one valid address
+    expect(result.errors.membersGeneral).not.toMatch(/duplicate/i);
+  });
+});
+
+// ─── validMembers output purity — no invalid address ever reaches the contract ─
+
+describe("validateCreateForm — validMembers output purity", () => {
+  it("ok:true form returns validMembers with no blank strings", () => {
+    const values = assertOk(valid({ members: [A, "", B, "   "] }));
+    values.validMembers.forEach((m) => expect(m.trim().length).toBeGreaterThan(0));
+  });
+
+  it("ok:true form returns validMembers with every entry passing validateMemberEntry", () => {
+    const values = assertOk(valid({ members: [A, B, C] }));
+    values.validMembers.forEach((m, i) => {
+      expect(validateMemberEntry(m, i)).toBeUndefined();
+    });
+  });
+
+  it("ok:true form with whitespace-padded entries returns trimmed addresses", () => {
+    const values = assertOk(valid({ members: [`  ${A}  `, `\t${B}\t`] }));
+    expect(values.validMembers).toEqual([A, B]);
+  });
+
+  it("validateCreateForm and validateMemberEntry agree on every entry in validMembers", () => {
+    // Exhaustive: for each address in the ok output, the per-entry validator
+    // must return undefined (no error).  This pins the shared-rule invariant.
+    const members = [A, B, C];
+    const values = assertOk(valid({ members }));
+    expect(values.validMembers).toHaveLength(3);
+    values.validMembers.forEach((m, i) => {
+      expect(validateMemberEntry(m, i)).toBeUndefined();
+    });
+  });
+});

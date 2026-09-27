@@ -300,8 +300,27 @@ export function validateCreateForm(
   }
 
   // ── Members — list-level ──────────────────────────────────────────────────
-  // Blank rows are dropped here, before any count is taken.
-  const validMembers = getFilledMembers(members);
+  //
+  // `validMembers` is the set that will actually reach the contract: filled,
+  // trimmed, and address-validated (no blank rows, no bad checksums, no
+  // contract-prefix entries).  It must exclude every row that already failed
+  // validateMemberEntry so that:
+  //
+  //   a) membersGeneral count messages reflect only submittable addresses.
+  //      A form like [A, "bad"] has 1 submittable member, not 2.
+  //
+  //   b) the `values.validMembers` returned on ok:true never contains an
+  //      address that failed per-field validation — closing the gap where
+  //      the contract call could receive an invalid payload.
+  //
+  // Both `getFilledMembers` (blank filter) and the per-field error check run
+  // on the same `members` array in the same iteration, so the two lists stay
+  // in sync without a second pass.
+  const validMembers = members
+    .map((raw, i) => ({ trimmed: raw.trim(), error: memberErrors[i] }))
+    .filter(({ trimmed, error }) => trimmed.length > 0 && error === undefined)
+    .map(({ trimmed }) => trimmed);
+
   const countStatus = getMemberCountStatus(validMembers.length);
 
   if (countStatus === "too_few") {
@@ -859,10 +878,15 @@ export default function CreateClient() {
           <ul className="space-y-0.5 text-slate-600" aria-live="polite" aria-atomic="true">
             {name.trim() && <li>📛 {name.trim()}</li>}
             <li>
-              👥 {filledCount} member{filledCount !== 1 ? "s" : ""}
-              {memberSummary.status === "too_few" && ` (at least ${MIN_MEMBERS} needed)`}
-              {memberSummary.duplicateRows > 0 &&
-                ` · ${memberSummary.duplicateRows} duplicate${memberSummary.duplicateRows !== 1 ? "s" : ""} not counted`}
+              <span>
+                👥 {filledCount} member{filledCount !== 1 ? "s" : ""}
+                {memberSummary.status === "too_few" && ` (at least ${MIN_MEMBERS} needed)`}
+              </span>
+              {memberSummary.duplicateRows > 0 && (
+                <span className="text-amber-700">
+                  {` · ${memberSummary.duplicateRows} duplicate${memberSummary.duplicateRows !== 1 ? "s" : ""} not counted`}
+                </span>
+              )}
             </li>
             <li>💰 ${memberAmountDisplay} USDC / member / round</li>
             <li>🎯 Pot per round: ${potDisplay}</li>
