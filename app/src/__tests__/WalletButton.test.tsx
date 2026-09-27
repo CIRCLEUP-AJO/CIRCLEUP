@@ -570,3 +570,263 @@ describe("WalletButton — accessibility", () => {
     try { Object.defineProperty(window, "freighter", { configurable: true, value: undefined }); delete (window as any).freighter; } catch { /* jsdom cleanup */ }
   });
 });
+
+// ─── Initial probe error handling ────────────────────────────────────────────
+//
+// resolveAccount runs on mount as a silent probe. Before this fix, ALL errors
+// from getWalletAddress() were mapped to the not_installed state regardless of
+// reason — a permission_denied or unknown error during the silent probe would
+// render the "Install Freighter" link instead of an error with retry guidance.
+// These tests pin the corrected behaviour.
+
+describe("WalletButton — initial probe error handling", () => {
+  it("shows error state (not install link) when probe throws permission_denied", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockRejectedValue(
+      new mockStellar.WalletError("permission_denied", "Wallet access was denied."),
+    );
+
+    render(<WalletButton />);
+
+    // Must NOT show the install link — permission_denied means wallet IS installed
+    await waitFor(() =>
+      expect(screen.queryByRole("link", { name: /install freighter/i })).not.toBeInTheDocument(),
+    );
+
+    // Must show the error panel with retry button
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /retry connection/i })).toBeInTheDocument(),
+    );
+  });
+
+  it("permission_denied probe shows the correct guidance message", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockRejectedValue(
+      new mockStellar.WalletError("permission_denied", "Wallet access was denied."),
+    );
+
+    render(<WalletButton />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/dismissed the Freighter prompt/i),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("shows error state when probe throws a generic (non-WalletError) exception", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockRejectedValue(
+      new Error("Extension communication failed"),
+    );
+
+    render(<WalletButton />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /retry connection/i })).toBeInTheDocument(),
+    );
+    // Should NOT show install link — this is not a not_installed error
+    expect(screen.queryByRole("link", { name: /install freighter/i })).not.toBeInTheDocument();
+  });
+
+  it("generic probe error shows the unknown guidance message", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockRejectedValue(
+      new Error("Extension communication failed"),
+    );
+
+    render(<WalletButton />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/connection error occurred/i),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("shows error state when probe throws WalletError with unknown reason", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockRejectedValue(
+      new mockStellar.WalletError("unknown", "RPC connection refused."),
+    );
+
+    render(<WalletButton />);
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /retry connection/i })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("link", { name: /install freighter/i })).not.toBeInTheDocument();
+  });
+
+  it("still shows not_installed when probe throws WalletError with not_installed reason", async () => {
+    // Belt-and-suspenders: the not_installed path must still work correctly.
+    mockStellar.isFreighterInstalled.mockReturnValue(false);
+    mockStellar.getWalletAddress.mockRejectedValue(
+      new mockStellar.WalletError("not_installed", "Freighter not installed."),
+    );
+
+    render(<WalletButton />);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("link", { name: /install freighter/i }),
+      ).toBeInTheDocument(),
+    );
+  });
+});
+
+// ─── Error render — per-reason guidance ──────────────────────────────────────
+//
+// Each WalletErrorReason must produce distinct, actionable guidance text so the
+// user knows their exact next step rather than a generic "something went wrong".
+
+describe("WalletButton — error render per-reason guidance", () => {
+  it("permission_denied connect shows dismiss guidance", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockRejectedValue(
+      new mockStellar.WalletError("permission_denied", "Access denied by user."),
+    );
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/dismissed the Freighter prompt/i),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("unknown WalletError connect shows generic connection guidance", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockRejectedValue(
+      new mockStellar.WalletError("unknown", "Unexpected extension error."),
+    );
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/connection error occurred/i),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("unsupported_capability connect shows update guidance", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockRejectedValue(
+      new mockStellar.WalletError(
+        "unsupported_capability",
+        "This action is not supported by your wallet.",
+      ),
+    );
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    await waitFor(() =>
+      expect(
+        screen.getByText(/version of Freighter does not support/i),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("error panel uses role=alert so screen readers announce it immediately", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockRejectedValue(
+      new mockStellar.WalletError("permission_denied", "Denied."),
+    );
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert).toBeInTheDocument();
+      // The alert must be a panel element (div/section), not just a span —
+      // confirms the full panel pattern, not the old truncated span.
+      expect(alert.tagName.toLowerCase()).toBe("div");
+    });
+  });
+
+  it("technical error message is visible in the DOM, not just a tooltip", async () => {
+    const technicalMsg = "Unexpected extension failure";
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockRejectedValue(
+      new mockStellar.WalletError("unknown", technicalMsg),
+    );
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    // The message must appear as visible text — NOT only in a title attribute.
+    await waitFor(() =>
+      expect(screen.getByText(technicalMsg)).toBeInTheDocument(),
+    );
+    // Confirm it is NOT only in a tooltip by checking the element is visible text
+    const el = screen.getByText(technicalMsg);
+    expect(el.tagName.toLowerCase()).not.toBe("button"); // not stuffed into title
+  });
+
+  it("retry button is linked to the error panel via aria-describedby", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockRejectedValue(
+      new mockStellar.WalletError("permission_denied", "Denied."),
+    );
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    await waitFor(() => {
+      const retryBtn = screen.getByRole("button", { name: /retry connection/i });
+      expect(retryBtn).toHaveAttribute("aria-describedby", "wallet-error-panel");
+    });
+  });
+});
+
+// ─── Checking state ───────────────────────────────────────────────────────────
+//
+// On mount the component sets status:"checking" while getWalletAddress() is
+// in-flight. The button must be rendered as disabled and aria-busy during
+// this window.
+
+describe("WalletButton — checking state", () => {
+  it("renders a disabled, aria-busy button while the initial probe is in-flight", async () => {
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    // Never resolves — simulates the probe still in-flight
+    mockStellar.getWalletAddress.mockReturnValue(new Promise(() => {}));
+
+    render(<WalletButton />);
+
+    // During checking the button is rendered but disabled and aria-busy
+    const btn = await screen.findByRole("button");
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("button label is 'Connect Freighter' (not a loading variant) during checking", async () => {
+    // The checking state uses the default "Connect Freighter" label since the
+    // user has not initiated a connection yet — it would be confusing to show
+    // "Connecting…" before they clicked anything.
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockReturnValue(new Promise(() => {}));
+
+    render(<WalletButton />);
+
+    const btn = await screen.findByRole("button");
+    expect(btn).toHaveTextContent(/connect freighter/i);
+  });
+});
