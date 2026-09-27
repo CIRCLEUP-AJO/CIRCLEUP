@@ -870,7 +870,15 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // so window.location is guaranteed to exist here — no typeof guard needed.
   // Keeping this in an effect (rather than useMemo) also means the URL is only
   // computed after hydration, preventing any server/client HTML mismatch.
+  //
+  // Address guard: circleAddress is validated by isSorobanContractId in both
+  // the server page (CircleDetailPage notFound() guard) and in doAction /
+  // doDefault before any contract call. We repeat the check here so the invite
+  // URL is never constructed from a malformed value — the prop is typed as
+  // `string` but a caller outside the normal page render path (tests, Storybook)
+  // could pass an arbitrary string.
   useEffect(() => {
+    if (!isSorobanContractId(circleAddress)) return;
     setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
   }, [circleAddress]);
 
