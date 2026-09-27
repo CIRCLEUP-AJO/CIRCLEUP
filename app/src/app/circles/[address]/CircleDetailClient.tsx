@@ -2,7 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract } from "@/lib/stellar";
-import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
+import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK, NETWORK_PASSPHRASE } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
 import { isSorobanContractId } from "@/lib/address";
 import { parseContractError, userMessageForError } from "@/lib/contractErrors";
@@ -10,7 +10,13 @@ import {
   buildAppSnapshot,
   computeActionEligibility,
   isGateBlocked,
+  type NetworkCheckState,
 } from "@/lib/gating";
+import {
+  checkNetworkMismatch,
+  describeNetworkMismatch,
+  type NetworkMismatchResult,
+} from "@/lib/walletCapabilities";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import clsx from "clsx";
 // ─── Shared response contracts (Issue #513) ────────────────────────────────────
@@ -773,6 +779,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // flash on/off during the async wallet check.
   const [walletLoadState, setWalletLoadState] = useState<WalletLoadState>("loading");
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [networkMismatch, setNetworkMismatch] = useState<NetworkMismatchResult | null>(null);
 
   // ── Circle data ────────────────────────────────────────────────────────────
   const [data, setData] = useState<CircleDetailData>(circleData);
@@ -830,6 +837,31 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (walletLoadState !== "connected") {
+      setNetworkMismatch(null);
+      return;
+    }
+
+    checkNetworkMismatch(NETWORK_PASSPHRASE)
+      .then((result) => {
+        if (!cancelled) setNetworkMismatch(result);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setNetworkMismatch({
+            kind: "provider_error",
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [walletLoadState, walletAddress]);
 
   // Ref for aborting any in-flight manual or post-action refresh when the
   // component unmounts, preventing setState calls on an unmounted tree.
@@ -936,6 +968,16 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Actions are only allowed when data is fully ready.
   // This is the single authoritative gate for data completeness.
   const actionsEnabled = dataReadiness === "ready" && walletLoadState !== "loading";
+  const networkCheck: NetworkCheckState =
+    networkMismatch?.kind === "mismatch"
+      ? "mismatch"
+      : networkMismatch?.kind === "match"
+      ? "match"
+      : networkMismatch == null
+      ? null
+      : "unknown";
+  const networkWarning = networkMismatch ? describeNetworkMismatch(networkMismatch) : null;
+  const myHasLockedCollateral = hasLockedCollateral;
 
   // ── Payout gate (for disabled-state display) ───────────────────────────────
   //
@@ -962,10 +1004,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         data.circle.deadline_ledger,
         data.latestLedger,
         data.members.map((m) => m.member_address),
-        myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+        myHasLockedCollateral,
         myContributedThisRound,
         data.currentRound?.contributions.length ?? 0,
-        null, // no network-mismatch data in this context — default null
+        networkCheck,
         dataFetchedAtMs, // use data fetch time, not snapshot build time
       ),
       { maxSnapshotAgeMs: Infinity },
@@ -986,11 +1028,43 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       data.circle.deadline_ledger,
       data.latestLedger,
       data.members.map((m) => m.member_address),
-      myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+      myHasLockedCollateral,
       myContributedThisRound,
       data.currentRound?.contributions.length ?? 0,
-      null, // no network-mismatch data in this context — default null
+      networkCheck,
       dataFetchedAtMs, // use data fetch time, not snapshot build time
+    ),
+    { maxSnapshotAgeMs: Infinity },
+  );
+  const joinGate = computeActionEligibility(
+    "join",
+    buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      myHasLockedCollateral,
+      myContributedThisRound,
+      data.currentRound?.contributions.length ?? 0,
+      networkCheck,
+      dataFetchedAtMs,
+    ),
+    { maxSnapshotAgeMs: Infinity },
+  );
+  const closeGate = computeActionEligibility(
+    "close",
+    buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      myHasLockedCollateral,
+      myContributedThisRound,
+      data.currentRound?.contributions.length ?? 0,
+      networkCheck,
+      dataFetchedAtMs,
     ),
     { maxSnapshotAgeMs: Infinity },
   );
@@ -1151,10 +1225,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         data.circle.deadline_ledger,
         data.latestLedger,
         data.members.map((m) => m.member_address),
-        myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+        myHasLockedCollateral,
         myContributedThisRound,
         currentRoundContributions,
-        null, // networkCheck — no network-mismatch signal here
+        networkCheck,
         dataFetchedAtMs, // ← correct: when the data was fetched, not now
       );
 
@@ -1301,7 +1375,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       false,
       targetContributed,
       data.currentRound?.contributions.length ?? 0,
-      null, // networkCheck — no network-mismatch signal here
+      networkCheck,
       dataFetchedAtMs, // ← correct: use data fetch time
     );
 
@@ -1421,6 +1495,29 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             aria-hidden="true"
           />
           Refreshing circle data…
+        </div>
+      )}
+
+      {networkWarning && (
+        <div
+          role={networkMismatch?.kind === "mismatch" ? "alert" : "status"}
+          aria-live="polite"
+          className={clsx(
+            "border rounded-xl px-5 py-4 flex items-start gap-3 text-sm",
+            networkMismatch?.kind === "mismatch"
+              ? "bg-red-50 border-red-200 text-red-700"
+              : "bg-amber-50 border-amber-200 text-amber-800",
+          )}
+        >
+          <span className="text-xl mt-0.5" aria-hidden="true">!</span>
+          <div>
+            <p className="font-semibold">
+              {networkMismatch?.kind === "mismatch"
+                ? "Wrong wallet network"
+                : "Wallet network not verified"}
+            </p>
+            <p className="mt-1">{networkWarning}</p>
+          </div>
         </div>
       )}
 
@@ -1619,14 +1716,26 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
             <button
               onClick={handleJoin}
-              disabled={loading !== null || !actionsEnabled}
+              disabled={loading !== null || !actionsEnabled || !joinGate.allowed}
               aria-busy={loading === "join" ? "true" : "false"}
-              aria-disabled={!actionsEnabled}
-              title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
+              aria-disabled={!actionsEnabled || !joinGate.allowed}
+              aria-describedby={!joinGate.allowed ? "join-gate-reason" : undefined}
+              title={
+                !actionsEnabled
+                  ? "Actions unavailable until circle data is fully loaded"
+                  : !joinGate.allowed
+                  ? joinGate.message
+                  : undefined
+              }
               className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "join" ? "Joining…" : "🔒 Lock Collateral & Join"}
             </button>
+            {!joinGate.allowed && actionsEnabled && (
+              <p id="join-gate-reason" className="text-xs text-slate-500" role="note">
+                {joinGate.message}
+              </p>
+            )}
           )}
 
           {data.circle.status === "Active" &&
@@ -1699,14 +1808,26 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             data.circle.status === "Cancelled") && (
             <button
               onClick={handleClose}
-              disabled={loading !== null || !actionsEnabled}
+              disabled={loading !== null || !actionsEnabled || !closeGate.allowed}
               aria-busy={loading === "close" ? "true" : "false"}
-              aria-disabled={!actionsEnabled}
-              title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
+              aria-disabled={!actionsEnabled || !closeGate.allowed}
+              aria-describedby={!closeGate.allowed ? "close-gate-reason" : undefined}
+              title={
+                !actionsEnabled
+                  ? "Actions unavailable until circle data is fully loaded"
+                  : !closeGate.allowed
+                  ? closeGate.message
+                  : undefined
+              }
               className="bg-slate-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
               {loading === "close" ? "Closing…" : "🔓 Release Collateral"}
             </button>
+            {!closeGate.allowed && actionsEnabled && (
+              <p id="close-gate-reason" className="text-xs text-slate-500" role="note">
+                {closeGate.message}
+              </p>
+            )}
           )}
 
           {loading !== null && (
