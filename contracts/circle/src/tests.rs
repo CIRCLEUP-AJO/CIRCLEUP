@@ -23,7 +23,7 @@
 mod circle_tests {
     extern crate std;
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, DataKey,
+        CircleContract, CircleContractClient, CircleStatus, CloseError, DataKey, InitError,
         COLLATERAL_MULTIPLIER, MAX_MEMBERS, MAX_ROUND_DEADLINE_LEDGERS, MIN_ROUND_DEADLINE_LEDGERS,
         PENALTY_BPS, BPS_DENOM,
     };
@@ -468,35 +468,59 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "not authorized to close: caller is not a circle member")]
     fn test_close_rejects_non_member() {
         let t = setup_circle();
         t.activate();
         t.force_status(CircleStatus::Completed);
 
         let stranger = Address::generate(&t.env);
-        t.circle.close(&stranger);
+        let result = t.circle.try_close(&stranger);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::Unauthorized)),
+            "non-member non-admin must receive CloseError::Unauthorized"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "circle already closed")]
-    fn test_close_second_call_panics() {
+    fn test_close_second_call_returns_already_closed() {
         let t = setup_circle();
         t.activate();
         t.force_status(CircleStatus::Completed);
 
         t.circle.close(&t.bob);
-        // Second invocation must be rejected — the Closed flag is set after the
-        // first call so no partial-release state can accumulate.
-        t.circle.close(&t.carol);
+        // Second invocation must return CloseError::AlreadyClosed.
+        let result = t.circle.try_close(&t.carol);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::AlreadyClosed)),
+            "second close must return CloseError::AlreadyClosed"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "circle still active")]
     fn test_close_rejects_while_active() {
         let t = setup_circle();
         t.activate();
-        t.circle.close(&t.alice);
+        let result = t.circle.try_close(&t.alice);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::NotTerminalState)),
+            "closing an active circle must return CloseError::NotTerminalState"
+        );
+    }
+
+    #[test]
+    fn test_close_admin_can_close() {
+        let t = setup_circle();
+        t.activate();
+        t.force_status(CircleStatus::Completed);
+
+        // The circle_admin is NOT a circle member but holds admin authority.
+        // The dedicated close authorization rule must allow this call.
+        assert!(!t.members.contains(&t.circle_admin), "circle_admin must not be a member");
+        t.circle.close(&t.circle_admin);
+        assert!(t.circle.is_closed(), "circle must be closed after admin-triggered close");
     }
 
 
@@ -656,12 +680,11 @@ mod circle_tests {
     // ── round_deadline_ledgers bounds tests ───────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers below minimum")]
-    fn test_initialize_deadline_below_minimum_panics() {
+    fn test_initialize_deadline_below_minimum_returns_typed_error() {
         let t = setup_circle();
         let circle_id = t.env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&t.env, &circle_id);
-        circle.initialize(
+        let result = circle.try_initialize(
             &t.circle_admin,
             &t.members,
             &ROUND_AMOUNT,
@@ -669,21 +692,36 @@ mod circle_tests {
             &t.reputation_id,
             &(MIN_ROUND_DEADLINE_LEDGERS - 1),
         );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DeadlineBelowMinimum,
+            "deadline below minimum must return InitError::DeadlineBelowMinimum"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers above maximum")]
-    fn test_initialize_deadline_above_maximum_panics() {
+    fn test_initialize_deadline_above_maximum_returns_typed_error() {
         let t = setup_circle();
         let circle_id = t.env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&t.env, &circle_id);
-        circle.initialize(
+        let result = circle.try_initialize(
             &t.circle_admin,
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
             &t.reputation_id,
             &(MAX_ROUND_DEADLINE_LEDGERS + 1),
+        );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DeadlineAboveMaximum,
+            "deadline above maximum must return InitError::DeadlineAboveMaximum"
         );
     }
 
@@ -2108,14 +2146,16 @@ mod circle_tests {
 
     // ── Close invariants ──────────────────────────────────────────────────────
 
-    /// `close` must be rejected while the circle is Active (bug fix: was
-    /// unconditionally panicking in original code due to missing `if` guard).
+    /// `close` must be rejected while the circle is Active.
     #[test]
-    #[should_panic(expected = "circle still active")]
     fn test_close_rejected_while_active() {
         let t = setup_circle();
         t.activate();
-        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.alice),
+            Err(Ok(CloseError::NotTerminalState)),
+            "close must return NotTerminalState while Active"
+        );
     }
 
     /// `close` must succeed after the circle is Completed.
@@ -2145,15 +2185,17 @@ mod circle_tests {
     /// "circle already closed" — the `Closed` flag set during the first call acts
     /// as an immutable guard that rejects subsequent invocations.
     #[test]
-    #[should_panic(expected = "circle already closed")]
     fn test_close_twice_panics() {
         let t = setup_circle();
         t.activate();
         t.complete_all_rounds();
 
         t.circle.close(&t.alice);
-        // Second call by a different member must also be rejected.
-        t.circle.close(&t.bob);
+        assert_eq!(
+            t.circle.try_close(&t.bob),
+            Err(Ok(CloseError::AlreadyClosed)),
+            "second close must return AlreadyClosed"
+        );
     }
 
     // ── Partial default then payout: consistency check ─────────────────────
@@ -2331,12 +2373,14 @@ mod circle_tests {
     /// that distinguishes it from the Active case so callers receive an
     /// actionable diagnostic.
     #[test]
-    #[should_panic(expected = "circle still pending")]
     fn test_close_rejected_while_pending() {
         let t = setup_circle();
-        // No members have joined — circle is Pending
         assert_eq!(t.circle.get_status(), CircleStatus::Pending);
-        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.alice),
+            Err(Ok(CloseError::NotTerminalState)),
+            "close must return NotTerminalState while Pending"
+        );
     }
 
     // ── Duplicate-close rejection ─────────────────────────────────────────────
@@ -2345,7 +2389,6 @@ mod circle_tests {
     /// invocation — even by a different member — must be rejected immediately so
     /// no partial-release state can accumulate across calls.
     #[test]
-    #[should_panic(expected = "circle already closed")]
     fn test_close_already_closed_panics() {
         let t = setup_circle();
         t.activate();
@@ -2355,8 +2398,11 @@ mod circle_tests {
         t.circle.close(&t.alice);
         assert!(t.circle.is_closed(), "is_closed must be true after first close");
 
-        // Any re-invocation must now panic
-        t.circle.close(&t.dave);
+        assert_eq!(
+            t.circle.try_close(&t.dave),
+            Err(Ok(CloseError::AlreadyClosed)),
+            "re-invocation must return AlreadyClosed"
+        );
     }
 
     // ── is_closed view ────────────────────────────────────────────────────────
@@ -2721,23 +2767,22 @@ mod circle_tests {
     /// If the count is wrong the function must panic with a storage-inconsistency
     /// message rather than silently releasing collateral in a bad state.
     #[test]
-    #[should_panic(expected = "not all rounds paid out")]
     fn test_close_completed_invariant_rejects_incomplete_rounds() {
         let t = setup_circle();
         t.activate();
 
-        // Set Status to Completed directly, deliberately leaving RoundsCompleted at 0
-        // (bypasses force_status which would also align RoundsCompleted).
         t.env.as_contract(&t.circle_id, || {
             t.env
                 .storage()
                 .instance()
                 .set(&DataKey::Status, &CircleStatus::Completed);
-            // RoundsCompleted stays 0 — this is the corrupted state we're testing
         });
 
-        // close() must detect the inconsistency (0 rounds completed, 4 required)
-        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.alice),
+            Err(Ok(CloseError::RoundsIncomplete)),
+            "close must return RoundsIncomplete for corrupted Completed state"
+        );
     }
 
     // ── Contribute rejects non-member ─────────────────────────────────────────
@@ -2814,29 +2859,29 @@ mod circle_tests {
 
     // ── Terminal-state precondition enforcement ───────────────────────────────
 
-    /// close() on an Active circle must panic with "circle still active".
-    /// This is the primary lifecycle guard — collateral release is forbidden
-    /// while any round may still be in progress.
+    /// close() on an Active circle must return CloseError::NotTerminalState.
     #[test]
-    #[should_panic(expected = "circle still active")]
     fn test_179_close_rejected_on_active_circle() {
         let t = setup_circle();
         t.activate();
-        // Circle is Active; close must be refused
-        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.alice),
+            Err(Ok(CloseError::NotTerminalState)),
+            "close must return NotTerminalState on Active circle"
+        );
     }
 
-    /// close() on a Pending circle (not all members joined) must panic with
-    /// "circle still pending".  This is distinct from the Active rejection so
-    /// callers know they need to call cancel() first.
+    /// close() on a Pending circle must return CloseError::NotTerminalState.
     #[test]
-    #[should_panic(expected = "circle still pending")]
     fn test_179_close_rejected_on_pending_circle() {
         let t = setup_circle();
-        // Only two members join — circle stays Pending
         t.circle.join(&t.alice);
         t.circle.join(&t.bob);
-        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.alice),
+            Err(Ok(CloseError::NotTerminalState)),
+            "close must return NotTerminalState on Pending circle"
+        );
     }
 
     // ── Completed-circle full settlement ─────────────────────────────────────
@@ -2990,7 +3035,6 @@ mod circle_tests {
     /// must be rejected with "circle already closed".  No partial-release state
     /// must accumulate across calls.
     #[test]
-    #[should_panic(expected = "circle already closed")]
     fn test_179_duplicate_close_panics() {
         let t = setup_circle();
         t.activate();
@@ -2999,22 +3043,27 @@ mod circle_tests {
         t.circle.close(&t.alice);
         assert!(t.circle.is_closed(), "is_closed must be true after first close");
 
-        // Any subsequent call — even from a different member — must panic
-        t.circle.close(&t.dave);
+        assert_eq!(
+            t.circle.try_close(&t.dave),
+            Err(Ok(CloseError::AlreadyClosed)),
+            "subsequent close must return AlreadyClosed"
+        );
     }
 
     /// A duplicate close attempt after a Cancelled-circle settlement must also
-    /// be rejected.  The Closed flag must survive the Cancelled path just as it
-    /// does the Completed path.
+    /// be rejected.
     #[test]
-    #[should_panic(expected = "circle already closed")]
     fn test_179_duplicate_close_after_cancel_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);
         t.circle.cancel(&t.alice);
 
-        t.circle.close(&t.alice);  // first call succeeds
-        t.circle.close(&t.bob);    // second call must panic
+        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.bob),
+            Err(Ok(CloseError::AlreadyClosed)),
+            "second close after cancel must return AlreadyClosed"
+        );
     }
 
     // ── Arithmetic assertion: sum(collateral_released) == total_released ──────
@@ -3171,38 +3220,38 @@ mod circle_tests {
         assert!(t.circle.is_closed());
     }
 
-    /// Non-members must be rejected from close() regardless of the circle state.
+    /// Non-members must be rejected from close() with CloseError::Unauthorized.
     #[test]
-    #[should_panic(expected = "not authorized to close: caller is not a circle member")]
     fn test_179_non_member_cannot_close() {
         let t = setup_circle();
         t.activate();
         t.complete_all_rounds();
         let outsider = Address::generate(&t.env);
-        t.circle.close(&outsider);
+        assert_eq!(
+            t.circle.try_close(&outsider),
+            Err(Ok(CloseError::Unauthorized)),
+            "non-member must be rejected with Unauthorized"
+        );
     }
 
-    /// Verify that the RoundsCompleted invariant check in close() catches a
-    /// Completed status that was set before all payouts ran (storage corruption).
-    /// This prevents collateral release in an inconsistent state.
+    /// Verify that the RoundsCompleted invariant check in close() catches corrupted state.
     #[test]
-    #[should_panic(expected = "not all rounds paid out")]
     fn test_179_close_completed_with_incomplete_rounds_panics() {
         let t = setup_circle();
         t.activate();
 
-        // Force Status to Completed without aligning RoundsCompleted — simulates
-        // storage corruption (bypasses force_status which aligns both).
         t.env.as_contract(&t.circle_id, || {
             t.env
                 .storage()
                 .instance()
                 .set(&DataKey::Status, &CircleStatus::Completed);
-            // RoundsCompleted intentionally left at 0
         });
 
-        // close() must detect the inconsistency (0 != 4 member count)
-        t.circle.close(&t.alice);
+        assert_eq!(
+            t.circle.try_close(&t.alice),
+            Err(Ok(CloseError::RoundsIncomplete)),
+            "close must return RoundsIncomplete for corrupted Completed state"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -3625,9 +3674,8 @@ mod circle_tests {
         circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
 
-    /// Regression: duplicate members still rejected.
+    /// Regression: duplicate members still rejected and surfaces as typed error.
     #[test]
-    #[should_panic(expected = "duplicate members")]
     fn test_322_regression_duplicate_members_still_rejected() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3639,7 +3687,22 @@ mod circle_tests {
         members.push_back(a); // duplicate
 
         let circle_admin = Address::generate(&env);
-        circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
+        let result = circle.try_initialize(
+            &circle_admin,
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DuplicateMembers,
+            "duplicate members must return InitError::DuplicateMembers"
+        );
     }
 
     /// Regression: zero round_amount still rejected.
@@ -3658,9 +3721,8 @@ mod circle_tests {
         circle.initialize(&circle_admin, &members, &0i128, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
 
-    /// Regression: deadline below minimum still rejected.
+    /// Regression: deadline below minimum still rejected as typed error.
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers below minimum")]
     fn test_322_regression_deadline_below_min_still_rejected() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3671,16 +3733,26 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         let circle_admin = Address::generate(&env);
-        circle.initialize(
+        let result = circle.try_initialize(
             &circle_admin,
-            &members, &ROUND_AMOUNT, &token_address, &reputation_id,
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
             &(MIN_ROUND_DEADLINE_LEDGERS - 1),
+        );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DeadlineBelowMinimum,
+            "deadline below minimum must return InitError::DeadlineBelowMinimum"
         );
     }
 
-    /// Regression: deadline above maximum still rejected.
+    /// Regression: deadline above maximum still rejected as typed error.
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers above maximum")]
     fn test_322_regression_deadline_above_max_still_rejected() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3691,10 +3763,21 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         let circle_admin = Address::generate(&env);
-        circle.initialize(
+        let result = circle.try_initialize(
             &circle_admin,
-            &members, &ROUND_AMOUNT, &token_address, &reputation_id,
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
             &(MAX_ROUND_DEADLINE_LEDGERS + 1),
+        );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DeadlineAboveMaximum,
+            "deadline above maximum must return InitError::DeadlineAboveMaximum"
         );
     }
 
