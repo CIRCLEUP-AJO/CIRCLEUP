@@ -371,7 +371,7 @@ export async function ingestEventInTx(
   const result = await client.query(
     `INSERT INTO ingested_events (event_key, contract_id, ledger, tx_hash, event_type, event_index)
      VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (event_key) DO NOTHING`,
+     ON CONFLICT DO NOTHING`,
     [eventKey, contractId, event.ledger, event.txHash, eventType, eventIndex],
   );
 
