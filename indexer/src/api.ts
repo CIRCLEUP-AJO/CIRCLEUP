@@ -993,6 +993,67 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
+  // ── Circle audit events ───────────────────────────────────────────────────────
+  //
+  // Returns the structured audit log for terminal lifecycle transitions
+  // (cancelled and closed) for a specific circle.  This is distinct from
+  // /indexer/state (which reports aggregate event counts across all circles)
+  // and /circles/:address (which returns the summarised status row).
+  //
+  // Callers can use this endpoint to:
+  //   - Display the exact closer address and release amounts in the UI
+  //   - Compute penalty forfeitures: total_expected_collateral - total_released
+  //   - Audit which member triggered cancellation / closure and when
+  //
+  // Returns an empty `events` array (not 404) when no audit rows exist yet
+  // for the circle, since events may arrive slightly after the status update
+  // during indexer replay.
+
+  app.get("/circles/:address/audit", detailRateLimiter, async (req: Request, res: Response) => {
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
+      return;
+    }
+    const address = addressResult;
+
+    try {
+      const [circle] = await query<Pick<CircleRow, "address">>(
+        `SELECT address FROM circles WHERE address = $1`,
+        [address],
+      );
+      if (!circle) {
+        res.status(404).json({ error: `Circle '${address}' not found` });
+        return;
+      }
+
+      const events = await query<{
+        id: number;
+        circle_address: string;
+        event_type: string;
+        triggered_by: string | null;
+        ledger: string | null;
+        tx_hash: string | null;
+        total_released: string | null;
+        total_expected_collateral: string | null;
+        close_reason: string | null;
+        created_at: string;
+      }>(
+        `SELECT id, circle_address, event_type, triggered_by, ledger, tx_hash,
+                total_released, total_expected_collateral, close_reason, created_at
+         FROM circle_audit_events
+         WHERE circle_address = $1
+         ORDER BY created_at ASC`,
+        [address],
+      );
+
+      res.json({ circle_address: address, events });
+    } catch (err) {
+      console.error(`[api] Failed to load audit events for circle ${redactAddress(address)}`, err);
+      sendError(res, 500, "Failed to load circle audit events", getErrorMessage(err));
+    }
+  });
+
   // ── Indexer ──────────────────────────────────────────────────────────────────
 
   // Audit endpoint for ops/monitoring: reports how far the indexer has
