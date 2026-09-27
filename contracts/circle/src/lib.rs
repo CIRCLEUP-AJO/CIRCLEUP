@@ -1054,10 +1054,45 @@ impl CircleContract {
             panic!("circle: stored recipient does not match rotation order — storage inconsistency");
         }
 
+        // ── Pot invariant ──────────────────────────────────────────────────────
+        //
+        // The pot is *always* round_amount × member_count — no more, no less.
+        //
+        // Formula:
+        //   pot = round_amount × member_count
+        //
+        // This is the single authoritative computation for what will be
+        // transferred to the recipient.  The multiply uses checked arithmetic
+        // (initialize already rejects any round_amount that would overflow this
+        // product, but we assert the invariant here explicitly so future
+        // refactors cannot silently break the financial model).
+        //
+        // The assertion below confirms the product matches the expected value
+        // before any state change is made, preventing both overpayment (pot
+        // larger than contributions received) and underpayment (pot smaller
+        // than the full collected amount).
         let pot: i128 = config
             .round_amount
             .checked_mul(member_count as i128)
             .unwrap_or_else(|| panic!("pot amount overflow"));
+
+        // Pot invariant assertion: pot must exactly equal
+        // round_amount × contributions_received (which == member_count here,
+        // since we already confirmed round.contributions_received == member_count).
+        // This guards against any future logic change that could allow payout
+        // with a mismatched counter.
+        {
+            let expected_pot = config
+                .round_amount
+                .checked_mul(round.contributions_received as i128)
+                .unwrap_or_else(|| panic!("pot invariant: contributions × round_amount overflows"));
+            if pot != expected_pot {
+                panic!(
+                    "pot invariant violation: computed {} but contributions imply {}",
+                    pot, expected_pot
+                );
+            }
+        }
 
         // ── CHECKS-EFFECTS-INTERACTIONS ───────────────────────────────────────
         //
@@ -1240,6 +1275,30 @@ impl CircleContract {
 
         // Deduct penalty from collateral.
         //
+        // Penalty arithmetic (explicit formula):
+        //
+        //   penalty     = collateral × PENALTY_BPS / BPS_DENOM
+        //               = collateral × 2_000 / 10_000
+        //               = collateral × 0.20  (20 %)
+        //
+        //   new_balance = collateral − penalty
+        //               = collateral × (1 − PENALTY_BPS / BPS_DENOM)
+        //               = collateral × 0.80  (80 % of current balance)
+        //
+        // Each successive default reduces the *remaining* balance — not the
+        // original deposit — so the sequence is:
+        //
+        //   after N defaults: collateral_N = initial × (0.80)^N
+        //
+        // Equivalently:  collateral_N = initial − Σ(penalty_i for i in 0..N)
+        //   where penalty_i = collateral_i × PENALTY_BPS / BPS_DENOM
+        //
+        // Integer arithmetic note: BPS_DENOM is 10_000, so for a collateral of
+        // 100_000_000 stroops the penalty is exactly 20_000_000 stroops.
+        // Integer truncation only occurs for non-multiple-of-10_000 balances
+        // (rare in practice since initial collateral == round_amount which is
+        // typically a whole USDC amount).
+        //
         // The `initialize` guard already rejects any `round_amount` that would
         // overflow `round_amount * PENALTY_BPS`, and collateral starts as
         // `round_amount * COLLATERAL_MULTIPLIER` (≤ round_amount for the
@@ -1418,6 +1477,18 @@ impl CircleContract {
 
             // Apply the standard 20 % penalty.
             //
+            // Penalty arithmetic (explicit formula — mirrors mark_default):
+            //
+            //   penalty     = collateral × PENALTY_BPS / BPS_DENOM
+            //               = collateral × 2_000 / 10_000  (20 %)
+            //   new_balance = collateral − penalty
+            //
+            // Checked arithmetic is used even though initialize already
+            // validated the initial bounds, because `collateral` here is the
+            // *current* balance (which may already be reduced by prior
+            // mark_default calls), and future changes to COLLATERAL_MULTIPLIER
+            // should not silently bypass this guard.
+            //
             // Mirrors the checked arithmetic used in mark_default: collateral
             // is bounded by the initial deposit (round_amount × COLLATERAL_MULTIPLIER),
             // which was already validated against PENALTY_BPS overflow at
@@ -1456,6 +1527,18 @@ impl CircleContract {
         }
 
         // Compute the partial pot: only contributions that actually arrived.
+        //
+        // Pot invariant for settle_round:
+        //   partial_pot = round_amount × contributed_count
+        //   where contributed_count ∈ [0, member_count)
+        //
+        // This is strictly ≤ the full pot (round_amount × member_count).
+        // The difference (round_amount × (member_count − contributed_count))
+        // represents the forfeited contribution amounts from defaulting members.
+        //
+        // The bounds assertion below prevents a storage inconsistency from
+        // producing a pot larger than the actual token balance held by the
+        // contract (contributed_count can never exceed member_count).
         //
         // `contributed_count` is a u32 in [0, member_count] — the loop above
         // only increments it for members whose Contributed key exists.  The
