@@ -67,7 +67,7 @@
 mod mutation_guard_tests {
     extern crate std;
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, DataKey,
+        CircleContract, CircleContractClient, CircleStatus, CloseError, DataKey, InitError,
         PENALTY_BPS, BPS_DENOM, COLLATERAL_MULTIPLIER,
         MIN_ROUND_DEADLINE_LEDGERS,
     };
@@ -462,14 +462,18 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "circle already closed")]
     fn guard_close_double_release_prevention() {
         let t = make_setup();
         t.activate();
         t.force_status(CircleStatus::Completed);
         t.circle.close(&t.alice);
         // Guard must fire immediately — Closed flag is set
-        t.circle.close(&t.bob);
+        let result = t.circle.try_close(&t.bob);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::AlreadyClosed)),
+            "second close must return CloseError::AlreadyClosed"
+        );
     }
 
     /// After a successful close, all collateral storage keys must be zero.
@@ -683,7 +687,6 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "duplicate members")]
     fn guard_duplicate_members_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -704,13 +707,21 @@ mod mutation_guard_tests {
         members.push_back(alice.clone()); // duplicate
 
         let circle_admin = Address::generate(&env);
-        circle.initialize(
+        let result = circle.try_initialize(
             &circle_admin,
             &members,
             &ROUND_AMOUNT,
             &token_reg.address(),
             &rep_id,
             &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        let Err(Ok(sdk_err)) = result else {
+            panic!("expected contract error, got success or invoke error");
+        };
+        assert_eq!(
+            InitError::try_from(sdk_err).expect("must be a typed InitError"),
+            InitError::DuplicateMembers,
+            "duplicate members must return InitError::DuplicateMembers"
         );
     }
 
@@ -725,13 +736,17 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "not authorized to close: caller is not a circle member")]
     fn guard_close_non_member_rejected() {
         let t = make_setup();
         t.activate();
         t.force_status(CircleStatus::Completed);
         let outsider = Address::generate(&t.env);
-        t.circle.close(&outsider);
+        let result = t.circle.try_close(&outsider);
+        assert_eq!(
+            result,
+            Err(Ok(CloseError::Unauthorized)),
+            "non-member non-admin must return CloseError::Unauthorized"
+        );
     }
 
     // ═════════════════════════════════════════════════════════════════════════
