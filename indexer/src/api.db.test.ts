@@ -269,6 +269,53 @@ if (hasDb) {
     assert.equal(res.status, 404);
   });
 
+  test("GET /circles/:address/members includes hasContributedCurrentRound per member (#539)", async () => {
+    const addr   = "CDBTEST_MEM_HASCONTRIB";
+    const member = "GDBTEST_MEM_HASCONTRIB";
+    await seedCircle(addr, { status: "Active", currentRound: 0 });
+    await seedMember(addr, member, 0);
+    await seedContribution(addr, member, 0, 1001);
+
+    try {
+      const res = await request(app).get(`/circles/${addr}/members`);
+      assert.equal(res.status, 200);
+      const m = res.body.members.find(
+        (x: { member_address: string }) => x.member_address === member,
+      );
+      assert.ok(m, "seeded member must appear in response");
+      assert.equal(
+        m.has_contributed_current_round,
+        true,
+        "has_contributed_current_round must be true after contribution in round 0",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
+  test("GET /circles/:address/members reports false hasContributedCurrentRound when not contributed (#539)", async () => {
+    const addr   = "CDBTEST_MEM_NOTCONTRIB";
+    const member = "GDBTEST_MEM_NOTCONTRIB";
+    await seedCircle(addr, { status: "Active", currentRound: 0 });
+    await seedMember(addr, member, 0);
+
+    try {
+      const res = await request(app).get(`/circles/${addr}/members`);
+      assert.equal(res.status, 200);
+      const m = res.body.members.find(
+        (x: { member_address: string }) => x.member_address === member,
+      );
+      assert.ok(m, "seeded member must appear in response");
+      assert.equal(
+        m.has_contributed_current_round,
+        false,
+        "has_contributed_current_round must be false when member has not contributed",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
   // ── GET /members/:member/contributions ───────────────────────────────────────
 
   test("GET /members/:member/contributions returns empty list for unknown member", async () => {
@@ -297,6 +344,44 @@ if (hasDb) {
     }
   });
 
+  test("GET /members/:member/contributions returns totalAmount aggregate (#541)", async () => {
+    const addr   = "CDBTEST_CONT_AMT_CIRCLE";
+    const member = "GDBTEST_CONT_AMT_MEMBER";
+    await seedCircle(addr);
+    await seedMember(addr, member, 0);
+    await seedContribution(addr, member, 0, 1001);
+    await seedContribution(addr, member, 1, 1002);
+
+    try {
+      const res = await request(app).get(`/members/${member}/contributions`);
+      assert.equal(res.status, 200);
+      assert.ok(
+        typeof res.body.totalAmount === "string",
+        "totalAmount must be a string (numeric amount)",
+      );
+      // Two contributions of 100 each = 200
+      assert.equal(Number(res.body.totalAmount), 200);
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
+  test("GET /members/:member/contributions returns hasMore=false on last page (#541)", async () => {
+    const addr   = "CDBTEST_CONT_HASMORE";
+    const member = "GDBTEST_CONT_HASMORE";
+    await seedCircle(addr);
+    await seedMember(addr, member, 0);
+    await seedContribution(addr, member, 0, 1001);
+
+    try {
+      const res = await request(app).get(`/members/${member}/contributions?limit=10&page=1`);
+      assert.equal(res.status, 200);
+      assert.equal(res.body.pagination.hasMore, false, "hasMore must be false when total fits on one page");
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
   test("GET /members/:member/contributions paginates correctly", async () => {
     const addr   = "CDBTEST_CONT_PAG_CIRCLE";
     const member = "GDBTEST_CONT_PAG_MEMBER";
@@ -312,6 +397,7 @@ if (hasDb) {
       assert.equal(res.body.contributions.length, 2);
       assert.equal(res.body.pagination.total, 5);
       assert.equal(res.body.pagination.totalPages, 3);
+      assert.equal(res.body.pagination.hasMore, true, "hasMore must be true when more pages remain");
     } finally {
       await cleanCircle(addr);
     }

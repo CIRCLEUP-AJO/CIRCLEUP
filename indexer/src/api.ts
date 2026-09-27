@@ -9,19 +9,24 @@
  *                                        ?limit=   1–100 (default: 20)
  * GET /circles/summary                 → circle counts by status (Pending/Active/Completed/Cancelled/Closed)
  * GET /circles/:address                → circle detail + members + rounds
- * GET /circles/:address/members        → members with contribution status
- * GET /circles/:address/rounds         → all rounds (payouts + defaults)
+ * GET /circles/:address/members        → members with reputation, contribution counts, and current-round status
+ * GET /circles/:address/rounds         → all rounds grouped by round_index: payouts + contributions + defaults
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
  * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
  * GET /indexer/schema                  → schema versioning and migration status diagnostics
  * GET /health                          → health check (db + RPC status)
+ *
+ * DB helpers used: query<T> (many rows), queryOne<T> (0‥1 rows → T|null),
+ * queryExact<T> (exactly 1 row or throws). The queryOne/queryExact helpers
+ * replace the fragile `const [row] = await query(...)` destructuring pattern
+ * that silently produced undefined when no row existed (see pool.ts).
  */
 
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { query } from "./db/pool";
+import { query, queryOne, queryExact } from "./db/pool";
 import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
@@ -657,7 +662,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
     const address = addressResult;
     try {
-      const [circle] = await query<CircleRow>(
+      const circle = await queryOne<CircleRow>(
         `SELECT * FROM circles WHERE address = $1`,
         [address],
       );
@@ -684,7 +689,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
       // Attach the latest indexed ledger so the client can derive wall-clock
       // estimates for the deadline countdown without a separate request.
-      const [indexerState] = await query<IndexerStateRow>(
+      const indexerState = await queryOne<IndexerStateRow>(
         `SELECT last_ledger FROM indexer_state WHERE id = 1`,
       );
       const latestLedger = indexerState ? Number(indexerState.last_ledger) : null;
@@ -723,6 +728,18 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
+  // ── Dedicated members endpoint (#539) ────────────────────────────────────────
+  //
+  // Returns all members for a single circle in payout_order with:
+  //   • reputation score (joined from reputation table)
+  //   • total historical contribution count across all rounds
+  //   • hasContributedCurrentRound — whether the member has contributed in the
+  //     circle's current round index (useful for the circle detail UI without
+  //     needing to load the full rounds history)
+  //   • totals aggregate: memberCount, totalCollateral, totalContributions
+  //   • roundDeadlineLedgers — from the circle row, so clients can derive
+  //     per-member deadline estimates without a second request
+
   app.get("/circles/:address/members", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
     if (isParseError(addressResult)) {
@@ -731,8 +748,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
     const address = addressResult;
     try {
-      const [circle] = await query<Pick<CircleRow, "address">>(
-        `SELECT address FROM circles WHERE address = $1`,
+      const circle = await queryOne<Pick<CircleRow, "address" | "current_round" | "round_deadline_ledgers">>(
+        `SELECT address, current_round, round_deadline_ledgers FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
@@ -762,14 +779,14 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
            LEFT JOIN reputation r ON r.member_address = cm.member_address
            WHERE cm.circle_address = $1
            ORDER BY cm.payout_order`,
-          [address],
+          [address, circle.current_round],
         ),
         // COALESCE guards SUM/COUNT-derived totals against NULL, which
         // Postgres returns for aggregates over zero rows (e.g. a circle with
         // no members yet, or no contributions recorded) — without it, a
         // freshly created circle would report total_collateral: null instead
         // of "0", inconsistent with member_count: 0.
-        query<CircleMemberTotalsRow>(
+        queryOne<CircleMemberTotalsRow>(
           `SELECT
              COUNT(cm.*) as member_count,
              COALESCE(SUM(cm.collateral), 0) as total_collateral,
@@ -783,22 +800,44 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         ),
       ]);
 
+      // totals will always have a row (COUNT over zero rows returns one row
+      // with count=0); use queryOne default fallback just in case.
+      const t = totals ?? { member_count: "0", total_collateral: "0", total_contributions: "0" };
+
       res.json({
         members: members.map((m) => ({
           ...m,
           total_contributions: Number(m.total_contributions),
         })),
         totals: {
-          memberCount: Number(totals.member_count),
-          totalCollateral: totals.total_collateral,
-          totalContributions: Number(totals.total_contributions),
+          memberCount: Number(t.member_count),
+          totalCollateral: t.total_collateral,
+          totalContributions: Number(t.total_contributions),
         },
+        roundDeadlineLedgers: circle.round_deadline_ledgers,
       });
     } catch (err) {
       console.error(`[api] Failed to load members for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle members", getErrorMessage(err));
     }
   });
+
+  // ── Rounds history endpoint (#540) ───────────────────────────────────────────
+  //
+  // Returns all indexed rounds for a circle grouped by round_index.  Each round
+  // includes its payout (if settled), all contributions, all defaults, and a
+  // resolved `status` (completed | current | cancelled | open).
+  //
+  // Grouping improvements over a flat payout list:
+  //   • Rounds that have contributions or defaults but no payout yet are
+  //     surfaced in `openRounds` instead of being silently dropped.
+  //   • The active current round is always present in `currentRound` even when
+  //     it has no activity yet.
+  //   • Duplicate payout rows (replay / ingest anomaly) are de-duplicated by
+  //     `buildPayoutIndex` with a non-fatal warning log.
+  //   • `deadlineLedger` is computed for every round from
+  //     `created_ledger + (roundIndex + 1) * round_deadline_ledgers` so clients
+  //     can display a countdown without a separate RPC call.
 
   app.get("/circles/:address/rounds", detailRateLimiter, async (req: Request, res: Response) => {
     const addressResult = parseAddress(req.params.address, "Circle address");
@@ -808,10 +847,10 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
     const address = addressResult;
     try {
-      const [circle] = await query<
-        Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status">
+      const circle = await queryOne<
+        Pick<CircleRow, "address" | "current_round" | "total_rounds" | "status" | "created_ledger" | "round_deadline_ledgers">
       >(
-        `SELECT address, current_round, total_rounds, status FROM circles WHERE address = $1`,
+        `SELECT address, current_round, total_rounds, status, created_ledger, round_deadline_ledgers FROM circles WHERE address = $1`,
         [address],
       );
       if (!circle) {
@@ -852,12 +891,39 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       const { rounds, currentRound, openRounds, pendingDefaults } =
         groupCircleRounds(circle, payouts, contributions, defaults);
 
+      // Compute deadlineLedger for each round when the circle has the
+      // round_deadline_ledgers field set (present on circles created after
+      // migration 001). Formula:
+      //   deadline = created_ledger + (roundIndex + 1) * round_deadline_ledgers
+      //
+      // This is an approximation derived from the creation ledger; the exact
+      // per-round deadline is set inside the contract but is not yet stored
+      // as a separate indexed column.
+      //
+      // `circle` is non-null here — the early return above guards that — but
+      // TypeScript cannot narrow it across a function boundary, so we capture
+      // the non-null value explicitly.
+      const nonNullCircle = circle;
+      const computeDeadlineLedger = (roundIndex: number): number | null => {
+        if (nonNullCircle.round_deadline_ledgers == null || nonNullCircle.created_ledger == null) {
+          return null;
+        }
+        return (
+          Number(nonNullCircle.created_ledger) +
+          (roundIndex + 1) * Number(nonNullCircle.round_deadline_ledgers)
+        );
+      };
+
+      const annotate = <C extends { round_index: number }, D extends { round_index: number }>(
+        r: import("./groupRounds").GroupedRound<C, D>,
+      ) => ({ ...r, deadlineLedger: computeDeadlineLedger(r.roundIndex) });
+
       res.json({
-        rounds,
-        currentRound,
+        rounds: rounds.map(annotate),
+        currentRound: currentRound ? annotate(currentRound) : null,
         // Unpaid non-current rounds that still have activity (rare, but
         // previously invisible to clients).
-        openRounds,
+        openRounds: openRounds.map(annotate),
         pendingDefaults,
       });
     } catch (err) {
@@ -866,7 +932,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
-  // ── Member contribution history ──────────────────────────────────────────────
+  // ── Member contribution history endpoint (#541) ───────────────────────────────
   //
   // Read-only ledger of every indexed contribution for a member. Unlike
   // /reputation/:member (which returns per-circle counts) and
@@ -878,6 +944,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // yield an empty list (not 404) — same convention as /reputation/:member.
   // An unknown ?circle= address is a 404 so callers get a clear signal that
   // the filter itself is invalid rather than a silently empty result.
+  //
+  // The response includes a `totalAmount` aggregate (sum of all contribution
+  // amounts for the queried scope) and a `hasMore` boolean convenience field
+  // derived from the pagination envelope so clients can page without computing
+  // `page < totalPages` themselves.
 
   app.get("/members/:member/contributions", historyRateLimiter, async (req: Request, res: Response) => {
     const memberResult = parseAddress(req.params.member, "Member address");
@@ -907,7 +978,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
     try {
       if (circleFilter) {
-        const [circle] = await query<Pick<CircleRow, "address">>(
+        const circle = await queryOne<Pick<CircleRow, "address">>(
           `SELECT address FROM circles WHERE address = $1`,
           [circleFilter],
         );
@@ -930,7 +1001,9 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         ? [member, circleFilter]
         : [member];
 
-      const [contributions, [countRow]] = await Promise.all([
+      interface ContribAggRow { count: string; total_amount: string }
+
+      const [contributions, agg] = await Promise.all([
         query<ContributionRow>(
           `SELECT c.circle_address, c.member_address, c.round_index, c.amount::text as amount,
                   c.tx_hash, c.ledger, c.created_at
@@ -940,23 +1013,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
            LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
           [...whereParams, limit, offset],
         ),
-        query<{ count: string }>(
-          `SELECT COUNT(*) as count FROM contributions c ${whereSql}`,
+        queryOne<ContribAggRow>(
+          `SELECT COUNT(*) as count, COALESCE(SUM(c.amount), 0)::text as total_amount
+           FROM contributions c
+           ${whereSql}`,
           whereParams,
         ),
       ]);
 
-      const total = Number(countRow.count);
+      const total = Number(agg?.count ?? 0);
+      const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
 
       res.json({
         member,
         circle: circleFilter ?? null,
         contributions,
+        totalAmount: agg?.total_amount ?? "0",
         pagination: {
           page,
           limit,
           total,
-          totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+          totalPages,
+          hasMore: page < totalPages,
         },
       });
     } catch (err) {
@@ -994,7 +1072,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     const circleFilter = circleResult;
 
     try {
-      const [row] = await query<ReputationRow>(
+      const row = await queryOne<ReputationRow>(
         `SELECT * FROM reputation WHERE member_address = $1`,
         [member],
       );
@@ -1143,7 +1221,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         ),
       ]);
 
-      const [state] = stateRows;
+      const state = stateRows[0] ?? null;
       if (!state) {
         sendError(res, 500, "Indexer state has not been initialized");
         return;
