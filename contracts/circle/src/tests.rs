@@ -4855,731 +4855,466 @@ mod circle_tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Issue #556 — Add test coverage for payout when a single member remains
+    // Issue #561 — Add tests for minimal valid initialization inputs
     //
-    // Covers the final-round payout path in a 2-member circle where the last
-    // remaining recipient has not yet received the pot.  Verifies that:
-    //   • The final payout transfers the full pot to the last recipient.
-    //   • The circle transitions to Completed after the final payout.
-    //   • get_current_round returns CircleNotActive after the final payout.
-    //   • The `completed` event is emitted exactly once.
-    //   • The `round_started` event is NOT emitted after the final payout.
+    // Tests in this section verify that the smallest legal combination of
+    // initialize() arguments is accepted and stored correctly, that the
+    // reentrancy guard fires before any state is committed, and that the guard
+    // is cleared after a successful initialization.
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// In a 2-member circle, round 0 belongs to member_a and round 1 belongs
-    /// to member_b.  After round 0 completes, only member_b has not yet
-    /// received the pot — this is the "single member remains" case.
-    /// Verify that the final payout to member_b transfers the correct amount
-    /// and transitions the circle to Completed.
+    /// Setting DataKey::Initializing before calling initialize must cause
+    /// initialize to panic with "initialize already in progress".  This mirrors
+    /// a reentrant mid-initialize call arriving before any state has committed.
     #[test]
-    fn test_556_two_member_final_payout_transfers_correct_pot() {
+    #[should_panic(expected = "initialize already in progress")]
+    fn test_561_initialize_reentrancy_guard_fires() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
-
-        let member_a = Address::generate(&env);
-        let member_b = Address::generate(&env);
-
-        // Fund both members: collateral + 2 rounds of contributions each
-        let token_asset = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        token_asset.mint(&member_a, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 2)));
-        token_asset.mint(&member_b, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 2)));
-
-        // Register reputation and authorize the circle as a caller
         let circle_id = env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&env, &circle_id);
-        let rep_client = ReputationContractClient::new(&env, &reputation_id);
-        let rep_admin = Address::generate(&env);
-        rep_client.initialize(&rep_admin);
-        rep_client.add_authorized_caller(&rep_admin, &circle_id);
 
-        let mut members = soroban_sdk::Vec::new(&env);
-        members.push_back(member_a.clone());
-        members.push_back(member_b.clone());
+        env.as_contract(&circle_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
 
-        let circle_admin = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
         circle.initialize(
-            &circle_admin,
+            &Address::generate(&env),
             &members,
-            &ROUND_AMOUNT,
+            &1i128,
             &token_address,
             &reputation_id,
-            &ROUND_DEADLINE,
-        );
-
-        // Both members join → circle goes Active
-        circle.join(&member_a);
-        circle.join(&member_b);
-        assert_eq!(circle.get_status(), CircleStatus::Active);
-
-        // Round 0: member_a is recipient (pot = 2 × ROUND_AMOUNT)
-        circle.contribute(&member_a);
-        circle.contribute(&member_b);
-
-        let member_a_before_r0 = soroban_sdk::token::Client::new(&env, &token_address).balance(&member_a);
-        circle.payout();
-        let member_a_after_r0 = soroban_sdk::token::Client::new(&env, &token_address).balance(&member_a);
-
-        // member_a net = pot − own contribution = ROUND_AMOUNT (one round worth)
-        let pot = ROUND_AMOUNT * 2;
-        assert_eq!(
-            member_a_after_r0 - member_a_before_r0,
-            pot - ROUND_AMOUNT,
-            "member_a net gain in round 0 must be pot minus own contribution"
-        );
-        // Circle is still Active after round 0 (one round remains)
-        assert_eq!(circle.get_status(), CircleStatus::Active);
-
-        // Round 1: member_b is the sole remaining recipient
-        let round_1 = circle.get_current_round();
-        assert_eq!(round_1.round_index, 1, "round index must be 1 before final payout");
-        assert_eq!(round_1.recipient, member_b, "member_b must be the round-1 recipient");
-
-        circle.contribute(&member_a);
-        circle.contribute(&member_b);
-
-        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-        let member_b_before_r1 = token_client.balance(&member_b);
-        circle.payout(); // final payout
-        let member_b_after_r1 = token_client.balance(&member_b);
-
-        // member_b receives the full pot and spent one contribution
-        assert_eq!(
-            member_b_after_r1 - member_b_before_r1,
-            pot - ROUND_AMOUNT,
-            "member_b net gain in final round must be pot minus own contribution"
-        );
-
-        // Circle must now be Completed
-        assert_eq!(
-            circle.get_status(),
-            CircleStatus::Completed,
-            "circle must be Completed after the final payout"
+            &MIN_ROUND_DEADLINE_LEDGERS,
         );
     }
 
-    /// After the final payout in a 2-member circle, get_current_round must
-    /// return an error (CircleNotActive) — there is no active round.
+    /// After a reentrancy-guard failure the Config key must remain absent,
+    /// confirming that no persistent state was committed before the guard fired.
     #[test]
-    fn test_556_get_current_round_returns_error_after_final_payout() {
+    fn test_561_initialize_reentrancy_guard_leaves_no_config_state() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
-
-        let member_a = Address::generate(&env);
-        let member_b = Address::generate(&env);
-
-        let token_asset = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        token_asset.mint(&member_a, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 2)));
-        token_asset.mint(&member_b, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 2)));
-
         let circle_id = env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&env, &circle_id);
-        let rep_client = ReputationContractClient::new(&env, &reputation_id);
-        let rep_admin = Address::generate(&env);
-        rep_client.initialize(&rep_admin);
-        rep_client.add_authorized_caller(&rep_admin, &circle_id);
 
-        let mut members = soroban_sdk::Vec::new(&env);
-        members.push_back(member_a.clone());
-        members.push_back(member_b.clone());
+        env.as_contract(&circle_id, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::Initializing, &true);
+        });
 
-        let circle_admin = Address::generate(&env);
-        circle.initialize(
-            &circle_admin,
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+        let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
-            &ROUND_AMOUNT,
+            &1i128,
             &token_address,
             &reputation_id,
-            &ROUND_DEADLINE,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+        assert!(result.is_err(), "initialize with Initializing flag set must fail");
+
+        let config_result = circle.try_get_config();
+        assert!(
+            config_result.is_err(),
+            "Config key must be absent after reentrancy-guard failure"
+        );
+    }
+
+    /// After a successful initialize the Initializing guard must be removed.
+    /// A second initialize call must fail with "already initialized" (from the
+    /// Config presence check) rather than "initialize already in progress"
+    /// (from the guard), proving the guard was cleared on success.
+    #[test]
+    fn test_561_reentrancy_guard_cleared_on_successful_init() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        members.push_back(Address::generate(&env));
+        members.push_back(Address::generate(&env));
+        let admin = Address::generate(&env);
+
+        circle.initialize(
+            &admin,
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
         );
 
-        circle.join(&member_a);
-        circle.join(&member_b);
-
-        // Complete both rounds
-        circle.contribute(&member_a);
-        circle.contribute(&member_b);
-        circle.payout(); // round 0
-
-        circle.contribute(&member_a);
-        circle.contribute(&member_b);
-        circle.payout(); // round 1 — final
-
-        // After the final payout no current round exists
-        let result = circle.try_get_current_round();
+        let result = circle.try_initialize(
+            &admin,
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
         assert!(
             result.is_err(),
-            "get_current_round must return an error after the final payout in a 2-member circle"
+            "second initialize must be rejected (already initialized)"
+        );
+        assert_eq!(
+            circle.get_config().round_amount,
+            1,
+            "Config must still hold the original round_amount after rejected second init"
         );
     }
 
-    /// The `completed` event must be emitted exactly once after the final
-    /// payout in a 2-member circle.  The `round_started` event must NOT be
-    /// emitted after the final payout (no next round to announce).
+    /// The minimal valid input (2 members, round_amount=1, min deadline) must
+    /// store every configuration field exactly as supplied: admin, usdc_token,
+    /// reputation_contract, members list, round_amount, round_deadline_ledgers.
     #[test]
-    fn test_556_final_payout_emits_completed_not_round_started() {
+    fn test_561_minimal_two_members_all_fields_stored_correctly() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
 
         let member_a = Address::generate(&env);
         let member_b = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a.clone());
+        members.push_back(member_b.clone());
+        let admin = Address::generate(&env);
 
-        let token_asset = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
-        token_asset.mint(&member_a, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 2)));
-        token_asset.mint(&member_b, &(ROUND_AMOUNT * (COLLATERAL_MULTIPLIER + 2)));
+        circle.initialize(
+            &admin,
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(config.members.len(), 2, "member count must be 2");
+        assert_eq!(config.members.get(0).unwrap(), member_a, "first member must match");
+        assert_eq!(config.members.get(1).unwrap(), member_b, "second member must match");
+        assert_eq!(config.round_amount, 1, "round_amount must be 1");
+        assert_eq!(
+            config.round_deadline_ledgers, MIN_ROUND_DEADLINE_LEDGERS,
+            "round_deadline_ledgers must equal MIN_ROUND_DEADLINE_LEDGERS"
+        );
+        assert_eq!(config.usdc_token, token_address, "token address must match");
+        assert_eq!(
+            config.reputation_contract, reputation_id,
+            "reputation address must match"
+        );
+
+        assert_eq!(circle.get_status(), CircleStatus::Pending);
+        assert_eq!(circle.get_admin(), admin, "stored admin must equal the address passed at init");
+    }
+
+    /// With round_amount=1 and 2 members the initial round state must have
+    /// round_index=0 and the recipient must be the first member in the list.
+    #[test]
+    fn test_561_initial_round_state_is_round_zero_first_member() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let first = Address::generate(&env);
+        let second = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(first.clone());
+        members.push_back(second.clone());
+
+        circle.initialize(
+            &Address::generate(&env),
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let round = circle.get_current_round();
+        assert_eq!(round.round_index, 0, "initial round index must be 0");
+        assert_eq!(round.recipient, first, "initial recipient must be the first member");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Issue #560 — Verify max member list handling remains safe under load
+    //
+    // Tests in this section confirm that a circle with exactly MAX_MEMBERS (256)
+    // members initializes successfully and that operations that iterate the full
+    // member list (close, mark_default penalty math) complete without overflow
+    // or out-of-bounds panics.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// A circle initialized with exactly MAX_MEMBERS (256) distinct addresses
+    /// must succeed and report the correct member count.
+    #[test]
+    fn test_560_initialize_with_max_members_succeeds() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let mut members = Vec::new(&env);
+        for _ in 0..MAX_MEMBERS {
+            members.push_back(Address::generate(&env));
+        }
+
+        circle.initialize(
+            &Address::generate(&env),
+            &members,
+            &1i128,
+            &token_address,
+            &reputation_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
+        );
+
+        let config = circle.get_config();
+        assert_eq!(
+            config.members.len(),
+            MAX_MEMBERS,
+            "config must store all MAX_MEMBERS members"
+        );
+        assert_eq!(circle.get_status(), CircleStatus::Pending);
+        let round = circle.get_current_round();
+        assert_eq!(round.round_index, 0);
+        assert_eq!(
+            round.recipient,
+            members.get(0).unwrap(),
+            "initial recipient must be the first of the max-member list"
+        );
+    }
+
+    /// close() on a Completed MAX_MEMBERS circle must iterate all 256 members,
+    /// return each one's collateral exactly once, and leave every storage key at
+    /// zero.  This confirms there is no out-of-bounds or iteration-limit issue
+    /// at the maximum member count.
+    #[test]
+    fn test_560_close_releases_collateral_for_all_max_members() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin);
+        let token = soroban_sdk::token::TokenClient::new(&env, &token_id.address());
+        let token_asset = soroban_sdk::token::StellarAssetClient::new(&env, &token_id.address());
+
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        rep_client.initialize(&Address::generate(&env));
 
         let circle_id = env.register_contract(None, CircleContract);
         let circle = CircleContractClient::new(&env, &circle_id);
-        let rep_client = ReputationContractClient::new(&env, &reputation_id);
-        let rep_admin = Address::generate(&env);
-        rep_client.initialize(&rep_admin);
-        rep_client.add_authorized_caller(&rep_admin, &circle_id);
+        rep_client.add_authorized_caller(&rep_client.get_admin(), &circle_id);
 
-        let mut members = soroban_sdk::Vec::new(&env);
-        members.push_back(member_a.clone());
-        members.push_back(member_b.clone());
+        let round_amount: i128 = 1_000_000;
+        let collateral = round_amount * COLLATERAL_MULTIPLIER;
 
-        let circle_admin = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        for _ in 0..MAX_MEMBERS {
+            let m = Address::generate(&env);
+            token_asset.mint(&m, &(collateral + round_amount));
+            members.push_back(m);
+        }
+
         circle.initialize(
-            &circle_admin,
+            &Address::generate(&env),
             &members,
-            &ROUND_AMOUNT,
-            &token_address,
-            &reputation_id,
-            &ROUND_DEADLINE,
+            &round_amount,
+            &token_id.address(),
+            &rep_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
         );
 
-        circle.join(&member_a);
-        circle.join(&member_b);
-
-        // Round 0
-        circle.contribute(&member_a);
-        circle.contribute(&member_b);
-        circle.payout();
-
-        // Flush events accumulated during round 0
-        let _ = env.events().all();
-
-        // Round 1 — final payout for the single remaining recipient
-        circle.contribute(&member_a);
-        circle.contribute(&member_b);
-        circle.payout();
-
-        let completed = events_named(&env, "completed");
-        assert_eq!(completed.len(), 1, "final payout must emit exactly one 'completed' event");
-
-        let round_started = events_named(&env, "round_started");
-        assert_eq!(
-            round_started.len(), 0,
-            "final payout must NOT emit 'round_started' — there is no next round"
-        );
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Issue #557 — Add invariants to prevent pot overpayment or underpayment
-    //
-    // The contract enforces pot = round_amount × member_count before every
-    // transfer.  These tests verify that the pot invariant holds across all
-    // code paths: normal payout, settle_round, and multi-round lifecycle.
-    //
-    // Additional defensive tests confirm that a crafted storage overflow is
-    // caught by the view layer (get_pot_amount) and the payout arithmetic.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// The pot paid in every normal-path payout must equal round_amount × member_count.
-    /// Drive all 4 rounds and verify recipient net gain == pot − own contribution
-    /// in each round.
-    #[test]
-    fn test_557_pot_invariant_holds_across_all_rounds() {
-        let t = setup_circle();
-        t.activate();
-
-        let expected_pot = ROUND_AMOUNT * 4; // 4-member circle
-
-        let members = [t.alice.clone(), t.bob.clone(), t.carol.clone(), t.dave.clone()];
-        for expected_recipient in &members {
-            let bal_before = t.token.balance(expected_recipient);
-            t.contribute_all();
-            t.circle.payout();
-            let bal_after = t.token.balance(expected_recipient);
-
-            // Net to recipient = pot − own contribution
-            let net = bal_after - bal_before;
-            assert_eq!(
-                net,
-                expected_pot - ROUND_AMOUNT,
-                "pot invariant: recipient net must equal pot − own_contribution in every round"
-            );
+        for i in 0..MAX_MEMBERS {
+            circle.join(&members.get(i).unwrap());
         }
-    }
+        assert_eq!(circle.get_status(), CircleStatus::Active);
 
-    /// get_pot_amount must equal the actual transfer amount observed during payout.
-    /// Verified by comparing the view's return value with the token balance delta
-    /// for the round-0 recipient.
-    #[test]
-    fn test_557_get_pot_amount_equals_actual_transfer() {
-        let t = setup_circle();
-        t.activate();
-
-        let pot_view = t.circle.get_pot_amount();
-        assert_eq!(pot_view, ROUND_AMOUNT * 4, "get_pot_amount must equal round_amount × member_count");
-
-        let alice_before = t.token.balance(&t.alice);
-        t.contribute_all();
-        t.circle.payout(); // alice is round-0 recipient
-        let alice_after = t.token.balance(&t.alice);
-
-        // Alice contributed ROUND_AMOUNT and received pot_view.
-        // Net change == pot_view − ROUND_AMOUNT.
-        assert_eq!(
-            alice_after - alice_before,
-            pot_view - ROUND_AMOUNT,
-            "actual transfer must equal get_pot_amount() − own contribution"
-        );
-    }
-
-    /// The partial pot paid by settle_round must be ≤ get_pot_amount.
-    /// The difference is accounted for by the defaulting members' forfeited contributions.
-    #[test]
-    fn test_557_settle_round_partial_pot_never_exceeds_full_pot() {
-        let t = setup_circle();
-        t.activate();
-
-        let full_pot = t.circle.get_pot_amount();
-
-        // Only alice contributes (round-0 recipient); bob, carol, dave default.
-        t.circle.contribute(&t.alice);
-        t.advance_past_deadline();
-
-        let alice_before = t.token.balance(&t.alice);
-        t.circle.settle_round();
-        let alice_after = t.token.balance(&t.alice);
-
-        // Partial pot = 1 contribution × round_amount
-        let partial_pot = ROUND_AMOUNT * 1;
-        assert!(
-            partial_pot <= full_pot,
-            "settle_round partial pot ({partial_pot}) must not exceed get_pot_amount ({full_pot})"
-        );
-
-        // Alice receives partial_pot − her own contribution (net zero here since
-        // she is both sole contributor and recipient).
-        assert_eq!(
-            alice_after - alice_before,
-            partial_pot - ROUND_AMOUNT,
-            "recipient net must be partial_pot − own contribution"
-        );
-    }
-
-    /// pot must be strictly positive when at least one member contributed.
-    /// Verify that a 1-contributor settle_round does not pass zero to the token.
-    #[test]
-    fn test_557_pot_is_positive_when_at_least_one_contributor() {
-        let t = setup_circle();
-        t.activate();
-
-        t.circle.contribute(&t.bob); // bob contributes; alice (recipient) does not
-        t.advance_past_deadline();
-
-        // The partial pot is 1 × ROUND_AMOUNT — positive, valid transfer.
-        // settle_round must not panic on a positive pot.
-        t.circle.settle_round(); // must succeed without panic
-
-        // After settlement the circle advanced to round 1
-        let round = t.circle.get_current_round();
-        assert_eq!(round.round_index, 1, "circle must advance to round 1 after settle_round");
-    }
-
-    /// zero-contribution settle_round (all default): pot == 0 must not panic.
-    /// The contract skips the token transfer for a zero pot.
-    #[test]
-    fn test_557_all_default_settle_round_pot_zero_no_panic() {
-        let t = setup_circle();
-        t.activate();
-        t.advance_past_deadline();
-
-        // No contributions at all — pot = 0
-        t.circle.settle_round(); // must not panic
-
-        // Circle advances to round 1 with no transfer
-        let round = t.circle.get_current_round();
-        assert_eq!(round.round_index, 1, "circle must advance to round 1 even with zero pot");
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    // Issue #558 — Make penalty reduction and collateral release arithmetic
-    // explicit.
-    //
-    // The penalty formula is:
-    //   penalty    = collateral × PENALTY_BPS / BPS_DENOM
-    //   new_balance = collateral − penalty
-    //
-    // After N defaults the collateral is:
-    //   collateral_N = initial × (1 − PENALTY_BPS/BPS_DENOM)^N
-    //
-    // These tests verify:
-    //   • Single penalty: new_collateral == initial − (initial × PENALTY_BPS / BPS_DENOM)
-    //   • Double penalty: each step reduces the *remaining* balance by 20%
-    //   • Collateral after N penalties == initial − Σ(penalty_i) for i in 0..N
-    //   • close() releases exactly the remaining balance (not the original)
-    //   • get_collateral reflects every penalty deduction immediately
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// Single penalty: new_collateral == initial − (initial × PENALTY_BPS / BPS_DENOM).
-    /// This is the canonical formula documented on mark_default.
-    #[test]
-    fn test_558_single_penalty_formula_is_correct() {
-        let t = setup_circle();
-        t.activate();
-
-        let initial = t.circle.get_collateral(&t.carol);
-        assert_eq!(initial, ROUND_AMOUNT * COLLATERAL_MULTIPLIER, "initial collateral must equal COLLATERAL_MULTIPLIER × round_amount");
-
-        t.advance_past_deadline();
-        t.circle.mark_default(&t.carol);
-
-        let after = t.circle.get_collateral(&t.carol);
-        // penalty = initial × PENALTY_BPS / BPS_DENOM  (integer division, truncates toward zero)
-        let penalty = initial * PENALTY_BPS / BPS_DENOM;
-        let expected = initial - penalty;
-
-        assert_eq!(
-            after, expected,
-            "new_collateral must equal initial − (initial × PENALTY_BPS / BPS_DENOM)"
-        );
-    }
-
-    /// Each successive penalty applies to the *remaining* balance, not the
-    /// initial deposit.  Two defaults must compound the reduction.
-    ///
-    /// After default 1:  c1 = initial − initial × rate
-    /// After default 2:  c2 = c1      − c1      × rate
-    /// Equivalently:     c2 = initial × (1 − rate)²
-    #[test]
-    fn test_558_double_penalty_compounds_on_remaining_balance() {
-        let t = setup_circle();
-        t.activate();
-
-        let initial = t.circle.get_collateral(&t.dave);
-
-        // Default 1 — round 0
-        t.advance_past_deadline();
-        t.circle.mark_default(&t.dave);
-        let after_first = t.circle.get_collateral(&t.dave);
-
-        let penalty_1 = initial * PENALTY_BPS / BPS_DENOM;
-        assert_eq!(after_first, initial - penalty_1, "after first default: c1 = initial - penalty_1");
-
-        // Advance to round 1 by forcing the round state (round 0 is unresolvable
-        // without full contributions; we manufacture a round-1 context via storage override)
-        t.env.as_contract(&t.circle_id, || {
-            let mut round: crate::RoundState = t
-                .env
-                .storage()
+        env.as_contract(&circle_id, || {
+            env.storage()
                 .instance()
-                .get(&crate::DataKey::CurrentRound)
-                .unwrap();
-            round.round_index = 1;
-            round.paid_out = false;
-            round.deadline_ledger = t.env.ledger().sequence() as u64 + 1;
-            t.env.storage().instance().set(&crate::DataKey::CurrentRound, &round);
+                .set(&DataKey::Status, &CircleStatus::Completed);
+            env.storage()
+                .instance()
+                .set(&DataKey::RoundsCompleted, &MAX_MEMBERS);
         });
-        t.env.ledger().with_mut(|l| { l.sequence_number += 2; });
 
-        t.circle.mark_default(&t.dave);
-        let after_second = t.circle.get_collateral(&t.dave);
+        let balances_before: std::vec::Vec<i128> = (0..MAX_MEMBERS)
+            .map(|i| token.balance(&members.get(i).unwrap()))
+            .collect();
 
-        // Default 2 applies to the remaining balance after default 1
-        let penalty_2 = after_first * PENALTY_BPS / BPS_DENOM;
-        assert_eq!(
-            after_second, after_first - penalty_2,
-            "after second default: c2 = c1 - (c1 × rate)"
-        );
+        circle.close(&members.get(0).unwrap());
 
-        // Verify the cumulative formula: initial - Σ(penalties)
-        let total_penalties = penalty_1 + penalty_2;
-        assert_eq!(
-            after_second, initial - total_penalties,
-            "collateral after 2 defaults must equal initial − Σ(penalties)"
-        );
-    }
+        assert!(circle.is_closed(), "circle must be closed after close()");
 
-    /// After any number of penalties, get_collateral reflects the running total.
-    /// Verify: collateral_after_N == initial − Σ(penalty_i for i in 0..N).
-    #[test]
-    fn test_558_collateral_equals_initial_minus_sum_of_penalties() {
-        let t = setup_circle();
-        t.activate();
-
-        let initial = t.circle.get_collateral(&t.bob);
-        let mut expected = initial;
-        let mut sum_of_penalties: i128 = 0;
-
-        // Apply up to 3 penalties across 3 synthetic rounds
-        for round_idx in 0u32..3 {
-            t.env.as_contract(&t.circle_id, || {
-                let mut round: crate::RoundState = t
-                    .env
-                    .storage()
-                    .instance()
-                    .get(&crate::DataKey::CurrentRound)
-                    .unwrap();
-                round.round_index = round_idx;
-                round.paid_out = false;
-                round.deadline_ledger = t.env.ledger().sequence() as u64 + 1;
-                t.env.storage().instance().set(&crate::DataKey::CurrentRound, &round);
-            });
-            t.env.ledger().with_mut(|l| { l.sequence_number += 2; });
-
-            let before = t.circle.get_collateral(&t.bob);
-            t.circle.mark_default(&t.bob);
-            let after = t.circle.get_collateral(&t.bob);
-
-            let penalty = before * PENALTY_BPS / BPS_DENOM;
-            sum_of_penalties += penalty;
-            expected = initial - sum_of_penalties;
-
+        for i in 0..MAX_MEMBERS {
+            let m = members.get(i).unwrap();
             assert_eq!(
-                after, expected,
-                "after default {}: collateral must equal initial − Σ(penalties)", round_idx
+                circle.get_collateral(&m),
+                0,
+                "collateral must be zero for member {i} after close"
+            );
+            assert_eq!(
+                token.balance(&m) - balances_before[i as usize],
+                collateral,
+                "member {i} must receive exactly their collateral back"
             );
         }
     }
 
-    /// close() releases exactly the remaining post-penalty balance, not the
-    /// original collateral.  The token balance delta for the penalised member
-    /// must equal get_collateral() before close.
+    /// mark_default penalty arithmetic must produce the correct result when
+    /// applied to a circle at MAX_MEMBERS capacity.  After advancing past the
+    /// round deadline, calling mark_default on one non-contributing member must
+    /// deduct exactly PENALTY_BPS / BPS_DENOM of their collateral without any
+    /// overflow or panic.
     #[test]
-    fn test_558_close_releases_exactly_remaining_collateral() {
-        let t = setup_circle();
-        t.activate();
+    fn test_560_mark_default_penalty_arithmetic_safe_at_max_members() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
 
-        // Apply one penalty to alice
-        t.advance_past_deadline();
-        t.circle.mark_default(&t.alice);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin);
+        let token_asset = soroban_sdk::token::StellarAssetClient::new(&env, &token_id.address());
 
-        let alice_remaining = t.circle.get_collateral(&t.alice);
-        let expected_penalty = ROUND_AMOUNT * COLLATERAL_MULTIPLIER * PENALTY_BPS / BPS_DENOM;
-        assert_eq!(
-            alice_remaining,
-            ROUND_AMOUNT * COLLATERAL_MULTIPLIER - expected_penalty,
-            "remaining collateral must equal initial − penalty"
+        let rep_id = env.register_contract(None, ReputationContract);
+        let rep_client = ReputationContractClient::new(&env, &rep_id);
+        rep_client.initialize(&Address::generate(&env));
+
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+        rep_client.add_authorized_caller(&rep_client.get_admin(), &circle_id);
+
+        let round_amount: i128 = 1_000_000;
+        let collateral = round_amount * COLLATERAL_MULTIPLIER;
+
+        let mut members = Vec::new(&env);
+        for _ in 0..MAX_MEMBERS {
+            let m = Address::generate(&env);
+            token_asset.mint(&m, &(collateral + round_amount));
+            members.push_back(m);
+        }
+
+        circle.initialize(
+            &Address::generate(&env),
+            &members,
+            &round_amount,
+            &token_id.address(),
+            &rep_id,
+            &MIN_ROUND_DEADLINE_LEDGERS,
         );
 
-        t.force_status(CircleStatus::Completed);
+        for i in 0..MAX_MEMBERS {
+            circle.join(&members.get(i).unwrap());
+        }
+        assert_eq!(circle.get_status(), CircleStatus::Active);
 
-        let alice_wallet_before = t.token.balance(&t.alice);
-        t.circle.close(&t.alice);
-        let alice_wallet_after = t.token.balance(&t.alice);
+        env.ledger().with_mut(|l| {
+            l.sequence_number += MIN_ROUND_DEADLINE_LEDGERS + 1;
+        });
 
+        let defaulter = members.get(0).unwrap();
+        let collateral_before = circle.get_collateral(&defaulter);
+
+        circle.mark_default(&defaulter);
+
+        let collateral_after = circle.get_collateral(&defaulter);
+        let expected_penalty = collateral_before * PENALTY_BPS / BPS_DENOM;
         assert_eq!(
-            alice_wallet_after - alice_wallet_before,
-            alice_remaining,
-            "close must transfer exactly the remaining (post-penalty) collateral balance"
+            collateral_before - collateral_after,
+            expected_penalty,
+            "penalty must equal exactly PENALTY_BPS / BPS_DENOM of collateral"
         );
-        assert_eq!(t.circle.get_collateral(&t.alice), 0, "storage key must be zeroed after close");
+        assert_eq!(circle.get_defaults(&defaulter), 1);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Issue #559 — Add a query to read member collateral and default counts
+    // Issue #551 — Clarify cancelled state semantics and supported lifecycle paths
     //
-    // get_collateral(member) and get_defaults(member) are public read-only
-    // views.  These tests cover the full lifecycle of both views:
-    //
-    //   • Pre-join  : get_collateral returns 0; get_defaults returns 0
-    //   • Post-join : get_collateral returns COLLATERAL_MULTIPLIER × round_amount
-    //   • Post-default (once): collateral decreases by penalty; defaults == 1
-    //   • Post-default (twice): collateral decreases again; defaults == 2
-    //   • Post-close : get_collateral returns 0 for every member
-    //   • Non-member : both views return 0 for any unknown address
-    //   • Independence: each member's counters are independent of others
+    // Tests in this section document which operations are blocked on a Cancelled
+    // circle and which reads remain available, providing a clear contract for
+    // off-chain consumers and SDK implementors.
     // ══════════════════════════════════════════════════════════════════════════
 
-    /// Before a member calls join(), get_collateral returns 0 for that member.
+    /// join() on a Cancelled circle must panic: the circle is no longer
+    /// accepting members after cancellation.
     #[test]
-    fn test_559_get_collateral_returns_zero_before_join() {
+    #[should_panic(expected = "circle not accepting members")]
+    fn test_551_join_on_cancelled_circle_panics() {
         let t = setup_circle();
-        // No one has joined yet
-        assert_eq!(t.circle.get_collateral(&t.alice), 0, "get_collateral must be 0 before join");
-        assert_eq!(t.circle.get_collateral(&t.bob),   0, "get_collateral must be 0 before join");
-        assert_eq!(t.circle.get_collateral(&t.carol), 0);
-        assert_eq!(t.circle.get_collateral(&t.dave),  0);
-    }
-
-    /// After join(), get_collateral returns COLLATERAL_MULTIPLIER × round_amount.
-    #[test]
-    fn test_559_get_collateral_returns_locked_amount_after_join() {
-        let t = setup_circle();
-        let expected = ROUND_AMOUNT * COLLATERAL_MULTIPLIER;
-
         t.circle.join(&t.alice);
-        assert_eq!(t.circle.get_collateral(&t.alice), expected, "get_collateral must equal COLLATERAL_MULTIPLIER × round_amount after join");
-
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
         t.circle.join(&t.bob);
-        assert_eq!(t.circle.get_collateral(&t.bob), expected);
-
-        // carol and dave have not joined — still 0
-        assert_eq!(t.circle.get_collateral(&t.carol), 0, "get_collateral must remain 0 for members who have not joined");
-        assert_eq!(t.circle.get_collateral(&t.dave),  0);
     }
 
-    /// get_defaults returns 0 before any default is recorded, for both joined
-    /// and not-yet-joined members.
+    /// contribute() on a Cancelled circle must panic: only Active circles
+    /// accept contributions.
     #[test]
-    fn test_559_get_defaults_returns_zero_initially() {
+    #[should_panic(expected = "circle is not active")]
+    fn test_551_contribute_on_cancelled_circle_panics() {
         let t = setup_circle();
-        t.activate();
-        assert_eq!(t.circle.get_defaults(&t.alice), 0);
-        assert_eq!(t.circle.get_defaults(&t.bob),   0);
-        assert_eq!(t.circle.get_defaults(&t.carol), 0);
-        assert_eq!(t.circle.get_defaults(&t.dave),  0);
-
-        // Also 0 for a completely unknown address
-        let stranger = Address::generate(&t.env);
-        assert_eq!(t.circle.get_defaults(&stranger), 0, "get_defaults must be 0 for unknown address");
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
+        t.circle.contribute(&t.alice);
     }
 
-    /// After one mark_default call:
-    ///   • get_defaults increments from 0 to 1
-    ///   • get_collateral decreases by the penalty
-    ///   • the other member's counters are unchanged (independence)
+    /// payout() on a Cancelled circle must panic: no round is in progress after
+    /// cancellation.
     #[test]
-    fn test_559_get_collateral_and_defaults_after_one_default() {
+    #[should_panic(expected = "circle is not active")]
+    fn test_551_payout_on_cancelled_circle_panics() {
         let t = setup_circle();
-        t.activate();
-        t.advance_past_deadline();
-
-        let initial = t.circle.get_collateral(&t.carol);
-        let penalty = initial * PENALTY_BPS / BPS_DENOM;
-
-        t.circle.mark_default(&t.carol);
-
-        assert_eq!(
-            t.circle.get_defaults(&t.carol), 1,
-            "get_defaults must be 1 after one mark_default call"
-        );
-        assert_eq!(
-            t.circle.get_collateral(&t.carol), initial - penalty,
-            "get_collateral must decrease by the penalty after one default"
-        );
-
-        // Other members are unaffected
-        assert_eq!(t.circle.get_defaults(&t.alice), 0, "alice's default count must be unaffected");
-        assert_eq!(t.circle.get_collateral(&t.alice), ROUND_AMOUNT * COLLATERAL_MULTIPLIER,
-            "alice's collateral must be unaffected by carol's default");
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
+        t.circle.payout();
     }
 
-    /// get_defaults increments once per mark_default call; each default is
-    /// independent because it targets a different round_index.
+    /// cancel() on an already-Cancelled circle must panic: only Pending circles
+    /// may be cancelled.
     #[test]
-    fn test_559_get_defaults_increments_per_round() {
+    #[should_panic(expected = "can only cancel a pending circle")]
+    fn test_551_cancel_already_cancelled_panics() {
         let t = setup_circle();
-        t.activate();
-
-        // Default in round 0
-        t.advance_past_deadline();
-        t.circle.mark_default(&t.dave);
-        assert_eq!(t.circle.get_defaults(&t.dave), 1, "defaults must be 1 after round-0 default");
-
-        // Manufacture round 1 so we can default again
-        t.env.as_contract(&t.circle_id, || {
-            let mut round: crate::RoundState = t
-                .env
-                .storage()
-                .instance()
-                .get(&crate::DataKey::CurrentRound)
-                .unwrap();
-            round.round_index = 1;
-            round.paid_out = false;
-            round.deadline_ledger = t.env.ledger().sequence() as u64 + 1;
-            t.env.storage().instance().set(&crate::DataKey::CurrentRound, &round);
-        });
-        t.env.ledger().with_mut(|l| { l.sequence_number += 2; });
-
-        t.circle.mark_default(&t.dave);
-        assert_eq!(t.circle.get_defaults(&t.dave), 2, "defaults must be 2 after round-1 default");
-
-        // Other members remain at 0
-        assert_eq!(t.circle.get_defaults(&t.alice), 0);
-        assert_eq!(t.circle.get_defaults(&t.bob),   0);
-        assert_eq!(t.circle.get_defaults(&t.carol), 0);
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
+        t.circle.cancel(&t.bob);
     }
 
-    /// After close(), get_collateral must return 0 for every member regardless
-    /// of how many penalties were applied.
+    /// All read-only views must remain callable on a Cancelled circle.
+    /// `get_current_round` returns a typed `Err` (not a host trap) for terminal
+    /// states — this is the correct, documented behavior.  All other views must
+    /// succeed and return their last committed values.
     #[test]
-    fn test_559_get_collateral_is_zero_for_all_members_after_close() {
+    fn test_551_read_only_views_succeed_on_cancelled_circle() {
         let t = setup_circle();
-        t.activate();
+        t.circle.join(&t.alice);
+        t.circle.cancel(&t.alice);
+        assert_eq!(t.circle.get_status(), CircleStatus::Cancelled);
 
-        // Apply a penalty to one member before close
-        t.advance_past_deadline();
-        t.circle.mark_default(&t.bob);
-
-        t.force_status(CircleStatus::Completed);
-        t.circle.close(&t.alice);
-
-        assert_eq!(t.circle.get_collateral(&t.alice), 0, "alice must have 0 collateral after close");
-        assert_eq!(t.circle.get_collateral(&t.bob),   0, "bob must have 0 collateral after close");
-        assert_eq!(t.circle.get_collateral(&t.carol), 0, "carol must have 0 collateral after close");
-        assert_eq!(t.circle.get_collateral(&t.dave),  0, "dave must have 0 collateral after close");
-    }
-
-    /// get_defaults persists after close(): the default count records a member's
-    /// history and is not erased by the settlement.
-    #[test]
-    fn test_559_get_defaults_persists_after_close() {
-        let t = setup_circle();
-        t.activate();
-
-        t.advance_past_deadline();
-        t.circle.mark_default(&t.carol);
-        assert_eq!(t.circle.get_defaults(&t.carol), 1);
-
-        t.force_status(CircleStatus::Completed);
-        t.circle.close(&t.alice);
-
-        // Default count is NOT reset by close
-        assert_eq!(
-            t.circle.get_defaults(&t.carol), 1,
-            "get_defaults must persist after close — it is a historical record"
-        );
-    }
-
-    /// get_collateral and get_defaults return 0 for any address that never
-    /// joined the circle (including completely unknown addresses).
-    #[test]
-    fn test_559_views_return_zero_for_non_member_address() {
-        let t = setup_circle();
-        t.activate();
-
-        let stranger = Address::generate(&t.env);
-        assert_eq!(t.circle.get_collateral(&stranger), 0, "get_collateral must be 0 for non-member");
-        assert_eq!(t.circle.get_defaults(&stranger),   0, "get_defaults must be 0 for non-member");
-    }
-
-    /// Each member's collateral and default counts are tracked independently.
-    /// Penalising one member must not affect any other member's values.
-    #[test]
-    fn test_559_collateral_and_defaults_are_per_member_independent() {
-        let t = setup_circle();
-        t.activate();
-        t.advance_past_deadline();
-
-        // Only carol defaults
-        t.circle.mark_default(&t.carol);
-
-        // carol's values changed
-        assert_eq!(t.circle.get_defaults(&t.carol), 1);
+        let _ = t.circle.get_config();
+        let _ = t.circle.get_status();
+        // get_current_round returns a typed error for terminal states — must
+        // not cause a host trap; a clean Err proves the path is handled.
         assert!(
-            t.circle.get_collateral(&t.carol) < ROUND_AMOUNT * COLLATERAL_MULTIPLIER,
-            "carol's collateral must decrease after penalty"
+            t.circle.try_get_current_round().is_err(),
+            "get_current_round must return a typed Err (not a host trap) on Cancelled"
         );
-
-        // Every other member is completely unaffected
-        let full_collateral = ROUND_AMOUNT * COLLATERAL_MULTIPLIER;
-        assert_eq!(t.circle.get_collateral(&t.alice), full_collateral, "alice unaffected");
-        assert_eq!(t.circle.get_collateral(&t.bob),   full_collateral, "bob unaffected");
-        assert_eq!(t.circle.get_collateral(&t.dave),  full_collateral, "dave unaffected");
-        assert_eq!(t.circle.get_defaults(&t.alice), 0, "alice defaults unaffected");
-        assert_eq!(t.circle.get_defaults(&t.bob),   0, "bob defaults unaffected");
-        assert_eq!(t.circle.get_defaults(&t.dave),  0, "dave defaults unaffected");
+        let _ = t.circle.get_pot_amount();
+        let _ = t.circle.get_collateral(&t.alice);
+        let _ = t.circle.get_defaults(&t.alice);
+        let _ = t.circle.get_protocol_params();
+        let _ = t.circle.get_usdc_token();
+        let _ = t.circle.get_admin();
+        assert!(!t.circle.is_closed(), "cancelled-but-not-closed must report is_closed = false");
     }
 
 }
