@@ -18,6 +18,12 @@ import {
   CircleDetailClient,
   type CircleDetailData,
 } from "./CircleDetailClient";
+// Canonical address validator — the single source of truth for Soroban contract
+// IDs. Replaces the inline `/^C[A-Z2-7]{55}$/` regex that was previously used
+// in generateMetadata only, and extends the guard to the page render path so
+// a malformed address never reaches the indexer, CircleHeader, or
+// CircleDetailClient.
+import { isSorobanContractId } from "@/lib/address";
 
 export async function generateMetadata({
   params,
@@ -26,11 +32,11 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   // Validate the address before using it in any metadata string.
   // A path traversal or injected value would otherwise appear verbatim in
-  // <title> and <meta> tags.  We only accept canonical 56-char Soroban
-  // contract IDs (C-prefix, base32) — anything else gets the safe fallback.
-  const safeAddress = /^C[A-Z2-7]{55}$/.test(params.address)
-    ? params.address
-    : null;
+  // <title> and <meta> tags. isSorobanContractId is the canonical validator
+  // from lib/address.ts — the single source of truth for C-prefix addresses.
+  // Previously an inline regex `/^C[A-Z2-7]{55}$/` was used here; this
+  // replacement ensures both paths (metadata and page render) share one rule.
+  const safeAddress = isSorobanContractId(params.address) ? params.address : null;
 
   if (!safeAddress) {
     // Malformed address segment: return a generic fallback rather than
@@ -356,6 +362,25 @@ export default async function CircleDetailPage({
 }: {
   params: { address: string };
 }) {
+  // ── Address validation ──────────────────────────────────────────────────────
+  //
+  // Validate params.address before any network call. Without this guard a
+  // malformed segment (e.g. "/circles/../../etc/passwd", a G-key mistakenly
+  // pasted into a circle URL, or a truncated address) would:
+  //   1. Reach indexerEndpoint() — which URL-encodes it and fires a real fetch.
+  //   2. Be displayed verbatim in CircleHeader's monospace address field.
+  //   3. Be passed to CircleDetailClient, which guards its action buttons but
+  //      not the invite-URL builder or the address display.
+  //
+  // isSorobanContractId is the canonical check for circle addresses; it is the
+  // same rule used in getCircleStatus / getCircleConfig in stellar.ts and in
+  // getMalformedContractAddresses in config.ts.  A 404 is the correct HTTP
+  // signal — it matches what the indexer would return for an unknown address,
+  // and it keeps the not-found.tsx error UI consistent.
+  if (!isSorobanContractId(params.address)) {
+    notFound();
+  }
+
   const result = await getCircleDetail(params.address);
 
   if (!result.ok) {
