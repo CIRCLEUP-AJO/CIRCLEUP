@@ -1,6 +1,6 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
-import { getWalletAddress, connectWallet, isFreighterInstalled, WalletError } from "@/lib/stellar";
+import { getWalletAddress, connectWallet, isFreighterInstalled, WalletError, type WalletErrorReason } from "@/lib/stellar";
 import { shortAddress, NETWORK_PASSPHRASE } from "@/lib/config";
 import {
   detectWalletCapabilities,
@@ -29,7 +29,7 @@ type ConnectionState =
   | { status: "connected"; address: string; networkMismatch?: NetworkMismatchResult | null; capabilities?: { canSign: boolean; canGetNetwork: boolean } }
   | { status: "limited"; message: string; address?: string }
   | { status: "not_installed" }
-  | { status: "error"; message: string };
+  | { status: "error"; message: string; reason: WalletErrorReason }
 
 // ─── Provider event shape ─────────────────────────────────────────────────────
 //
@@ -84,8 +84,25 @@ export function WalletButton() {
     let address: string | null;
     try {
       address = await getWalletAddress();
-    } catch {
-      if (mountedRef.current) setState({ status: "not_installed" });
+    } catch (err) {
+      if (!mountedRef.current) return;
+      // getWalletAddress only throws WalletError("not_installed") — but handle
+      // all reasons explicitly so a permission_denied or unknown error during
+      // the silent probe surfaces as an error state rather than the install link.
+      if (err instanceof WalletError) {
+        if (err.reason === "not_installed") {
+          setState({ status: "not_installed" });
+        } else {
+          setState({ status: "error", message: err.message, reason: err.reason });
+        }
+      } else {
+        // Non-WalletError (e.g. network failure talking to the extension).
+        setState({
+          status: "error",
+          message: (err as Error)?.message || "An unexpected error occurred checking your wallet.",
+          reason: "unknown",
+        });
+      }
       return;
     }
 
@@ -182,9 +199,9 @@ export function WalletButton() {
       if (err instanceof WalletError) {
         setState(err.reason === "not_installed"
           ? { status: "not_installed" }
-          : { status: "error", message: err.message });
+          : { status: "error", message: err.message, reason: err.reason });
       } else {
-        setState({ status: "error", message: (err as Error)?.message || "Failed to connect wallet." });
+        setState({ status: "error", message: (err as Error)?.message || "Failed to connect wallet.", reason: "unknown" });
       }
     }
   }
@@ -267,24 +284,55 @@ export function WalletButton() {
   }
 
   // ── Error ───────────────────────────────────────────────────────────────
+  //
+  // Each WalletErrorReason maps to distinct guidance so the user knows their
+  // exact next step — not a generic "something went wrong" dead end.
+  //
+  //  permission_denied   — wallet is installed; user dismissed the prompt
+  //  not_installed       — should have been caught above; belt-and-suspenders
+  //  unsupported_capability — wallet version too old / wrong provider
+  //  unknown             — network/RPC failure or unclassified extension error
   if (state.status === "error") {
+    const guidanceMap: Record<WalletErrorReason, string> = {
+      permission_denied:
+        "You dismissed the Freighter prompt. Click Retry to try again.",
+      not_installed:
+        "Freighter does not appear to be installed. Install it and reload the page.",
+      unsupported_capability:
+        "Your version of Freighter does not support this action. Update the extension and try again.",
+      unknown:
+        "A connection error occurred. Check that Freighter is unlocked and try again.",
+    };
+    const guidance = guidanceMap[state.reason] ?? guidanceMap.unknown;
+    const errorPanelId = "wallet-error-panel";
+
     return (
       <div className="flex items-center gap-2">
         <button
           onClick={connect}
+          aria-describedby={errorPanelId}
           className="bg-brand-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-brand-700 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2"
-          title={state.message}
         >
           Retry Connection
         </button>
-        <span
-          className="text-xs text-red-600 max-w-[180px] truncate"
-          title={state.message}
-          aria-live="polite"
+        {/*
+          Full error message + guidance in a visible, non-truncated panel.
+          - role="alert" announces immediately to screen readers.
+          - aria-live="polite" ensures subsequent updates are announced too.
+          - The technical error message is in a <p> so it can be read in full
+            without relying on a tooltip (which keyboard users cannot access).
+        */}
+        <div
+          id={errorPanelId}
           role="alert"
+          aria-live="polite"
+          className="flex flex-col gap-0.5 text-xs max-w-[220px]"
         >
-          {state.message}
-        </span>
+          <span className="text-red-600 font-medium">{guidance}</span>
+          {state.message && state.message !== guidance && (
+            <span className="text-slate-500 break-words">{state.message}</span>
+          )}
+        </div>
       </div>
     );
   }
