@@ -1161,16 +1161,56 @@ export interface ApiDefaultRecord {
 }
 
 /**
- * A completed payout round as returned by GET /circles/:address/rounds.
- * `amount` is in stroops (string-serialised).
+ * Lifecycle phase of a single round as reconciled by the indexer.
+ *
+ * | Value       | Meaning |
+ * |-------------|---------|
+ * | `"completed"` | A payout row exists for this round — it has been paid out. |
+ * | `"current"`   | The active in-progress round (Active circle, no payout yet). |
+ * | `"cancelled"` | The current round of a Cancelled circle (no payout will occur). |
+ * | `"open"`      | An unpaid round that has recorded contributions and/or defaults but is not the current round (reorg / partial-ingest edge case). |
+ *
+ * Payout presence always wins: a round whose `round_index` has a payout row
+ * is always `"completed"`, regardless of the circle's `current_round` cursor.
+ *
+ * @see RoundPhase in sdk/src/types.ts (read-model section)
+ * @see groupCircleRounds in indexer/src/groupRounds.ts (status resolution)
+ */
+export type ApiRoundPhase = "completed" | "current" | "cancelled" | "open";
+
+/**
+ * A round row as returned by GET /circles/:address/rounds.
+ *
+ * Every round the indexer has observed is included exactly once, with a
+ * `status` field that identifies its lifecycle phase. Previously the `status`
+ * was computed inside the indexer but omitted from the wire format, requiring
+ * clients to infer it from context (presence of a payout, circle status, etc.).
+ * It is now part of the public API contract (issue #529).
+ *
+ * Monetary amounts are in stroops, serialised as strings.
  */
 export interface ApiRoundRow {
   roundIndex: number;
-  recipient: string;
-  /** Pot paid out, in stroops (string-serialised). */
-  amount: string;
-  txHash: string;
-  ledger?: number;
+  /**
+   * Lifecycle phase of this round.
+   *
+   * Clients should branch on this field rather than inferring phase from the
+   * presence/absence of `recipient`, `amount`, or `txHash`:
+   *   - `"completed"` — payout fields are populated.
+   *   - `"current"` / `"cancelled"` — payout fields are `null`; this is the
+   *     live round. Returned as `currentRound` in the response envelope.
+   *   - `"open"` — payout fields are `null`; unpaid round with activity.
+   *     Returned in `openRounds`.
+   */
+  status: ApiRoundPhase;
+  /** Payout recipient (G…); `null` until the round is paid out. */
+  recipient: string | null;
+  /** Pot paid out, in stroops (string-serialised); `null` until the round is paid out. */
+  amount: string | null;
+  /** Payout transaction hash; `null` until the round is paid out. */
+  txHash: string | null;
+  /** Ledger sequence of the payout; `null` until the round is paid out. */
+  ledger?: number | null;
   contributions: ApiContributionRecord[];
   defaults: ApiDefaultRecord[];
 }
@@ -1234,10 +1274,15 @@ export interface ApiMembersResponse {
 
 /** Response body for GET /circles/:address/rounds */
 export interface ApiRoundsResponse {
+  /**
+   * Completed rounds (status `"completed"`), sorted ascending by `roundIndex`.
+   * Every entry has `status: "completed"` and populated payout fields.
+   */
   rounds: ApiRoundRow[];
   /**
-   * Unpaid rounds that have contributions and/or defaults recorded but are not
-   * the circle's current round (reorg / partial-ingest edge case, issue #170).
+   * Unpaid non-current rounds that have contributions and/or defaults recorded
+   * (reorg / partial-ingest edge case, issue #170). Every entry has
+   * `status: "open"`.
    */
   openRounds: ApiRoundRow[];
   /** Defaults that belong to a round not yet paid out. */
@@ -1245,8 +1290,10 @@ export interface ApiRoundsResponse {
   /**
    * The in-progress round (status `"current"` or `"cancelled"`), returned
    * alongside the history so clients can show live contribution status without
-   * a second request. `null` when the circle is not Active or the indexer has
-   * not yet processed the current round.
+   * a second request. `null` when the circle is not Active or Cancelled, or
+   * when the indexer has not yet processed the current round.
+   *
+   * The `status` field on this object is always `"current"` or `"cancelled"`.
    */
   currentRound: ApiRoundRow | null;
 }
@@ -1263,15 +1310,23 @@ export interface ApiCircleDetailWithRoundsResponse {
   members: ApiMemberRow[];
   /** Latest ledger the indexer has processed; used for deadline countdown. */
   latestLedger: number | null;
-  /** Completed/open rounds from GET /circles/:address/rounds. */
+  /**
+   * Completed rounds (status `"completed"`) from GET /circles/:address/rounds,
+   * sorted ascending by `roundIndex`. All entries have `status: "completed"`.
+   */
   rounds: ApiRoundRow[];
-  /** Unpaid rounds with activity that are not the current round (issue #170). */
+  /**
+   * Unpaid rounds with activity that are not the current round (issue #170).
+   * All entries have `status: "open"`.
+   */
   openRounds: ApiRoundRow[];
   /** Pending defaults not yet associated with a payout round. */
   pendingDefaults: ApiDefaultRecord[];
   /**
    * The in-progress round containing live contribution data; `null` when the
-   * circle is not Active or the indexer has not yet processed this round.
+   * circle is not Active or Cancelled, or when the indexer has not yet
+   * processed this round. The `status` field is always `"current"` or
+   * `"cancelled"`.
    */
   currentRound: ApiRoundRow | null;
 }
@@ -1356,7 +1411,7 @@ export interface ApiHealthResponse {
 //   • Timestamps → ISO-8601 `string`.
 
 /** Lifecycle phase of a single round, as reconciled by the indexer. */
-export type RoundPhase = "completed" | "current" | "cancelled" | "open";
+export type RoundPhase = ApiRoundPhase;
 
 /**
  * Compact per-circle model for list views (`GET /circles`).
@@ -1501,4 +1556,89 @@ export interface PayoutHistory {
   circleAddress: string;
   /** Payout records, oldest-first by round index. */
   payouts: PayoutRecord[];
+}
+
+// ─── Audit events (Issue: add audit events for close and cancelled transitions) ──
+
+/**
+ * Event type for a circle's terminal lifecycle audit row.
+ *
+ * - `"cancelled"` — emitted when a circle is cancelled while Pending
+ *   (`circle/cancelled` event).
+ * - `"closed"` — emitted when collateral is settled and released
+ *   (`circle/closed` event, triggered after Completed or Cancelled).
+ */
+export type AuditEventType = "cancelled" | "closed";
+
+/**
+ * A single structured audit record for a terminal lifecycle transition.
+ *
+ * Stored in the `circle_audit_events` table by the indexer's
+ * `handleCircleCancelled` and `handleCircleClosed` handlers.  The fields
+ * carry the full event payload so the close/cancel context (who triggered it,
+ * amounts involved, penalties forfeited) is durable and queryable without
+ * replaying the event log.
+ *
+ * Monetary amounts are string-serialised stroops to preserve precision.
+ */
+export interface AuditEvent {
+  /** Auto-increment PK from the database. */
+  id: number;
+  /** Circle contract address (C…). */
+  circle_address: string;
+  /** Type of the terminal transition that produced this record. */
+  event_type: AuditEventType;
+  /**
+   * Address that triggered the transition.
+   * - For `"cancelled"`: the member who called `cancel()`.
+   * - For `"closed"`: the member who called `close()`.
+   * `null` if the event payload did not include a caller field.
+   */
+  triggered_by: string | null;
+  /**
+   * On-chain ledger sequence at the time of the transition.
+   * Serialised as a string because ledger sequences are u64 on-chain and can
+   * exceed `Number.MAX_SAFE_INTEGER` at very high ledger counts.
+   * `null` when the indexer could not extract the ledger from the event.
+   */
+  ledger: string | null;
+  /**
+   * Transaction hash that produced the event.
+   * `null` when not available from the RPC event response.
+   */
+  tx_hash: string | null;
+  /**
+   * Total USDC stroops returned to members at close time (string).
+   * `null` for `"cancelled"` rows (no amounts are released at cancellation —
+   * they are released when `close()` is subsequently called).
+   */
+  total_released: string | null;
+  /**
+   * What total_released would have been with zero penalties (string).
+   * Used to compute forfeited collateral: `total_expected - total_released`.
+   * `null` for `"cancelled"` rows and when the event payload omitted the field.
+   */
+  total_expected_collateral: string | null;
+  /**
+   * Close reason symbol — `"completed"` or `"cancelled"` — copied from the
+   * contract event.  Tells the indexer and UI whether the collateral was
+   * released after a successful completion or an abandoned circle.
+   * `null` for `"cancelled"` event rows (no reason is recorded at cancel time;
+   * only the subsequent `close` carries the reason).
+   */
+  close_reason: string | null;
+  /** ISO-8601 timestamp of when this audit record was written to the database. */
+  created_at: string;
+}
+
+/** Response body for `GET /circles/:address/audit`. */
+export interface ApiAuditEventsResponse {
+  /** Circle contract address the audit records belong to (C…). */
+  circle_address: string;
+  /**
+   * Audit records for terminal lifecycle transitions, ordered by `created_at`
+   * ascending (oldest first).  An empty array means no terminal transitions
+   * have been indexed yet for this circle.
+   */
+  events: AuditEvent[];
 }

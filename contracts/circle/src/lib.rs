@@ -68,7 +68,7 @@ mod error_path_tests; // no swallowed errors / defaulted counters (issue #567)
 #[cfg(test)]
 mod transfer_failure_tests; // failed token transfer handling (issue #573)
 #[cfg(test)]
-mod test_support_tests; // type-safe builder API tests (issue #574)
+mod issue_fixes_tests; // targeted fixes: #552 #553 #554 #555
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
