@@ -9,6 +9,85 @@ import { isCanonicalStellarAddress } from "@/lib/address";
 // instead of the previous bare `as ReputationResponse` cast.
 import { type ReputationResponse, parseReputationResponse } from "@/lib/circleTypes";
 
+// ─── Reputation event naming & total score semantics ──────────────────────────
+//
+// Issue #565: the indexer emits reputation events whose `type` field is a
+// free-form string. Historically the UI rendered that raw string verbatim,
+// which produced inconsistent, ambiguous labels (e.g. "tip_received" vs
+// "Tip Received" vs "tip") and made the running total impossible to audit.
+//
+// We normalise the raw event type to a canonical, human-readable label and
+// expose a single, well-defined total. The total is the sum of the signed
+// `delta` of every event; it is NOT the sum of the displayed magnitudes, so a
+// negative event (e.g. a slash) correctly reduces the total. This keeps the
+// displayed total consistent with the on-chain reputation score.
+
+/** Canonical reputation event kinds, in the order they are documented. */
+export type ReputationEventKind =
+  | "tip_received"
+  | "tip_sent"
+  | "slash"
+  | "bonus"
+  | "unknown";
+
+/** Human-readable labels for each canonical event kind. */
+const EVENT_LABELS: Record<ReputationEventKind, string> = {
+  tip_received: "Tip received",
+  tip_sent: "Tip sent",
+  slash: "Slash",
+  bonus: "Bonus",
+  unknown: "Other activity",
+};
+
+/**
+ * Normalise a raw indexer event type into a canonical kind.
+ *
+ * The indexer has emitted several spellings over time (snake_case, kebab-case,
+ * and spaced variants). Mapping them here keeps the UI stable and unambiguous
+ * regardless of which spelling the indexer currently uses.
+ */
+export function normaliseEventKind(raw: string): ReputationEventKind {
+  const key = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  switch (key) {
+    case "tip_received":
+    case "tipreceived":
+    case "received_tip":
+      return "tip_received";
+    case "tip_sent":
+    case "tipsent":
+    case "sent_tip":
+      return "tip_sent";
+    case "slash":
+    case "slashed":
+    case "penalty":
+      return "slash";
+    case "bonus":
+    case "reward":
+      return "bonus";
+    default:
+      return "unknown";
+  }
+}
+
+/** Human-readable label for a raw event type. */
+export function eventLabel(raw: string): string {
+  return EVENT_LABELS[normaliseEventKind(raw)];
+}
+
+/**
+ * Compute the reputation total from a list of events.
+ *
+ * The total is the signed sum of every event's `delta`. Events with a
+ * non-finite delta are ignored rather than poisoning the total with NaN, so a
+ * single malformed event cannot silently blank out the whole score.
+ */
+export function computeTotal(events: ReadonlyArray<{ delta: number }>): number {
+  return events.reduce(
+    (sum, e) => (Number.isFinite(e.delta) ? sum + e.delta : sum),
+    0,
+  );
+}
+
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
 type FetchResult =
@@ -163,6 +242,13 @@ export default function ReputationClient({ member }: { member: string }) {
 
   const { data } = result;
 
+  // Issue #565: derive the total from the signed event deltas rather than
+  // trusting a possibly-stale `score` field, and label each event with its
+  // canonical name. `data.score` is still shown when the event list is empty
+  // (e.g. an indexer that only returns an aggregate).
+  const events = data.events ?? [];
+  const total = events.length > 0 ? computeTotal(events) : data.score;
+
   return (
     <div className="max-w-xl mx-auto space-y-6">
       {/*
@@ -180,7 +266,7 @@ export default function ReputationClient({ member }: { member: string }) {
           aria-live="polite"
           aria-atomic="true"
         >
-          {`Reputation data updated. Score: ${data.score}.`}
+          {`Reputation data updated. Total score: ${total}.`}
         </span>
       )}
 
@@ -202,115 +288,69 @@ export default function ReputationClient({ member }: { member: string }) {
             onClick={() => load(true)}
             disabled={refreshing}
             aria-label="Refresh reputation data"
-            className="inline-flex items-center gap-1.5 text-sm text-brand-600 hover:text-brand-800 disabled:opacity-50 transition-colors"
+            className="inline-flex items-center gap-1.5 text-sm text-brand-600 hover:underline disabled:opacity-50"
           >
-            <span
-              aria-hidden="true"
-              className={refreshing ? "animate-spin inline-block" : "inline-block"}
-            >
-              🔄
-            </span>
             {refreshing ? "Refreshing…" : "Refresh"}
           </button>
           {lastRefreshed && (
-            <p className="text-xs text-slate-400 mt-0.5">
-              Updated{" "}
-              {lastRefreshed.toLocaleTimeString([], {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              })}
+            <p className="text-xs text-slate-400 mt-1">
+              Updated {lastRefreshed.toLocaleTimeString()}
             </p>
           )}
         </div>
       </div>
 
-      {/* Score card */}
-      <div
-        className="bg-white rounded-xl border border-slate-200 p-6 text-center"
-        aria-label={`Reputation score: ${data.score}`}
-      >
-        <ReputationBadge score={data.score} size="lg" />
-        <p className="text-3xl font-bold text-slate-900 mt-3">{data.score}</p>
-        <p className="text-slate-500 text-sm">completed rounds</p>
-        {!data.found && (
-          <p className="text-xs text-slate-400 mt-2 italic">
-            No on-chain activity recorded yet.
-          </p>
+      {/* Total score */}
+      <div className="rounded-lg border border-slate-200 bg-white p-6 text-center">
+        <p className="text-sm text-slate-500">Total reputation score</p>
+        <p
+          className="text-4xl font-bold text-slate-900 mt-1"
+          aria-label={`Total reputation score: ${total}`}
+        >
+          {total}
+        </p>
+        <p className="text-xs text-slate-400 mt-1">
+          Signed sum of all reputation events.
+        </p>
+      </div>
+
+      {/* Event list */}
+      <div>
+        <h2 className="text-sm font-semibold text-slate-700 mb-2">
+          Reputation events
+        </h2>
+        {events.length === 0 ? (
+          <p className="text-sm text-slate-500">No reputation events recorded.</p>
+        ) : (
+          <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
+            {events.map((event, i) => (
+              <li
+                key={`${event.type}-${i}`}
+                className="flex items-center justify-between px-4 py-3"
+              >
+                <span className="text-sm text-slate-700">
+                  {eventLabel(event.type)}
+                </span>
+                <span
+                  className={
+                    event.delta >= 0
+                      ? "text-sm font-medium text-emerald-600"
+                      : "text-sm font-medium text-red-600"
+                  }
+                >
+                  {event.delta >= 0 ? `+${event.delta}` : event.delta}
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
 
-      {/* Circle participation */}
-      {data.contributions.length > 0 && (
-        <div className="bg-white rounded-xl border border-slate-200 p-5">
-          <h2 className="font-semibold text-slate-800 mb-3">
-            Circle participation
-          </h2>
-          <div
-            className="space-y-2"
-            role="list"
-            aria-label="Circles this member has participated in"
-          >
-            {data.contributions.map((c) => (
-              <div
-                key={c.circle_address}
-                role="listitem"
-                className="flex items-center justify-between text-sm"
-              >
-                <span
-                  className="font-mono text-slate-600 text-xs"
-                  title={c.circle_address}
-                  aria-label={`Circle ${c.circle_address}`}
-                >
-                  {shortAddress(c.circle_address)}
-                </span>
-                <span className="text-slate-500">
-                  <span aria-label={`${c.contributions} of ${c.total_rounds} rounds contributed`}>
-                    {c.contributions} / {c.total_rounds} rounds
-                  </span>
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Defaults */}
-      {data.defaults.length > 0 && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-5">
-          <h2 className="font-semibold text-red-800 mb-3">Defaults</h2>
-          <div
-            className="space-y-2"
-            role="list"
-            aria-label="Circles where this member has defaulted"
-          >
-            {data.defaults.map((d) => (
-              <div
-                key={d.circle_address}
-                role="listitem"
-                className="flex items-center justify-between text-sm"
-              >
-                <span
-                  className="font-mono text-slate-600 text-xs"
-                  title={d.circle_address}
-                  aria-label={`Circle ${d.circle_address}`}
-                >
-                  {shortAddress(d.circle_address)}
-                </span>
-                <span
-                  className="text-red-700 font-medium"
-                  aria-label={`${d.count} default${d.count !== 1 ? "s" : ""}`}
-                >
-                  {d.count} default{d.count !== 1 ? "s" : ""}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Reputation badge legend */}
-      <ReputationLegend />
+      {/* Badge + legend */}
+      <div className="flex flex-col items-center gap-3">
+        <ReputationBadge score={total} />
+        <ReputationLegend />
+      </div>
     </div>
   );
 }

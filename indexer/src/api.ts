@@ -13,7 +13,8 @@
  * GET /circles/:address/rounds         → all rounds grouped by round_index: payouts + contributions + defaults
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
- * GET /indexer/state                   → indexer audit: last ledger + event counts
+ * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
+ * GET /indexer/schema                  → schema versioning and migration status diagnostics
  * GET /health                          → health check (db + RPC status)
  *
  * DB helpers used: query<T> (many rows), queryOne<T> (0‥1 rows → T|null),
@@ -395,6 +396,7 @@ interface CircleMemberRow {
   circle_address: string;
   member_address: string;
   payout_order: number;
+  join_order: number | null;
   collateral: string;
   defaults: number;
   joined_at: string | null;
@@ -471,6 +473,20 @@ interface EventTypeCountRow {
   event_type: string | null;
   count: string;
 }
+
+interface EntityCountsSingleRow {
+  circles: string;
+  members: string;
+  contributions: string;
+  payouts: string;
+  defaults: string;
+}
+
+interface CircleStatusCountRow {
+  status: string;
+  count: string;
+}
+
 
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
@@ -651,7 +667,14 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -730,30 +753,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
-      interface MemberWithCurrentRoundRow extends CircleMemberWithContributionsRow {
-        has_contributed_current_round: boolean;
-      }
-
-      const [members, totals] = await Promise.all([
-        query<MemberWithCurrentRoundRow>(
-          `SELECT cm.member_address, cm.payout_order, cm.collateral,
+      const [members, [totals]] = await Promise.all([
+        query<CircleMemberWithContributionsRow>(
+          `SELECT cm.member_address, cm.payout_order, cm.join_order, cm.collateral,
                   cm.defaults, cm.joined_at,
                   r.score as reputation_score,
-                  (
-                    SELECT COUNT(*) FROM contributions c2
-                    WHERE c2.circle_address = cm.circle_address
-                      AND c2.member_address = cm.member_address
-                  ) as total_contributions,
-                  EXISTS (
-                    SELECT 1 FROM contributions c3
-                    WHERE c3.circle_address = cm.circle_address
-                      AND c3.member_address = cm.member_address
-                      AND c3.round_index = $2
-                  ) as has_contributed_current_round
+                  COALESCE(
+                    (SELECT COUNT(*) FROM contributions c2
+                     WHERE c2.circle_address = cm.circle_address
+                       AND c2.member_address = cm.member_address),
+                    0
+                  ) as total_contributions
            FROM circle_members cm
            LEFT JOIN reputation r ON r.member_address = cm.member_address
            WHERE cm.circle_address = $1
@@ -784,7 +805,10 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       const t = totals ?? { member_count: "0", total_collateral: "0", total_contributions: "0" };
 
       res.json({
-        members,
+        members: members.map((m) => ({
+          ...m,
+          total_contributions: Number(m.total_contributions),
+        })),
         totals: {
           memberCount: Number(t.member_count),
           totalCollateral: t.total_collateral,
@@ -830,7 +854,14 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address],
       );
       if (!circle) {
-        res.status(404).json({ error: `Circle '${address}' not found` });
+        res.status(404).json({
+          error: "Circle not found",
+          detail:
+            `No circle with address '${address}' has been indexed yet. ` +
+            `The circle may not exist on-chain, or the indexer may not have ` +
+            `processed the factory/circle_created event for this address.`,
+          address,
+        });
         return;
       }
 
@@ -852,6 +883,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       // Single-pass grouping by round_index so contributions/defaults for
       // unpaid rounds are never silently dropped, and we avoid O(n×m)
       // filter scans per payout.
+      //
+      // Every GroupedRound carries a `status` field ("completed", "current",
+      // "cancelled", or "open") that is included in the serialised JSON so
+      // clients can branch on lifecycle phase directly rather than inferring
+      // it from the presence/absence of payout fields (issue #529).
       const { rounds, currentRound, openRounds, pendingDefaults } =
         groupCircleRounds(circle, payouts, contributions, defaults);
 
@@ -947,7 +983,13 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           [circleFilter],
         );
         if (!circle) {
-          res.status(404).json({ error: `Circle '${circleFilter}' not found` });
+          res.status(404).json({
+            error: "Circle not found",
+            detail:
+              `No circle with address '${circleFilter}' has been indexed yet. ` +
+              `The ?circle= filter must reference an address that exists in the indexer.`,
+            address: circleFilter,
+          });
           return;
         }
       }
@@ -1063,6 +1105,16 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       res.json({
         member,
         found: row != null,
+        // When `found` is false, the member has no recorded reputation activity
+        // yet. This means either no reputation/increment event has been emitted
+        // for this wallet address, or the indexer has not yet processed it.
+        // A score of 0 is returned in either case; clients can use `found` to
+        // distinguish an untracked wallet from one with an explicit zero score.
+        detail: row == null
+          ? `Member '${member}' has no reputation record in the indexer. ` +
+            `This address has not completed any circle rounds yet, or the ` +
+            `reputation/increment event has not been indexed.`
+          : undefined,
         score: row?.score ?? 0,
         contributions: contributions.map((c) => ({
           circle_address: c.circle_address,
@@ -1081,6 +1133,67 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     }
   });
 
+  // ── Circle audit events ───────────────────────────────────────────────────────
+  //
+  // Returns the structured audit log for terminal lifecycle transitions
+  // (cancelled and closed) for a specific circle.  This is distinct from
+  // /indexer/state (which reports aggregate event counts across all circles)
+  // and /circles/:address (which returns the summarised status row).
+  //
+  // Callers can use this endpoint to:
+  //   - Display the exact closer address and release amounts in the UI
+  //   - Compute penalty forfeitures: total_expected_collateral - total_released
+  //   - Audit which member triggered cancellation / closure and when
+  //
+  // Returns an empty `events` array (not 404) when no audit rows exist yet
+  // for the circle, since events may arrive slightly after the status update
+  // during indexer replay.
+
+  app.get("/circles/:address/audit", detailRateLimiter, async (req: Request, res: Response) => {
+    const addressResult = parseAddress(req.params.address, "Circle address");
+    if (isParseError(addressResult)) {
+      res.status(400).json({ error: addressResult.error });
+      return;
+    }
+    const address = addressResult;
+
+    try {
+      const [circle] = await query<Pick<CircleRow, "address">>(
+        `SELECT address FROM circles WHERE address = $1`,
+        [address],
+      );
+      if (!circle) {
+        res.status(404).json({ error: `Circle '${address}' not found` });
+        return;
+      }
+
+      const events = await query<{
+        id: number;
+        circle_address: string;
+        event_type: string;
+        triggered_by: string | null;
+        ledger: string | null;
+        tx_hash: string | null;
+        total_released: string | null;
+        total_expected_collateral: string | null;
+        close_reason: string | null;
+        created_at: string;
+      }>(
+        `SELECT id, circle_address, event_type, triggered_by, ledger, tx_hash,
+                total_released, total_expected_collateral, close_reason, created_at
+         FROM circle_audit_events
+         WHERE circle_address = $1
+         ORDER BY created_at ASC`,
+        [address],
+      );
+
+      res.json({ circle_address: address, events });
+    } catch (err) {
+      console.error(`[api] Failed to load audit events for circle ${redactAddress(address)}`, err);
+      sendError(res, 500, "Failed to load circle audit events", getErrorMessage(err));
+    }
+  });
+
   // ── Indexer ──────────────────────────────────────────────────────────────────
 
   // Audit endpoint for ops/monitoring: reports how far the indexer has
@@ -1088,12 +1201,23 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   // /health (which only checks connectivity, not indexing progress).
   app.get("/indexer/state", detailRateLimiter, async (_req: Request, res: Response) => {
     try {
-      const [stateRows, eventCountRows] = await Promise.all([
+      const [stateRows, eventCountRows, [entityCounts], statusRows] = await Promise.all([
         query<IndexerStateAuditRow>(
           `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
         ),
         query<EventTypeCountRow>(
           `SELECT event_type, COUNT(*) as count FROM ingested_events GROUP BY event_type`,
+        ),
+        query<EntityCountsSingleRow>(
+          `SELECT
+             (SELECT COUNT(*) FROM circles)::text AS circles,
+             (SELECT COUNT(*) FROM circle_members)::text AS members,
+             (SELECT COUNT(*) FROM contributions)::text AS contributions,
+             (SELECT COUNT(*) FROM payouts)::text AS payouts,
+             (SELECT COUNT(*) FROM defaults)::text AS defaults`,
+        ),
+        query<CircleStatusCountRow>(
+          `SELECT status, COUNT(*) as count FROM circles GROUP BY status`,
         ),
       ]);
 
@@ -1111,11 +1235,24 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         eventCounts[row.event_type ?? "unknown"] = count;
       }
 
+      const circlesByStatus: Record<string, number> = {};
+      for (const row of statusRows) {
+        circlesByStatus[row.status] = Number(row.count);
+      }
+
       res.json({
         lastLedger: Number(state.last_ledger),
         updatedAt: state.updated_at,
         totalEvents,
         eventCounts,
+        entityCounts: {
+          circles: Number(entityCounts?.circles ?? 0),
+          members: Number(entityCounts?.members ?? 0),
+          contributions: Number(entityCounts?.contributions ?? 0),
+          payouts: Number(entityCounts?.payouts ?? 0),
+          defaults: Number(entityCounts?.defaults ?? 0),
+          circlesByStatus,
+        },
       });
     } catch (err) {
       console.error("[api] Failed to load indexer state", err);
@@ -1139,6 +1276,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         events: {
           processed: metrics.totalEventsProcessed,
           failed: metrics.totalEventsFailed,
+          skipped: metrics.totalEventsSkipped,
         },
         pollCycles: {
           completed: metrics.pollCyclesCompleted,
@@ -1156,6 +1294,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     } catch (err) {
       console.error("[api] Failed to load indexer health", err);
       sendError(res, 500, "Failed to load indexer health", getErrorMessage(err));
+    }
+  });
+
+  // Exposes the full migration history for ops and diagnostics: which migrations
+  // have been applied, which are pending, and whether the schema is clean.
+  app.get("/indexer/schema", detailRateLimiter, async (_req: Request, res: Response) => {
+    try {
+      const { checkMigrationHealth } = await import("./db/migrate");
+      const health = await checkMigrationHealth();
+      res.json({
+        state: health.state,
+        summary: health.summary,
+        canStartSafely: health.canStartSafely,
+        currentVersion: health.status.currentVersion,
+        applied: health.status.applied,
+        pending: health.status.pending,
+        missingOnDisk: health.status.missingOnDisk,
+        modified: health.status.modified,
+      });
+    } catch (err) {
+      console.error("[api] Failed to load schema status", err);
+      sendError(res, 500, "Failed to load schema status", getErrorMessage(err));
     }
   });
 

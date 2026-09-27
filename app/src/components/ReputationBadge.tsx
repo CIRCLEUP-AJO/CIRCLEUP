@@ -219,72 +219,47 @@ export function ReputationLegend() {
         Badge levels
       </h2>
       <table
-        className="w-full text-sm border-collapse"
-        aria-labelledby="rep-legend-heading"
+        className="w-full text-sm text-left border-collapse"
+        aria-describedby="rep-legend-desc"
       >
+        <caption id="rep-legend-desc" className="sr-only">
+          Reputation badge levels, their score ranges, and what each level means.
+        </caption>
         <thead>
-          <tr className="border-b border-slate-200">
-            <th
-              scope="col"
-              className="pb-2 pr-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wide"
-            >
+          <tr className="text-slate-500 border-b border-slate-200">
+            <th scope="col" className="py-2 pr-3 font-medium">
               Level
             </th>
-            <th
-              scope="col"
-              className="pb-2 pr-3 text-left text-xs font-medium text-slate-500 uppercase tracking-wide tabular-nums"
-            >
+            <th scope="col" className="py-2 pr-3 font-medium">
               Score range
             </th>
-            <th
-              scope="col"
-              className="pb-2 text-left text-xs font-medium text-slate-500 uppercase tracking-wide"
-            >
-              Description
+            <th scope="col" className="py-2 font-medium">
+              Meaning
             </th>
           </tr>
         </thead>
         <tbody>
-          {REPUTATION_LEVELS.map((tier) => {
-            const rangeLabel =
-              tier.maxScore === Infinity
-                ? `${tier.minScore}+`
-                : `${tier.minScore}–${tier.maxScore - 1}`;
-
-            return (
-              <tr key={tier.label} className="border-t border-slate-100 first:border-0">
-                {/*
-                 * th scope="row": names this row for assistive technology so
-                 * screen readers announce cells relative to "New", "Starter",
-                 * etc. rather than just announcing raw cell values.
-                 */}
-                <th
-                  scope="row"
-                  className="py-2 pr-3 align-middle font-normal text-left"
+          {REPUTATION_LEVELS.map((level) => (
+            <tr key={level.label} className="border-b border-slate-100 last:border-0">
+              <th scope="row" className="py-2 pr-3 font-normal text-slate-700">
+                <span
+                  aria-hidden="true"
+                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${level.color}`}
                 >
-                  {/* Decorative coloured badge — aria-hidden; th carries the name */}
-                  <span
-                    className={`inline-flex items-center gap-1 rounded-full font-medium text-xs px-2 py-0.5 ${tier.color}`}
-                    aria-hidden="true"
-                  >
-                    <span className="font-mono leading-none">{tier.marker}</span>
-                    <span>{tier.label}</span>
-                  </span>
-                  {/* Accessible text for the tier name — visually hidden, read by AT */}
-                  <span className="sr-only">{tier.label}</span>
-                </th>
-                <td
-                  className="py-2 pr-3 align-middle text-slate-500 tabular-nums whitespace-nowrap"
-                  aria-label={`Score range: ${rangeLabel}`}
-                >
-                  {rangeLabel}
-                </td>
-                <td className="py-2 align-middle text-slate-500">
-                  {tier.description}
-                </td>
-              </tr>
-            );
-          })}
+                  <span className="font-mono leading-none">{level.marker}</span>
+                  {level.label}
+                </span>
+              </th>
+              <td className="py-2 pr-3 text-slate-600">
+                {level.maxScore === Infinity
+                  ? `${level.minScore}+`
+                  : level.maxScore - level.minScore === 1
+                  ? `${level.minScore}`
+                  : `${level.minScore}–${level.maxScore - 1}`}
+              </td>
+              <td className="py-2 text-slate-600">{level.description}</td>
+            </tr>
+          ))}
         </tbody>
       </table>
     </section>

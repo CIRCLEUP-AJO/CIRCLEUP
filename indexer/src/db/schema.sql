@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS circle_members (
     circle_address  TEXT NOT NULL REFERENCES circles(address),
     member_address  TEXT NOT NULL,
     payout_order    INTEGER NOT NULL,        -- 0-indexed position in rotation
+    join_order      INTEGER,                 -- 1-based join-queue position (NULL until joined)
     collateral      NUMERIC NOT NULL DEFAULT 0,
     defaults        INTEGER NOT NULL DEFAULT 0,
     joined_at       TIMESTAMPTZ,
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_circle_members_address ON circle_members(member_address);
+CREATE INDEX IF NOT EXISTS idx_circle_members_join_order ON circle_members(circle_address, join_order) WHERE join_order IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_contributions_member ON contributions(member_address);
 CREATE INDEX IF NOT EXISTS idx_payouts_recipient ON payouts(recipient);
 CREATE INDEX IF NOT EXISTS idx_defaults_member ON defaults(member_address);

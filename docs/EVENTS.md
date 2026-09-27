@@ -92,9 +92,16 @@ ready to accept members.
 | 1 | `member_count` | `number` | Number of configured members (= total rounds) |
 | 2 | `round_amount` | `bigint` | USDC contribution per member per round (stroops) |
 
-**Indexer note:** The indexer creates the `circles` DB row from the
-`factory/circle_created` event, not from this one. This event is currently a
-no-op in the ingest pipeline and is present for diagnostic purposes only.
+**Indexer note:** The indexer uses this event to backfill `member_count`,
+`total_rounds`, and `round_amount` on the `circles` row that was created by
+the `factory/circle_created` handler.  The factory event does not carry those
+fields, so they are written as `0` placeholders at creation time and updated
+here.  Because `circle/initialized` fires inside the **same transaction** as
+`factory/circle_created` (the circle's `initialize` is called synchronously by
+the factory's `create_circle`), both events are processed in the same indexer
+ledger batch, guaranteeing the row is complete by the time the batch commits.
+
+**Parser:** `parseInitializedEvent` (exported for unit testing)
 
 ---
 

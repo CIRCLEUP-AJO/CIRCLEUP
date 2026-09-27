@@ -147,6 +147,10 @@ export interface LedgerProcessedCtx {
   ledger: number;
   processed: number;
   failed: number;
+  /** Wall-clock time in milliseconds for the entire per-ledger transaction. */
+  latencyMs?: number;
+  /** Number of events that were skipped as duplicates (already in ingested_events). */
+  skipped?: number;
 }
 
 export interface LedgerGapCtx {
@@ -429,8 +433,10 @@ export function logPollBackoff(ctx: PollBackoffCtx): void {
 
 /** One ledger's event batch was processed. */
 export function logLedgerProcessed(ctx: LedgerProcessedCtx): void {
+  const latencyStr = ctx.latencyMs !== undefined ? `, ${ctx.latencyMs}ms` : "";
+  const skippedStr = ctx.skipped !== undefined && ctx.skipped > 0 ? `, ${ctx.skipped} skipped` : "";
   log("debug", "ledger_processed", ctx as LogContext,
-    `Ledger ${ctx.ledger}: ${ctx.processed} processed, ${ctx.failed} failed`);
+    `Ledger ${ctx.ledger}: ${ctx.processed} processed, ${ctx.failed} failed${skippedStr}${latencyStr}`);
 }
 
 /** Ledger gaps detected in a poll range. */
