@@ -86,6 +86,21 @@ export async function connectWithRetry({
   );
 }
 
+/**
+ * Execute a parameterised SQL query and return all matching rows as a typed
+ * array.
+ *
+ * Use this for queries that may legitimately return zero, one, or many rows.
+ * For single-row lookups prefer {@link queryOne} (returns `T | null`) or
+ * {@link queryExact} (throws when no row is found) — both communicate intent
+ * more clearly at the call-site and eliminate the `const [row] = await
+ * query(...)` pattern that silently discards type-safety on `undefined`.
+ *
+ * @param text   Parameterised SQL string — parameters are referenced as `$1`,
+ *               `$2`, … (never interpolated directly).
+ * @param params Query parameter values, in `$N` order.
+ * @returns      Typed array of result rows; empty when no rows match.
+ */
 export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params?: unknown[],
@@ -97,6 +112,58 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   } finally {
     client.release();
   }
+}
+
+/**
+ * Execute a parameterised SQL query and return the first matching row, or
+ * `null` when no rows are returned.
+ *
+ * This is the canonical helper for point lookups (e.g. `SELECT … WHERE id =
+ * $1`) — it replaces the fragile `const [row] = await query(...)` pattern
+ * that silently produces `undefined` (typed as `T`) when no row exists.
+ *
+ * **Invariant**: if the query returns more than one row, only the first is
+ * returned; add a `LIMIT 1` clause when the query does not already guarantee
+ * at most one row.
+ *
+ * @param text   Parameterised SQL string.
+ * @param params Query parameter values, in `$N` order.
+ * @returns      First row typed as `T`, or `null` if the result set is empty.
+ */
+export async function queryOne<T extends QueryResultRow = QueryResultRow>(
+  text: string,
+  params?: unknown[],
+): Promise<T | null> {
+  const rows = await query<T>(text, params);
+  return rows[0] ?? null;
+}
+
+/**
+ * Execute a parameterised SQL query and return the first matching row,
+ * throwing a descriptive `Error` when the result set is empty.
+ *
+ * Use this helper when the caller has already confirmed (via a prior
+ * constraint or business rule) that a row must exist — the thrown error
+ * surfaces the problem immediately rather than letting `undefined` propagate
+ * and produce a confusing downstream failure.
+ *
+ * @param text        Parameterised SQL string.
+ * @param params      Query parameter values, in `$N` order.
+ * @param errorMessage Optional message for the thrown error; defaults to
+ *                    `"Expected exactly one row but got none"`.
+ * @returns           First row typed as `T`.
+ * @throws            `Error` when the query returns zero rows.
+ */
+export async function queryExact<T extends QueryResultRow = QueryResultRow>(
+  text: string,
+  params?: unknown[],
+  errorMessage = "Expected exactly one row but got none",
+): Promise<T> {
+  const row = await queryOne<T>(text, params);
+  if (row === null) {
+    throw new Error(errorMessage);
+  }
+  return row;
 }
 
 export async function withTransaction<T>(
