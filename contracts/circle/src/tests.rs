@@ -694,6 +694,7 @@ mod circle_tests {
         let circle_lo = t.env.register_contract(None, CircleContract);
         let client_lo = CircleContractClient::new(&t.env, &circle_lo);
         client_lo.initialize(
+            &Address::generate(&t.env),
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -708,6 +709,7 @@ mod circle_tests {
         let circle_hi = t.env.register_contract(None, CircleContract);
         let client_hi = CircleContractClient::new(&t.env, &circle_hi);
         client_hi.initialize(
+            &Address::generate(&t.env),
             &t.members,
             &ROUND_AMOUNT,
             &t.token_address,
@@ -978,9 +980,9 @@ mod circle_tests {
 
     // ── circle.joined event ───────────────────────────────────────────────────
     //
-    // The `joined` event data is a tuple `(Address, u32)` where the first
-    // element is the joining member's address and the second is their 1-based
-    // position in the join queue (1 = first to join, N = last / activating join).
+    // The `joined` event data is `(circle_address, member, join_order,
+    // collateral_amount)`.  `join_order` is the member's 1-based position in
+    // the join queue (1 = first to join, N = last / activating join).
     // These tests act as a contract-level API guarantee for the event shape.
 
     #[test]
@@ -993,10 +995,10 @@ mod circle_tests {
         let joined = events_named(&t.env, "joined");
         assert_eq!(joined.len(), 1, "expected exactly one 'joined' event");
 
-        // The data payload is `(member: Address, order: u32)`.
+        // The data payload is `(circle_address, member, join_order, collateral)`.
         // Decode via the tuple IntoVal / FromVal round-trip.
         let data_val = joined[0].clone();
-        let (member, order): (Address, u32) =
+        let (_circle, member, order, _collateral): (Address, Address, u32, i128) =
             soroban_sdk::FromVal::from_val(&t.env, &data_val);
         assert_eq!(member, t.alice, "event member must be the joining address");
         assert_eq!(order, 1u32, "alice is the first to join — order must be 1");
@@ -1016,7 +1018,7 @@ mod circle_tests {
 
         let expected_members = [&t.alice, &t.bob, &t.carol, &t.dave];
         for (i, (val, &expected_member)) in joined.iter().zip(expected_members.iter()).enumerate() {
-            let (member, order): (Address, u32) =
+            let (_circle, member, order, _collateral): (Address, Address, u32, i128) =
                 soroban_sdk::FromVal::from_val(&t.env, val);
             assert_eq!(
                 member, *expected_member,
@@ -1040,7 +1042,7 @@ mod circle_tests {
 
         // The final join (dave) should carry order == 4 == total member count.
         let last_val = joined.last().unwrap().clone();
-        let (member, order): (Address, u32) =
+        let (_circle, member, order, _collateral): (Address, Address, u32, i128) =
             soroban_sdk::FromVal::from_val(&t.env, &last_val);
         assert_eq!(member, t.dave);
         assert_eq!(
@@ -3367,6 +3369,7 @@ mod circle_tests {
 
         // Attempt the invalid initialize — it panics.
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &circle_id,
@@ -3427,6 +3430,7 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3486,6 +3490,7 @@ mod circle_tests {
         members.push_back(Address::generate(&env));
 
         let result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3556,6 +3561,7 @@ mod circle_tests {
 
         // First attempt: reputation == usdc_token (invalid)
         let bad_result = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &token_address,
@@ -3597,6 +3603,7 @@ mod circle_tests {
         let mut members = Vec::new(&env);
         members.push_back(Address::generate(&env));
         members.push_back(Address::generate(&env));
+        let circle_admin = Address::generate(&env);
 
         circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
         // Second call must be rejected.
@@ -3613,6 +3620,7 @@ mod circle_tests {
 
         let mut members = Vec::new(&env);
         members.push_back(Address::generate(&env));
+        let circle_admin = Address::generate(&env);
 
         circle.initialize(&circle_admin, &members, &ROUND_AMOUNT, &token_address, &reputation_id, &ROUND_DEADLINE);
     }
@@ -4497,6 +4505,7 @@ mod circle_tests {
 
         // First attempt: invalid token — must fail.
         let bad = circle.try_initialize(
+            &Address::generate(&env),
             &members,
             &ROUND_AMOUNT,
             &not_a_token,
