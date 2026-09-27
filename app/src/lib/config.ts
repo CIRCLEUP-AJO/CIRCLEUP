@@ -319,10 +319,29 @@ export function getExplorerLink(
 // on @circleup/sdk (see lib/gating.ts), so the money math is duplicated here and
 // MUST stay behaviourally identical to the SDK: parse on strings only, never
 // through floating point, and refuse — never silently truncate — values with
-// more than 7 decimal places. Keep the two in sync.
+// more than USDC_DECIMALS (7) decimal places. Keep the two in sync.
+//
+// Sync checklist — whenever sdk/src/utils.ts changes its conversion logic:
+//   1. Update USDC_DECIMALS here if the constant changes in sdk/src/constants.ts.
+//   2. Re-verify every `USDC_DECIMALS` usage below matches the SDK's behaviour.
+//   3. Run app/src/__tests__/usdc-parity.test.ts — it imports both copies and
+//      asserts identical output for every representative input.
 
-/** 1 USDC = 10_000_000 stroops (7 decimal places) */
-export const STROOP = BigInt(10_000_000);
+/**
+ * Number of decimal places USDC supports (= `USDC_DECIMALS` in sdk/src/constants.ts).
+ *
+ * Declared here as a named constant — not a magic `7` — so:
+ *   a) it is easy to grep for all precision-dependent code, and
+ *   b) a future change to USDC_DECIMALS in the SDK is immediately visible as a
+ *      required sync here rather than a silent divergence in behaviour.
+ *
+ * INVARIANT: this value must always equal `USDC_DECIMALS` in sdk/src/constants.ts.
+ */
+export const USDC_DECIMALS = 7;
+
+/** 1 USDC = 10 ** USDC_DECIMALS stroops = 10_000_000 stroops.
+ *  Mirror of `STROOP` in sdk/src/utils.ts. */
+export const STROOP = BigInt(10 ** USDC_DECIMALS);
 
 /**
  * Convert a human-readable USDC amount to stroops (bigint), losslessly.
@@ -344,14 +363,14 @@ export function usdcToStroops(usdc: number | string): bigint {
   const [whole, fracRaw = ""] = str.split(".");
   // Trailing fractional zeros carry no value; drop them before counting places.
   const frac = fracRaw.replace(/0+$/, "");
-  if (frac.length > 7) {
+  if (frac.length > USDC_DECIMALS) {
     throw new TypeError(
       `usdcToStroops: "${str}" has ${frac.length} significant decimal places but USDC ` +
-        `supports at most 7. Round or truncate before converting — this function ` +
+        `supports at most ${USDC_DECIMALS}. Round or truncate before converting — this function ` +
         `refuses to drop digits silently.`,
     );
   }
-  const fracPadded = frac.padEnd(7, "0");
+  const fracPadded = frac.padEnd(USDC_DECIMALS, "0");
   return BigInt(whole) * STROOP + BigInt(fracPadded);
 }
 
@@ -401,15 +420,8 @@ function expandScientificNotation(intPart: string, fracPart: string, exp: number
 /**
  * Convert a stroops value to a human-readable USDC string.
  *
- * - Accepts `bigint | string | number` so callers don't need to cast.
- * - Returns `"0"` for falsy / invalid input rather than throwing.
- * - Strips trailing fractional zeros: 10.0000000 → "10", 1.5000000 → "1.5"
- */
-/**
- * Convert a stroops value to a human-readable USDC string.
- *
- * - The exact inverse of {@link usdcToStroops}: prints all 7 fractional digits
- *   and strips only trailing zeros, so no precision is lost.
+ * - The exact inverse of {@link usdcToStroops}: prints all {@link USDC_DECIMALS}
+ *   fractional digits and strips only trailing zeros, so no precision is lost.
  * - Accepts `bigint | string | number` so callers don't need to cast.
  * - Returns `"0"` for falsy / invalid / negative input rather than throwing.
  * - Strips trailing fractional zeros: 10.0000000 → "10", 1.5000000 → "1.5"
@@ -423,7 +435,7 @@ export function stroopsToUsdc(stroops: bigint | string | number): string {
   }
   if (n < 0n) return "0";
   const whole = n / STROOP;
-  const frac = (n % STROOP).toString().padStart(7, "0");
+  const frac = (n % STROOP).toString().padStart(USDC_DECIMALS, "0");
   return `${whole}.${frac}`.replace(/\.?0+$/, "") || "0";
 }
 
@@ -444,7 +456,7 @@ export function formatUsdc(stroops: bigint | string | number): string {
   }
   if (n < 0n) return "0.00";
   const whole = n / STROOP;
-  const frac = (n % STROOP).toString().padStart(7, "0").slice(0, 2); // 2 dp (truncate)
+  const frac = (n % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2); // 2 dp (truncate)
   return `${whole}.${frac}`;
 }
 
