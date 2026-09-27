@@ -375,4 +375,104 @@ if (hasDb) {
     const res = await request(app).get("/circles?order=sideways");
     assert.equal(res.status, 400);
   });
+
+  // ── #530 GET /circles/:address/members — stable totals for empty contributions ─
+
+  test("GET /circles/:address/members returns numeric totalContributions=0 when no contributions are seeded", async () => {
+    const addr   = "CDBTEST_EMPTY_CONTRIB_CIRCLE";
+    const member = "GDBTEST_EMPTY_CONTRIB_MEMBER";
+    await seedCircle(addr);
+    await seedMember(addr, member, 0);
+
+    try {
+      const res = await request(app).get(`/circles/${addr}/members`);
+      assert.equal(res.status, 200);
+      assert.equal(
+        res.body.totals.totalContributions,
+        0,
+        "totalContributions must be 0 when no contributions are seeded",
+      );
+      assert.equal(
+        typeof res.body.totals.totalContributions,
+        "number",
+        "totalContributions must be a number, not null or a string",
+      );
+      assert.equal(
+        res.body.members[0].total_contributions,
+        0,
+        "per-member total_contributions must be 0 (number) when no contributions exist",
+      );
+      assert.equal(
+        typeof res.body.members[0].total_contributions,
+        "number",
+        "per-member total_contributions must be a number, not a string",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
+  // ── #531 GET /indexer/state — entity counts ───────────────────────────────────
+
+  test("GET /indexer/state includes entityCounts with numeric totals and circlesByStatus", async () => {
+    const addr = "CDBTEST_STATE_ENTITY_CIRCLE";
+    await seedCircle(addr, { status: "Active" });
+
+    try {
+      const res = await request(app).get("/indexer/state");
+      assert.equal(res.status, 200);
+      const { entityCounts } = res.body as { entityCounts: Record<string, unknown> };
+      assert.ok(
+        typeof entityCounts === "object" && entityCounts !== null,
+        "entityCounts must be an object",
+      );
+      assert.equal(typeof entityCounts.circles,       "number", "entityCounts.circles must be a number");
+      assert.equal(typeof entityCounts.members,       "number", "entityCounts.members must be a number");
+      assert.equal(typeof entityCounts.contributions, "number", "entityCounts.contributions must be a number");
+      assert.equal(typeof entityCounts.payouts,       "number", "entityCounts.payouts must be a number");
+      assert.equal(typeof entityCounts.defaults,      "number", "entityCounts.defaults must be a number");
+      assert.ok(
+        typeof entityCounts.circlesByStatus === "object" && entityCounts.circlesByStatus !== null,
+        "entityCounts.circlesByStatus must be an object",
+      );
+      assert.ok(
+        (entityCounts.circles as number) >= 1,
+        "entityCounts.circles must be at least 1 after seeding",
+      );
+    } finally {
+      await cleanCircle(addr);
+    }
+  });
+
+  // ── #532 GET /indexer/schema — migration status diagnostics ──────────────────
+
+  test("GET /indexer/schema returns schema state and full migration details", async () => {
+    const res = await request(app).get("/indexer/schema");
+    assert.equal(res.status, 200);
+    assert.equal(typeof res.body.state,          "string",  "state must be a string");
+    assert.equal(typeof res.body.summary,        "string",  "summary must be a string");
+    assert.equal(typeof res.body.canStartSafely, "boolean", "canStartSafely must be a boolean");
+    assert.ok(Array.isArray(res.body.applied),             "applied must be an array");
+    assert.ok(Array.isArray(res.body.pending),             "pending must be an array");
+    assert.ok(Array.isArray(res.body.missingOnDisk),       "missingOnDisk must be an array");
+    assert.ok(Array.isArray(res.body.modified),            "modified must be an array");
+    assert.equal(
+      res.body.state,
+      "clean",
+      "schema state must be clean after running all migrations in before()",
+    );
+    assert.equal(res.body.canStartSafely, true, "canStartSafely must be true when state is clean");
+  });
+
+  // ── #533 GET /indexer/schema — 004 migration applied ─────────────────────────
+
+  test("GET /indexer/schema — 004_query_plan_indexes migration is listed as applied", async () => {
+    const res = await request(app).get("/indexer/schema");
+    assert.equal(res.status, 200);
+    const applied = res.body.applied as string[];
+    assert.ok(
+      applied.some((f: string) => f.startsWith("004")),
+      "004_query_plan_indexes migration must appear in the applied list",
+    );
+  });
 }
