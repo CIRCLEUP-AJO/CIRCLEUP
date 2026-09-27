@@ -216,6 +216,27 @@ pub enum PauseError {
     NotInitialized = 4,
 }
 
+/// Typed errors returned by [`CircleContract::close`].
+///
+/// Using `contracterror` keeps the error model consistent with `PauseError`
+/// and lets SDK consumers branch on stable codes rather than message strings.
+///
+/// The numeric discriminants are stable — do not renumber existing variants.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum CloseError {
+    /// `close` was called after a previous successful call.
+    AlreadyClosed = 1,
+    /// `close` was called while the circle is not in a terminal state
+    /// (`Active` or `Pending`). Call `cancel` first for a Pending circle.
+    NotTerminalState = 2,
+    /// Caller is neither the stored admin nor a configured circle member.
+    Unauthorized = 3,
+    /// Circle status is `Completed` but `RoundsCompleted` does not equal
+    /// the member count — storage inconsistency guard.
+    RoundsIncomplete = 4,
+}
+
 /// Penalty: forfeit 20 % of collateral on a missed contribution.
 ///
 /// Expressed in basis points (1 bp = 0.01 %).  Divide by [`BPS_DENOM`] to get
@@ -442,7 +463,7 @@ impl CircleContract {
         }
     }
 
-    fn assert_unique_members(members: &Vec<Address>) {
+    fn assert_unique_members(env: &Env, members: &Vec<Address>) {
         let len = members.len();
         let mut i: u32 = 0;
         while i < len {
@@ -455,7 +476,7 @@ impl CircleContract {
                     .get(j)
                     .unwrap_or_else(|| panic!("circle: member index {} out of bounds", j));
                 if a == b {
-                    panic!("duplicate members");
+                    env.panic_with_error(InitError::DuplicateMembers);
                 }
                 j += 1;
             }
@@ -526,7 +547,7 @@ impl CircleContract {
         if members.len() > MAX_MEMBERS {
             panic!("too many members");
         }
-        Self::assert_unique_members(&members);
+        Self::assert_unique_members(&env, &members);
         if round_amount <= 0 {
             panic!("round_amount must be positive");
         }
@@ -541,10 +562,10 @@ impl CircleContract {
             .checked_mul(PENALTY_BPS)
             .unwrap_or_else(|| panic!("round_amount too large: overflows penalty calculation"));
         if round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS {
-            panic!("round_deadline_ledgers below minimum");
+            env.panic_with_error(InitError::DeadlineBelowMinimum);
         }
         if round_deadline_ledgers > MAX_ROUND_DEADLINE_LEDGERS {
-            panic!("round_deadline_ledgers above maximum");
+            env.panic_with_error(InitError::DeadlineAboveMaximum);
         }
 
         // ── Token and contract address validation ─────────────────────────────
@@ -1567,8 +1588,11 @@ impl CircleContract {
     /// # Preconditions (enforced, not assumed)
     ///
     /// - The circle must be in a terminal state (`Completed` or `Cancelled`).
-    ///   Active and Pending circles are explicitly rejected with distinct messages.
-    /// - The `closer` must be a configured circle member.
+    ///   Active and Pending circles return `CloseError::NotTerminalState`.
+    /// - The `closer` must be either the stored admin or a configured circle
+    ///   member.  Non-authorized callers receive `CloseError::Unauthorized`.
+    ///   Allowing the admin to close provides an emergency recovery path when
+    ///   members are unavailable to trigger collateral release themselves.
     /// - For `Completed` circles the `RoundsCompleted` counter must equal the
     ///   member count — this cross-checks that every round was paid out before
     ///   the status was set, guarding against storage-level inconsistencies.
@@ -1611,7 +1635,7 @@ impl CircleContract {
     /// # Storage cost
     /// Writes one instance entry (`Closed = true`) and zeroes one persistent
     /// entry (`Collateral(member)`) per member that held a non-zero balance.
-    pub fn close(env: Env, closer: Address) {
+    pub fn close(env: Env, closer: Address) -> Result<(), CloseError> {
         closer.require_auth();
 
         Self::assert_not_paused(&env);
@@ -1624,7 +1648,7 @@ impl CircleContract {
 
         // Reject duplicate close invocations before touching any other state.
         if env.storage().instance().has(&DataKey::Closed) {
-            panic!("circle already closed");
+            return Err(CloseError::AlreadyClosed);
         }
 
         let status: CircleStatus = env
@@ -1633,25 +1657,29 @@ impl CircleContract {
             .get(&DataKey::Status)
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
-        // Only terminal states may trigger settlement.  Each non-terminal state
-        // gets its own message so callers receive an actionable diagnostic.
+        // Only terminal states may trigger settlement.
         match &status {
             CircleStatus::Completed | CircleStatus::Cancelled => {}
-            CircleStatus::Active => {
-                panic!("circle still active")
-            }
-            CircleStatus::Pending => {
-                panic!("circle still pending; call cancel first to reach a terminal state")
+            CircleStatus::Active | CircleStatus::Pending => {
+                return Err(CloseError::NotTerminalState);
             }
         }
 
-        if !config.members.contains(&closer) {
-            panic!("not authorized to close: caller is not a circle member");
+        // Dedicated close authorization rule: the closer must be either the
+        // stored admin (for emergency recovery) or a configured circle member.
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("circle: Admin missing — storage inconsistency"));
+        let is_authorized = closer == admin || config.members.contains(&closer);
+        if !is_authorized {
+            return Err(CloseError::Unauthorized);
         }
 
         // For Completed circles, cross-check that every round was paid out.
-        // This guards against a hypothetical state corruption where Status was
-        // set to Completed before all payouts ran.
+        // Returns a typed error so SDK consumers can distinguish a storage
+        // inconsistency from an authorization failure.
         if matches!(status, CircleStatus::Completed) {
             let rounds_completed: u32 = env
                 .storage()
@@ -1659,7 +1687,7 @@ impl CircleContract {
                 .get(&DataKey::RoundsCompleted)
                 .unwrap_or_else(|| panic!("circle: RoundsCompleted missing — storage inconsistency"));
             if rounds_completed != config.members.len() {
-                panic!("circle: Completed status set but not all rounds paid out — storage inconsistency");
+                return Err(CloseError::RoundsIncomplete);
             }
         }
 
@@ -1771,6 +1799,8 @@ impl CircleContract {
             event_topics(&env, "closed"),
             (env.current_contract_address(), closer, total_released, total_expected_collateral, reason),
         );
+
+        Ok(())
     }
 
     /// Returns `true` if `close` has been successfully called and all collateral

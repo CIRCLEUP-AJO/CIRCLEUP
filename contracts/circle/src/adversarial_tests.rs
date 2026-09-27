@@ -28,7 +28,7 @@ mod adversarial_tests {
     extern crate std;
 
     use crate::{
-        CircleContract, CircleContractClient, CircleStatus, DataKey,
+        CircleContract, CircleContractClient, CircleStatus, CloseError, DataKey,
         COLLATERAL_MULTIPLIER, MIN_ROUND_DEADLINE_LEDGERS,
     };
     use reputation::{ReputationContract, ReputationContractClient};
@@ -308,12 +308,15 @@ mod adversarial_tests {
 
     /// A stranger cannot trigger close on a completed circle.
     #[test]
-    #[should_panic(expected = "not authorized to close: caller is not a circle member")]
     fn adv_circle_close_stranger_rejected() {
         let t = make_setup();
         t.activate();
         t.force_completed();
-        t.circle.close(&t.stranger);
+        assert_eq!(
+            t.circle.try_close(&t.stranger),
+            Err(Ok(CloseError::Unauthorized)),
+            "stranger must be rejected with CloseError::Unauthorized"
+        );
     }
 
     /// After a rejected close, no collateral is transferred and all member

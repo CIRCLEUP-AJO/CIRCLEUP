@@ -459,6 +459,35 @@ impl CircleFactory {
             .get(&DataKey::UsdcToken)
             .unwrap_or_else(|| panic!("not initialized"))
     }
+
+    /// Returns the reputation contract address configured at initialize.
+    ///
+    /// Exposes the reputation contract address so off-chain tooling and
+    /// auditors can verify which reputation contract this factory interacts
+    /// with without deserializing the full factory configuration.
+    ///
+    /// Panics with `"not initialized"` if called before `initialize`.
+    pub fn get_reputation_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::ReputationContract)
+            .unwrap_or_else(|| panic!("not initialized"))
+    }
+
+    /// Returns the circle WASM hash configured at initialize.
+    ///
+    /// The hash identifies the exact version of the circle contract that this
+    /// factory deploys.  Callers can compare it against a known hash to verify
+    /// that the factory is deploying the expected contract binary before
+    /// committing gas to `create_circle`.
+    ///
+    /// Panics with `"not initialized"` if called before `initialize`.
+    pub fn get_circle_wasm_hash(env: Env) -> BytesN<32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircleWasmHash)
+            .unwrap_or_else(|| panic!("not initialized"))
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -521,6 +550,77 @@ mod tests {
         let s = setup_factory(&env);
         assert_eq!(s.client.get_admin(), s.admin);
         assert_eq!(s.client.get_usdc_token(), s.usdc);
+    }
+
+    #[test]
+    fn test_get_reputation_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let rep   = Address::generate(&env);
+        let usdc  = Address::generate(&env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        assert_eq!(
+            client.get_reputation_contract(),
+            rep,
+            "get_reputation_contract must return the address set at initialize"
+        );
+    }
+
+    #[test]
+    fn test_get_circle_wasm_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin = Address::generate(&env);
+        let rep   = Address::generate(&env);
+        let usdc  = Address::generate(&env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0xabu8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        assert_eq!(
+            client.get_circle_wasm_hash(),
+            wasm_hash,
+            "get_circle_wasm_hash must return the hash set at initialize"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not initialized")]
+    fn test_get_reputation_contract_before_init_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        CircleFactoryClient::new(&env, &id).get_reputation_contract();
+    }
+
+    #[test]
+    #[should_panic(expected = "not initialized")]
+    fn test_get_circle_wasm_hash_before_init_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        CircleFactoryClient::new(&env, &id).get_circle_wasm_hash();
+    }
+
+    #[test]
+    fn test_all_getters_return_configured_values() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, CircleFactory);
+        let client = CircleFactoryClient::new(&env, &id);
+        let admin     = Address::generate(&env);
+        let rep       = Address::generate(&env);
+        let usdc      = Address::generate(&env);
+        let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[0x42u8; 32]);
+        client.initialize(&admin, &wasm_hash, &rep, &usdc);
+        assert_eq!(client.get_admin(),                admin,     "admin");
+        assert_eq!(client.get_usdc_token(),           usdc,      "usdc_token");
+        assert_eq!(client.get_reputation_contract(),  rep,       "reputation_contract");
+        assert_eq!(client.get_circle_wasm_hash(),     wasm_hash, "circle_wasm_hash");
     }
 
     #[test]
@@ -854,18 +954,18 @@ mod tests {
     // ── create_circle: input validation rejects before any state mutation ─────
 
     #[test]
-    #[should_panic(expected = "need at least 2 members")]
     fn test_create_circle_rejects_single_member_no_state_change() {
         let env = Env::default();
+        env.mock_all_auths();
         let s = setup_factory(&env);
         let mut m = Vec::new(&env);
         m.push_back(Address::generate(&env));
         let count_before = s.client.get_circle_count();
-        let _ = s.client.try_create_circle(
+        let result = s.client.try_create_circle(
             &Address::generate(&env), &m, &1_000_000i128, &MIN_ROUND_DEADLINE_LEDGERS,
         );
-        // Count must be unchanged
-        assert_eq!(s.client.get_circle_count(), count_before);
+        assert!(result.is_err(), "single-member create_circle must be rejected");
+        assert_eq!(s.client.get_circle_count(), count_before, "count must be unchanged after rejection");
     }
 
     #[test]
@@ -1113,9 +1213,8 @@ mod tests {
             &Address::generate(&env),
             &Address::generate(&env),
         );
-        let err_str = format!("{:?}", result);
         assert!(
-            err_str.contains("already initialized") || result.is_err(),
+            result.is_err(),
             "second initialize must fail on Admin presence check, not on lingering Initializing flag"
         );
         // The Admin key must still be the original admin — proving the guard
