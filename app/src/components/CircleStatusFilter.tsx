@@ -3,8 +3,33 @@
 import { useRouter, usePathname } from "next/navigation";
 import { useTransition } from "react";
 import clsx from "clsx";
-import type { CircleStatusFilter as StatusFilter } from "@/app/page";
-import { CIRCLE_STATUS_OPTIONS } from "@/app/page";
+/**
+ * The full set of status values accepted by GET /circles?status=.
+ * Mirrors the CIRCLE_STATUSES constant in indexer/src/api.ts.
+ * "Closed" is an indexer-only projection (not a contract enum variant).
+ */
+export const CIRCLE_STATUS_OPTIONS = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+  "Closed",
+] as const;
+
+export type CircleStatusFilter = (typeof CIRCLE_STATUS_OPTIONS)[number];
+
+/**
+ * Returns true when `value` is a recognised status filter value.
+ * Used to guard the raw searchParams string before it reaches the fetch call.
+ */
+export function isValidStatusFilter(value: unknown): value is CircleStatusFilter {
+  return (
+    typeof value === "string" &&
+    (CIRCLE_STATUS_OPTIONS as readonly string[]).includes(value)
+  );
+}
+
+type StatusFilter = CircleStatusFilter;
 
 // ─── Label + colour map ───────────────────────────────────────────────────────
 

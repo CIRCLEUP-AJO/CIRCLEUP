@@ -38,7 +38,7 @@ import {
   formatPot as sdkFormatPot,
   daysToLedgers as sdkDaysToLedgers,
   ledgersToDays as sdkLedgersToDays,
-} from "../../../../sdk/src/utils";
+} from "../../../sdk/src/utils";
 
 // ─── Shared test vectors ──────────────────────────────────────────────────────
 
@@ -330,7 +330,7 @@ describe("#460 conversion edge cases", () => {
 describe("#460 STROOP and USDC_DECIMALS constant parity", () => {
   it("app USDC_DECIMALS equals SDK USDC_DECIMALS (both must be 7)", async () => {
     const { USDC_DECIMALS: appDecimals } = await import("../lib/config");
-    const { USDC_DECIMALS: sdkDecimals } = await import("../../../../sdk/src/utils");
+    const { USDC_DECIMALS: sdkDecimals } = await import("../../../sdk/src/utils");
     // Structural equality — if either changes this test fails immediately.
     expect(appDecimals).toBe(sdkDecimals);
     // Absolute value — documents the agreed constant so reviewers see it explicitly.
@@ -340,7 +340,7 @@ describe("#460 STROOP and USDC_DECIMALS constant parity", () => {
 
   it("app STROOP equals SDK STROOP (both must be 10_000_000n)", async () => {
     const { STROOP: appStroop } = await import("../lib/config");
-    const { STROOP: sdkStroop } = await import("../../../../sdk/src/utils");
+    const { STROOP: sdkStroop } = await import("../../../sdk/src/utils");
     expect(appStroop).toBe(sdkStroop);
     expect(appStroop).toBe(10_000_000n);
   });
@@ -352,7 +352,7 @@ describe("#460 STROOP and USDC_DECIMALS constant parity", () => {
 
   it("usdcToStroops('1') returns STROOP in both copies", async () => {
     const { STROOP: appStroop } = await import("../lib/config");
-    const { STROOP: sdkStroop } = await import("../../../../sdk/src/utils");
+    const { STROOP: sdkStroop } = await import("../../../sdk/src/utils");
     expect(appUsdcToStroops("1")).toBe(appStroop);
     expect(sdkUsdcToStroops("1")).toBe(sdkStroop);
     expect(appUsdcToStroops("1")).toBe(sdkUsdcToStroops("1"));

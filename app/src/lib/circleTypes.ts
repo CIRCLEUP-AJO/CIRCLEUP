@@ -252,7 +252,7 @@ export interface RoundsResponse {
  * @see ApiCircleDetailWithRoundsResponse in sdk/src/types.ts
  */
 export interface CircleDetailData {
-  circle: CircleRow;
+  circle: CircleRow | CircleState;
   members: CircleMemberRow[];
   /**
    * Completed rounds only (status === "completed"), sorted by roundIndex.
@@ -295,6 +295,11 @@ export interface CircleState {
  *
  * @see ApiReputationResponse in sdk/src/types.ts
  */
+export interface ReputationEvent {
+  type: string;
+  delta: number;
+}
+
 export interface ReputationResponse {
   member: string;
   /** true when a reputation row exists; false means no activity recorded yet. */
@@ -309,6 +314,7 @@ export interface ReputationResponse {
     circle_address: string;
     count: number;
   }>;
+  events?: ReputationEvent[];
   updatedAt: string | null;
 }
 
@@ -630,12 +636,23 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
         .map((d) => ({ circle_address: d.circle_address, count: d.count }))
     : [];
 
+  const events = Array.isArray(r.events)
+    ? r.events
+        .filter((e): e is ReputationEvent => {
+          if (typeof e !== "object" || e === null) return false;
+          const row = e as Record<string, unknown>;
+          return typeof row.type === "string" && typeof row.delta === "number";
+        })
+        .map((e) => ({ type: e.type, delta: e.delta }))
+    : undefined;
+
   return {
     member: r.member,
     found: r.found,
     score: r.score,
     contributions,
     defaults,
+    ...(events ? { events } : {}),
     updatedAt: isString(r.updatedAt) ? r.updatedAt : null,
   };
 }
