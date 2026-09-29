@@ -979,6 +979,10 @@ export interface TxFailure {
    * supplied none or nothing survived sanitisation.
    */
   readonly metadata?: TxMetadata;
+  /**
+   * Field mismatches detected when preflight failed due to a stale-write attempt.
+   */
+  readonly mismatches?: readonly StateMismatch[];
 }
 
 /** Discriminated union of all possible transaction outcomes. */
@@ -1336,11 +1340,13 @@ export interface ApiReputationResponse {
   member: string;
   /**
    * `true` when a reputation row exists for this member in the database.
-   * `false` means the member has no recorded activity; `score` will be 0.
+   * `false` means the member has no recorded activity; `score` may be `0` or `null`.
    * Lets clients distinguish an explicit zero from a member not yet seen.
    */
   found: boolean;
-  score: number;
+  score: number | null;
+  /** Optional diagnostic or explanatory detail message. */
+  detail?: string;
   contributions: Array<{
     circle_address: string;
     /** Number of rounds the member has contributed in this circle. */

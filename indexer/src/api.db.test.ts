@@ -582,6 +582,7 @@ if (hasDb) {
     const res = await request(app).get("/circles/CDBTEST_NO_ROUNDS_CIRCLE/rounds");
     assert.equal(res.status, 404);
   });
+  test("GET /circles returns 400 for invalid sort field", async () => {
     const res = await request(app).get("/circles?sort=nonexistent_field");
     assert.equal(res.status, 400);
   });

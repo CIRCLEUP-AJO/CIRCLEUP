@@ -704,39 +704,6 @@ async function handleCircleJoined(client: PoolClient, circleAddr: string, event:
   );
 }
 
-async function handleCircleInitialized(client: PoolClient, circleAddr: string, event: SdkEvent) {
-  // Event data: (circle_address, member_count, round_amount)
-  //
-  // The `factory/circle_created` handler inserts the circles row with
-  // round_amount=0, member_count=0, total_rounds=0 as placeholders because
-  // those fields are not part of the factory event payload.  This handler
-  // backfills the real values once the circle publishes its own initialized
-  // event (which fires inside the same factory transaction, after deploy+init).
-  //
-  // Using ON CONFLICT DO UPDATE ensures idempotency: if the row was somehow
-  // already written with the correct values this is a no-op.
-  const { memberCount, roundAmount } = parseInitializedEvent(getValueNative(event));
-
-  await client.query(
-    `UPDATE circles
-        SET member_count  = $2,
-            total_rounds  = $2,
-            round_amount  = $3,
-            updated_at    = NOW()
-      WHERE address = $1`,
-    [circleAddr, memberCount, roundAmount.toString()],
-  );
-  console.log(
-    `[indexer] Circle initialized: ${redactAddress(circleAddr)} ` +
-      `members=${memberCount} round_amount=${roundAmount}`,
-  );
-  log("info", "event_ingested", {
-    ledger: event.ledger,
-    eventType: "circle/joined",
-    contractId: circleAddr,
-    txHash: event.txHash,
-  }, `Member joined: ${redactAddress(memberAddr)} → ${redactAddress(circleAddr)}`);
-}
 
 async function handleCircleActive(client: PoolClient, circleAddr: string) {
   await client.query(

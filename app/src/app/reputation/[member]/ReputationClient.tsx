@@ -94,7 +94,14 @@ type FetchResult =
   | { ok: true; data: ReputationResponse }
   | {
       ok: false;
-      reason: "not_found" | "network" | "unknown" | "aborted" | "indexer_outage" | "misconfigured";
+      reason:
+        | "not_found"
+        | "network"
+        | "unknown"
+        | "aborted"
+        | "indexer_outage"
+        | "misconfigured"
+        | "malformed";
     };
 
 async function fetchReputation(member: string, signal?: AbortSignal): Promise<FetchResult> {
@@ -118,10 +125,10 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
     if (res.status === 503) return { ok: false, reason: "indexer_outage" };
     if (!res.ok) return { ok: false, reason: "unknown" };
     // Issue #513: validate the response shape before returning it as typed data.
-    // The bare `as ReputationResponse` cast was previously here; a malformed or
-    // unexpected response would have propagated into the render tree silently.
-    const parsed = parseReputationResponse(await res.json());
-    if (!parsed) return { ok: false, reason: "unknown" };
+    // Structural errors return "malformed" so the UI displays explicit error messaging.
+    const rawJson = await res.json();
+    const parsed = parseReputationResponse(rawJson);
+    if (!parsed) return { ok: false, reason: "malformed" };
     return { ok: true, data: parsed };
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") {
@@ -214,6 +221,8 @@ export default function ReputationClient({ member }: { member: string }) {
       misconfigured:
         "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
         "Set a valid indexer URL in app/.env.local and restart the server.",
+      malformed:
+        "Malformed reputation data received from server. The response payload structure is invalid.",
     };
     // Retrying cannot fix a configuration error, so don't offer it.
     const canRetry = result.reason !== "misconfigured";
@@ -242,21 +251,14 @@ export default function ReputationClient({ member }: { member: string }) {
 
   const { data } = result;
 
-  // Issue #565: derive the total from the signed event deltas rather than
-  // trusting a possibly-stale `score` field, and label each event with its
-  // canonical name. `data.score` is still shown when the event list is empty
-  // (e.g. an indexer that only returns an aggregate).
   const events = data.events ?? [];
   const total = events.length > 0 ? computeTotal(events) : data.score;
+  const isNoRecord = !data.found || (data.score === null && events.length === 0);
 
   return (
     <div className="max-w-xl mx-auto space-y-6">
       {/*
         Screen-reader announcement for manual refresh completion.
-        `key={refreshCount}` remounts the node on each successful refresh so
-        the polite live region re-announces even when the score hasn't changed.
-        Only rendered after the first manual refresh (refreshCount > 0) to
-        avoid announcing on the initial page load.
       */}
       {refreshCount > 0 && (
         <span
@@ -266,7 +268,9 @@ export default function ReputationClient({ member }: { member: string }) {
           aria-live="polite"
           aria-atomic="true"
         >
-          {`Reputation data updated. Total score: ${total}.`}
+          {isNoRecord
+            ? "Reputation data updated. No reputation record recorded yet."
+            : `Reputation data updated. Total score: ${total}.`}
         </span>
       )}
 
@@ -300,19 +304,35 @@ export default function ReputationClient({ member }: { member: string }) {
         </div>
       </div>
 
-      {/* Total score */}
-      <div className="rounded-lg border border-slate-200 bg-white p-6 text-center">
-        <p className="text-sm text-slate-500">Total reputation score</p>
-        <p
-          className="text-4xl font-bold text-slate-900 mt-1"
-          aria-label={`Total reputation score: ${total}`}
-        >
-          {total}
-        </p>
-        <p className="text-xs text-slate-400 mt-1">
-          Signed sum of all reputation events.
-        </p>
-      </div>
+      {/* State display card */}
+      {isNoRecord ? (
+        <div className="rounded-lg border border-slate-200 bg-white p-6 text-center space-y-3">
+          <div className="text-3xl" aria-hidden="true">🌱</div>
+          <h2 className="text-lg font-semibold text-slate-800">No Reputation Record Yet</h2>
+          <p className="text-sm text-slate-600 max-w-md mx-auto">
+            {data.detail ??
+              "This address has no on-chain reputation record or circle participation history on CircleUp yet."}
+          </p>
+          <div className="pt-2 flex justify-center">
+            <ReputationBadge score={null} />
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-slate-200 bg-white p-6 text-center">
+          <p className="text-sm text-slate-500">Total reputation score</p>
+          <p
+            className="text-4xl font-bold text-slate-900 mt-1"
+            aria-label={`Total reputation score: ${total}`}
+          >
+            {total ?? 0}
+          </p>
+          <p className="text-xs text-slate-400 mt-1">
+            {events.length > 0
+              ? "Signed sum of all reputation events."
+              : "On-chain reputation score recorded by contract."}
+          </p>
+        </div>
+      )}
 
       {/* Event list */}
       <div>
@@ -348,7 +368,7 @@ export default function ReputationClient({ member }: { member: string }) {
 
       {/* Badge + legend */}
       <div className="flex flex-col items-center gap-3">
-        <ReputationBadge score={total} />
+        {!isNoRecord && <ReputationBadge score={total} />}
         <ReputationLegend />
       </div>
     </div>
