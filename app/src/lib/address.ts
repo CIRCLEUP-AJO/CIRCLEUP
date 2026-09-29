@@ -211,6 +211,200 @@ export function isValidStellarAccount(address: string): boolean {
   return isStellarPublicKey(address) && hasValidStrKeyChecksum(address);
 }
 
+// ─── Structured validation result ────────────────────────────────────────────
+//
+// Boolean validators are the right tool inside trusted code paths (parsers,
+// internal API guards). For user-facing surfaces — route handlers, form
+// submissions, error banners — callers need a reason they can display directly
+// or branch on deterministically.  `validateAddress` fills that role: it runs
+// every applicable check in order and returns the first failure with a stable
+// `reason` code and a ready-to-display `message`.
+//
+// Ordering within `validateAddress`:
+//   1. empty/non-string     — catches null, undefined, whitespace from URL params
+//   2. length               — catches truncated copy-pastes before the alphabet check
+//   3. prefix               — names the namespace (G/C/M/other) unambiguously
+//   4. alphabet/shape       — catches non-base32 characters
+//   5. checksum             — catches one-character typos that pass shape checks
+//
+// Accepting `"G" | "C" | "any"` as the `kind` option keeps the call-site
+// intent explicit: a circle route always expects "C"; a reputation route
+// accepts "any"; the create form always expects "G".
+
+/** Reason code for a failed address validation. */
+export type AddressValidationReason =
+  | "empty"
+  | "wrong_length"
+  | "wrong_prefix"
+  | "unsupported_prefix"
+  | "invalid_alphabet"
+  | "checksum_mismatch"
+  | "contract_not_allowed"
+  | "muxed_not_allowed";
+
+/** Result returned by {@link validateAddress}. */
+export type AddressValidationResult =
+  | { valid: true; kind: "account" | "contract" }
+  | { valid: false; reason: AddressValidationReason; message: string };
+
+/**
+ * Options accepted by {@link validateAddress}.
+ *
+ * `kind`:
+ *  - `"G"` — only Stellar public keys (G-prefix) are accepted.
+ *  - `"C"` — only Soroban contract IDs (C-prefix) are accepted.
+ *  - `"any"` — either G-prefix or C-prefix is accepted (default).
+ *
+ * `requireChecksum`:
+ *  - When `true` (default), the strkey CRC16/XMODEM checksum is verified so
+ *    shape-valid but typo'd addresses are caught at the input boundary.
+ *  - Set to `false` only for values produced by a trusted encoder (SDK output,
+ *    internal code) where the checksum is guaranteed correct and you want a
+ *    faster pure-shape check.
+ */
+export interface ValidateAddressOptions {
+  kind?: "G" | "C" | "any";
+  requireChecksum?: boolean;
+}
+
+/**
+ * Validate a Stellar / Soroban address and return a structured result.
+ *
+ * Unlike the boolean helpers, this function returns a stable `reason` code and
+ * a ready-to-display `message` on failure, making it the right choice for:
+ *   - Route handler guards (replace inline regex, produce notFound or error page)
+ *   - Error banners in client components
+ *   - Any surface where the caller needs to branch on *why* validation failed
+ *
+ * The `kind` option restricts which prefix is accepted:
+ *   - `"G"` — wallet / member addresses only
+ *   - `"C"` — Soroban contract IDs only
+ *   - `"any"` — either (default)
+ *
+ * The `requireChecksum` option (default `true`) runs the CRC16/XMODEM strkey
+ * checksum so single-character typos are caught before the address reaches any
+ * RPC call or indexer lookup.
+ *
+ * @example
+ * // Route guard — only accept a Soroban contract ID
+ * const result = validateAddress(params.address, { kind: "C" });
+ * if (!result.valid) notFound();
+ *
+ * // Form validation — only accept a wallet address, with checksum
+ * const result = validateAddress(userInput, { kind: "G" });
+ * if (!result.valid) return result.message; // display to user
+ */
+export function validateAddress(
+  address: unknown,
+  options: ValidateAddressOptions = {},
+): AddressValidationResult {
+  const { kind = "any", requireChecksum = true } = options;
+
+  // ── 1. Empty / non-string ─────────────────────────────────────────────────
+  if (typeof address !== "string" || address.trim() === "") {
+    return {
+      valid: false,
+      reason: "empty",
+      message: "Address is required.",
+    };
+  }
+
+  const trimmed = address.trim();
+
+  // ── 2. Length ─────────────────────────────────────────────────────────────
+  if (trimmed.length !== STRKEY_LENGTH) {
+    return {
+      valid: false,
+      reason: "wrong_length",
+      message:
+        `Invalid address length (${trimmed.length} characters). ` +
+        `Stellar addresses are always exactly 56 characters.`,
+    };
+  }
+
+  // ── 3. Prefix / namespace ─────────────────────────────────────────────────
+  const prefix = trimmed.charAt(0);
+
+  // Explicitly unsupported prefix: muxed addresses (M-prefix)
+  if (prefix === "M") {
+    return {
+      valid: false,
+      reason: "muxed_not_allowed",
+      message:
+        "Muxed addresses (M…) are not supported. Use a plain G-prefixed wallet address instead.",
+    };
+  }
+
+  // Caller wants only G-addresses but got a C-contract
+  if (kind === "G" && prefix === "C") {
+    return {
+      valid: false,
+      reason: "contract_not_allowed",
+      message:
+        "Contract addresses (C…) are not allowed here. Provide a G-prefixed wallet address.",
+    };
+  }
+
+  // Caller wants only C-addresses but got a G-key
+  if (kind === "C" && prefix === "G") {
+    return {
+      valid: false,
+      reason: "wrong_prefix",
+      message:
+        "Expected a Soroban contract ID (C-prefixed). Provide the circle's contract address.",
+    };
+  }
+
+  // Any other prefix that is neither G nor C
+  if (prefix !== "G" && prefix !== "C") {
+    return {
+      valid: false,
+      reason: "unsupported_prefix",
+      message:
+        `Unrecognised address prefix "${prefix}". Stellar wallet addresses start with "G" ` +
+        `and contract addresses start with "C".`,
+    };
+  }
+
+  // ── 4. Alphabet / shape ───────────────────────────────────────────────────
+  // After the prefix check we know the first char is G or C, so the regex
+  // only needs to validate the remaining 55 characters.
+  const bodyOk = /^[A-Z2-7]{55}$/.test(trimmed.slice(1));
+  if (!bodyOk) {
+    const lower = trimmed.toLowerCase();
+    if (lower === trimmed && isStellarPublicKey(trimmed.toUpperCase())) {
+      return {
+        valid: false,
+        reason: "invalid_alphabet",
+        message:
+          "Address must be typed in uppercase — Stellar addresses are case-sensitive.",
+      };
+    }
+    return {
+      valid: false,
+      reason: "invalid_alphabet",
+      message:
+        "Address contains invalid characters. Stellar addresses only use uppercase A–Z and digits 2–7.",
+    };
+  }
+
+  // ── 5. Checksum ───────────────────────────────────────────────────────────
+  if (requireChecksum && !hasValidStrKeyChecksum(trimmed)) {
+    return {
+      valid: false,
+      reason: "checksum_mismatch",
+      message:
+        "Address checksum failed — this looks like a typo or a truncated copy-paste. " +
+        "Double-check the address character by character.",
+    };
+  }
+
+  return {
+    valid: true,
+    kind: prefix === "G" ? "account" : "contract",
+  };
+}
+
 // ─── Assertion helpers ────────────────────────────────────────────────────────
 
 /**
