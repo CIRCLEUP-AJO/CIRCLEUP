@@ -40,7 +40,7 @@
  * No exclusions — all guards listed are financial or authorization boundaries.
  */
 
-import { test, describe } from "node:test";
+import { describe, test, expect } from "vitest";
 import assert from "node:assert/strict";
 
 import {
