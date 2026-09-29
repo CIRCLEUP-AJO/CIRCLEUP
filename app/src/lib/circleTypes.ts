@@ -299,7 +299,8 @@ export interface ReputationResponse {
   member: string;
   /** true when a reputation row exists; false means no activity recorded yet. */
   found: boolean;
-  score: number;
+  score: number | null;
+  detail?: string;
   contributions: Array<{
     circle_address: string;
     contributions: number;
@@ -308,6 +309,10 @@ export interface ReputationResponse {
   defaults: Array<{
     circle_address: string;
     count: number;
+  }>;
+  events?: Array<{
+    type: string;
+    delta: number;
   }>;
   updatedAt: string | null;
 }
@@ -598,7 +603,9 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
 
   if (!isNonEmptyString(r.member)) return null;
   if (typeof r.found !== "boolean") return null;
-  if (typeof r.score !== "number") return null;
+  if (typeof r.score !== "number" && r.score !== null) return null;
+
+  const detail = isString(r.detail) ? r.detail : undefined;
 
   const contributions = Array.isArray(r.contributions)
     ? r.contributions
@@ -630,12 +637,24 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
         .map((d) => ({ circle_address: d.circle_address, count: d.count }))
     : [];
 
+  const events = Array.isArray(r.events)
+    ? r.events
+        .filter((e): e is { type: string; delta: number } => {
+          if (typeof e !== "object" || e === null) return false;
+          const row = e as Record<string, unknown>;
+          return isString(row.type) && typeof row.delta === "number";
+        })
+        .map((e) => ({ type: e.type, delta: e.delta }))
+    : undefined;
+
   return {
     member: r.member,
     found: r.found,
     score: r.score,
+    detail,
     contributions,
     defaults,
+    events,
     updatedAt: isString(r.updatedAt) ? r.updatedAt : null,
   };
 }

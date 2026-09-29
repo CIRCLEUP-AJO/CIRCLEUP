@@ -31,6 +31,7 @@ import type {
   ApiHealthResponse,
   ApiAuditEventsResponse,
   GetCirclesParams,
+  StateMismatch,
 } from "./types";
 import {
   validateCircleUpConfig,
@@ -248,19 +249,7 @@ function validatePollConfig(cfg: Required<PollConfig>): void {
 
 // ─── Stale-state message formatter ───────────────────────────────────────────
 
-/**
- * Build a single human-readable sentence summarising all the state fields that
- * diverged between what the caller expected and what was found on-chain.
- *
- * Used by {@link CircleClient.preflight} to populate {@link PreflightStale.message}.
- */
-function formatMismatchMessage(mismatches: readonly import("./types").StateMismatch[]): string {
-  if (mismatches.length === 0) return "State is fresh.";
-  const parts = mismatches.map(
-    (m) => `${m.field} changed from ${JSON.stringify(m.expected)} to ${JSON.stringify(m.actual)}`,
-  );
-  return `On-chain state has changed since you last loaded this page: ${parts.join("; ")}. Refresh and try again.`;
-}
+
 
 // ─── Transient RPC retry ──────────────────────────────────────────────────────
 
