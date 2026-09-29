@@ -33,7 +33,7 @@
 // lib/config.ts.
 
 import { isCanonicalStellarAddress } from "@/lib/address";
-import { isStellarPublicKey } from "@/lib/address";
+import { isStellarPublicKey, hasValidStrKeyChecksum } from "@/lib/address";
 
 // ─── Status values ────────────────────────────────────────────────────────────
 
@@ -509,7 +509,24 @@ export function parseMemberRows(raw: unknown): CircleMemberRow[] {
 
     const address =
       typeof r.member_address === "string" ? r.member_address.trim() : "";
-    if (!isStellarPublicKey(address) || addresses.has(address)) return [];
+    // Shape check (isStellarPublicKey): only G-prefixed wallet addresses are
+    // valid circle members. Contract addresses (C-prefix) and any other value
+    // are rejected here.
+    //
+    // Checksum check (hasValidStrKeyChecksum): the indexer is a trusted source,
+    // but a shape-valid address with a bad checksum is either:
+    //   (a) a data integrity problem in the indexer (bug, migration error), or
+    //   (b) a manually injected value that bypassed normal write paths.
+    // In both cases the address must not reach `new Address(member_address)` in
+    // ScVal encoding, `invokeContract`, or comparison with a real wallet address.
+    // Failing the whole list (all-or-nothing) is correct here for the same
+    // reason `isStellarPublicKey` already rejects any single bad row: dropping
+    // one member would shift every later member into the wrong payout slot.
+    if (
+      !isStellarPublicKey(address) ||
+      !hasValidStrKeyChecksum(address) ||
+      addresses.has(address)
+    ) return [];
     if (!isNonNegativeInt(r.payout_order) || positions.has(r.payout_order)) return [];
     addresses.add(address);
     positions.add(r.payout_order);
