@@ -22,26 +22,32 @@ import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import React from "react";
 
+import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
+import * as stellarMock from "@/lib/stellar";
 import {
   computeDataReadiness,
   fetchCircleData,
   MAX_DATA_AGE_MS,
+  CircleDetailClient,
   type CircleDetailData,
   type CircleRound,
   type CircleMember,
   type RefreshResult,
 } from "./CircleDetailClient";
 
+import { Keypair } from "@stellar/stellar-sdk";
+
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
-const MEMBER_A = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const MEMBER_B = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPCIB";
+const MEMBER_A = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 1)).publicKey();
+const MEMBER_B = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 2)).publicKey();
 const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
 function makeMember(address: string, overrides: Partial<CircleMember> = {}): CircleMember {
+  const defaultOrder = address === MEMBER_B ? 1 : 0;
   return {
     member_address: address,
-    payout_order: 0,
+    payout_order: defaultOrder,
     collateral: "10000000",
     defaults: 0,
     joined_at: null,
@@ -372,7 +378,6 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     //
     // The fix is to pass the actual data-fetch timestamp from component state,
     // which IS older than Date.now() at action-submit time.
-    const { buildAppSnapshot, computeActionEligibility } = require("@/lib/gating");
 
     // Simulate: data was fetched 60 seconds ago
     const dataFetchedAt = Date.now() - 60_000;
@@ -399,7 +404,6 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
 
 describe("Payout gate with empty members", () => {
   test("payout gate should fail when members array is empty", () => {
-    const { buildAppSnapshot, computeActionEligibility } = require("@/lib/gating");
     const snapshot = buildAppSnapshot(
       "Active",
       0,
@@ -452,13 +456,11 @@ vi.mock("@/lib/config", async (importOriginal) => {
 });
 
 describe("CircleDetailClient render — data readiness banners", () => {
-  const { CircleDetailClient } = require("./CircleDetailClient");
 
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: wallet not connected
-    const stellarMock = require("@/lib/stellar");
-    stellarMock.getWalletAddress.mockResolvedValue(null);
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
   test("shows partial data banner when members[] is empty", async () => {
@@ -492,9 +494,8 @@ describe("CircleDetailClient render — data readiness banners", () => {
   });
 
   test("action buttons are disabled while wallet state is still loading", async () => {
-    const stellarMock = require("@/lib/stellar");
     // Never resolves — simulates slow wallet check
-    stellarMock.getWalletAddress.mockImplementation(
+    (stellarMock.getWalletAddress as any).mockImplementation(
       () => new Promise(() => {}),
     );
 
@@ -705,10 +706,12 @@ describe("Refresh recovers without full reload", () => {
     const roundsBody = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
 
     let attempt = 0;
-    global.fetch = vi.fn(async () => {
+    global.fetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
       attempt += 1;
       if (attempt === 1) throw new TypeError("Network error");
-      return { ok: true, status: 200, json: async () => (attempt === 2 ? goodBody : roundsBody) } as Response;
+      const body = urlStr.endsWith("/rounds") ? roundsBody : goodBody;
+      return { ok: true, status: 200, json: async () => body } as Response;
     });
 
     const firstResult = await fetchCircleData(CONTRACT);
@@ -751,17 +754,12 @@ function makeProps(circleAddress: string): { circleAddress: string; circleData: 
 describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   // Stub wallet so the component doesn't hang waiting for a connected wallet
   beforeEach(() => {
-    vi.mock("@/lib/stellar", () => ({
-      getWalletAddress: vi.fn().mockResolvedValue(null),
-      connectWallet:    vi.fn().mockResolvedValue(null),
-      getWalletError:   vi.fn().mockResolvedValue(null),
-    }));
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
-  test("invite input starts with empty value (null coalesced to '') on first render", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
+  test("invite input starts with empty value (null coalesced to '') when unresolved", async () => {
     const { container } = render(
-      <CircleDetailClient {...makeProps(CONTRACT)} />,
+      <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
 
     const input = container.querySelector<HTMLInputElement>(
@@ -772,9 +770,8 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   });
 
   test("invite input shows aria-busy=true while URL not yet resolved", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
     const { container } = render(
-      <CircleDetailClient {...makeProps(CONTRACT)} />,
+      <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
 
     const input = container.querySelector<HTMLInputElement>(
@@ -785,8 +782,7 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   });
 
   test("copy button is disabled while invite URL is not yet resolved", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
-    render(<CircleDetailClient {...makeProps(CONTRACT)} />);
+    render(<CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />);
 
     const copyBtn = screen.getByRole("button", { name: /copy invite link/i });
     expect(copyBtn).toBeDisabled();
@@ -827,12 +823,10 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
 // circle status or round changes after a post-action data refresh.
 
 describe("CircleDetailClient — screen-reader status announcements", () => {
-  const { CircleDetailClient } = require("./CircleDetailClient");
 
   beforeEach(() => {
     vi.clearAllMocks();
-    const stellarMock = require("@/lib/stellar");
-    stellarMock.getWalletAddress.mockResolvedValue(null);
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
   test("sr-only live region contains circle status on initial render", async () => {

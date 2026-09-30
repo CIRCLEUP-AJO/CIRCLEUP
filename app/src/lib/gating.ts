@@ -335,6 +335,9 @@ export function computeActionEligibility(
   const nowMs  = opts.nowMs  ?? Date.now();
   const maxAge = opts.maxSnapshotAgeMs ?? DEFAULT_MAX_SNAPSHOT_AGE_MS;
 
+  const netGate = checkNetworkGate(snapshot);
+  if (netGate) return netGate;
+
   switch (action) {
     case "join":       return gateJoin(snapshot, nowMs, maxAge);
     case "contribute": return gateContribute(snapshot, nowMs, maxAge);

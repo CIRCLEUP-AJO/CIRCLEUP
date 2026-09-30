@@ -43,6 +43,14 @@ export type CircleLifecycleStatus =
   | "Cancelled"
   | "Closed";
 
+export const CIRCLE_STATUS_OPTIONS = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+  "Closed",
+] as const;
+
 /** Contract-native statuses (without the indexer's Closed projection). */
 export type ContractCircleStatus = "Pending" | "Active" | "Completed" | "Cancelled";
 
@@ -279,15 +287,17 @@ export function nextActionHint(
 
 // ─── Indexer status mapping ──────────────────────────────────────────────────
 
-/**
- * Maps an indexer status string to the canonical lifecycle status.
- * The indexer may return "Closed" which is not in the contract enum but is
- * a valid lifecycle status for query convenience.
- */
-export function normalizeStatus(raw: string): CircleLifecycleStatus | null {
+export function normalizeStatus(raw: string): CircleLifecycleStatus | undefined {
+  if (!raw) return undefined;
   const valid: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-  if (valid.includes(raw as CircleLifecycleStatus)) {
-    return raw as CircleLifecycleStatus;
+  const lower = raw.trim().toLowerCase();
+  return valid.find((s) => s.toLowerCase() === lower);
+}
+
+export function assertValidStatus(raw: string): CircleLifecycleStatus {
+  const norm = normalizeStatus(raw);
+  if (!norm) {
+    throw new Error(`Invalid circle lifecycle status: ${raw}`);
   }
-  return null;
+  return norm;
 }
