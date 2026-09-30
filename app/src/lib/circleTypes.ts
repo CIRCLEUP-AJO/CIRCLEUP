@@ -370,7 +370,8 @@ export interface ReputationResponse {
   member: string;
   /** true when a reputation row exists; false means no activity recorded yet. */
   found: boolean;
-  score: number;
+  score: number | null;
+  detail?: string;
   contributions: Array<{
     circle_address: string;
     contributions: number;
@@ -670,7 +671,9 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
 
   if (!isNonEmptyString(r.member)) return null;
   if (typeof r.found !== "boolean") return null;
-  if (typeof r.score !== "number") return null;
+  if (typeof r.score !== "number" && r.score !== null) return null;
+
+  const detail = isString(r.detail) ? r.detail : undefined;
 
   const contributions = Array.isArray(r.contributions)
     ? r.contributions
@@ -716,6 +719,7 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
     member: r.member,
     found: r.found,
     score: r.score,
+    detail,
     contributions,
     defaults,
     ...(events ? { events } : {}),

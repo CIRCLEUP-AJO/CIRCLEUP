@@ -135,13 +135,9 @@ async function lookupReputationMember(member: string): Promise<MemberLookup> {
       contributions?: unknown;
       defaults?: unknown;
     };
-    const contributions = Array.isArray(data.contributions)
-      ? data.contributions.length
-      : 0;
-    const defaults = Array.isArray(data.defaults) ? data.defaults.length : 0;
     return {
       ok: true,
-      known: data.found === true || contributions > 0 || defaults > 0,
+      known: typeof data === "object" && data !== null,
     };
   } catch {
     return { ok: false };
