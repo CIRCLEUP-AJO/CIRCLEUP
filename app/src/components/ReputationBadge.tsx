@@ -239,27 +239,35 @@ export function ReputationLegend() {
           </tr>
         </thead>
         <tbody>
-          {REPUTATION_LEVELS.map((level) => (
-            <tr key={level.label} className="border-b border-slate-100 last:border-0">
-              <th scope="row" className="py-2 pr-3 font-normal text-slate-700">
-                <span
-                  aria-hidden="true"
-                  className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${level.color}`}
+          {REPUTATION_LEVELS.map((level) => {
+            const rangeStr =
+              level.maxScore === Infinity
+                ? `${level.minScore}+`
+                : level.maxScore - level.minScore === 1
+                ? `${level.minScore}`
+                : `${level.minScore}–${level.maxScore - 1}`;
+
+            return (
+              <tr key={level.label} className="border-b border-slate-100 last:border-0">
+                <th scope="row" className="py-2 pr-3 font-normal text-slate-700">
+                  <span className="sr-only">{level.label}</span>
+                  <span
+                    className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${level.color}`}
+                  >
+                    <span aria-hidden="true" className="font-mono leading-none">{level.marker}</span>
+                    <span>{level.label}</span>
+                  </span>
+                </th>
+                <td
+                  className="py-2 pr-3 text-slate-600"
+                  aria-label={`Score range: ${rangeStr}`}
                 >
-                  <span className="font-mono leading-none">{level.marker}</span>
-                  {level.label}
-                </span>
-              </th>
-              <td className="py-2 pr-3 text-slate-600">
-                {level.maxScore === Infinity
-                  ? `${level.minScore}+`
-                  : level.maxScore - level.minScore === 1
-                  ? `${level.minScore}`
-                  : `${level.minScore}–${level.maxScore - 1}`}
-              </td>
-              <td className="py-2 text-slate-600">{level.description}</td>
-            </tr>
-          ))}
+                  {rangeStr}
+                </td>
+                <td className="py-2 text-slate-600">{level.description}</td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </section>

@@ -11,7 +11,7 @@ import { WalletRepLink } from "@/components/WalletRepLink";
 // Component that cannot access the request object directly in the App Router
 // metadata export.
 
-export const SITE_URL =
+const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") || "http://localhost:3000";
 
 export const metadata: Metadata = {
