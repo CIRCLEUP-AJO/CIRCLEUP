@@ -68,6 +68,72 @@ export function isCircleApiStatus(value: unknown): value is CircleApiStatus {
   );
 }
 
+export const CIRCLE_STATUS_OPTIONS = CIRCLE_API_STATUSES;
+export type CircleStatusFilter = CircleApiStatus;
+export const isValidStatusFilter = isCircleApiStatus;
+
+/** Returns true when `url` is a valid http or https URL. */
+export function isValidUrl(url: string): boolean {
+  if (!url || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+export interface ProtocolGuarantee {
+  emoji: string;
+  title: string;
+  desc: string;
+}
+
+export const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
+  {
+    emoji: "🔒",
+    title: "No rug-pulls",
+    desc: "The smart contract holds all funds until payout. No single member or organizer can withdraw money prematurely.",
+  },
+  {
+    emoji: "🔄",
+    title: "Deterministic rotation",
+    desc: "Payout order and rotation schedule are fixed on-chain upon circle creation and cannot be tampered with.",
+  },
+  {
+    emoji: "🛡️",
+    title: "Collateral-backed defaults",
+    desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
+  },
+  {
+    emoji: "⭐",
+    title: "On-chain reputation",
+    desc: "Successful contributions build an immutable reputation score across circles on the Stellar network.",
+  },
+] as const;
+
+export type BrowseState =
+  | { kind: "browse"; count: number }
+  | { kind: "empty" }
+  | { kind: "unavailable" };
+
+/**
+ * Decides what the hero's secondary call-to-action should offer.
+ */
+export function getBrowseState(
+  result: { ok: boolean; circles?: unknown[]; total?: number } | null,
+): BrowseState {
+  if (!result || !result.ok) return { kind: "unavailable" };
+  const total =
+    typeof result.total === "number"
+      ? result.total
+      : Array.isArray(result.circles)
+        ? result.circles.length
+        : 0;
+  if (total === 0) return { kind: "empty" };
+  return { kind: "browse", count: total };
+}
+
 // ─── Circle row (list + detail) ───────────────────────────────────────────────
 
 /**
@@ -252,7 +318,7 @@ export interface RoundsResponse {
  * @see ApiCircleDetailWithRoundsResponse in sdk/src/types.ts
  */
 export interface CircleDetailData {
-  circle: CircleRow;
+  circle: CircleState;
   members: CircleMemberRow[];
   /**
    * Completed rounds only (status === "completed"), sorted by roundIndex.
@@ -295,6 +361,11 @@ export interface CircleState {
  *
  * @see ApiReputationResponse in sdk/src/types.ts
  */
+export interface ReputationEvent {
+  type: string;
+  delta: number;
+}
+
 export interface ReputationResponse {
   member: string;
   /** true when a reputation row exists; false means no activity recorded yet. */
@@ -310,10 +381,7 @@ export interface ReputationResponse {
     circle_address: string;
     count: number;
   }>;
-  events?: Array<{
-    type: string;
-    delta: number;
-  }>;
+  events?: ReputationEvent[];
   updatedAt: string | null;
 }
 
@@ -639,10 +707,10 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
 
   const events = Array.isArray(r.events)
     ? r.events
-        .filter((e): e is { type: string; delta: number } => {
+        .filter((e): e is ReputationEvent => {
           if (typeof e !== "object" || e === null) return false;
           const row = e as Record<string, unknown>;
-          return isString(row.type) && typeof row.delta === "number";
+          return typeof row.type === "string" && typeof row.delta === "number";
         })
         .map((e) => ({ type: e.type, delta: e.delta }))
     : undefined;
@@ -654,7 +722,7 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
     detail,
     contributions,
     defaults,
-    events,
+    ...(events ? { events } : {}),
     updatedAt: isString(r.updatedAt) ? r.updatedAt : null,
   };
 }
