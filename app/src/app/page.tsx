@@ -6,7 +6,12 @@ import { indexerEndpoint, INDEXER_TIMEOUT_MS } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
-import { CircleStatusFilter } from "@/components/CircleStatusFilter";
+import { CircleStatusFilter as CircleStatusFilterNav } from "@/components/CircleStatusFilter";
+import {
+  isValidStatusFilter,
+  getBrowseState,
+  type CircleStatusFilter,
+} from "@/lib/circleTypes";
 
 export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
@@ -30,33 +35,7 @@ export const metadata: Metadata = {
   },
 };
 
-// ─── Status filter types ──────────────────────────────────────────────────────
 
-/**
- * The full set of status values accepted by GET /circles?status=.
- * Mirrors the CIRCLE_STATUSES constant in indexer/src/api.ts.
- * "Closed" is an indexer-only projection (not a contract enum variant).
- */
-export const CIRCLE_STATUS_OPTIONS = [
-  "Pending",
-  "Active",
-  "Completed",
-  "Cancelled",
-  "Closed",
-] as const;
-
-export type CircleStatusFilter = (typeof CIRCLE_STATUS_OPTIONS)[number];
-
-/**
- * Returns true when `value` is a recognised status filter value.
- * Used to guard the raw searchParams string before it reaches the fetch call.
- */
-export function isValidStatusFilter(value: unknown): value is CircleStatusFilter {
-  return (
-    typeof value === "string" &&
-    (CIRCLE_STATUS_OPTIONS as readonly string[]).includes(value)
-  );
-}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -72,7 +51,7 @@ type FetchResult =
  * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
  * identical to a real network failure and gives no actionable guidance.
  */
-export function isValidUrl(url: string): boolean {
+function isValidUrl(url: string): boolean {
   if (!url || url.trim() === "") return false;
   try {
     const parsed = new URL(url);
@@ -339,24 +318,37 @@ async function CircleCount({
   );
 }
 
-// ─── Hero call-to-action ──────────────────────────────────────────────────────
-
-type BrowseState =
-  | { kind: "browse"; count: number }
-  | { kind: "empty" }
-  | { kind: "unavailable" };
-
-/**
- * Decides what the hero's secondary call-to-action should offer.
- *
- * Uses the unfiltered list so the hero always reflects the global state of the
- * platform, independent of any status filter the user has selected.
- */
-export function getBrowseState(result: FetchResult | null): BrowseState {
-  if (!result || !result.ok) return { kind: "unavailable" };
-  if (result.total === 0) return { kind: "empty" };
-  return { kind: "browse", count: result.total };
+interface ProtocolGuarantee {
+  emoji: string;
+  title: string;
+  desc: string;
 }
+
+const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
+  {
+    emoji: "🔒",
+    title: "No rug-pulls",
+    desc: "The smart contract holds all funds until payout. No single member or organizer can withdraw money prematurely.",
+  },
+  {
+    emoji: "🔄",
+    title: "Deterministic rotation",
+    desc: "Payout order and rotation schedule are fixed on-chain upon circle creation and cannot be tampered with.",
+  },
+  {
+    emoji: "🛡️",
+    title: "Collateral-backed defaults",
+    desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
+  },
+  {
+    emoji: "⭐",
+    title: "On-chain reputation",
+    desc: "Successful contributions build an immutable reputation score across circles on the Stellar network.",
+  },
+] as const;
+
+
+
 
 /**
  * Shared button geometry so the two CTAs line up and share focus styling.

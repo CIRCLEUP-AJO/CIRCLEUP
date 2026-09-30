@@ -979,6 +979,8 @@ export interface TxFailure {
    * supplied none or nothing survived sanitisation.
    */
   readonly metadata?: TxMetadata;
+  /** Present when errorCode is "stale_state". Lists the mismatched fields. */
+  readonly mismatches?: readonly StateMismatch[];
 }
 
 /** Discriminated union of all possible transaction outcomes. */

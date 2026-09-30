@@ -281,13 +281,20 @@ export function nextActionHint(
 
 /**
  * Maps an indexer status string to the canonical lifecycle status.
- * The indexer may return "Closed" which is not in the contract enum but is
- * a valid lifecycle status for query convenience.
+ * Returns undefined when the status is unrecognized.
  */
-export function normalizeStatus(raw: string): CircleLifecycleStatus | null {
+export function normalizeStatus(raw: string): CircleLifecycleStatus | undefined {
   const valid: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
-  if (valid.includes(raw as CircleLifecycleStatus)) {
-    return raw as CircleLifecycleStatus;
-  }
-  return null;
+  const match = valid.find((s) => s.toLowerCase() === raw?.trim().toLowerCase());
+  return match ?? undefined;
 }
+
+/**
+ * Throws an error when status is not a valid CircleLifecycleStatus.
+ */
+export function assertValidStatus(status: string): void {
+  if (!normalizeStatus(status)) {
+    throw new Error(`Invalid circle status: "${status}"`);
+  }
+}
+
