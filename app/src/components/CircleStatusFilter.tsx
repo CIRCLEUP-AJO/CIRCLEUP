@@ -3,8 +3,8 @@
 import { useRouter, usePathname } from "next/navigation";
 import { useTransition } from "react";
 import clsx from "clsx";
-import type { CircleStatusFilter as StatusFilter } from "@/app/page";
-import { CIRCLE_STATUS_OPTIONS } from "@/app/page";
+import type { CircleStatusFilter as StatusFilter } from "@/lib/circleTypes";
+import { CIRCLE_STATUS_OPTIONS } from "@/lib/circleTypes";
 
 // ─── Label + colour map ───────────────────────────────────────────────────────
 
