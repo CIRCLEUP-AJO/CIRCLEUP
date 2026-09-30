@@ -69,6 +69,8 @@ mod error_path_tests; // no swallowed errors / defaulted counters (issue #567)
 mod transfer_failure_tests; // failed token transfer handling (issue #573)
 #[cfg(test)]
 mod issue_fixes_tests; // targeted fixes: #552 #553 #554 #555
+#[cfg(test)]
+mod lifecycle_invariant_tests; // settle_round, deadline boundary, close arithmetic, reputation rollback (issue #631)
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
