@@ -1354,6 +1354,10 @@ export interface ApiReputationResponse {
     /** Number of rounds the member has defaulted in this circle. */
     count: number;
   }>;
+  events?: Array<{
+    type: string;
+    delta: number;
+  }>;
   updatedAt: string | null;
 }
 
