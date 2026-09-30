@@ -68,22 +68,7 @@ import type {
 
 /**
  * Build a human-readable summary of which on-chain fields diverged during a
- * stale-write preflight check.
- *
- * The message is designed for display in a UI toast or error banner — it lists
- * every mismatch on its own line so the user can see exactly what changed and
- * why their action was blocked.
- */
-function formatMismatchMessage(mismatches: readonly StateMismatch[]): string {
-  const lines = mismatches.map(
-    (m) => `  • ${m.field}: expected ${JSON.stringify(m.expected)}, got ${JSON.stringify(m.actual)}`,
-  );
-  return (
-    `The circle state changed since your last update. ` +
-    `The following fields no longer match:\n${lines.join("\n")}\n` +
-    `Refresh and try again.`
-  );
-}
+
 
 // ─── Polling configuration ────────────────────────────────────────────────────
 
@@ -249,7 +234,19 @@ function validatePollConfig(cfg: Required<PollConfig>): void {
 
 // ─── Stale-state message formatter ───────────────────────────────────────────
 
-
+/**
+ * Build a single human-readable sentence summarising all the state fields that
+ * diverged between what the caller expected and what was found on-chain.
+ *
+ * Used by {@link CircleClient.preflight} to populate {@link PreflightStale.message}.
+ */
+function formatMismatchMessage(mismatches: readonly StateMismatch[]): string {
+  if (mismatches.length === 0) return "State is fresh.";
+  const parts = mismatches.map(
+    (m) => `${m.field} changed from ${JSON.stringify(m.expected)} to ${JSON.stringify(m.actual)}`,
+  );
+  return `On-chain state has changed since you last loaded this page: ${parts.join("; ")}. Refresh and try again.`;
+}
 
 // ─── Transient RPC retry ──────────────────────────────────────────────────────
 

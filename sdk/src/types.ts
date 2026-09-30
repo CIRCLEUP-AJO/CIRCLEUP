@@ -979,9 +979,7 @@ export interface TxFailure {
    * supplied none or nothing survived sanitisation.
    */
   readonly metadata?: TxMetadata;
-  /**
-   * Field mismatches detected when preflight failed due to a stale-write attempt.
-   */
+  /** Present when errorCode is "stale_state". Lists the mismatched fields. */
   readonly mismatches?: readonly StateMismatch[];
 }
 
@@ -1357,6 +1355,10 @@ export interface ApiReputationResponse {
     circle_address: string;
     /** Number of rounds the member has defaulted in this circle. */
     count: number;
+  }>;
+  events?: Array<{
+    type: string;
+    delta: number;
   }>;
   updatedAt: string | null;
 }
