@@ -20,8 +20,10 @@ export async function generateMetadata({
 }: {
   params: { member: string };
 }): Promise<Metadata> {
-  // Guard: only accept well-formed Stellar/Soroban addresses
-  if (!isCanonicalStellarAddress(params.member)) {
+  const memberParam = typeof params?.member === "string" ? params.member.trim() : "";
+  const safeMember = isCanonicalStellarAddress(memberParam) ? memberParam : null;
+
+  if (!safeMember) {
     return {
       title: "Reputation — CircleUp",
       description: "On-chain reputation score and contribution history on CircleUp.",
@@ -33,27 +35,40 @@ export async function generateMetadata({
     };
   }
 
-  const short = shortAddress(params.member);
+  const lookup = await lookupReputationMember(safeMember);
+  if (lookup.ok && !lookup.known) {
+    return {
+      title: "Member Not Found — CircleUp",
+      description: "The requested member address has no recorded activity on CircleUp.",
+      twitter: {
+        card: "summary",
+        title: "Member Not Found — CircleUp",
+        description: "The requested member address has no recorded activity on CircleUp.",
+      },
+    };
+  }
+
+  const short = shortAddress(safeMember);
   return {
-    title: `Reputation: ${short}`,
+    title: `Reputation: ${short} — CircleUp`,
     description:
-      `On-chain reputation score and circle participation history for ${params.member} on CircleUp. ` +
+      `On-chain reputation score and circle participation history for ${safeMember} on CircleUp. ` +
       `View completed rounds, defaults, and contribution records.`,
     alternates: {
-      canonical: `/reputation/${params.member}`,
+      canonical: `/reputation/${safeMember}`,
     },
     openGraph: {
       title: `Reputation: ${short} — CircleUp`,
       description:
-        `On-chain reputation score and circle participation history for ${params.member} on CircleUp.`,
-      url: `/reputation/${params.member}`,
+        `On-chain reputation score and circle participation history for ${safeMember} on CircleUp.`,
+      url: `/reputation/${safeMember}`,
       type: "profile",
     },
     twitter: {
       card: "summary",
       title: `Reputation: ${short} — CircleUp`,
       description:
-        `On-chain reputation score and circle participation history for ${params.member} on CircleUp.`,
+        `On-chain reputation score and circle participation history for ${safeMember} on CircleUp.`,
     },
   };
 }
@@ -120,13 +135,9 @@ async function lookupReputationMember(member: string): Promise<MemberLookup> {
       contributions?: unknown;
       defaults?: unknown;
     };
-    const contributions = Array.isArray(data.contributions)
-      ? data.contributions.length
-      : 0;
-    const defaults = Array.isArray(data.defaults) ? data.defaults.length : 0;
     return {
       ok: true,
-      known: data.found === true || contributions > 0 || defaults > 0,
+      known: typeof data === "object" && data !== null,
     };
   } catch {
     return { ok: false };

@@ -6,7 +6,12 @@ import { indexerEndpoint, INDEXER_TIMEOUT_MS } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
-import { CircleStatusFilter } from "@/components/CircleStatusFilter";
+import { CircleStatusFilter as CircleStatusFilterNav } from "@/components/CircleStatusFilter";
+import {
+  isValidStatusFilter,
+  getBrowseState,
+  type CircleStatusFilter,
+} from "@/lib/circleTypes";
 
 export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
@@ -298,7 +303,35 @@ async function CircleCount({
   );
 }
 
-// ─── Hero call-to-action ──────────────────────────────────────────────────────
+interface ProtocolGuarantee {
+  emoji: string;
+  title: string;
+  desc: string;
+}
+
+const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
+  {
+    emoji: "🔒",
+    title: "No rug-pulls",
+    desc: "The smart contract holds all funds until payout. No single member or organizer can withdraw money prematurely.",
+  },
+  {
+    emoji: "🔄",
+    title: "Deterministic rotation",
+    desc: "Payout order and rotation schedule are fixed on-chain upon circle creation and cannot be tampered with.",
+  },
+  {
+    emoji: "🛡️",
+    title: "Collateral-backed defaults",
+    desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
+  },
+  {
+    emoji: "⭐",
+    title: "On-chain reputation",
+    desc: "Successful contributions build an immutable reputation score across circles on the Stellar network.",
+  },
+] as const;
+
 
 
 

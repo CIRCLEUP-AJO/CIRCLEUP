@@ -31,6 +31,7 @@ import type {
   ApiHealthResponse,
   ApiAuditEventsResponse,
   GetCirclesParams,
+  StateMismatch,
 } from "./types";
 import {
   validateCircleUpConfig,
@@ -67,22 +68,7 @@ import type {
 
 /**
  * Build a human-readable summary of which on-chain fields diverged during a
- * stale-write preflight check.
- *
- * The message is designed for display in a UI toast or error banner — it lists
- * every mismatch on its own line so the user can see exactly what changed and
- * why their action was blocked.
- */
-function formatMismatchMessage(mismatches: readonly StateMismatch[]): string {
-  const lines = mismatches.map(
-    (m) => `  • ${m.field}: expected ${JSON.stringify(m.expected)}, got ${JSON.stringify(m.actual)}`,
-  );
-  return (
-    `The circle state changed since your last update. ` +
-    `The following fields no longer match:\n${lines.join("\n")}\n` +
-    `Refresh and try again.`
-  );
-}
+
 
 // ─── Polling configuration ────────────────────────────────────────────────────
 

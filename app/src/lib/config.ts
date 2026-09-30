@@ -89,11 +89,23 @@ export function getMalformedContractAddresses(
  * passphrase (or vice versa) will silently reject every transaction.  Returns
  * one diagnostic string per conflict.  Exported for unit testing.
  *
- * Detection is heuristic: it looks for "testnet" in the RPC hostname and
- * compares the passphrase against the two well-known public network strings.
+ * Detection is heuristic. Two signals are used in combination:
+ *
+ *  1. "testnet" in the RPC hostname → the URL is likely pointing at testnet.
+ *  2. The passphrase matches one of the two canonical public Stellar networks.
+ *
  * Custom or private networks that happen to use these patterns are out of
  * scope — operators running non-standard networks should set matching values
- * and this function will produce no output.
+ * and this function will produce no output for unrecognised passphrases.
+ *
+ * Both mismatch directions are checked:
+ *  - Mainnet passphrase + testnet RPC  → every tx will be rejected by the network.
+ *  - Testnet passphrase + mainnet RPC  → every tx will be rejected by the network.
+ *
+ * The passphrase must also be validated as a recognised known value; an
+ * unrecognised passphrase is flagged separately so operators on private
+ * networks are told what the recognised values are rather than seeing a silent
+ * pass that may mask a typo.
  */
 export function getNetworkConflicts(
   env: Record<string, string | undefined> = process.env as Record<
@@ -108,8 +120,31 @@ export function getNetworkConflicts(
   if (!rpcUrl || !passphrase) return conflicts;
 
   const rpcIsTestnet = /testnet/i.test(rpcUrl);
+  // "mainnet" in the URL or the well-known horizon/soroban mainnet hostnames.
+  const rpcIsMainnet =
+    /mainnet/i.test(rpcUrl) ||
+    (rpcUrl.includes("soroban.stellar.org") && !rpcIsTestnet) ||
+    rpcUrl.includes("horizon.stellar.org");
+
   const passphraseIsMainnet = passphrase === MAINNET_PASSPHRASE;
   const passphraseIsTestnet = passphrase === TESTNET_PASSPHRASE;
+
+  // Flag an entirely unrecognised passphrase so operators on standard networks
+  // catch typos before they deploy. Private/custom networks are deliberately
+  // exempt — if neither canonical passphrase matches we produce no output.
+  if (
+    passphrase !== "" &&
+    !passphraseIsMainnet &&
+    !passphraseIsTestnet
+  ) {
+    conflicts.push(
+      `NEXT_PUBLIC_NETWORK_PASSPHRASE "${passphrase}" is not a recognised Stellar network passphrase. ` +
+        `Expected "${TESTNET_PASSPHRASE}" for testnet or "${MAINNET_PASSPHRASE}" for mainnet. ` +
+        `Every transaction will be rejected. Correct the passphrase or leave this message if you are using a private network.`,
+    );
+    // Cannot determine direction mismatch for an unknown passphrase — stop here.
+    return conflicts;
+  }
 
   if (passphraseIsMainnet && rpcIsTestnet) {
     conflicts.push(
@@ -119,7 +154,7 @@ export function getNetworkConflicts(
     );
   }
 
-  if (passphraseIsTestnet && !rpcIsTestnet && rpcUrl.includes("soroban.stellar.org")) {
+  if (passphraseIsTestnet && rpcIsMainnet) {
     conflicts.push(
       `NEXT_PUBLIC_NETWORK_PASSPHRASE is the testnet passphrase but ` +
         `NEXT_PUBLIC_STELLAR_RPC_URL appears to target mainnet ("${rpcUrl}"). ` +
