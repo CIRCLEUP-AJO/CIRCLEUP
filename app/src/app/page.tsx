@@ -6,17 +6,12 @@ import { indexerEndpoint, INDEXER_TIMEOUT_MS } from "@/lib/config";
 import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
+import { CircleStatusFilter as CircleStatusFilterNav } from "@/components/CircleStatusFilter";
 import {
-  CircleStatusFilter,
-  CIRCLE_STATUS_OPTIONS,
   isValidStatusFilter,
-} from "@/components/CircleStatusFilter";
-import {
   getBrowseState,
-  isValidUrl,
-  PROTOCOL_GUARANTEES,
-} from "@/lib/home";
-import type { FetchResult, BrowseState } from "@/lib/home";
+  type CircleStatusFilter,
+} from "@/lib/circleTypes";
 
 export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
@@ -39,6 +34,32 @@ export const metadata: Metadata = {
       "Ajo, Esusu, Tanda, and Chama on Stellar. Everyone pays in once a round, and the contract hands the whole pot to whoever's turn it is.",
   },
 };
+
+
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type FetchResult =
+  | { ok: true; circles: Circle[]; total: number }
+  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage" };
+
+// ─── URL validation ───────────────────────────────────────────────────────────
+
+/**
+ * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
+ * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
+ * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
+ * identical to a real network failure and gives no actionable guidance.
+ */
+function isValidUrl(url: string): boolean {
+  if (!url || url.trim() === "") return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
@@ -297,7 +318,35 @@ async function CircleCount({
   );
 }
 
-// ─── Hero call-to-action ──────────────────────────────────────────────────────
+interface ProtocolGuarantee {
+  emoji: string;
+  title: string;
+  desc: string;
+}
+
+const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
+  {
+    emoji: "🔒",
+    title: "No rug-pulls",
+    desc: "The smart contract holds all funds until payout. No single member or organizer can withdraw money prematurely.",
+  },
+  {
+    emoji: "🔄",
+    title: "Deterministic rotation",
+    desc: "Payout order and rotation schedule are fixed on-chain upon circle creation and cannot be tampered with.",
+  },
+  {
+    emoji: "🛡️",
+    title: "Collateral-backed defaults",
+    desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
+  },
+  {
+    emoji: "⭐",
+    title: "On-chain reputation",
+    desc: "Successful contributions build an immutable reputation score across circles on the Stellar network.",
+  },
+] as const;
+
 
 
 

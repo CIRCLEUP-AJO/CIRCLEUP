@@ -12,7 +12,7 @@
  *   - checkNetworkMismatch: match, mismatch, unknown, unsupported, provider_error
  *   - describeNetworkMismatch: all five result kinds
  */
-import { describe, test, expect } from "vitest";
+import { test, describe } from "vitest";
 import assert from "node:assert/strict";
 import {
   detectWalletCapabilities,
