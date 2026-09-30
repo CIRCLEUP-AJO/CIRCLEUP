@@ -242,6 +242,7 @@ export function ReputationLegend() {
           {REPUTATION_LEVELS.map((level) => (
             <tr key={level.label} className="border-b border-slate-100 last:border-0">
               <th scope="row" className="py-2 pr-3 font-normal text-slate-700">
+                <span className="sr-only">{level.label}</span>
                 <span
                   aria-hidden="true"
                   className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${level.color}`}
@@ -250,7 +251,16 @@ export function ReputationLegend() {
                   {level.label}
                 </span>
               </th>
-              <td className="py-2 pr-3 text-slate-600">
+              <td
+                className="py-2 pr-3 text-slate-600"
+                aria-label={`Score range: ${
+                  level.maxScore === Infinity
+                    ? `${level.minScore}+`
+                    : level.maxScore - level.minScore === 1
+                    ? `${level.minScore}`
+                    : `${level.minScore}–${level.maxScore - 1}`
+                }`}
+              >
                 {level.maxScore === Infinity
                   ? `${level.minScore}+`
                   : level.maxScore - level.minScore === 1

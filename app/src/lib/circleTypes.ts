@@ -252,7 +252,7 @@ export interface RoundsResponse {
  * @see ApiCircleDetailWithRoundsResponse in sdk/src/types.ts
  */
 export interface CircleDetailData {
-  circle: CircleRow;
+  circle: CircleState;
   members: CircleMemberRow[];
   /**
    * Completed rounds only (status === "completed"), sorted by roundIndex.
@@ -310,6 +310,11 @@ export interface ReputationResponse {
     count: number;
   }>;
   updatedAt: string | null;
+  events?: Array<{
+    type: string;
+    delta: number;
+    timestamp?: string;
+  }>;
 }
 
 // ─── Runtime validators ────────────────────────────────────────────────────────
@@ -630,6 +635,20 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
         .map((d) => ({ circle_address: d.circle_address, count: d.count }))
     : [];
 
+  const events = Array.isArray(r.events)
+    ? r.events
+        .filter((e): e is { type: string; delta: number; timestamp?: string } => {
+          if (typeof e !== "object" || e === null) return false;
+          const row = e as Record<string, unknown>;
+          return typeof row.type === "string" && typeof row.delta === "number";
+        })
+        .map((e) => ({
+          type: e.type,
+          delta: e.delta,
+          ...(typeof e.timestamp === "string" ? { timestamp: e.timestamp } : {}),
+        }))
+    : undefined;
+
   return {
     member: r.member,
     found: r.found,
@@ -637,5 +656,6 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
     contributions,
     defaults,
     updatedAt: isString(r.updatedAt) ? r.updatedAt : null,
+    ...(events ? { events } : {}),
   };
 }

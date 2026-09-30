@@ -30,57 +30,16 @@ export const metadata: Metadata = {
   },
 };
 
-// ─── Status filter types ──────────────────────────────────────────────────────
-
-/**
- * The full set of status values accepted by GET /circles?status=.
- * Mirrors the CIRCLE_STATUSES constant in indexer/src/api.ts.
- * "Closed" is an indexer-only projection (not a contract enum variant).
- */
-export const CIRCLE_STATUS_OPTIONS = [
-  "Pending",
-  "Active",
-  "Completed",
-  "Cancelled",
-  "Closed",
-] as const;
-
-export type CircleStatusFilter = (typeof CIRCLE_STATUS_OPTIONS)[number];
-
-/**
- * Returns true when `value` is a recognised status filter value.
- * Used to guard the raw searchParams string before it reaches the fetch call.
- */
-export function isValidStatusFilter(value: unknown): value is CircleStatusFilter {
-  return (
-    typeof value === "string" &&
-    (CIRCLE_STATUS_OPTIONS as readonly string[]).includes(value)
-  );
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type FetchResult =
-  | { ok: true; circles: Circle[]; total: number }
-  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage" };
-
-// ─── URL validation ───────────────────────────────────────────────────────────
-
-/**
- * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
- * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
- * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
- * identical to a real network failure and gives no actionable guidance.
- */
-export function isValidUrl(url: string): boolean {
-  if (!url || url.trim() === "") return false;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
+import {
+  CIRCLE_STATUS_OPTIONS,
+  isValidStatusFilter,
+  isValidUrl,
+  PROTOCOL_GUARANTEES,
+  getBrowseState,
+  type CircleStatusFilter as StatusFilterType,
+  type BrowseState,
+  type FetchResult,
+} from "@/lib/homeHero";
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
@@ -96,7 +55,7 @@ export function isValidUrl(url: string): boolean {
  * `total` comes from the indexer's pagination envelope so the heading can
  * show the accurate filtered count without a second request.
  */
-function makeGetCircles(status: CircleStatusFilter | undefined) {
+function makeGetCircles(status: StatusFilterType | undefined) {
   const cacheKey = status ? `circles-homepage-${status}` : "circles-homepage";
 
   return unstable_cache(
@@ -252,7 +211,7 @@ function CircleListSkeleton() {
 async function CirclesList({
   status,
 }: {
-  status: CircleStatusFilter | undefined;
+  status: StatusFilterType | undefined;
 }) {
   const getCircles = makeGetCircles(status);
   const result = await getCircles();
@@ -304,7 +263,7 @@ async function CirclesList({
 async function CirclesListWithRetry({
   status,
 }: {
-  status: CircleStatusFilter | undefined;
+  status: StatusFilterType | undefined;
 }) {
   const getCircles = makeGetCircles(status);
   const result = await getCircles().catch(() => null);
@@ -326,7 +285,7 @@ async function CirclesListWithRetry({
 async function CircleCount({
   status,
 }: {
-  status: CircleStatusFilter | undefined;
+  status: StatusFilterType | undefined;
 }) {
   const getCircles = makeGetCircles(status);
   const result = await getCircles().catch(() => null);
@@ -341,22 +300,7 @@ async function CircleCount({
 
 // ─── Hero call-to-action ──────────────────────────────────────────────────────
 
-type BrowseState =
-  | { kind: "browse"; count: number }
-  | { kind: "empty" }
-  | { kind: "unavailable" };
 
-/**
- * Decides what the hero's secondary call-to-action should offer.
- *
- * Uses the unfiltered list so the hero always reflects the global state of the
- * platform, independent of any status filter the user has selected.
- */
-export function getBrowseState(result: FetchResult | null): BrowseState {
-  if (!result || !result.ok) return { kind: "unavailable" };
-  if (result.total === 0) return { kind: "empty" };
-  return { kind: "browse", count: result.total };
-}
 
 /**
  * Shared button geometry so the two CTAs line up and share focus styling.
@@ -421,7 +365,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
   // Guard the raw query-string value: only pass it through when it matches a
   // known status so a crafted URL can never inject an arbitrary string into the
   // fetch URL or the heading label.
-  const activeStatus: CircleStatusFilter | undefined = isValidStatusFilter(rawStatus)
+  const activeStatus: StatusFilterType | undefined = isValidStatusFilter(rawStatus)
     ? rawStatus
     : undefined;
 

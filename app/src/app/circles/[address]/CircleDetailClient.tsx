@@ -25,6 +25,7 @@ import {
   type CircleRound,
   type CircleState,
   type CircleDetailData,
+  parseCircleRow,
   parseCircleState,
   parseCircleRound,
   parsePendingDefault,
@@ -781,6 +782,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Seeded to Date.now() on mount because circleData comes from a fresh SSR
   // fetch; updated on every successful manual or post-action refresh.
   const [dataFetchedAtMs, setDataFetchedAtMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    setData(circleData);
+    setDataFetchedAtMs(Date.now());
+  }, [circleData]);
 
   // ── Action state ───────────────────────────────────────────────────────────
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
