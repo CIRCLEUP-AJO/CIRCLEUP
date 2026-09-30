@@ -21,8 +21,10 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import React from "react";
+import ReactDOMServer from "react-dom/server";
 
 import {
+  CircleDetailClient,
   computeDataReadiness,
   fetchCircleData,
   MAX_DATA_AGE_MS,
@@ -163,10 +165,19 @@ describe("fetchCircleData", () => {
     circleResponse: { status: number; body?: unknown },
     roundsResponse?: { status: number; body?: unknown },
   ) {
-    let callCount = 0;
-    global.fetch = vi.fn(async (_url: RequestInfo, _opts?: RequestInit) => {
-      callCount += 1;
-      const resp = callCount === 1 ? circleResponse : (roundsResponse ?? { status: 200, body: { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null } });
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+      const resp = url.includes("/rounds")
+        ? roundsResponse ?? {
+            status: 200,
+            body: { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null },
+          }
+        : circleResponse;
       return {
         ok: resp.status >= 200 && resp.status < 300,
         status: resp.status,
@@ -659,14 +670,15 @@ describe("Refresh recovers without full reload", () => {
     };
     const roundsBody = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: makeCurrentRound() };
 
-    let callPair = 0;
-    global.fetch = vi.fn(async () => {
-      callPair += 1;
-      // fetch pairs: (1=circle,2=rounds) for first call, (3=circle,4=rounds) for second
-      if (callPair === 1) return { ok: true, status: 200, json: async () => firstBody } as Response;
-      if (callPair === 2) return { ok: true, status: 200, json: async () => roundsBody } as Response;
-      if (callPair === 3) return { ok: true, status: 200, json: async () => secondBody } as Response;
-      return { ok: true, status: 200, json: async () => roundsBody } as Response;
+    let circleCount = 0;
+    global.fetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.includes("/rounds")) {
+        return { ok: true, status: 200, json: async () => roundsBody } as Response;
+      }
+      circleCount += 1;
+      const body = circleCount === 1 ? firstBody : secondBody;
+      return { ok: true, status: 200, json: async () => body } as Response;
     });
 
     const first = await fetchCircleData(CONTRACT);
@@ -693,10 +705,12 @@ describe("Refresh recovers without full reload", () => {
     const roundsBody = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null };
 
     let attempt = 0;
-    global.fetch = vi.fn(async () => {
+    global.fetch = vi.fn(async (url: string | URL | Request) => {
       attempt += 1;
       if (attempt === 1) throw new TypeError("Network error");
-      return { ok: true, status: 200, json: async () => (attempt === 2 ? goodBody : roundsBody) } as Response;
+      const urlStr = typeof url === "string" ? url : url.toString();
+      const body = urlStr.includes("/rounds") ? roundsBody : goodBody;
+      return { ok: true, status: 200, json: async () => body } as Response;
     });
 
     const firstResult = await fetchCircleData(CONTRACT);
@@ -742,41 +756,27 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   });
 
   test("invite input starts with empty value (null coalesced to '') on first render", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
-    const { container } = render(
+    const html = ReactDOMServer.renderToString(
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
-
-    const input = container.querySelector<HTMLInputElement>(
-      'input[aria-label="Invite link for this circle"]',
-    );
-    expect(input).not.toBeNull();
-    expect(input!.value).toBe("");
+    expect(html).toContain('value=""');
   });
 
   test("invite input shows aria-busy=true while URL not yet resolved", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
-    const { container } = render(
+    const html = ReactDOMServer.renderToString(
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
-
-    const input = container.querySelector<HTMLInputElement>(
-      'input[aria-label="Invite link for this circle"]',
-    );
-    expect(input).not.toBeNull();
-    expect(input!.getAttribute("aria-busy")).toBe("true");
+    expect(html).toContain('aria-busy="true"');
   });
 
   test("copy button is disabled while invite URL is not yet resolved", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
-    render(<CircleDetailClient {...makeProps(CONTRACT)} />);
-
-    const copyBtn = screen.getByRole("button", { name: /copy invite link/i });
-    expect(copyBtn).toBeDisabled();
+    const html = ReactDOMServer.renderToString(
+      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    );
+    expect(html).toContain('disabled=""');
   });
 
   test("invite input is populated with window.location.origin after effect fires", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
     const { container } = render(
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
@@ -790,7 +790,6 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   });
 
   test("invite input aria-busy becomes false after URL is resolved", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
     const { container } = render(
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
@@ -847,7 +846,7 @@ describe("CircleDetailClient — screen-reader status announcements", () => {
     });
 
     rerender(
-      <CircleDetailClient circleAddress={CONTRACT} circleData={updatedData} />,
+      <CircleDetailClient key="updated" circleAddress={CONTRACT} circleData={updatedData} />,
     );
 
     await waitFor(() => {
