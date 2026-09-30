@@ -285,7 +285,12 @@ export function nextActionHint(
   }
 }
 
-// ─── Indexer status mapping ──────────────────────────────────────────────────
+export function normalizeStatus(raw: string): CircleLifecycleStatus | undefined {
+  if (!raw) return undefined;
+  const valid: CircleLifecycleStatus[] = ["Pending", "Active", "Completed", "Cancelled", "Closed"];
+  const lower = raw.trim().toLowerCase();
+  return valid.find((status) => status.toLowerCase() === lower);
+}
 
 export function normalizeStatus(raw: string): CircleLifecycleStatus | undefined {
   if (!raw) return undefined;
@@ -301,3 +306,4 @@ export function assertValidStatus(raw: string): CircleLifecycleStatus {
   }
   return norm;
 }
+

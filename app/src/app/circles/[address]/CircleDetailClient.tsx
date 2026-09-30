@@ -777,6 +777,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // ── Circle data ────────────────────────────────────────────────────────────
   const [data, setData] = useState<CircleDetailData>(circleData);
+  useEffect(() => {
+    setData(circleData);
+  }, [circleData]);
 
   // Wall-clock timestamp of the last *successful* data fetch.
   // Seeded to Date.now() on mount because circleData comes from a fresh SSR

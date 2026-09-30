@@ -123,12 +123,56 @@ describe("getNetworkConflicts", () => {
     expect(getNetworkConflicts(env)).toEqual([]);
   });
 
+  it("returns empty when mainnet RPC + mainnet passphrase", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
+    };
+    expect(getNetworkConflicts(env)).toEqual([]);
+  });
+
   it("flags mainnet passphrase + testnet RPC URL", () => {
     const env = {
       NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
       NEXT_PUBLIC_NETWORK_PASSPHRASE: "Public Global Stellar Network ; September 2015",
     };
     expect(getNetworkConflicts(env).length).toBeGreaterThan(0);
+    expect(getNetworkConflicts(env)[0]).toMatch(/mainnet passphrase.*testnet/i);
+  });
+
+  it("flags testnet passphrase + mainnet RPC URL (soroban.stellar.org)", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+    };
+    const conflicts = getNetworkConflicts(env);
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts[0]).toMatch(/testnet passphrase.*mainnet/i);
+  });
+
+  it("flags testnet passphrase + horizon.stellar.org mainnet RPC", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://horizon.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
+    };
+    const conflicts = getNetworkConflicts(env);
+    expect(conflicts.length).toBeGreaterThan(0);
+  });
+
+  it("flags an entirely unrecognised passphrase", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org",
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "My Custom Network ; 2024",
+    };
+    const conflicts = getNetworkConflicts(env);
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts[0]).toMatch(/not a recognised/i);
+  });
+
+  it("returns empty when either value is missing", () => {
+    expect(getNetworkConflicts({ NEXT_PUBLIC_STELLAR_RPC_URL: "https://soroban-testnet.stellar.org" })).toEqual([]);
+    expect(getNetworkConflicts({ NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015" })).toEqual([]);
+    expect(getNetworkConflicts({})).toEqual([]);
   });
 });
 

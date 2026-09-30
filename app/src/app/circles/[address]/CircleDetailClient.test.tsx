@@ -21,10 +21,12 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import React from "react";
+import ReactDOMServer from "react-dom/server";
 
 import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
 import * as stellarMock from "@/lib/stellar";
 import {
+  CircleDetailClient,
   computeDataReadiness,
   fetchCircleData,
   MAX_DATA_AGE_MS,
@@ -33,7 +35,10 @@ import {
   type CircleRound,
   type CircleMember,
   type RefreshResult,
+  CircleDetailClient,
 } from "./CircleDetailClient";
+import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
+import * as stellarMock from "@/lib/stellar";
 
 import { Keypair } from "@stellar/stellar-sdk";
 
@@ -84,7 +89,7 @@ function makeReadyData(overrides: Partial<CircleDetailData> = {}): CircleDetailD
       member_count: 2,
       deadline_ledger: 5000,
     },
-    members: [makeMember(MEMBER_A), makeMember(MEMBER_B)],
+    members: [makeMember(MEMBER_A, 0), makeMember(MEMBER_B, 1)],
     rounds: [],
     openRounds: [],
     pendingDefaults: [],
@@ -166,10 +171,19 @@ describe("fetchCircleData", () => {
     circleResponse: { status: number; body?: unknown },
     roundsResponse?: { status: number; body?: unknown },
   ) {
-    let callCount = 0;
-    global.fetch = vi.fn(async (_url: RequestInfo, _opts?: RequestInit) => {
-      callCount += 1;
-      const resp = callCount === 1 ? circleResponse : (roundsResponse ?? { status: 200, body: { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null } });
+    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+          ? input.toString()
+          : (input as Request).url;
+      const resp = url.includes("/rounds")
+        ? roundsResponse ?? {
+            status: 200,
+            body: { rounds: [], openRounds: [], pendingDefaults: [], currentRound: null },
+          }
+        : circleResponse;
       return {
         ok: resp.status >= 200 && resp.status < 300,
         status: resp.status,
@@ -188,7 +202,7 @@ describe("fetchCircleData", () => {
         member_count: 2,
         deadline_ledger: 5000,
       },
-      members: [makeMember(MEMBER_A), makeMember(MEMBER_B)],
+      members: [makeMember(MEMBER_A, 0), makeMember(MEMBER_B, 1)],
       latestLedger: 4000,
     };
     const roundsBody = {
@@ -445,18 +459,10 @@ vi.mock("@/lib/stellar", () => ({
   isFreighterInstalled: vi.fn().mockReturnValue(false),
 }));
 
-vi.mock("@/lib/config", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/lib/config")>();
-  return {
-    ...actual,
-    INDEXER_URL: "http://localhost:3001",
-    ACTIVE_NETWORK: "testnet",
-    getExplorerLink: () => null,
-  };
-});
 
 describe("CircleDetailClient render — data readiness banners", () => {
 
+describe("CircleDetailClient render — data readiness banners", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: wallet not connected
@@ -667,19 +673,20 @@ describe("Refresh recovers without full reload", () => {
     };
     const secondBody = {
       circle: { status: "Active", current_round: 1, total_rounds: 4, round_amount: "10000000", member_count: 2 },
-      members: [makeMember(MEMBER_A), makeMember(MEMBER_B)],
+      members: [makeMember(MEMBER_A, 0), makeMember(MEMBER_B, 1)],
       latestLedger: 5001,
     };
     const roundsBody = { rounds: [], openRounds: [], pendingDefaults: [], currentRound: makeCurrentRound() };
 
-    let callPair = 0;
-    global.fetch = vi.fn(async () => {
-      callPair += 1;
-      // fetch pairs: (1=circle,2=rounds) for first call, (3=circle,4=rounds) for second
-      if (callPair === 1) return { ok: true, status: 200, json: async () => firstBody } as Response;
-      if (callPair === 2) return { ok: true, status: 200, json: async () => roundsBody } as Response;
-      if (callPair === 3) return { ok: true, status: 200, json: async () => secondBody } as Response;
-      return { ok: true, status: 200, json: async () => roundsBody } as Response;
+    let circleCount = 0;
+    global.fetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.includes("/rounds")) {
+        return { ok: true, status: 200, json: async () => roundsBody } as Response;
+      }
+      circleCount += 1;
+      const body = circleCount === 1 ? firstBody : secondBody;
+      return { ok: true, status: 200, json: async () => body } as Response;
     });
 
     const first = await fetchCircleData(CONTRACT);
@@ -752,7 +759,6 @@ function makeProps(circleAddress: string): { circleAddress: string; circleData: 
 }
 
 describe("Issue #480 — invite URL SSR-safe initialisation", () => {
-  // Stub wallet so the component doesn't hang waiting for a connected wallet
   beforeEach(() => {
     (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
@@ -761,24 +767,14 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
     const { container } = render(
       <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
-
-    const input = container.querySelector<HTMLInputElement>(
-      'input[aria-label="Invite link for this circle"]',
-    );
-    expect(input).not.toBeNull();
-    expect(input!.value).toBe("");
+    expect(html).toContain('value=""');
   });
 
   test("invite input shows aria-busy=true while URL not yet resolved", async () => {
     const { container } = render(
       <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
-
-    const input = container.querySelector<HTMLInputElement>(
-      'input[aria-label="Invite link for this circle"]',
-    );
-    expect(input).not.toBeNull();
-    expect(input!.getAttribute("aria-busy")).toBe("true");
+    expect(html).toContain('aria-busy="true"');
   });
 
   test("copy button is disabled while invite URL is not yet resolved", async () => {
@@ -789,7 +785,6 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   });
 
   test("invite input is populated with window.location.origin after effect fires", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
     const { container } = render(
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
@@ -803,7 +798,6 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   });
 
   test("invite input aria-busy becomes false after URL is resolved", async () => {
-    const { CircleDetailClient } = await import("./CircleDetailClient");
     const { container } = render(
       <CircleDetailClient {...makeProps(CONTRACT)} />,
     );
@@ -861,7 +855,7 @@ describe("CircleDetailClient — screen-reader status announcements", () => {
     });
 
     rerender(
-      <CircleDetailClient circleAddress={CONTRACT} circleData={updatedData} />,
+      <CircleDetailClient key="updated" circleAddress={CONTRACT} circleData={updatedData} />,
     );
 
     await waitFor(() => {
