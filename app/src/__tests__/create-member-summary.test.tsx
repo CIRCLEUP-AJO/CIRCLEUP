@@ -200,7 +200,7 @@ describe("CreateClient — summary ignores blank member rows", () => {
     typeInto(inputs[1], B);
     typeInto(inputs[2], A);
 
-    expect(screen.getByLabelText("Circle summary").textContent).toMatch(/2 members.*1 duplicate not counted/);
+    expect(screen.getByLabelText("Circle summary")).toHaveTextContent(/2 members · 1 duplicate not counted/);
     expect(summary().getByText(/Pot per round: \$200\.00$/)).toBeInTheDocument();
   });
 });

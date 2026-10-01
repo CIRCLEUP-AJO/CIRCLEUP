@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { getBrowseState, isValidUrl, PROTOCOL_GUARANTEES } from "@/lib/circleTypes";
+import { getBrowseState, isValidUrl, PROTOCOL_GUARANTEES } from "@/lib/homeHero";
 
 describe("homepage hero validation and CTA state", () => {
   it("accepts absolute HTTP and HTTPS indexer URLs", () => {
