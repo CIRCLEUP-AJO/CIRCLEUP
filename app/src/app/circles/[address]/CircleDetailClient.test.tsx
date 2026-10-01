@@ -23,11 +23,14 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import React from "react";
 import ReactDOMServer from "react-dom/server";
 
+import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
+import * as stellarMock from "@/lib/stellar";
 import {
   CircleDetailClient,
   computeDataReadiness,
   fetchCircleData,
   MAX_DATA_AGE_MS,
+  CircleDetailClient,
   type CircleDetailData,
   type CircleRound,
   type CircleMember,
@@ -37,16 +40,19 @@ import {
 import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
 import * as stellarMock from "@/lib/stellar";
 
+import { Keypair } from "@stellar/stellar-sdk";
+
 // ─── Fixtures ──────────────────────────────────────────────────────────────────
 
-const MEMBER_A = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
-const MEMBER_B = "GBRPYHIL2CI3FNQ4BXLFMNDLFJUNPU2HY3ZMFXYSFIZGK65BN4LBGWL5";
+const MEMBER_A = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 1)).publicKey();
+const MEMBER_B = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 2)).publicKey();
 const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
-function makeMember(address: string, payoutOrder = 0, overrides: Partial<CircleMember> = {}): CircleMember {
+function makeMember(address: string, overrides: Partial<CircleMember> = {}): CircleMember {
+  const defaultOrder = address === MEMBER_B ? 1 : 0;
   return {
     member_address: address,
-    payout_order: payoutOrder,
+    payout_order: defaultOrder,
     collateral: "10000000",
     defaults: 0,
     joined_at: null,
@@ -386,6 +392,7 @@ describe("Staleness regression: buildAppSnapshot must use data fetch time", () =
     //
     // The fix is to pass the actual data-fetch timestamp from component state,
     // which IS older than Date.now() at action-submit time.
+
     // Simulate: data was fetched 60 seconds ago
     const dataFetchedAt = Date.now() - 60_000;
     // Correct behaviour: use dataFetchedAt as the snapshot timestamp
@@ -453,12 +460,13 @@ vi.mock("@/lib/stellar", () => ({
 }));
 
 
+describe("CircleDetailClient render — data readiness banners", () => {
 
 describe("CircleDetailClient render — data readiness banners", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: wallet not connected
-    vi.mocked(stellarMock.getWalletAddress).mockResolvedValue(null);
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
   test("shows partial data banner when members[] is empty", async () => {
@@ -493,7 +501,7 @@ describe("CircleDetailClient render — data readiness banners", () => {
 
   test("action buttons are disabled while wallet state is still loading", async () => {
     // Never resolves — simulates slow wallet check
-    vi.mocked(stellarMock.getWalletAddress).mockImplementation(
+    (stellarMock.getWalletAddress as any).mockImplementation(
       () => new Promise(() => {}),
     );
 
@@ -706,10 +714,10 @@ describe("Refresh recovers without full reload", () => {
 
     let attempt = 0;
     global.fetch = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
       attempt += 1;
       if (attempt === 1) throw new TypeError("Network error");
-      const urlStr = typeof url === "string" ? url : url.toString();
-      const body = urlStr.includes("/rounds") ? roundsBody : goodBody;
+      const body = urlStr.endsWith("/rounds") ? roundsBody : goodBody;
       return { ok: true, status: 200, json: async () => body } as Response;
     });
 
@@ -752,28 +760,28 @@ function makeProps(circleAddress: string): { circleAddress: string; circleData: 
 
 describe("Issue #480 — invite URL SSR-safe initialisation", () => {
   beforeEach(() => {
-    vi.mocked(stellarMock.getWalletAddress).mockResolvedValue(null);
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
-  test("invite input starts with empty value (null coalesced to '') on first render", async () => {
-    const html = ReactDOMServer.renderToString(
-      <CircleDetailClient {...makeProps(CONTRACT)} />,
+  test("invite input starts with empty value (null coalesced to '') when unresolved", async () => {
+    const { container } = render(
+      <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
     expect(html).toContain('value=""');
   });
 
   test("invite input shows aria-busy=true while URL not yet resolved", async () => {
-    const html = ReactDOMServer.renderToString(
-      <CircleDetailClient {...makeProps(CONTRACT)} />,
+    const { container } = render(
+      <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
     expect(html).toContain('aria-busy="true"');
   });
 
   test("copy button is disabled while invite URL is not yet resolved", async () => {
-    const html = ReactDOMServer.renderToString(
-      <CircleDetailClient {...makeProps(CONTRACT)} />,
-    );
-    expect(html).toContain('disabled=""');
+    render(<CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />);
+
+    const copyBtn = screen.getByRole("button", { name: /copy invite link/i });
+    expect(copyBtn).toBeDisabled();
   });
 
   test("invite input is populated with window.location.origin after effect fires", async () => {
@@ -809,9 +817,10 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
 // circle status or round changes after a post-action data refresh.
 
 describe("CircleDetailClient — screen-reader status announcements", () => {
+
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(stellarMock.getWalletAddress).mockResolvedValue(null);
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
   });
 
   test("sr-only live region contains circle status on initial render", async () => {

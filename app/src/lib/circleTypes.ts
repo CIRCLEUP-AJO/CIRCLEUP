@@ -383,6 +383,11 @@ export interface ReputationResponse {
   }>;
   events?: ReputationEvent[];
   updatedAt: string | null;
+  events?: Array<{
+    type: string;
+    delta: number;
+    timestamp?: string;
+  }>;
 }
 
 // ─── Runtime validators ────────────────────────────────────────────────────────
@@ -707,12 +712,16 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
 
   const events = Array.isArray(r.events)
     ? r.events
-        .filter((e): e is ReputationEvent => {
+        .filter((e): e is { type: string; delta: number; timestamp?: string } => {
           if (typeof e !== "object" || e === null) return false;
           const row = e as Record<string, unknown>;
           return typeof row.type === "string" && typeof row.delta === "number";
         })
-        .map((e) => ({ type: e.type, delta: e.delta }))
+        .map((e) => ({
+          type: e.type,
+          delta: e.delta,
+          ...(typeof e.timestamp === "string" ? { timestamp: e.timestamp } : {}),
+        }))
     : undefined;
 
   return {
@@ -724,5 +733,6 @@ export function parseReputationResponse(raw: unknown): ReputationResponse | null
     defaults,
     ...(events ? { events } : {}),
     updatedAt: isString(r.updatedAt) ? r.updatedAt : null,
+    ...(events ? { events } : {}),
   };
 }

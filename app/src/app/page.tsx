@@ -35,31 +35,16 @@ export const metadata: Metadata = {
   },
 };
 
-
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-type FetchResult =
-  | { ok: true; circles: Circle[]; total: number }
-  | { ok: false; error: "network" | "parse" | "server" | "misconfigured" | "indexer_outage" };
-
-// ─── URL validation ───────────────────────────────────────────────────────────
-
-/**
- * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
- * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
- * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
- * identical to a real network failure and gives no actionable guidance.
- */
-function isValidUrl(url: string): boolean {
-  if (!url || url.trim() === "") return false;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "http:" || parsed.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
+import {
+  CIRCLE_STATUS_OPTIONS,
+  isValidStatusFilter,
+  isValidUrl,
+  PROTOCOL_GUARANTEES,
+  getBrowseState,
+  type CircleStatusFilter as StatusFilterType,
+  type BrowseState,
+  type FetchResult,
+} from "@/lib/homeHero";
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
@@ -75,7 +60,7 @@ function isValidUrl(url: string): boolean {
  * `total` comes from the indexer's pagination envelope so the heading can
  * show the accurate filtered count without a second request.
  */
-function makeGetCircles(status: CircleStatusFilter | undefined) {
+function makeGetCircles(status: StatusFilterType | undefined) {
   const cacheKey = status ? `circles-homepage-${status}` : "circles-homepage";
 
   return unstable_cache(
@@ -231,7 +216,7 @@ function CircleListSkeleton() {
 async function CirclesList({
   status,
 }: {
-  status: CircleStatusFilter | undefined;
+  status: StatusFilterType | undefined;
 }) {
   const getCircles = makeGetCircles(status);
   const result = await getCircles();
@@ -283,7 +268,7 @@ async function CirclesList({
 async function CirclesListWithRetry({
   status,
 }: {
-  status: CircleStatusFilter | undefined;
+  status: StatusFilterType | undefined;
 }) {
   const getCircles = makeGetCircles(status);
   const result = await getCircles().catch(() => null);
@@ -305,7 +290,7 @@ async function CirclesListWithRetry({
 async function CircleCount({
   status,
 }: {
-  status: CircleStatusFilter | undefined;
+  status: StatusFilterType | undefined;
 }) {
   const getCircles = makeGetCircles(status);
   const result = await getCircles().catch(() => null);
@@ -413,7 +398,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
   // Guard the raw query-string value: only pass it through when it matches a
   // known status so a crafted URL can never inject an arbitrary string into the
   // fetch URL or the heading label.
-  const activeStatus: CircleStatusFilter | undefined = isValidStatusFilter(rawStatus)
+  const activeStatus: StatusFilterType | undefined = isValidStatusFilter(rawStatus)
     ? rawStatus
     : undefined;
 
