@@ -875,3 +875,42 @@ describe("CircleDetailClient — screen-reader status announcements", () => {
     });
   });
 });
+
+// ─── Duplicate submission guard ─────────────────────────────────────────────
+//
+// Retries and rapid re-clicks must never submit a duplicate wallet transaction.
+//
+// The primary guard is the button's `disabled` attribute while an action is in
+// flight — a real browser will not fire a second click on a disabled control.
+// `doAction`'s `submittingRef` is defence-in-depth against anything that can
+// bypass the attribute (programmatic dispatches, accessibility tools).
+
+describe("Duplicate submission guard", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (stellarMock.getWalletAddress as any).mockResolvedValue(MEMBER_A);
+    (stellarMock.invokeContract as any).mockResolvedValue({
+      success: true,
+      txHash: "0x" + "a".repeat(64),
+    });
+  });
+
+  test("a single contribute click submits one transaction and disables the button while in flight", async () => {
+    const data = makeReadyData();
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Contribute Round 0/i)).toBeInTheDocument();
+    });
+
+    const btn = screen.getByRole("button", { name: /contribute round/i });
+    expect(btn).not.toBeDisabled();
+
+    fireEvent.click(btn);
+
+    // The button disables while the action is in flight, so a real browser
+    // cannot fire a second click on it (no duplicate transaction).
+    expect(btn).toBeDisabled();
+    expect(stellarMock.invokeContract).toHaveBeenCalledTimes(1);
+  });
+});

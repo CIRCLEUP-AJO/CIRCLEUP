@@ -18,6 +18,7 @@ import {
   CircleDetailClient,
   type CircleDetailData,
 } from "./CircleDetailClient";
+import CircleErrorBody from "./CircleErrorBody";
 // Canonical address validator — the single source of truth for Soroban contract
 // IDs. Replaces the inline `/^C[A-Z2-7]{55}$/` regex that was previously used
 // in generateMetadata only, and extends the guard to the page render path so
@@ -310,41 +311,6 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
             <p className="text-xs text-slate-500 mt-0.5">{s.label}</p>
           </div>
         ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── Error body ───────────────────────────────────────────────────────────────
-//
-// Rendered below the header (never instead of it) so the address context is
-// always visible.
-
-function CircleErrorBody({ error }: { error: FetchError }) {
-  const messages: Record<string, string> = {
-    misconfigured:
-      "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
-      "Copy app/.env.example to app/.env.local and set a valid indexer URL, then restart the server.",
-    network:
-      "The indexer is unreachable. Check that the indexer service is running and try again.",
-    server:
-      "The indexer returned an unexpected error loading this circle.",
-    parse:
-      "The indexer response was malformed. This is likely temporary — try refreshing.",
-    indexer_outage:
-      "The indexer is running but currently degraded. It may be catching up with the chain or experiencing a service disruption. " +
-      "Circle details may be incomplete or temporarily unavailable. Try refreshing in a few minutes.",
-  };
-
-  return (
-    <div
-      role="alert"
-      className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-6 flex items-start gap-3"
-    >
-      <span className="text-2xl mt-0.5" aria-hidden="true">⚠️</span>
-      <div>
-        <p className="font-semibold text-amber-800">Could not load circle details</p>
-        <p className="text-amber-700 text-sm mt-1">{messages[error]}</p>
       </div>
     </div>
   );

@@ -765,9 +765,13 @@ export default function CreateClient() {
               const atMin    = members.length <= MIN_MEMBERS;
               return (
                 <li key={i} className="flex flex-col gap-0.5">
-                  <div className="flex items-center gap-2">
+                  {/* On narrow viewports the row stacks so a 56-character Stellar
+                      address stays fully legible instead of being clipped inside
+                      a shrunken input. Address entry needs the user's full
+                      attention, so the input stays wide and readable.        */}
+                  <div className="flex gap-2 sm:flex-row flex-col items-start sm:items-center">
                     <span
-                      className="text-xs text-slate-400 w-5 shrink-0 text-right select-none"
+                      className="text-xs text-slate-400 w-5 shrink-0 text-right select-none self-start sm:self-center"
                       aria-hidden="true"
                     >
                       {i + 1}.
@@ -779,7 +783,7 @@ export default function CreateClient() {
                       placeholder={`G… (member ${i + 1})`}
                       value={m}
                       onChange={(e) => updateMember(i, e.target.value)}
-                      className={`flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
+                      className={`w-full sm:flex-1 min-w-0 border rounded-lg px-3 py-2.5 text-sm font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-brand-500 ${
                         fieldErr ? "border-red-400 focus:ring-red-400" : "border-slate-300"
                       }`}
                       aria-label={`Member ${i + 1} of ${members.length} — Stellar address (payout position ${i + 1})`}
