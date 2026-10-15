@@ -8,71 +8,13 @@ import clsx from "clsx";
 export type { Circle } from "@/lib/circleTypes";
 export { parseCircleRow } from "@/lib/circleTypes";
 import type { Circle } from "@/lib/circleTypes";
+// Shared status presentation model — single source of truth for status labels,
+// descriptions, and visual variants across list cards, the detail header, and
+// the status filter pills.  Re-exported here so existing imports keep working.
+import { getCircleStatusMeta, type CircleStatusPresentation } from "@/lib/circleStatus";
 
-interface StatusMeta {
-  label: string;
-  /** Plain-language explanation, surfaced as a tooltip */
-  description: string;
-  chipClasses: string;
-  dotClasses: string;
-}
-
-const STATUS_META: Record<string, StatusMeta> = {
-  pending: {
-    label: "Pending",
-    description: "Waiting for members to join",
-    chipClasses: "bg-yellow-100 text-yellow-800",
-    dotClasses: "bg-yellow-500",
-  },
-  active: {
-    label: "Active",
-    description: "Rounds in progress",
-    chipClasses: "bg-brand-100 text-brand-700",
-    dotClasses: "bg-brand-500",
-  },
-  completed: {
-    label: "Completed",
-    description: "All rounds finished successfully",
-    chipClasses: "bg-green-100 text-green-800",
-    dotClasses: "bg-green-500",
-  },
-  cancelled: {
-    label: "Cancelled",
-    description: "Closed before all rounds completed",
-    chipClasses: "bg-red-100 text-red-800",
-    dotClasses: "bg-red-400",
-  },
-  // Indexer-only status: collateral has been released; circle is fully settled.
-  // Not a contract-native enum value — the contract tracks this as a boolean flag
-  // and the indexer projects it as "Closed" for query convenience.
-  closed: {
-    label: "Closed",
-    description: "Collateral released. Circle fully settled",
-    chipClasses: "bg-slate-100 text-slate-500",
-    dotClasses: "bg-slate-400",
-  },
-};
-
-// ─── Row validation ───────────────────────────────────────────────────────────
-//
-// parseCircleRow is now the shared validator exported from @/lib/circleTypes.
-// The re-export above keeps existing `import { parseCircleRow } from
-// "@/components/CircleCard"` call sites working without changes.
-
-export function getStatusMeta(status: string): StatusMeta {
-  const known = STATUS_META[status?.trim().toLowerCase()];
-  if (known) return known;
-  // Explicit unknown fallback: never silent, never misleads.
-  // The raw value is preserved as the label so developers can diagnose
-  // unexpected statuses, but the description makes clear it isn't recognized.
-  const label = status?.trim() || "Unknown";
-  return {
-    label,
-    description: `Unrecognized status: "${label}"`,
-    chipClasses: "bg-slate-100 text-slate-700",
-    dotClasses: "bg-slate-400",
-  };
-}
+export type { CircleStatusPresentation as StatusMeta } from "@/lib/circleStatus";
+export { getCircleStatusMeta as getStatusMeta } from "@/lib/circleStatus";
 
 // ─── Input guards ─────────────────────────────────────────────────────────────
 //

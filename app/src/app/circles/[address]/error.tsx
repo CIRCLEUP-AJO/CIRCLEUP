@@ -73,12 +73,14 @@ export default function CircleError({ error, reset }: Props) {
         )}
       </div>
       <div className="flex gap-3">
-        <button
-          onClick={reset}
-          className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors"
-        >
-          Try again
-        </button>
+        {outage && (
+          <button
+            onClick={reset}
+            className="px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 transition-colors"
+          >
+            Try again
+          </button>
+        )}
         <a
           href="/"
           className="px-4 py-2 bg-white border border-red-200 text-red-700 text-sm font-medium rounded-lg hover:bg-red-50 transition-colors"

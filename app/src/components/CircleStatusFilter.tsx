@@ -5,8 +5,33 @@ import { useTransition } from "react";
 import clsx from "clsx";
 import type { CircleLifecycleStatus as StatusFilter } from "@/lib/lifecycle";
 import { CIRCLE_STATUS_OPTIONS } from "@/lib/lifecycle";
+import { getCircleStatusMeta } from "@/lib/circleStatus";
 
 // ─── Label + colour map ───────────────────────────────────────────────────────
+//
+// Labels and descriptions come from the shared circle-status presentation model
+// (lib/circleStatus.ts) so the filter pills, list cards, and detail header
+// never disagree on what a status means.  Colours here are the filled pill
+// variants of the same semantic hues (Pending=amber, Active=brand,
+// Completed=green, Cancelled=red, Closed=slate).
+
+const FILL_CLASSES: Record<StatusFilter, string> = {
+  Pending: "bg-amber-500",
+  Active: "bg-brand-600",
+  Completed: "bg-green-600",
+  Cancelled: "bg-red-500",
+  Closed: "bg-slate-500",
+};
+
+function statusUi(status: StatusFilter) {
+  const meta = getCircleStatusMeta(status);
+  const fill = FILL_CLASSES[status];
+  return {
+    label: meta.label,
+    activeClasses: `${fill} text-white border-${fill.replace("bg-", "")}`,
+    dotClasses: meta.dotClasses,
+  };
+}
 
 const STATUS_UI: Record<
   StatusFilter | "All",
@@ -17,31 +42,9 @@ const STATUS_UI: Record<
     activeClasses: "bg-slate-800 text-white border-slate-800",
     dotClasses: "",
   },
-  Pending: {
-    label: "Pending",
-    activeClasses: "bg-yellow-500 text-white border-yellow-500",
-    dotClasses: "bg-yellow-500",
-  },
-  Active: {
-    label: "Active",
-    activeClasses: "bg-brand-600 text-white border-brand-600",
-    dotClasses: "bg-brand-500",
-  },
-  Completed: {
-    label: "Completed",
-    activeClasses: "bg-blue-600 text-white border-blue-600",
-    dotClasses: "bg-blue-500",
-  },
-  Cancelled: {
-    label: "Cancelled",
-    activeClasses: "bg-red-500 text-white border-red-500",
-    dotClasses: "bg-red-400",
-  },
-  Closed: {
-    label: "Closed",
-    activeClasses: "bg-slate-500 text-white border-slate-500",
-    dotClasses: "bg-slate-400",
-  },
+  ...Object.fromEntries(
+    CIRCLE_STATUS_OPTIONS.map((s) => [s, statusUi(s)]),
+  ) as Record<StatusFilter, { label: string; activeClasses: string; dotClasses: string }>,
 };
 
 // ─── Component ────────────────────────────────────────────────────────────────

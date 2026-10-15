@@ -11,6 +11,7 @@ import {
   computeActionEligibility,
   isGateBlocked,
 } from "@/lib/gating";
+import { computeDeadlineDisplay, SECONDS_PER_LEDGER } from "@/lib/deadline";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import clsx from "clsx";
 // ─── Shared response contracts (Issue #513) ────────────────────────────────────
@@ -113,36 +114,12 @@ interface DefaultConfirmState {
 type CopyState = "idle" | "success" | "error";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-
-const SECONDS_PER_LEDGER = 5;
-
-/**
- * Maximum age (ms) before the component considers its data stale and shows a
- * banner prompting the user to refresh. Conservative at 2 min — long enough
- * to read the page but short enough to catch a missed payout event.
- *
- * Distinct from DEFAULT_MAX_SNAPSHOT_AGE_MS (30 s) in gating.ts, which is the
- * per-action pre-flight check. Both guards are required: the page-level check
- * prevents the user from sitting on stale data without noticing; the gate
- * check fires just before the on-chain write.
- */
-export const MAX_DATA_AGE_MS = 2 * 60 * 1000; // 2 minutes
+//
+// Re-exported from lib/deadline.ts so the page-level staleness threshold and
+// the deadline display model share a single source of truth.
+export { DEADLINE_MAX_DATA_AGE_MS as MAX_DATA_AGE_MS } from "@/lib/deadline";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function ledgersToHuman(ledgers: number): string {
-  if (ledgers <= 0) return "overdue";
-  const totalSeconds = ledgers * SECONDS_PER_LEDGER;
-  const days    = Math.floor(totalSeconds / 86400);
-  const hours   = Math.floor((totalSeconds % 86400) / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (days > 0)    return `${days}d ${hours}h`;
-  if (hours > 0)   return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
 
 /**
  * Compute the data readiness from the current data snapshot and the timestamp
@@ -189,15 +166,33 @@ interface DeadlineProps {
   deadlineLedger: number | null | undefined;
   latestLedger:   number | null | undefined;
   status: string;
+  /** Wall-clock ms when the deadline data was last successfully fetched. */
+  fetchedAtMs: number;
 }
 
-function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineProps) {
+function RoundDeadlineStatus({
+  deadlineLedger,
+  latestLedger,
+  status,
+  fetchedAtMs,
+}: DeadlineProps) {
+  const display = computeDeadlineDisplay({
+    deadlineLedger,
+    latestLedger,
+    status,
+    fetchedAtMs,
+  });
+
+  // Only tick for fresh data on an Active circle.  Stale or missing data is
+  // never presented as a live, precise countdown — it stays a static estimate
+  // (or is shown as unavailable) so users aren't misled about when a default
+  // is permitted.
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (status !== "Active" || deadlineLedger == null) return;
+    if (status !== "Active" || display.kind !== "fresh") return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [status, deadlineLedger]);
+  }, [status, display.kind]);
 
   if (status !== "Active") {
     return (
@@ -219,7 +214,7 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
     );
   }
 
-  if (deadlineLedger == null || latestLedger == null) {
+  if (display.kind === "unavailable") {
     return (
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-center gap-3">
         <span className="text-xl" aria-hidden="true">⏱️</span>
@@ -235,17 +230,8 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
     );
   }
 
-  const ledgersRemaining = deadlineLedger - latestLedger;
-  const isOverdue = ledgersRemaining <= 0;
-  const human = ledgersToHuman(ledgersRemaining);
-
-  const totalSecondsRemaining = ledgersRemaining * SECONDS_PER_LEDGER;
-  const urgency =
-    isOverdue || totalSecondsRemaining < 86_400
-      ? "red"
-      : totalSecondsRemaining < 2 * 86_400
-      ? "yellow"
-      : "green";
+  const isStale = display.kind === "stale";
+  const { human, isOverdue, urgency, ledgersRemaining } = display;
 
   const colorMap = {
     green:  "bg-brand-50 border-brand-200 text-brand-800",
@@ -253,33 +239,36 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
     red:    "bg-red-50 border-red-300 text-red-800",
   } as const;
 
-  const labelMap = {
-    green:  "Time remaining",
-    yellow: "Deadline approaching",
-    red:    isOverdue ? "Payout overdue" : "Deadline imminent",
-  } as const;
+  const boxClasses = `border rounded-xl p-4 flex items-center gap-3 ${
+    isStale ? "bg-amber-50 border-amber-200 text-amber-800" : colorMap[urgency]
+  }`;
 
   return (
     <div
-      className={`border rounded-xl p-4 flex items-center gap-3 ${colorMap[urgency]}`}
+      className={boxClasses}
       role="status"
       aria-live="polite"
-      aria-label={`Round deadline: ${human}`}
+      aria-label={`Round deadline: ${display.label}, ${human}`}
     >
       <span className="text-xl" aria-hidden="true">
         {isOverdue ? "🔔" : "⏱️"}
       </span>
       <div className="flex-1">
         <p className="text-xs font-medium uppercase tracking-wide opacity-70">
-          {labelMap[urgency]}
+          {display.label}
         </p>
         <p className="text-lg font-bold mt-0.5 tabular-nums">{human}</p>
         <p className="text-xs opacity-60 mt-0.5">
-          Deadline at ledger {deadlineLedger.toLocaleString()} ·{" "}
-          {Math.abs(ledgersRemaining).toLocaleString()} ledger
-          {Math.abs(ledgersRemaining) !== 1 ? "s" : ""}{" "}
+          Deadline at ledger {deadlineLedger!.toLocaleString()} ·{" "}
+          {Math.abs(ledgersRemaining!).toLocaleString()} ledger
+          {Math.abs(ledgersRemaining!) !== 1 ? "s" : ""}{" "}
           {isOverdue ? "past deadline" : "remaining"}{" "}
-          · ~{SECONDS_PER_LEDGER}s per ledger
+          · ~{SECONDS_PER_LEDGER}s per ledger (estimate)
+          {isStale
+            ? ` · indexed data is ${Math.round(
+                (display.dataAgeMs ?? 0) / 1000,
+              )}s old — refresh for an accurate deadline`
+            : ""}
         </p>
       </div>
     </div>
@@ -1812,6 +1801,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         deadlineLedger={data.circle.deadline_ledger}
         latestLedger={data.latestLedger}
         status={data.circle.status}
+        fetchedAtMs={dataFetchedAtMs}
       />
 
       {/* Rotation view */}
