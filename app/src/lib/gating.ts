@@ -344,6 +344,8 @@ export function computeActionEligibility(
 ): GateResult {
   const nowMs  = opts.nowMs  ?? Date.now();
   const maxAge = opts.maxSnapshotAgeMs ?? DEFAULT_MAX_SNAPSHOT_AGE_MS;
+  const networkGate = checkNetworkGate(snapshot);
+  if (networkGate) return networkGate;
 
   const netGate = checkNetworkGate(snapshot);
   if (netGate) return netGate;

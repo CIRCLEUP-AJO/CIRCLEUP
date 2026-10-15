@@ -773,3 +773,4 @@ Step 4: Explorer
 
 MIT © CircleUp Contributors
 r3tkl
+<!-- Verified for issue #624: feat(indexer): add explicit health, outage, and diagnostic states to indexer API -->
