@@ -547,7 +547,9 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       usdcAddress: USDC,
       cachedMigrationHealth: options.cachedMigrationHealth ?? null,
     });
-    res.status(report.status === "ok" ? 200 : 503).json(report);
+    res.status(
+      report.serviceStatus === "healthy" || report.status === "ok" ? 200 : 503,
+    ).json(report);
   });
 
   // ── Circles ──────────────────────────────────────────────────────────────────
