@@ -44,6 +44,7 @@
  */
 
 import { pool, withTransaction } from "./pool";
+import { assertLocalDatabase } from "./dbGuard";
 import type { PoolClient } from "pg";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -934,7 +935,26 @@ if (require.main === module) {
       process.exit(1);
     }
 
-    const finish = async (code: number) => {
+    // Refuse to run against staging or production — this operation wipes tables.
+    try {
+      assertLocalDatabase(process.env.DATABASE_URL, "replay");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exit(1);
+    }
+
+    if (dryRun) {
+      console.log(`[replay] --dry-run: checking preflight for replay from ledger ${fromLedger}...`);
+      const preflight = await replayPreflight(fromLedger);
+      console.log(`[replay] Current indexer cursor: ledger ${preflight.currentLedger}`);
+      console.log(`[replay] Estimated events to re-process: ${preflight.estimatedEventsToReplay}`);
+      console.log(`[replay] Wipe mode: ${!partial || fromLedger === 0 ? "full" : "partial"}`);
+      if (preflight.warnings.length > 0) {
+        for (const w of preflight.warnings) {
+          console.warn(`[replay] Warning: ${w}`);
+        }
+      }
+      console.log("[replay] Dry run complete — no changes made.");
       await pool.end();
       process.exit(code);
     };

@@ -9,6 +9,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { IndexerClient, IndexerError } from "../client";
 import type { CircleUpConfig } from "../types";
+import { CIRCLE_ADDR, MEMBER_A_ADDR } from "./fixtures";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -23,8 +24,15 @@ const BASE_CONFIG: CircleUpConfig = {
   indexerUrl: "http://localhost:3001",
 };
 
-const CIRCLE_ADDR = "CTEST_CIRCLE_ADDRESS";
-const MEMBER_ADDR = "GABC123";
+const MEMBER_ADDR = MEMBER_A_ADDR;
+
+/** A well-formed GET /circles page envelope. */
+function circlesPage(circles: unknown[] = [], page = 1, limit = 20, total = circles.length) {
+  return {
+    circles,
+    pagination: { page, limit, total, totalPages: total === 0 ? 0 : Math.ceil(total / limit) },
+  };
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -93,7 +101,7 @@ describe("IndexerClient construction", () => {
 
   it("normalises trailing slashes and keeps a base path", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ circles: [] }), { status: 200 }),
+      new Response(JSON.stringify(circlesPage()), { status: 200 }),
     );
     vi.stubGlobal("fetch", fetchMock);
     try {
@@ -110,7 +118,7 @@ describe("IndexerClient construction", () => {
 
   it("strips trailing slash from indexerUrl", async () => {
     const cfg: CircleUpConfig = { ...BASE_CONFIG, indexerUrl: "http://localhost:3001/" };
-    const mockFetch = mockOk({ circles: [] });
+    const mockFetch = mockOk(circlesPage());
     vi.stubGlobal("fetch", mockFetch);
 
     const client = new IndexerClient(cfg);
@@ -129,7 +137,7 @@ describe("IndexerClient.getCircles", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("returns parsed circles list", async () => {
-    const payload = { circles: [{ address: CIRCLE_ADDR, status: "Active" }] };
+    const payload = circlesPage([{ address: CIRCLE_ADDR, status: "Active" }]);
     vi.stubGlobal("fetch", mockOk(payload));
 
     const client = new IndexerClient(BASE_CONFIG);
@@ -140,7 +148,7 @@ describe("IndexerClient.getCircles", () => {
   });
 
   it("calls the correct endpoint", async () => {
-    const mockFetch = mockOk({ circles: [] });
+    const mockFetch = mockOk(circlesPage());
     vi.stubGlobal("fetch", mockFetch);
 
     await new IndexerClient(BASE_CONFIG).getCircles();

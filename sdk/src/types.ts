@@ -531,6 +531,121 @@ export function decodeBigInt(value: unknown, label: string): bigint {
   );
 }
 
+/** Inclusive bounds of the XDR integer widths the contracts return. */
+const I128_MIN = -(1n << 127n);
+const I128_MAX = (1n << 127n) - 1n;
+const U64_MAX = (1n << 64n) - 1n;
+
+/**
+ * Decode an `i128` field produced by `scValToNative`, rejecting values the XDR
+ * type cannot hold and, optionally, values below a domain minimum.
+ *
+ * Built on {@link decodeBigInt}, so a safe-integer `number` is still accepted.
+ * `min` expresses a contract invariant — e.g. collateral is clamped to `0n`,
+ * and a round amount is always positive — so a value that breaks it fails here
+ * with the field name instead of rendering as a negative balance.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not an integer, or is out of range.
+ */
+export function decodeI128(
+  value: unknown,
+  label: string,
+  options: { min?: bigint } = {},
+): bigint {
+  const n = decodeBigInt(value, label);
+  if (n < I128_MIN || n > I128_MAX) {
+    throw new TypeError(`${label}: ${n} is out of range for i128.`);
+  }
+  if (options.min !== undefined && n < options.min) {
+    throw new TypeError(
+      `${label}: expected a value >= ${options.min} but the contract returned ${n}.`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Decode a `u64` field (e.g. a ledger sequence) produced by `scValToNative`.
+ *
+ * @param label Call-site context included in the error message.
+ * @throws `TypeError` when the value is not an integer in `[0, 2^64 - 1]`.
+ */
+export function decodeU64(value: unknown, label: string): bigint {
+  const n = decodeBigInt(value, label);
+  if (n < 0n || n > U64_MAX) {
+    throw new TypeError(`${label}: ${n} is out of range for u64 (0–${U64_MAX}).`);
+  }
+  return n;
+}
+
+/**
+ * Decode a `u32` that the contract additionally constrains to `[min, max]`.
+ *
+ * The range is the contract's own validation (e.g. `round_deadline_ledgers`
+ * is checked against `MIN_/MAX_ROUND_DEADLINE_LEDGERS` at initialize), so a
+ * value outside it means the SDK is reading the wrong field or a contract
+ * built with different bounds — either way not something to pass on silently.
+ *
+ * @throws `TypeError` when the value is not a u32 or falls outside the range.
+ */
+export function decodeU32InRange(
+  value: unknown,
+  label: string,
+  min: number,
+  max: number,
+): number {
+  const n = decodeU32(value, label);
+  if (n < min || n > max) {
+    throw new TypeError(
+      `${label}: expected a value in [${min}, ${max}] but the contract returned ${n}.`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Decode a contract struct produced by `scValToNative` into a plain record,
+ * checking that every required field is present.
+ *
+ * `scValToNative` turns an `ScMap` into a plain object, so anything else — an
+ * array (a `Vec` or an enum variant), a primitive, or `null` — means the view
+ * returned a different type entirely. Every missing field is listed at once so
+ * a renamed field is reported together with whatever replaced it.
+ *
+ * @param label Call-site context, e.g. `"mapRawConfig"`.
+ * @param required Field names that must be present and not `undefined`.
+ * @param structName Contract type named in the error, e.g. `"CircleConfig"`.
+ * @throws `TypeError` when `value` is not a struct or a required field is absent.
+ */
+export function decodeRecord<K extends string>(
+  value: unknown,
+  label: string,
+  required: readonly K[],
+  structName = "contract struct",
+): Record<K, unknown> {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value instanceof Map
+  ) {
+    throw new TypeError(
+      `${label}: expected a ${structName} object but the contract returned ${describeValue(value)}.`,
+    );
+  }
+  const record = value as Record<string, unknown>;
+  const missing = required.filter((key) => record[key] === undefined);
+  if (missing.length > 0) {
+    throw new TypeError(
+      `${label}: missing required field${missing.length === 1 ? "" : "s"} ` +
+        `${missing.map((k) => `"${k}"`).join(", ")}. Fields present: ` +
+        `${Object.keys(record).map((k) => `"${k}"`).join(", ") || "(none)"}.`,
+    );
+  }
+  return record as Record<K, unknown>;
+}
+
 /**
  * Decode a `bool` field produced by `scValToNative`.
  *
@@ -575,43 +690,96 @@ export function decodeAddress(value: unknown, label: string): string {
  * Empty lists are valid — a freshly deployed factory has no circles yet.
  *
  * @param label Call-site context included in the error message.
- * @throws `TypeError` when the value is not an array of Stellar addresses.
+ * @param options.unique Reject a list that names the same address twice, for
+ *   fields the contract guarantees are distinct (e.g. a circle's members).
+ * @param options.maxLength Reject a list longer than the contract allows.
+ * @throws `TypeError` when the value is not an array of Stellar addresses, or
+ *   breaks one of the requested constraints.
  */
-export function decodeAddressList(value: unknown, label: string): string[] {
+export function decodeAddressList(
+  value: unknown,
+  label: string,
+  options: { unique?: boolean; maxLength?: number } = {},
+): string[] {
   if (!Array.isArray(value)) {
     throw new TypeError(
       `${label}: expected an array of Stellar addresses but the contract returned ${describeValue(value)}.`,
     );
   }
-  return value.map((entry, i) => decodeAddress(entry, `${label}[${i}]`));
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new TypeError(
+      `${label}: expected at most ${options.maxLength} addresses but the contract returned ${value.length}.`,
+    );
+  }
+  const addresses = value.map((entry, i) => decodeAddress(entry, `${label}[${i}]`));
+  if (options.unique) {
+    const seen = new Map<string, number>();
+    addresses.forEach((addr, i) => {
+      const first = seen.get(addr);
+      if (first !== undefined) {
+        throw new TypeError(
+          `${label}: address ${addr} appears at both index ${first} and index ${i}; ` +
+            `the contract guarantees these entries are distinct.`,
+        );
+      }
+      seen.set(addr, i);
+    });
+  }
+  return addresses;
 }
+
+/** Bounds the circle contract enforces at `initialize` (see contracts/circle). */
+const MIN_ROUND_DEADLINE_LEDGERS = 100;
+const MAX_ROUND_DEADLINE_LEDGERS = 1_036_800;
+const MAX_CIRCLE_MEMBERS = 256;
+
+const CONFIG_FIELDS = [
+  "members",
+  "round_amount",
+  "usdc_token",
+  "reputation_contract",
+  "round_deadline_ledgers",
+] as const;
+
+const ROUND_FIELDS = [
+  "round_index",
+  "recipient",
+  "contributions_received",
+  "deadline_ledger",
+  "paid_out",
+] as const;
 
 /**
  * Map a raw `scValToNative` wire object to the typed `CircleConfig` domain
  * shape, validating every field as it is decoded.
  *
- * @throws `TypeError` if `raw` is not an object or any field has the wrong
- *   type — surfaces decode bugs at the boundary rather than letting `undefined`
- *   leak into domain code.
+ * Beyond the per-field types, this enforces the invariants `initialize`
+ * guarantees — distinct members (at most 256), a positive round amount, and a
+ * deadline inside the contract's bounds — so a value that breaks them is
+ * reported here rather than producing a config that looks valid but is not.
+ *
+ * @throws `TypeError` if `raw` is not an object, a field is missing, or any
+ *   field has the wrong type or an out-of-range value — surfaces decode bugs
+ *   at the boundary rather than letting `undefined` leak into domain code.
  */
 export function mapRawConfig(raw: unknown): CircleConfig {
-  if (!raw || typeof raw !== "object") {
-    throw new TypeError(
-      `mapRawConfig: expected a CircleConfig object but the contract returned ${describeValue(raw)}.`,
-    );
-  }
-  const wire = raw as Partial<RawCircleConfig>;
+  const wire = decodeRecord(raw, "mapRawConfig", CONFIG_FIELDS, "CircleConfig");
   return {
-    members: decodeAddressList(wire.members, "mapRawConfig.members"),
-    roundAmount: decodeBigInt(wire.round_amount, "mapRawConfig.round_amount"),
+    members: decodeAddressList(wire.members, "mapRawConfig.members", {
+      unique: true,
+      maxLength: MAX_CIRCLE_MEMBERS,
+    }),
+    roundAmount: decodeI128(wire.round_amount, "mapRawConfig.round_amount", { min: 1n }),
     usdcToken: decodeAddress(wire.usdc_token, "mapRawConfig.usdc_token"),
     reputationContract: decodeAddress(
       wire.reputation_contract,
       "mapRawConfig.reputation_contract",
     ),
-    roundDeadlineLedgers: decodeU32(
+    roundDeadlineLedgers: decodeU32InRange(
       wire.round_deadline_ledgers,
       "mapRawConfig.round_deadline_ledgers",
+      MIN_ROUND_DEADLINE_LEDGERS,
+      MAX_ROUND_DEADLINE_LEDGERS,
     ),
   };
 }
@@ -620,23 +788,21 @@ export function mapRawConfig(raw: unknown): CircleConfig {
  * Map a raw `scValToNative` wire object to the typed `RoundState` domain shape,
  * validating every field as it is decoded.
  *
- * @throws `TypeError` if `raw` is not an object or any field has the wrong type.
+ * @throws `TypeError` if `raw` is not an object, a field is missing, or any
+ *   field has the wrong type or an out-of-range value.
  */
 export function mapRawRoundState(raw: unknown): RoundState {
-  if (!raw || typeof raw !== "object") {
-    throw new TypeError(
-      `mapRawRoundState: expected a RoundState object but the contract returned ${describeValue(raw)}.`,
-    );
-  }
-  const wire = raw as Partial<RawRoundState>;
+  const wire = decodeRecord(raw, "mapRawRoundState", ROUND_FIELDS, "RoundState");
   return {
     roundIndex: decodeU32(wire.round_index, "mapRawRoundState.round_index"),
     recipient: decodeAddress(wire.recipient, "mapRawRoundState.recipient"),
-    contributionsReceived: decodeU32(
+    contributionsReceived: decodeU32InRange(
       wire.contributions_received,
       "mapRawRoundState.contributions_received",
+      0,
+      MAX_CIRCLE_MEMBERS,
     ),
-    deadlineLedger: decodeBigInt(
+    deadlineLedger: decodeU64(
       wire.deadline_ledger,
       "mapRawRoundState.deadline_ledger",
     ),
@@ -644,22 +810,38 @@ export function mapRawRoundState(raw: unknown): RoundState {
   };
 }
 
+const CIRCLE_STATUSES: readonly CircleStatus[] = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+];
+
 /**
- * Validate that a string returned by the contract's `get_status` view is a
- * recognised `CircleStatus` variant.
+ * Validate a value returned by the contract's `get_status` view and narrow it
+ * to a {@link CircleStatus}.
  *
- * Returns the narrowed type on success; throws a descriptive `Error` on an
- * unrecognised value so SDK consumers are never silently handed a garbage status.
+ * `CircleStatus` is a `#[contracttype]` enum, and Soroban encodes a unit enum
+ * variant as a one-element vector holding its name, which `scValToNative`
+ * decodes to `["Active"]`. That wire form and a bare `"Active"` symbol are
+ * both accepted. Anything else — an unknown variant, a variant carrying data
+ * (`["Active", 1]`), wrong case, or a non-string — throws, so callers are never
+ * handed a status that only looks valid.
+ *
+ * @throws `Error` naming the offending value and listing the valid variants.
  */
 export function assertValidCircleStatus(value: unknown): CircleStatus {
-  const valid: CircleStatus[] = ["Pending", "Active", "Completed", "Cancelled"];
-  if (typeof value !== "string" || !valid.includes(value as CircleStatus)) {
+  const name =
+    Array.isArray(value) && value.length === 1 && typeof value[0] === "string"
+      ? value[0]
+      : value;
+  if (typeof name !== "string" || !CIRCLE_STATUSES.includes(name as CircleStatus)) {
     throw new Error(
-      `assertValidCircleStatus: unexpected value "${String(value)}". ` +
-        `Expected one of: ${valid.map((v) => `"${v}"`).join(", ")}.`,
+      `assertValidCircleStatus: unexpected value ${describeValue(value)}. ` +
+        `Expected one of: ${CIRCLE_STATUSES.map((v) => `"${v}"`).join(", ")}.`,
     );
   }
-  return value as CircleStatus;
+  return name as CircleStatus;
 }
 
 // ─── simulateAndRead result ───────────────────────────────────────────────────
@@ -986,16 +1168,20 @@ export interface TxSuccess {
  * | `"stale_rpc"` | The RPC stopped advancing its ledger while the transaction was pending. | Yes — against a healthy RPC. |
  * | `"stale_state"` | An opt-in write preflight found the on-chain state had moved past the caller's expected state, so the submission would predictably fail. | No — refresh state and rebuild. |
  * | `"timeout"` | Confirmation polling exceeded the timeout window. | Check the hash before retrying. |
+ * | `"outcome_unknown"` | The write may or may not have been applied: the submission got no answer, or connectivity was lost while confirming. `diagnostics` says what is known. | No — look up `txHash` first. |
+ * | `"tx_expired"` | The RPC closed a ledger past the transaction's time bound without including it, so it was never applied. | Yes, after rebuilding. |
  * | `"unknown"` | An unclassified error (should not normally occur). | Unknown. |
  *
  * Use this field to branch on the error type without parsing `errorMessage`
  * strings — e.g. show a wallet-funding prompt on `"account_not_found"` or a
  * "check your inputs" banner on `"simulation_failed"`.
  *
- * The three codes that mean "this transaction may still be in flight"
- * (`"timeout"`, `"stale_rpc"`, `"try_again_later"`) carry the hash the RPC
- * reported, so callers can look the transaction up before resubmitting rather
- * than risk paying twice.
+ * The codes that mean "this transaction may still be in flight"
+ * (`"timeout"`, `"stale_rpc"`, `"outcome_unknown"`) carry the transaction
+ * hash, so callers can look the transaction up (see
+ * `CircleUpClient.lookupTransaction`) before resubmitting rather than risk
+ * applying the write twice. `"network_error"` is only returned when the
+ * request provably never reached the RPC.
  */
 export type TxErrorCode =
   | "invalid_argument"
@@ -1005,10 +1191,72 @@ export type TxErrorCode =
   | "try_again_later"
   | "tx_rejected"
   | "tx_failed"
+  | "tx_expired"
   | "stale_rpc"
   | "stale_state"
   | "timeout"
+  | "outcome_unknown"
   | "unknown";
+
+/**
+ * What the SDK knows about a write whose outcome it could not settle, attached
+ * to a `TxFailure` with `errorCode: "outcome_unknown"`.
+ *
+ * The SDK never rebuilds a write in this state, because a rebuilt transaction
+ * uses the next sequence number and would apply the write a second time if
+ * the original was accepted. Look `txHash` up instead; only a not-found result
+ * observed after `validUntil` proves the original was never applied.
+ */
+export interface SubmissionDiagnostics {
+  /** Hash of the signed envelope — computed locally, so present even if the RPC never answered. */
+  readonly txHash: string;
+  /**
+   * `"accepted"` — the RPC queued the transaction (PENDING / DUPLICATE) but its
+   * confirmation was not observed. `"unknown"` — no submission response was
+   * received (or only a rejection of a resend), so delivery is unconfirmed.
+   */
+  readonly submission: "accepted" | "unknown";
+  /** `sendTransaction` attempts made with this one envelope. */
+  readonly sendAttempts: number;
+  /**
+   * Result of the follow-up lookups by hash: `"not_found"` if at least one
+   * lookup answered NOT_FOUND, `"failed"` if every lookup errored, and
+   * `"not_attempted"` if the budget ran out before any lookup.
+   */
+  readonly lookup: "not_found" | "failed" | "not_attempted";
+  /** Latest ledger the RPC reported during the lookups, when known. */
+  readonly latestLedger?: number;
+  /** Unix time (seconds) after which the transaction can no longer be included. */
+  readonly validUntil?: number;
+  /** The last network error observed, already formatted for display. */
+  readonly lastError?: string;
+}
+
+/** The result of `CircleUpClient.lookupTransaction`. */
+export type TxLookup =
+  | {
+      readonly status: "success";
+      readonly txHash: string;
+      readonly ledger: number;
+      /** Decoded contract return value, `undefined` when absent or undecodable. */
+      readonly returnValue?: unknown;
+      readonly latestLedger?: number;
+      readonly latestLedgerCloseTime?: number;
+    }
+  | {
+      readonly status: "failed";
+      readonly txHash: string;
+      readonly ledger: number;
+      readonly latestLedger?: number;
+      readonly latestLedgerCloseTime?: number;
+    }
+  | {
+      /** Not (yet) included. Definitive only once `latestLedgerCloseTime` is past the transaction's time bound. */
+      readonly status: "not_found";
+      readonly txHash: string;
+      readonly latestLedger?: number;
+      readonly latestLedgerCloseTime?: number;
+    };
 
 /**
  * One field of on-chain state that has diverged from the value a caller
@@ -1070,6 +1318,8 @@ export interface TxFailure {
   readonly estimate?: SimulationEstimate;
   /** Present when errorCode is "stale_state". Lists the mismatched fields. */
   readonly mismatches?: readonly StateMismatch[];
+  /** Present when errorCode is "outcome_unknown". See {@link SubmissionDiagnostics}. */
+  readonly diagnostics?: SubmissionDiagnostics;
 }
 
 /** Discriminated union of all possible transaction outcomes. */
@@ -1089,24 +1339,6 @@ export function isTxSuccess(result: TxResult): result is TxSuccess {
 }
 
 /**
- * Returns true when a failed transaction is safe to retry without risk of
- * duplication or wasted funds.
- *
- * Conservative classification:
- * - Retryable: transient network/RPC issues where the tx was never confirmed.
- * - NOT retryable: validation failures, user rejection, and confirmed on-chain
- *   failures — retrying these wastes fees or duplicates state changes.
- *
- * For `"timeout"` and `"stale_rpc"` the transaction may still be in flight;
- * callers should check the hash on Stellar Expert before resubmitting.
- *
- * @example
- * const result = await client.contribute(keypair);
- * if (isTxFailure(result) && isRetryable(result)) {
- *   // safe to resubmit
- * }
- */
-/**
  * Type-guard — narrows `TxResult` to `TxFailure`.
  *
  * @example
@@ -1119,16 +1351,37 @@ export function isTxFailure(result: TxResult): result is TxFailure {
   return result.success === false;
 }
 
+/**
+ * Returns true when a failed transaction is safe to retry without risk of
+ * duplication or wasted funds.
+ *
+ * Conservative classification:
+ * - Retryable: the SDK knows the write was not applied — the request never
+ *   reached the RPC, the RPC refused it, or it expired unincluded.
+ * - NOT retryable: validation failures, confirmed on-chain failures, and every
+ *   outcome where the write may already have been applied.
+ *
+ * For `"timeout"`, `"stale_rpc"`, and `"outcome_unknown"` the transaction may
+ * still be in flight; look the hash up (`lookupTransaction`) before resubmitting.
+ *
+ * @example
+ * const result = await client.contribute(keypair);
+ * if (isTxFailure(result) && isRetryable(result)) {
+ *   // safe to resubmit
+ * }
+ */
 export function isRetryable(result: TxFailure): boolean {
   switch (result.errorCode) {
     case "network_error":
     case "try_again_later":
     case "tx_rejected":
+    case "tx_expired":
       return true;
-    // timeout / stale_rpc: tx may be in flight — check the hash first.
-    // Classified as NOT automatically retryable to prevent blind duplication.
+    // timeout / stale_rpc / outcome_unknown: tx may be in flight — check the
+    // hash first. NOT automatically retryable to prevent blind duplication.
     case "timeout":
     case "stale_rpc":
+    case "outcome_unknown":
     case "invalid_argument":
     case "account_not_found":
     case "simulation_failed":
@@ -1309,6 +1562,35 @@ export interface ApiRoundRow {
 // ─── Indexer API response envelopes ───────────────────────────────────────────
 
 /**
+ * Pagination envelope returned by the indexer's paged list endpoints
+ * (`GET /circles`, `GET /members/:member/contributions`).
+ *
+ * `page` and `limit` echo the values the server applied (its defaults when the
+ * request omitted them); `IndexerClient` checks the echo against what it asked
+ * for, so a page is never silently returned in place of another.
+ */
+export interface IndexerPagination {
+  /** 1-based page number the server returned. */
+  page: number;
+  /** Page size the server applied. */
+  limit: number;
+  /** Total rows matching the filters, across all pages. */
+  total: number;
+  /** Number of pages at this `limit`; `0` when `total` is `0`. */
+  totalPages: number;
+  /** `page < totalPages`. Sent by `/members/:member/contributions` only. */
+  hasMore?: boolean;
+}
+
+/** Columns `GET /circles` can sort by. */
+export type CircleSortField =
+  | "created_ledger"
+  | "updated_at"
+  | "round_amount"
+  | "member_count"
+  | "status";
+
+/**
  * Query parameters accepted by `GET /circles`.
  *
  * All fields are optional; the indexer's defaults apply when omitted:
@@ -1316,7 +1598,12 @@ export interface ApiRoundRow {
  *   - `sort`    — `"created_ledger"`
  *   - `order`   — `"desc"`
  *   - `page`    — `1`
- *   - `limit`   — `20`
+ *   - `limit`   — `20` (`INDEXER_DEFAULT_PAGE_SIZE`)
+ *
+ * `IndexerClient` validates these before sending the request: an unknown key,
+ * a value outside the indexer's accepted set, or a `limit` outside
+ * `1..INDEXER_MAX_PAGE_SIZE` rejects locally with a `RangeError` rather than
+ * being dropped or turned into an HTTP 400.
  */
 export interface GetCirclesParams {
   /**
@@ -1325,13 +1612,36 @@ export interface GetCirclesParams {
    */
   status?: ApiCircleStatus;
   /** Column to sort results by. */
-  sort?: "created_ledger" | "updated_at" | "round_amount" | "member_count" | "status";
+  sort?: CircleSortField;
   /** Sort direction. */
   order?: "asc" | "desc";
   /** 1-based page number. */
   page?: number;
   /** Results per page (1–100). */
   limit?: number;
+}
+
+/**
+ * Query parameters accepted by `GET /members/:member/contributions`.
+ * Validated locally like {@link GetCirclesParams}.
+ */
+export interface GetMemberContributionsParams {
+  /** Restrict results to one circle (a G… or C… address). */
+  circle?: string;
+  /** 1-based page number. Defaults to `1`. */
+  page?: number;
+  /** Results per page (1–100). Defaults to `20`. */
+  limit?: number;
+}
+
+/**
+ * Bound on an aggregating helper such as `IndexerClient.iterateCircles`.
+ * Every aggregating helper stops after `maxPages` pages, so none fetches an
+ * unbounded result set by default.
+ */
+export interface PaginateOptions {
+  /** Maximum number of pages to fetch (1–1000). Defaults to `10`. */
+  maxPages?: number;
 }
 
 /** Response body for GET /circles */
@@ -1342,12 +1652,7 @@ export interface ApiCirclesListResponse {
    * Present on all responses; callers should use `total` and `totalPages` for
    * building pagination controls.
    */
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
+  pagination: IndexerPagination;
 }
 
 /** Response body for GET /circles/:address */
@@ -1472,12 +1777,12 @@ export interface ApiMemberContributionsResponse {
   /** Circle filter applied, or null when returning history across all circles. */
   circle: string | null;
   contributions: ApiMemberContributionRow[];
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
+  /**
+   * Sum of `amount` over every matching row (all pages, not just this one),
+   * in stroops (string-serialised).
+   */
+  totalAmount?: string;
+  pagination: IndexerPagination;
 }
 
 /** Response body for GET /health */
