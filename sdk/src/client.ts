@@ -52,6 +52,7 @@ import {
   decodeU32,
   decodeI128,
   decodeBoolean,
+  decodeAddress,
   decodeAddressList,
   validateContractArgs,
   sanitizeTxMetadata,
@@ -63,6 +64,7 @@ import {
   isGateBlocked,
   isSnapshotFresh,
 } from "./gating";
+import { USDC_DECIMALS } from "./constants";
 import type {
   ActualState,
   CircleAction,
@@ -1217,6 +1219,118 @@ export interface TxLogEvent {
  */
 export type TxLogger = (event: TxLogEvent) => void;
 
+// ─── Deployment verification ────────────────────────────────────────────────
+//
+// `validateCircleUpConfig` proves the configured addresses are well-formed; it
+// cannot prove they are *CircleUp* contracts on *this* network. The opt-in
+// {@link CircleUpClient.verifyDeployment} flow closes that gap with read-only
+// RPC calls (network passphrase + simulated view methods). Construction never
+// touches the network; verification runs only when the caller asks for it.
+
+/** Default upper bound, in milliseconds, for each verification RPC call. */
+export const DEFAULT_VERIFY_TIMEOUT_MS = 15_000;
+
+/**
+ * Identifier of one verification check.
+ *
+ * | Check                      | Evidence read                                   |
+ * |----------------------------|-------------------------------------------------|
+ * | `network`                  | RPC `getNetwork().passphrase` vs config         |
+ * | `factory.usdc`             | factory `get_usdc_token()` vs `contracts.usdc`  |
+ * | `factory.reputation`       | factory `get_reputation_contract()` vs `contracts.reputation` |
+ * | `factory.circleWasmHash`   | factory `get_circle_wasm_hash()` (vs the expected hash, when supplied) |
+ * | `reputation`               | reputation `get_admin()` returns an address     |
+ * | `usdc`                     | token `decimals()` equals USDC_DECIMALS         |
+ */
+export type DeploymentCheckName =
+  | "network"
+  | "factory.usdc"
+  | "factory.reputation"
+  | "factory.circleWasmHash"
+  | "reputation"
+  | "usdc";
+
+/**
+ * Outcome of one check.
+ *
+ * - `ok`           — the identity matched.
+ * - `mismatch`     — the contract answered, but with a different identity
+ *                    (wrong network, wrong linked address, wrong wasm hash).
+ * - `missing`      — no contract instance exists at the address on this network.
+ * - `incompatible` — something answered, but not with the expected view
+ *                    method or return type (not a CircleUp contract, or an
+ *                    incompatible version).
+ * - `unreachable`  — the RPC could not be reached or did not answer in time.
+ * - `skipped`      — not attempted because a prerequisite check failed.
+ */
+export type DeploymentCheckStatus =
+  | "ok"
+  | "mismatch"
+  | "missing"
+  | "incompatible"
+  | "unreachable"
+  | "skipped";
+
+/** Result of one verification check. */
+export interface DeploymentCheck {
+  name: DeploymentCheckName;
+  status: DeploymentCheckStatus;
+  /** Contract queried, when the check reads a contract. */
+  contractId?: string;
+  /** The configured / expected identity value. */
+  expected?: string;
+  /** The value the network reported, when one was read. */
+  actual?: string;
+  /** Human-readable explanation, safe to log. */
+  detail: string;
+}
+
+/** Aggregate result of {@link CircleUpClient.verifyDeployment}. */
+export interface DeploymentVerification {
+  /** `true` only when every check is `ok`. Gate writes on this. */
+  ok: boolean;
+  checks: DeploymentCheck[];
+}
+
+/** Options for {@link CircleUpClient.verifyDeployment}. */
+export interface VerifyDeploymentOptions {
+  /**
+   * Upper bound per RPC call (including the SDK's transient-error retries).
+   * @default DEFAULT_VERIFY_TIMEOUT_MS (15 000)
+   */
+  timeoutMs?: number;
+  /**
+   * Hex-encoded circle wasm hash the factory is expected to deploy (e.g. from
+   * the release manifest). When omitted the hash is reported but not compared.
+   */
+  expectedCircleWasmHash?: string;
+}
+
+/** Simulation error text that means no contract instance exists at the address. */
+const MISSING_CONTRACT_RE =
+  /required storage entry was not found|value that does not exist|MissingValue|non-?exist(ing|ent)|contract.*not found/i;
+
+/** Simulation error text produced when the RPC itself could not be reached. */
+const SIMULATION_NETWORK_ERROR_PREFIX = "Simulation network error";
+
+/** Race `promise` against a timer; resolves to `null` on timeout. */
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Lower-case hex encoding of a byte array (no Buffer dependency). */
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // ─── Base client ─────────────────────────────────────────────────────────────
 
 export class CircleUpClient {
@@ -1973,6 +2087,263 @@ export class CircleUpClient {
       );
     }
     return result.value;
+  }
+
+  // ── Deployment verification ─────────────────────────────────────────────────
+
+  /**
+   * Opt-in, read-only check that the configured network and contract
+   * addresses really are the expected CircleUp deployment.
+   *
+   * Reads the RPC's network passphrase and the stable identity view methods
+   * (factory links to USDC / reputation and its circle wasm hash, reputation
+   * admin, USDC decimals) and compares them with this client's config. Never
+   * signs or submits anything, and never runs implicitly — construction stays
+   * offline. Every RPC call is bounded by `options.timeoutMs`.
+   *
+   * Never throws: each failure is reported as a typed {@link DeploymentCheck}.
+   * Applications should keep write actions disabled until `ok` is `true`.
+   *
+   * @example
+   * const result = await client.verifyDeployment();
+   * if (!result.ok) {
+   *   for (const c of result.checks.filter((c) => c.status !== "ok")) {
+   *     console.warn(`${c.name}: ${c.status} — ${c.detail}`);
+   *   }
+   * }
+   */
+  async verifyDeployment(options?: VerifyDeploymentOptions): Promise<DeploymentVerification> {
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("verifyDeployment: timeoutMs must be a positive, finite number of milliseconds.");
+    }
+    const { circleFactory, reputation, usdc } = this.config.contracts;
+    const checks: DeploymentCheck[] = [];
+
+    // ── 1. Network identity — every contract read below is meaningless if the
+    //       RPC serves a different network than the config targets.
+    const expectedPassphrase = this.config.networkPassphrase;
+    let networkCheck: DeploymentCheck;
+    try {
+      const network = await withTimeout(this.rpc.getNetwork(), timeoutMs);
+      if (network === null) {
+        networkCheck = {
+          name: "network",
+          status: "unreachable",
+          expected: expectedPassphrase,
+          detail: `The RPC at ${this.config.rpcUrl} did not answer getNetwork within ${timeoutMs} ms.`,
+        };
+      } else if (typeof network?.passphrase !== "string") {
+        networkCheck = {
+          name: "network",
+          status: "incompatible",
+          expected: expectedPassphrase,
+          detail: "getNetwork returned no passphrase.",
+        };
+      } else if (network.passphrase !== expectedPassphrase) {
+        networkCheck = {
+          name: "network",
+          status: "mismatch",
+          expected: expectedPassphrase,
+          actual: network.passphrase,
+          detail:
+            `The RPC at ${this.config.rpcUrl} serves "${network.passphrase}", ` +
+            `but config.networkPassphrase is "${expectedPassphrase}".`,
+        };
+      } else {
+        networkCheck = {
+          name: "network",
+          status: "ok",
+          expected: expectedPassphrase,
+          actual: network.passphrase,
+          detail: "RPC network passphrase matches the config.",
+        };
+      }
+    } catch (err: any) {
+      networkCheck = {
+        name: "network",
+        status: "unreachable",
+        expected: expectedPassphrase,
+        detail: `getNetwork failed: ${formatRpcError(err?.message ?? "unknown", this.config.rpcUrl)}`,
+      };
+    }
+    checks.push(networkCheck);
+
+    const contractChecks: Array<[DeploymentCheckName, string]> = [
+      ["factory.usdc", circleFactory],
+      ["factory.reputation", circleFactory],
+      ["factory.circleWasmHash", circleFactory],
+      ["reputation", reputation],
+      ["usdc", usdc],
+    ];
+    if (networkCheck.status !== "ok") {
+      for (const [name, contractId] of contractChecks) {
+        checks.push({
+          name,
+          status: "skipped",
+          contractId,
+          detail: "Skipped because the network check did not pass.",
+        });
+      }
+      return { ok: false, checks };
+    }
+
+    // ── 2. Contract identity reads, in parallel.
+    const read = async (contractId: string, method: string) => {
+      const result = await withTimeout(this.simulateAndRead(contractId, method, []), timeoutMs);
+      return result ?? { ok: false as const, error: `__timeout__` };
+    };
+    const [usdcLink, reputationLink, wasmHash, reputationAdmin, usdcDecimals] = await Promise.all([
+      read(circleFactory, "get_usdc_token"),
+      read(circleFactory, "get_reputation_contract"),
+      read(circleFactory, "get_circle_wasm_hash"),
+      read(reputation, "get_admin"),
+      read(usdc, "decimals"),
+    ]);
+
+    /** Map a failed read to a typed check, or run `onValue` for a successful one. */
+    const evaluate = (
+      name: DeploymentCheckName,
+      contractId: string,
+      method: string,
+      result: SimulateResult,
+      expected: string | undefined,
+      onValue: (value: unknown) => DeploymentCheck,
+    ): DeploymentCheck => {
+      if (result.ok) {
+        try {
+          return onValue(result.value);
+        } catch (err: any) {
+          return {
+            name,
+            status: "incompatible",
+            contractId,
+            expected,
+            detail: `${method}() returned an unexpected value: ${err?.message ?? "decode failed"}`,
+          };
+        }
+      }
+      const error = result.error;
+      if (error === "__timeout__") {
+        return {
+          name,
+          status: "unreachable",
+          contractId,
+          expected,
+          detail: `${method}() did not answer within ${timeoutMs} ms.`,
+        };
+      }
+      if (error.startsWith(SIMULATION_NETWORK_ERROR_PREFIX)) {
+        return { name, status: "unreachable", contractId, expected, detail: error };
+      }
+      if (MISSING_CONTRACT_RE.test(error)) {
+        return {
+          name,
+          status: "missing",
+          contractId,
+          expected,
+          detail: `No initialised contract answered ${method}() at ${contractId} on this network.`,
+        };
+      }
+      return {
+        name,
+        status: "incompatible",
+        contractId,
+        expected,
+        detail: `${method}() failed: ${error}`,
+      };
+    };
+
+    const compareAddress =
+      (name: DeploymentCheckName, label: string, expected: string, method: string) =>
+      (value: unknown): DeploymentCheck => {
+        const actual = decodeAddress(value, `${circleFactory}.${method}`);
+        return actual === expected
+          ? { name, status: "ok", contractId: circleFactory, expected, actual, detail: `Factory ${label} link matches the config.` }
+          : {
+              name,
+              status: "mismatch",
+              contractId: circleFactory,
+              expected,
+              actual,
+              detail: `The factory is linked to ${label} ${actual}, but the config names ${expected}.`,
+            };
+      };
+
+    checks.push(
+      evaluate("factory.usdc", circleFactory, "get_usdc_token", usdcLink, usdc,
+        compareAddress("factory.usdc", "USDC token", usdc, "get_usdc_token")),
+      evaluate("factory.reputation", circleFactory, "get_reputation_contract", reputationLink, reputation,
+        compareAddress("factory.reputation", "reputation contract", reputation, "get_reputation_contract")),
+    );
+
+    const expectedHash = options?.expectedCircleWasmHash?.trim().toLowerCase() || undefined;
+    checks.push(
+      evaluate("factory.circleWasmHash", circleFactory, "get_circle_wasm_hash", wasmHash, expectedHash, (value) => {
+        if (!(value instanceof Uint8Array) || value.length !== 32) {
+          throw new Error("expected a 32-byte hash");
+        }
+        const actual = bytesToHex(value);
+        if (expectedHash === undefined) {
+          return {
+            name: "factory.circleWasmHash",
+            status: "ok",
+            contractId: circleFactory,
+            actual,
+            detail: "Factory reports a circle wasm hash (no expected hash supplied to compare).",
+          };
+        }
+        return actual === expectedHash
+          ? {
+              name: "factory.circleWasmHash",
+              status: "ok",
+              contractId: circleFactory,
+              expected: expectedHash,
+              actual,
+              detail: "Factory circle wasm hash matches the expected release.",
+            }
+          : {
+              name: "factory.circleWasmHash",
+              status: "mismatch",
+              contractId: circleFactory,
+              expected: expectedHash,
+              actual,
+              detail: "Factory deploys a different circle wasm than the expected release.",
+            };
+      }),
+      evaluate("reputation", reputation, "get_admin", reputationAdmin, undefined, (value) => {
+        const actual = decodeAddress(value, `${reputation}.get_admin`);
+        return {
+          name: "reputation",
+          status: "ok",
+          contractId: reputation,
+          actual,
+          detail: "Reputation contract answers get_admin().",
+        };
+      }),
+      evaluate("usdc", usdc, "decimals", usdcDecimals, String(USDC_DECIMALS), (value) => {
+        const decimals = decodeU32(value, `${usdc}.decimals`);
+        return decimals === USDC_DECIMALS
+          ? {
+              name: "usdc",
+              status: "ok",
+              contractId: usdc,
+              expected: String(USDC_DECIMALS),
+              actual: String(decimals),
+              detail: "USDC token reports the expected decimals.",
+            }
+          : {
+              name: "usdc",
+              status: "mismatch",
+              contractId: usdc,
+              expected: String(USDC_DECIMALS),
+              actual: String(decimals),
+              detail: `Token reports ${decimals} decimals; USDC uses ${USDC_DECIMALS}.`,
+            };
+      }),
+    );
+
+    return { ok: checks.every((c) => c.status === "ok"), checks };
   }
 }
 
@@ -2870,22 +3241,120 @@ export class ReputationClient extends CircleUpClient {
 // aggregated reputation, and the full list of circles (the factory only stores
 // an on-chain Vec which requires a contract read per address).
 //
-// All methods throw a descriptive `IndexerError` on any non-2xx response or
-// network failure so callers always get an actionable message rather than a
-// generic TypeError from a failed JSON parse.
+// All methods throw a descriptive `IndexerError` on any failure so callers
+// always get an actionable message rather than a generic TypeError from a
+// failed JSON parse. `IndexerError.kind` separates the failure categories:
+//
+//   network  — fetch() rejected (DNS, connection refused, CORS, …)
+//   timeout  — no complete response within the request budget
+//              (DEFAULT_INDEXER_TIMEOUT_MS unless overridden)
+//   aborted  — the caller's AbortSignal fired
+//   http     — the indexer answered with a non-2xx status
+//   json     — a 2xx response whose body is not valid JSON
+//   schema   — valid JSON whose envelope does not match the endpoint contract
+//
+// These are deliberately distinct from Soroban RPC failures (`withRpcRetry`,
+// `PollConfig`): the indexer is a plain HTTP read path and is never retried
+// automatically. Error messages never embed the full response body — at most
+// the indexer's short `error` string, truncated.
+
+/**
+ * Default upper bound, in milliseconds, for a single indexer request
+ * (connect + headers + body). Override per client via
+ * {@link IndexerClientOptions.timeoutMs} or per call via
+ * {@link IndexerRequestOptions.timeoutMs}.
+ */
+export const DEFAULT_INDEXER_TIMEOUT_MS = 10_000;
+
+/** Longest indexer-supplied `error` string echoed into an IndexerError message. */
+const MAX_ERROR_DETAIL_LENGTH = 200;
+
+/** Failure category of an {@link IndexerError}; see the section comment above. */
+export type IndexerErrorKind =
+  | "network"
+  | "timeout"
+  | "aborted"
+  | "http"
+  | "json"
+  | "schema";
 
 /** Thrown by {@link IndexerClient} on any failed request. */
 export class IndexerError extends Error {
-  /** HTTP status code, or 0 for network-level failures. */
+  /** HTTP status code, or 0 when no HTTP response was received. */
   readonly status: number;
   /** The URL that was requested. */
   readonly url: string;
+  /** Failure category — branch on this rather than parsing `message`. */
+  readonly kind: IndexerErrorKind;
+  /**
+   * `true` when retrying the same request later may succeed: network
+   * failures, timeouts, HTTP 429 and 5xx. Caller aborts, 4xx, and malformed
+   * payloads are not retryable.
+   */
+  readonly retryable: boolean;
 
-  constructor(message: string, status: number, url: string) {
+  constructor(message: string, status: number, url: string, kind?: IndexerErrorKind) {
     super(message);
     this.name = "IndexerError";
     this.status = status;
     this.url = url;
+    this.kind = kind ?? (status === 0 ? "network" : "http");
+    this.retryable =
+      this.kind === "network" ||
+      this.kind === "timeout" ||
+      (this.kind === "http" && (status === 429 || status >= 500));
+  }
+}
+
+/** Client-wide options for {@link IndexerClient}. */
+export interface IndexerClientOptions {
+  /**
+   * Upper bound in milliseconds for each request, including reading the body.
+   * @default DEFAULT_INDEXER_TIMEOUT_MS (10 000)
+   */
+  timeoutMs?: number;
+}
+
+/** Per-call options accepted by every {@link IndexerClient} read method. */
+export interface IndexerRequestOptions {
+  /**
+   * Caller cancellation. When it fires the request is abandoned and the
+   * method rejects with an {@link IndexerError} of kind `"aborted"`.
+   */
+  signal?: AbortSignal;
+  /** Overrides the client's timeout for this call only. */
+  timeoutMs?: number;
+}
+
+/**
+ * Minimal envelope contract for one endpoint: top-level keys the SDK relies
+ * on and their JSON container type. Deeper field validation lives in
+ * indexerSchema.ts and is exercised by the compatibility fixtures; the
+ * runtime check stays shallow so additive server changes never break callers.
+ */
+type EnvelopeSpec = Record<string, "array" | "object" | "string">;
+
+function validateEnvelope(body: unknown, spec: EnvelopeSpec): string | null {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return `expected a JSON object, got ${body === null ? "null" : Array.isArray(body) ? "array" : typeof body}`;
+  }
+  const record = body as Record<string, unknown>;
+  for (const [key, type] of Object.entries(spec)) {
+    const value = record[key];
+    const ok =
+      type === "array"
+        ? Array.isArray(value)
+        : type === "object"
+          ? value !== null && typeof value === "object" && !Array.isArray(value)
+          : typeof value === type;
+    if (!ok) return `field "${key}" must be ${type === "array" ? "an array" : `a ${type}`}`;
+  }
+  return null;
+}
+
+function assertPositiveTimeout(value: number, label: string): void {
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`IndexerClient: ${label} must be a positive, finite number of milliseconds.`);
   }
 }
 
@@ -3086,13 +3555,15 @@ function resolveMaxPages(method: string, options: PaginateOptions | undefined): 
  */
 export class IndexerClient {
   private baseUrl: string;
+  private timeoutMs: number;
 
   /**
-   * @param config SDK config. `indexerUrl` is required — construction throws
-   *               immediately if it is missing so the error surfaces at setup
-   *               time rather than at the first API call.
+   * @param config  SDK config. `indexerUrl` is required — construction throws
+   *                immediately if it is missing so the error surfaces at setup
+   *                time rather than at the first API call.
+   * @param options Optional transport settings (request timeout).
    */
-  constructor(config: CircleUpConfig) {
+  constructor(config: CircleUpConfig, options?: IndexerClientOptions) {
     if (!config.indexerUrl || config.indexerUrl.trim() === "") {
       throw new Error(
         "IndexerClient requires config.indexerUrl to be set. " +
@@ -3122,14 +3593,20 @@ export class IndexerClient {
     }
     // Strip trailing slash so path concatenation is consistent
     this.baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
+
+    this.timeoutMs = options?.timeoutMs ?? DEFAULT_INDEXER_TIMEOUT_MS;
+    assertPositiveTimeout(this.timeoutMs, "options.timeoutMs");
   }
 
   // ── Internal fetch wrapper ────────────────────────────────────────────────
 
   /**
-   * Fetch `path` from the indexer, parse the JSON response, and return the
-   * typed body. Throws {@link IndexerError} on any non-2xx status or network
-   * failure.
+   * Fetch `path` from the indexer, parse the JSON response, check its
+   * envelope against `spec`, and return the typed body.
+   *
+   * The whole exchange (connect, headers, body) is bounded by the request
+   * timeout and by the caller's `signal`. Throws {@link IndexerError} with a
+   * distinct `kind` for each failure category.
    */
   private async get<T>(path: string): Promise<T> {
     return (await this.request<T>(path)).body;
@@ -3215,33 +3692,65 @@ export class IndexerClient {
   /** Fetch `path` and return the parsed body with the status and URL it came from. */
   private async request<T>(path: string): Promise<{ body: T; status: number; url: string }> {
     const url = `${this.baseUrl}${path}`;
-    let response: Response;
-    try {
-      response = await fetch(url);
-    } catch (err: any) {
-      throw new IndexerError(
-        `Network error reaching the indexer at ${url}: ${err?.message ?? "fetch failed"}. ` +
-        "Check that the indexer is running and that config.indexerUrl is correct.",
-        0,
-        url,
-      );
+    const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
+    assertPositiveTimeout(timeoutMs, "timeoutMs");
+
+    const callerSignal = options?.signal;
+    if (callerSignal?.aborted) {
+      throw new IndexerError(`Indexer request to ${url} was aborted by the caller.`, 0, url, "aborted");
     }
 
-    if (!response.ok) {
-      let detail = "";
+    // One controller aborts the underlying fetch for both the timeout and the
+    // caller's signal; `failure` records which one fired so the error kind is
+    // accurate, and the race below guarantees the promise settles even if the
+    // fetch implementation ignores the signal.
+    const controller = new AbortController();
+    let failure = null as IndexerError | null;
+    let rejectPending: (err: IndexerError) => void = () => {};
+    const pending = new Promise<never>((_resolve, reject) => {
+      rejectPending = reject;
+    });
+    const fail = (err: IndexerError) => {
+      if (failure) return;
+      failure = err;
+      controller.abort();
+      rejectPending(err);
+    };
+    // Prevent an unhandled rejection if the race below has already settled.
+    pending.catch(() => {});
+
+    const timer = setTimeout(
+      () =>
+        fail(
+          new IndexerError(
+            `Indexer request to ${url} timed out after ${timeoutMs} ms.`,
+            0,
+            url,
+            "timeout",
+          ),
+        ),
+      timeoutMs,
+    );
+    const onCallerAbort = () =>
+      fail(new IndexerError(`Indexer request to ${url} was aborted by the caller.`, 0, url, "aborted"));
+    callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+
+    const bounded = <R>(promise: Promise<R>): Promise<R> => Promise.race([promise, pending]);
+
+    try {
+      let response: Response;
       try {
-        const body = await response.json() as Record<string, unknown>;
-        const msg = body?.error;
-        detail = typeof msg === "string" ? ` — ${msg}` : "";
-      } catch {
-        // Ignore JSON parse failure for error bodies
+        response = await bounded(fetch(url, { signal: controller.signal }));
+      } catch (err: any) {
+        if (failure) throw failure;
+        throw new IndexerError(
+          `Network error reaching the indexer at ${url}: ${err?.message ?? "fetch failed"}. ` +
+          "Check that the indexer is running and that config.indexerUrl is correct.",
+          0,
+          url,
+          "network",
+        );
       }
-      throw new IndexerError(
-        `Indexer returned HTTP ${response.status} for ${url}${detail}`,
-        response.status,
-        url,
-      );
-    }
 
     try {
       return { body: (await response.json()) as T, status: response.status, url };
@@ -3334,8 +3843,15 @@ export class IndexerClient {
    *
    * @param address On-chain contract address of the circle.
    */
-  async getCircleDetail(address: string): Promise<ApiCircleDetailResponse> {
-    return this.get<ApiCircleDetailResponse>(`/circles/${encodeURIComponent(address)}`);
+  async getCircleDetail(
+    address: string,
+    options?: IndexerRequestOptions,
+  ): Promise<ApiCircleDetailResponse> {
+    return this.get<ApiCircleDetailResponse>(
+      `/circles/${encodeURIComponent(address)}`,
+      { circle: "object", members: "array" },
+      options,
+    );
   }
 
   /**
@@ -3354,8 +3870,12 @@ export class IndexerClient {
    *
    * @param address On-chain contract address of the circle.
    */
-  async getMembers(address: string): Promise<ApiMembersResponse> {
-    return this.get<ApiMembersResponse>(`/circles/${encodeURIComponent(address)}/members`);
+  async getMembers(address: string, options?: IndexerRequestOptions): Promise<ApiMembersResponse> {
+    return this.get<ApiMembersResponse>(
+      `/circles/${encodeURIComponent(address)}/members`,
+      { members: "array" },
+      options,
+    );
   }
 
   /**
@@ -3374,8 +3894,12 @@ export class IndexerClient {
    *
    * @param address On-chain contract address of the circle.
    */
-  async getRounds(address: string): Promise<ApiRoundsResponse> {
-    return this.get<ApiRoundsResponse>(`/circles/${encodeURIComponent(address)}/rounds`);
+  async getRounds(address: string, options?: IndexerRequestOptions): Promise<ApiRoundsResponse> {
+    return this.get<ApiRoundsResponse>(
+      `/circles/${encodeURIComponent(address)}/rounds`,
+      { rounds: "array", pendingDefaults: "array" },
+      options,
+    );
   }
 
   /**
@@ -3389,8 +3913,15 @@ export class IndexerClient {
    *
    * @param member Stellar public key of the member.
    */
-  async getReputation(member: string): Promise<ApiReputationResponse> {
-    return this.get<ApiReputationResponse>(`/reputation/${encodeURIComponent(member)}`);
+  async getReputation(
+    member: string,
+    options?: IndexerRequestOptions,
+  ): Promise<ApiReputationResponse> {
+    return this.get<ApiReputationResponse>(
+      `/reputation/${encodeURIComponent(member)}`,
+      { contributions: "array", defaults: "array" },
+      options,
+    );
   }
 
   /**
@@ -3477,8 +4008,15 @@ export class IndexerClient {
    *
    * @param address On-chain contract address of the circle.
    */
-  async getCircleAuditEvents(address: string): Promise<ApiAuditEventsResponse> {
-    return this.get<ApiAuditEventsResponse>(`/circles/${encodeURIComponent(address)}/audit`);
+  async getCircleAuditEvents(
+    address: string,
+    options?: IndexerRequestOptions,
+  ): Promise<ApiAuditEventsResponse> {
+    return this.get<ApiAuditEventsResponse>(
+      `/circles/${encodeURIComponent(address)}/audit`,
+      { events: "array" },
+      options,
+    );
   }
 
   /**
@@ -3488,7 +4026,7 @@ export class IndexerClient {
    *
    * @throws {@link IndexerError} if the indexer is unreachable.
    */
-  async health(): Promise<ApiHealthResponse> {
-    return this.get<ApiHealthResponse>("/health");
+  async health(options?: IndexerRequestOptions): Promise<ApiHealthResponse> {
+    return this.get<ApiHealthResponse>("/health", { status: "string" }, options);
   }
 }

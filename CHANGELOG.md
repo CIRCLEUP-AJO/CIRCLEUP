@@ -48,6 +48,31 @@ Versions follow [Semantic Versioning](https://semver.org/).
   merge had removed, leaving `sdk/src/client.ts` unable to compile.
 
 ### Added
+- **Issue 32**: Bounded timeouts and categorised failures for SDK indexer
+  requests (`sdk/src/client.ts`) — every `IndexerClient` request (connect,
+  headers and body) is bounded by `DEFAULT_INDEXER_TIMEOUT_MS` (10 s,
+  configurable per client and per call) and honours a caller `AbortSignal`.
+  `IndexerError` gains `kind` (`network` | `timeout` | `aborted` | `http` |
+  `json` | `schema`) and `retryable`; error messages never include full
+  response bodies. Covered by `sdk/src/__tests__/indexerClient.test.ts`
+- **Issue 34**: Indexer response compatibility checks
+  (`sdk/src/indexerSchema.ts`, `docs/INDEXER_API_COMPATIBILITY.md`) — runtime
+  wire schemas for list, detail, members, rounds, history, reputation, audit,
+  health and state responses, with representative fixtures validated in
+  `sdk/src/__tests__/indexerContract.test.ts`. Documents which response changes
+  are additive and which need a coordinated release
+- **Issue 35**: Opt-in `CircleUpClient.verifyDeployment()` (`sdk/src/client.ts`)
+  — read-only, time-bounded check of the RPC network passphrase and the
+  factory / reputation / USDC contract identities against the config, with a
+  typed per-check result (`ok` | `mismatch` | `missing` | `incompatible` |
+  `unreachable` | `skipped`). Construction stays offline. Covered by
+  `sdk/src/__tests__/verifyDeployment.test.ts`
+- **Issue 41**: Query-plan review for indexer indexes (`indexer/src/db/explain.ts`,
+  `docs/QUERY_PLANS.md`, `indexer/src/db/migrations/006_status_and_history_composite_indexes.sql`)
+  — `npm run explain` now reports cardinalities, per-query cost / time / scan
+  nodes, and queries that miss their expected index. Adds composite indexes
+  for `GET /circles?status=` and `GET /members/:member/contributions?circle=`,
+  whose filter-only indexes forced a full Sort before LIMIT
 - **Issue 477**: Address validation for every member entry on the create flow
   (`app/src/lib/address.ts`, `app/src/app/create/CreateClient.tsx`)
   — Added dependency-free strkey checksum verification (base32 decode +

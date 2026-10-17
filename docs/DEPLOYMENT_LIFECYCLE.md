@@ -34,6 +34,7 @@ For the manifest schema see
   - [Profile rules enforced by validate-env.ts](#profile-rules-enforced-by-validate-envts)
   - [Manifest network guard](#manifest-network-guard)
   - [CI guard for active manifest](#ci-guard-for-active-manifest)
+  - [Runtime identity verification (SDK)](#runtime-identity-verification-sdk)
 - [Deployment history log](#deployment-history-log)
 - [Special cases](#special-cases)
   - [Testnet resets](#testnet-resets)
@@ -276,6 +277,38 @@ manifest:
 
 The script exits non-zero on any validation failure, blocking the job before
 stale or tampered addresses can propagate.
+
+### Runtime identity verification (SDK)
+
+The checks above prove addresses are well-formed and belong to the right
+manifest; they cannot prove the addresses are CircleUp contracts on the RPC's
+network. The SDK's opt-in `verifyDeployment()` does that with read-only RPC
+calls — no signing, no submission — and never runs during client
+construction:
+
+```ts
+const client = new CircleUpClient(config); // offline
+const result = await client.verifyDeployment({
+  timeoutMs: 10_000,                                 // per RPC call
+  expectedCircleWasmHash: manifest.contracts.circlWasmHash, // optional
+});
+if (!result.ok) disableWrites(result.checks);
+```
+
+| Check | Evidence |
+|-------|----------|
+| `network` | RPC `getNetwork().passphrase` equals `config.networkPassphrase` |
+| `factory.usdc` | factory `get_usdc_token()` equals `contracts.usdc` |
+| `factory.reputation` | factory `get_reputation_contract()` equals `contracts.reputation` |
+| `factory.circleWasmHash` | factory `get_circle_wasm_hash()` (compared when an expected hash is given) |
+| `reputation` | reputation `get_admin()` returns an address |
+| `usdc` | token `decimals()` equals 7 |
+
+Each check reports `ok`, `mismatch`, `missing` (no contract at that address on
+this network), `incompatible` (unexpected method or return type),
+`unreachable` (RPC error or timeout), or `skipped` (contract reads are skipped
+when the network check fails). Applications should keep write actions
+disabled until `result.ok` is `true`.
 
 ---
 
