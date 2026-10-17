@@ -1,170 +1,105 @@
-"use client";
+﻿"use client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
-import { getWalletAddress, invokeContract } from "@/lib/stellar";
-import { shortAddress, formatUsdc, INDEXER_URL, getExplorerLink, ACTIVE_NETWORK } from "@/lib/config";
+import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/stellar";
+import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK, NETWORK_PASSPHRASE } from "@/lib/config";
+import { parseMemberRows } from "@/lib/members";
 import { isSorobanContractId } from "@/lib/address";
+import { parseContractError, userMessageForError, type ContractAppError } from "@/lib/contractErrors";
 import {
   buildAppSnapshot,
   computeActionEligibility,
   isGateBlocked,
+  type NetworkCheckState,
 } from "@/lib/gating";
+import {
+  checkNetworkMismatch,
+  describeNetworkMismatch,
+  type NetworkMismatchResult,
+} from "@/lib/walletCapabilities";
 import { ReputationBadge } from "@/components/ReputationBadge";
+import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
 import clsx from "clsx";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Shared response contracts (Issue #513) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
-// These shapes mirror the canonical API model types defined in
-// sdk/src/types.ts (ApiMemberRow, ApiRoundRow, ApiDefaultRecord, etc.).
-// They are re-declared here because the app package does not take a direct
-// dependency on @circleup/sdk; keep them in sync when the indexer schema
-// changes and update sdk/src/types.ts as the source of truth.
+// All circle API types and runtime parsers now live in lib/circleTypes.ts,
+// which is the single source of truth for the app layer. They mirror the
+// canonical Api* types in sdk/src/types.ts.
+import {
+  type CircleMember,
+  type ContributionRecord,
+  type DefaultRecord,
+  type CircleRound,
+  type CircleState,
+  type CircleDetailData,
+  parseCircleRow,
+  parseCircleState,
+  parseCircleRound,
+  parsePendingDefault,
+  parseRoundsResponse,
+} from "@/lib/circleTypes";
 
-/** @see ApiMemberRow in sdk/src/types.ts */
-export interface CircleMember {
-  member_address: string;
-  payout_order: number;
-  collateral: string;
-  defaults: number;
-  joined_at: string | null;
-  reputation_score: number;
-  total_contributions: number;
-}
-
-/** @see ApiContributionRecord in sdk/src/types.ts */
-export interface ContributionRecord {
-  member_address: string;
-  amount: string;
-  tx_hash: string;
-}
-
-/** @see ApiDefaultRecord in sdk/src/types.ts */
-export interface DefaultRecord {
-  member_address: string;
-  penalty: string;
-}
-
-/** @see ApiRoundRow in sdk/src/types.ts */
-export interface CircleRound {
-  roundIndex: number;
-  /**
-   * "completed" — payout row exists for this round.
-   * "current"   — the active in-progress round (no payout yet).
-   * "cancelled" — the current round of a Cancelled circle.
-   * "open"      — unpaid round with activity that is not the current round
-   *               (reorg / partial-ingest edge case; was previously invisible).
-   */
-  status: "completed" | "current" | "cancelled" | "open";
-  /** null when the round has not been paid out yet. */
-  recipient: string | null;
-  /** null when the round has not been paid out yet. */
-  amount: string | null;
-  /** null when the round has not been paid out yet. */
-  txHash: string | null;
-  contributions: ContributionRecord[];
-  defaults: DefaultRecord[];
-}
-
-/** Pending default — a DefaultRecord not yet associated with a payout round.
- *  @see ApiDefaultRecord in sdk/src/types.ts */
-export interface CirclePendingDefault {
-  member_address: string;
-  penalty: string;
-}
-
-/** Subset of ApiCircleRow fields used by the detail view.
- *  @see ApiCircleRow in sdk/src/types.ts */
-export interface CircleState {
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  round_amount: string;
-  member_count: number;
-  /** Computed deadline ledger for the current active round (null if unknown) */
-  deadline_ledger?: number | null;
-}
-
-/** Composite data object for the circle detail page.
- *  @see ApiCircleDetailResponse + ApiRoundsResponse in sdk/src/types.ts */
-export interface CircleDetailData {
-  circle: CircleState;
-  members: CircleMember[];
-  /**
-   * Completed rounds only (status === "completed"), sorted by roundIndex.
-   * Returned by the indexer's /rounds endpoint as the `rounds` field.
-   */
-  rounds: CircleRound[];
-  /**
-   * Unpaid rounds that have contributions and/or defaults recorded but are
-   * not the circle's current round — previously dropped silently (issue #170).
-   * Returned by the indexer's /rounds endpoint as the `openRounds` field.
-   */
-  openRounds: CircleRound[];
-  pendingDefaults: CirclePendingDefault[];
-  /** Latest ledger the indexer has processed (used for countdown math) */
-  latestLedger?: number | null;
-  /**
-   * The in-progress round returned by the indexer's /rounds endpoint.
-   * Contains the actual contributions list for the current round, used to
-   * determine whether the connected wallet has already contributed this round.
-   * Null when the circle is not Active or the indexer hasn't processed it yet.
-   */
-  currentRound?: CircleRound | null;
-}
+// Re-export the types that page.tsx and test files import directly from this module.
+export type { CircleMember, ContributionRecord, DefaultRecord, CircleRound, CircleState, CircleDetailData };
+// CirclePendingDefault was a distinct interface in the old code; it is now
+// identical to DefaultRecord (both are { member_address, penalty }) and unified
+// under PendingDefault in circleTypes.ts. The alias keeps downstream imports
+// building without changes.
+export type { PendingDefault as CirclePendingDefault } from "@/lib/circleTypes";
 
 interface Props {
   circleAddress: string;
   circleData: CircleDetailData;
 }
 
-// ─── Action key type ──────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Action key type ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 type ActionKey = "join" | "contribute" | "payout" | "default" | "close";
 
-// ─── Success state shape ──────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Success state shape ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 interface SuccessState {
   message: string;
   txHash?: string;
 }
 
-// ─── Data-refresh state ───────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Data-refresh state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
-// "idle"      — no refresh in flight.
-// "refreshing" — post-action background refresh is running.
-// "error"     — refresh failed after a successful action; data may be stale.
+// "idle"      ΓÇö no refresh in flight.
+// "refreshing" ΓÇö post-action background refresh is running.
+// "error"     ΓÇö refresh failed after a successful action; data may be stale.
 
 type RefreshState = "idle" | "refreshing" | "error";
 
-// ─── Wallet load state ────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Wallet load state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Distinct from walletAddress === null, which conflates "still loading" with
 // "genuinely not connected". Action buttons must not render until we know
 // definitively which case we're in.
 //
-// "loading"     — getWalletAddress() has not resolved yet.
-// "connected"   — wallet is installed and an address was returned.
-// "disconnected" — wallet is installed but no address (not connected).
-// "not_installed" — Freighter extension is absent.
+// "loading"     ΓÇö getWalletAddress() has not resolved yet.
+// "connected"   ΓÇö wallet is installed and an address was returned.
+// "disconnected" ΓÇö wallet is installed but no address (not connected).
+// "not_installed" ΓÇö Freighter extension is absent.
 
 type WalletLoadState = "loading" | "connected" | "disconnected" | "not_installed";
 
-// ─── Data completeness state ──────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Data completeness state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Tracks whether the data passed in (or updated via refresh) has all fields
-// required for safe action-gating. This is separate from network errors — it
+// required for safe action-gating. This is separate from network errors ΓÇö it
 // describes the *content* of a successful response.
 //
-// "ready"     — all required fields are present and non-empty.
-// "partial"   — data is present but some fields are missing (members[], latestLedger,
+// "ready"     ΓÇö all required fields are present and non-empty.
+// "partial"   ΓÇö data is present but some fields are missing (members[], latestLedger,
 //               currentRound). Actions are blocked until a refresh fills the gaps.
-// "stale"     — the data was last fetched more than MAX_DATA_AGE_MS ago.
+// "stale"     ΓÇö the data was last fetched more than MAX_DATA_AGE_MS ago.
 //               The user sees a banner and must explicitly refresh.
-// "refreshing" — a manual refresh is in flight (data from prop is kept visible).
+// "refreshing" ΓÇö a manual refresh is in flight (data from prop is kept visible).
 
 export type DataReadiness = "ready" | "partial" | "stale" | "refreshing";
 
-// ─── Contribution receipt ──────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Contribution receipt ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 interface ContributionReceipt {
   amount: string;
@@ -173,56 +108,32 @@ interface ContributionReceipt {
   explorerUrl: string | null;
 }
 
-// ─── Default confirmation ──────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Default confirmation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 interface DefaultConfirmState {
   memberAddress: string;
   roundIndex: number;
 }
 
-// ─── Copy feedback ────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Copy feedback ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 type CopyState = "idle" | "success" | "error";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Constants ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+//
+// Re-exported from lib/deadline.ts so the page-level staleness threshold and
+// the deadline display model share a single source of truth.
+export { DEADLINE_MAX_DATA_AGE_MS as MAX_DATA_AGE_MS } from "@/lib/deadline";
 
-const SECONDS_PER_LEDGER = 5;
-
-/**
- * Maximum age (ms) before the component considers its data stale and shows a
- * banner prompting the user to refresh. Conservative at 2 min — long enough
- * to read the page but short enough to catch a missed payout event.
- *
- * Distinct from DEFAULT_MAX_SNAPSHOT_AGE_MS (30 s) in gating.ts, which is the
- * per-action pre-flight check. Both guards are required: the page-level check
- * prevents the user from sitting on stale data without noticing; the gate
- * check fires just before the on-chain write.
- */
-export const MAX_DATA_AGE_MS = 2 * 60 * 1000; // 2 minutes
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function ledgersToHuman(ledgers: number): string {
-  if (ledgers <= 0) return "overdue";
-  const totalSeconds = ledgers * SECONDS_PER_LEDGER;
-  const days    = Math.floor(totalSeconds / 86400);
-  const hours   = Math.floor((totalSeconds % 86400) / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (days > 0)    return `${days}d ${hours}h`;
-  if (hours > 0)   return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
+// ΓöÇΓöÇΓöÇ Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Compute the data readiness from the current data snapshot and the timestamp
  * at which data was last successfully fetched.
  *
- * "ready"   — members loaded, latestLedger known, currentRound available (or
+ * "ready"   ΓÇö members loaded, latestLedger known, currentRound available (or
  *             circle is not Active so currentRound is not required).
- * "partial" — members empty OR (circle is Active AND currentRound is null).
+ * "partial" ΓÇö members empty OR (circle is Active AND currentRound is null).
  *
  * Staleness is checked separately against fetchedAtMs in the render path.
  */
@@ -255,26 +166,48 @@ function isRetryableError(err: string): boolean {
   );
 }
 
-// ─── Sub-components ───────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Sub-components ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 interface DeadlineProps {
   deadlineLedger: number | null | undefined;
   latestLedger:   number | null | undefined;
   status: string;
+  /** Wall-clock ms when the deadline data was last successfully fetched. */
+  fetchedAtMs: number;
+  /** ISO-8601 checkpoint timestamp from the indexer. null = absent from response. */
+  checkpointTime?: string | null;
 }
 
-function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineProps) {
+function RoundDeadlineStatus({
+  deadlineLedger,
+  latestLedger,
+  status,
+  fetchedAtMs,
+  checkpointTime = null,
+}: DeadlineProps) {
+  const display = computeDeadlineDisplay({
+    deadlineLedger,
+    latestLedger,
+    status,
+    fetchedAtMs,
+    checkpointTime,
+  });
+
+  // Only tick for fresh data on an Active circle.  Stale or missing data is
+  // never presented as a live, precise countdown ΓÇö it stays a static estimate
+  // (or is shown as unavailable) so users aren't misled about when a default
+  // is permitted.
   const [, setTick] = useState(0);
   useEffect(() => {
-    if (status !== "Active" || deadlineLedger == null) return;
+    if (status !== "Active" || display.kind !== "fresh") return;
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
-  }, [status, deadlineLedger]);
+  }, [status, display.kind]);
 
   if (status !== "Active") {
     return (
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-center gap-3">
-        <span className="text-xl" aria-hidden="true">⏱️</span>
+        <span className="text-xl" aria-hidden="true">ΓÅ▒∩╕Å</span>
         <div>
           <p className="text-xs text-slate-500 font-medium uppercase tracking-wide">
             Round deadline
@@ -291,10 +224,10 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
     );
   }
 
-  if (deadlineLedger == null || latestLedger == null) {
+  if (display.kind === "unavailable") {
     return (
-      <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-center gap-3">
-        <span className="text-xl" aria-hidden="true">⏱️</span>
+      <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-start gap-3">
+        <span className="text-xl mt-0.5" aria-hidden="true">ΓÅ▒∩╕Å</span>
         <div>
           <p className="text-xs text-slate-500 font-medium uppercase tracking-wide">
             Round deadline
@@ -302,22 +235,15 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
           <p className="text-sm text-slate-400 mt-0.5">
             Deadline data not available for this circle
           </p>
+          {/* Explicitly report missing checkpoint — absence itself is diagnostic. */}
+          <CheckpointAgeRow checkpointTime={display.checkpointTime} />
         </div>
       </div>
     );
   }
 
-  const ledgersRemaining = deadlineLedger - latestLedger;
-  const isOverdue = ledgersRemaining <= 0;
-  const human = ledgersToHuman(ledgersRemaining);
-
-  const totalSecondsRemaining = ledgersRemaining * SECONDS_PER_LEDGER;
-  const urgency =
-    isOverdue || totalSecondsRemaining < 86_400
-      ? "red"
-      : totalSecondsRemaining < 2 * 86_400
-      ? "yellow"
-      : "green";
+  const isStale = display.kind === "stale";
+  const { human, isOverdue, urgency, ledgersRemaining } = display;
 
   const colorMap = {
     green:  "bg-brand-50 border-brand-200 text-brand-800",
@@ -325,43 +251,103 @@ function RoundDeadlineStatus({ deadlineLedger, latestLedger, status }: DeadlineP
     red:    "bg-red-50 border-red-300 text-red-800",
   } as const;
 
-  const labelMap = {
-    green:  "Time remaining",
-    yellow: "Deadline approaching",
-    red:    isOverdue ? "Payout overdue" : "Deadline imminent",
-  } as const;
+  const boxClasses = `border rounded-xl p-4 flex items-start gap-3 ${
+    isStale ? "bg-amber-50 border-amber-200 text-amber-800" : colorMap[urgency]
+  }`;
 
   return (
     <div
-      className={`border rounded-xl p-4 flex items-center gap-3 ${colorMap[urgency]}`}
+      className={boxClasses}
       role="status"
       aria-live="polite"
-      aria-label={`Round deadline: ${human}`}
+      aria-label={`Round deadline: ${display.label}, ${human}`}
     >
-      <span className="text-xl" aria-hidden="true">
-        {isOverdue ? "🔔" : "⏱️"}
+      <span className="text-xl mt-0.5" aria-hidden="true">
+        {isOverdue ? "≡ƒöö" : "ΓÅ▒∩╕Å"}
       </span>
       <div className="flex-1">
         <p className="text-xs font-medium uppercase tracking-wide opacity-70">
-          {labelMap[urgency]}
+          {display.label}
         </p>
         <p className="text-lg font-bold mt-0.5 tabular-nums">{human}</p>
         <p className="text-xs opacity-60 mt-0.5">
-          Deadline at ledger {deadlineLedger.toLocaleString()} ·{" "}
-          {Math.abs(ledgersRemaining).toLocaleString()} ledger
-          {Math.abs(ledgersRemaining) !== 1 ? "s" : ""}{" "}
+          Deadline at ledger {deadlineLedger!.toLocaleString()} ┬╖{" "}
+          {Math.abs(ledgersRemaining!).toLocaleString()} ledger
+          {Math.abs(ledgersRemaining!) !== 1 ? "s" : ""}{" "}
           {isOverdue ? "past deadline" : "remaining"}{" "}
-          · ~{SECONDS_PER_LEDGER}s per ledger
+          ┬╖ ~{SECONDS_PER_LEDGER}s per ledger (estimate)
+          {isStale
+            ? ` ┬╖ indexed data is ${Math.round(
+                (display.dataAgeMs ?? 0) / 1000,
+              )}s old ΓÇö refresh for an accurate deadline`
+            : ""}
         </p>
+        {/* Checkpoint age separates ledger distance from approximate processing age.
+            Always rendered — if absent the row labels that explicitly. */}
+        <CheckpointAgeRow checkpointTime={display.checkpointTime} />
       </div>
     </div>
+  );
+}
+
+// ─── CheckpointAgeRow ─────────────────────────────────────────────────────────
+//
+// Shows the indexer processing age alongside the ledger countdown so operators
+// can distinguish ledger *distance* from approximate *processing age*.
+// When checkpointTime is null the row says so explicitly — absence is a
+// diagnostic signal and must never be silently omitted.
+
+function CheckpointAgeRow({ checkpointTime }: { checkpointTime: string | null }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (checkpointTime == null) {
+    return (
+      <p
+        className="text-xs opacity-60 mt-1"
+        title="The indexer response did not include a checkpointTime field. Processing age is unknown."
+      >
+        Indexer age: no checkpoint data · source: absent
+      </p>
+    );
+  }
+
+  const parsed = Date.parse(checkpointTime);
+  if (isNaN(parsed)) {
+    return (
+      <p className="text-xs opacity-60 mt-1">
+        Indexer age: unparseable timestamp · source: indexer_response
+      </p>
+    );
+  }
+
+  // Clamp to ≥ 0: minor clock skew (indexer clock slightly ahead of client)
+  // produces a confusing negative age without this guard.
+  const ageSec = Math.max(0, (nowMs - parsed) / 1000);
+  const ageStr =
+    ageSec < 60
+      ? `${Math.round(ageSec)}s ago`
+      : ageSec < 3600
+      ? `${Math.round(ageSec / 60)}m ago`
+      : `${(ageSec / 3600).toFixed(1)}h ago`;
+
+  return (
+    <p
+      className="text-xs opacity-60 mt-1"
+      title={`Checkpoint timestamp: ${checkpointTime}`}
+    >
+      Indexer age: {ageStr} · source: indexer_response
+    </p>
   );
 }
 
 // ─── Partial data banner ──────────────────────────────────────────────────────
 //
 // Shown when data is structurally present but incomplete. Explains why actions
-// are locked and provides a Retry button. Distinct from a network/fetch error —
+// are locked and provides a Retry button. Distinct from a network/fetch error ΓÇö
 // this is "we got a response, but it doesn't have everything we need yet."
 
 interface PartialDataBannerProps {
@@ -384,7 +370,7 @@ function PartialDataBanner({ data, onRefresh, isRefreshing }: PartialDataBannerP
       aria-live="polite"
       className="bg-amber-50 border border-amber-300 rounded-xl px-5 py-4 flex items-start gap-3 text-sm"
     >
-      <span className="text-xl mt-0.5" aria-hidden="true">⏳</span>
+      <span className="text-xl mt-0.5" aria-hidden="true">ΓÅ│</span>
       <div className="flex-1">
         <p className="font-semibold text-amber-800">
           Some data is still loading
@@ -399,14 +385,62 @@ function PartialDataBanner({ data, onRefresh, isRefreshing }: PartialDataBannerP
           disabled={isRefreshing}
           className="mt-2 text-xs font-medium underline text-amber-800 hover:text-amber-900 disabled:opacity-50"
         >
-          {isRefreshing ? "Refreshing…" : "Refresh now"}
+          {isRefreshing ? "RefreshingΓÇª" : "Refresh now"}
         </button>
       </div>
     </div>
   );
 }
 
-// ─── Stale data banner ────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Member list fallback ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+//
+// Rendered inside the Rotation Order card when the indexer returned no usable
+// member rows (see parseMemberRows). The indexer writes member rows when the
+// circle is created, so an empty list always means "not available", never
+// "nobody has joined". One muted placeholder row per expected member keeps
+// the card the same height it will have once the rows arrive, and nothing
+// here names an address, a payout position, or a contribution status that
+// could be mistaken for real data.
+
+/** Upper bound on placeholder rows, whatever member_count the indexer reports. */
+const MAX_PLACEHOLDER_ROWS = 20;
+
+function MemberListFallback({ memberCount }: { memberCount: number }) {
+  const rows =
+    Number.isInteger(memberCount) && memberCount > 0
+      ? Math.min(memberCount, MAX_PLACEHOLDER_ROWS)
+      : 0;
+
+  return (
+    <div>
+      <p role="status" className="text-sm text-slate-600 mb-3">
+        Member details are not available right now, so the rotation order
+        can&apos;t be shown yet.{" "}
+        {rows > 0
+          ? `This circle has ${memberCount} member${memberCount === 1 ? "" : "s"}; `
+          : ""}
+        they will appear here once the indexer has them.
+      </p>
+      {rows > 0 && (
+        <ol className="space-y-2" aria-hidden="true">
+          {Array.from({ length: rows }, (_, i) => (
+            <li
+              key={i}
+              className="flex items-center gap-2 sm:gap-3 p-2.5 sm:p-3 rounded-lg border border-dashed border-slate-200"
+            >
+              <span className="text-slate-300 text-sm w-5 shrink-0 text-right">
+                {i + 1}
+              </span>
+              <span className="text-xs text-slate-400">Member details unavailable</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+// ΓöÇΓöÇΓöÇ Stale data banner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Shown when the data is older than MAX_DATA_AGE_MS. Distinct from partial data:
 // the data was complete when it arrived, but it's now too old to trust for
@@ -423,7 +457,7 @@ function StaleDataBanner({ onRefresh, isRefreshing }: StaleDataBannerProps) {
       role="alert"
       className="bg-orange-50 border border-orange-300 rounded-xl px-5 py-4 flex items-start gap-3 text-sm"
     >
-      <span className="text-xl mt-0.5" aria-hidden="true">🕐</span>
+      <span className="text-xl mt-0.5" aria-hidden="true">≡ƒòÉ</span>
       <div className="flex-1">
         <p className="font-semibold text-orange-800">Circle data is out of date</p>
         <p className="text-orange-700 mt-1">
@@ -436,24 +470,24 @@ function StaleDataBanner({ onRefresh, isRefreshing }: StaleDataBannerProps) {
           disabled={isRefreshing}
           className="mt-2 text-xs font-medium underline text-orange-800 hover:text-orange-900 disabled:opacity-50"
         >
-          {isRefreshing ? "Refreshing…" : "Refresh now"}
+          {isRefreshing ? "RefreshingΓÇª" : "Refresh now"}
         </button>
       </div>
     </div>
   );
 }
 
-// ─── WorkflowBanner ───────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ WorkflowBanner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Issue #497: Inline workflow explanations for join and contribute actions.
 //
 // The banner contextualises the action buttons so users understand:
-//   • What the action does (semantics, not just the button label)
-//   • What will happen on-chain (collateral, pot pooling, rotation)
-//   • What the outcome will be for them personally
-//   • Any prerequisites they need to be aware of
+//   ΓÇó What the action does (semantics, not just the button label)
+//   ΓÇó What will happen on-chain (collateral, pot pooling, rotation)
+//   ΓÇó What the outcome will be for them personally
+//   ΓÇó Any prerequisites they need to be aware of
 //
-// Each case is distinct and complete. The banners are intentionally verbose —
+// Each case is distinct and complete. The banners are intentionally verbose ΓÇö
 // a savings-circle user may be new to on-chain protocols and needs more than
 // a one-liner to make an informed decision about locking real funds.
 
@@ -478,14 +512,14 @@ function WorkflowBanner({
 }: WorkflowBannerProps) {
   if (status === "Completed" || status === "Cancelled") return null;
 
-  // Don't show a "connect your wallet" banner while still loading — it would
+  // Don't show a "connect your wallet" banner while still loading ΓÇö it would
   // flash and disappear once the wallet check resolves.
   if (walletLoadState === "loading") return null;
 
   if (!walletAddress) {
     return (
       <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800 flex gap-3 items-start">
-        <span className="text-lg" aria-hidden="true">ℹ️</span>
+        <span className="text-lg" aria-hidden="true">Γä╣∩╕Å</span>
         <div>
           <p className="font-semibold mb-1">Connect your wallet to interact</p>
           <p>
@@ -502,7 +536,7 @@ function WorkflowBanner({
   if (status === "Pending" && !isMember) {
     return (
       <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800 flex gap-3 items-start">
-        <span className="text-lg" aria-hidden="true">🔒</span>
+        <span className="text-lg" aria-hidden="true">≡ƒöÆ</span>
         <div>
           <p className="font-semibold mb-1">How joining works</p>
           <ol className="list-decimal list-inside space-y-1 mt-1">
@@ -512,7 +546,7 @@ function WorkflowBanner({
             </li>
             <li>
               The contract locks{" "}
-              <strong>1× the round contribution</strong> from your wallet as
+              <strong>1├ù the round contribution</strong> from your wallet as
               collateral. This secures your spot in the rotation and covers any
               penalty if you miss a round.
             </li>
@@ -523,7 +557,7 @@ function WorkflowBanner({
             </li>
           </ol>
           <p className="mt-2 text-blue-700 text-xs">
-            ⚠️ Make sure your wallet has enough USDC to cover the collateral
+            ΓÜá∩╕Å Make sure your wallet has enough USDC to cover the collateral
             before clicking Join.
           </p>
         </div>
@@ -534,13 +568,13 @@ function WorkflowBanner({
   if (status === "Pending" && isMember) {
     return (
       <div className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-brand-800 flex gap-3 items-start">
-        <span className="text-lg" aria-hidden="true">✅</span>
+        <span className="text-lg" aria-hidden="true">Γ£à</span>
         <div>
-          <p className="font-semibold mb-1">You have joined — waiting for the circle to start</p>
+          <p className="font-semibold mb-1">You have joined ΓÇö waiting for the circle to start</p>
           <p>
             Your collateral is locked on-chain. The circle will activate
             automatically once all invited members have locked their collateral.
-            You will receive the full pot when it is your turn in the rotation —
+            You will receive the full pot when it is your turn in the rotation ΓÇö
             no further action is needed until the circle goes Active.
           </p>
         </div>
@@ -551,10 +585,10 @@ function WorkflowBanner({
   if (status === "Active" && isMember && !alreadyContributed) {
     return (
       <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800 flex gap-3 items-start">
-        <span className="text-lg" aria-hidden="true">💰</span>
+        <span className="text-lg" aria-hidden="true">≡ƒÆ░</span>
         <div>
           <p className="font-semibold mb-1">
-            Round {currentRound} of {totalRounds} — your contribution is due
+            Round {currentRound} of {totalRounds} ΓÇö your contribution is due
           </p>
           <ol className="list-decimal list-inside space-y-1 mt-1">
             <li>
@@ -563,8 +597,8 @@ function WorkflowBanner({
             </li>
             <li>
               Your contribution is transferred to the smart contract and pooled
-              with the other members&apos; contributions. No individual — not
-              even the circle organiser — can access these funds.
+              with the other members&apos; contributions. No individual ΓÇö not
+              even the circle organiser ΓÇö can access these funds.
             </li>
             <li>
               Once <strong>all members have contributed</strong>, the full pot
@@ -573,7 +607,7 @@ function WorkflowBanner({
             </li>
           </ol>
           <p className="mt-2 text-amber-700 text-xs">
-            ⚠️ <strong>Missing a round incurs a penalty</strong> deducted from
+            ΓÜá∩╕Å <strong>Missing a round incurs a penalty</strong> deducted from
             your locked collateral. Contribute before the round deadline shown
             in the countdown below.
           </p>
@@ -585,7 +619,7 @@ function WorkflowBanner({
   if (status === "Active" && isMember && alreadyContributed) {
     return (
       <div className="bg-brand-50 border border-brand-200 rounded-xl p-4 text-sm text-brand-800 flex gap-3 items-start">
-        <span className="text-lg" aria-hidden="true">✅</span>
+        <span className="text-lg" aria-hidden="true">Γ£à</span>
         <div>
           <p className="font-semibold mb-1">
             Your round {currentRound} contribution is in
@@ -605,14 +639,14 @@ function WorkflowBanner({
   if (status === "Active" && !isMember) {
     return (
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 text-sm text-slate-600 flex gap-3 items-start">
-        <span className="text-lg" aria-hidden="true">👀</span>
+        <span className="text-lg" aria-hidden="true">≡ƒæÇ</span>
         <div>
           <p className="font-semibold mb-1">Observing this circle</p>
           <p>
             This circle is active. You are not a member, but you can watch the
             contribution and payout progress in the Rotation Order section
             below. The <strong>Trigger Payout</strong> button is available to
-            anyone — member or not — once all contributions for the current
+            anyone ΓÇö member or not ΓÇö once all contributions for the current
             round are in.
           </p>
         </div>
@@ -623,7 +657,7 @@ function WorkflowBanner({
   return null;
 }
 
-// ─── getMemberContributionStatus ─────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ getMemberContributionStatus ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Issue #498: Improve member contribution state display in rotation order.
 //
@@ -653,7 +687,7 @@ function getMemberContributionStatus(
 ): "contributed" | "pending" | "defaulted" | "not_applicable" {
   if (status !== "Active") return "not_applicable";
 
-  // The current recipient receives the pot — they are not a contributor this round.
+  // The current recipient receives the pot ΓÇö they are not a contributor this round.
   if (member.payout_order === currentRound) return "not_applicable";
 
   // Issue #498: prefer the authoritative contributions list when available.
@@ -676,139 +710,27 @@ function getMemberContributionStatus(
   return "pending";
 }
 
-// ─── Type-safe parsers for indexer API responses (Issue #496) ────────────────
+// ΓöÇΓöÇΓöÇ Type-safe parsers for indexer API responses (Issue #496, #513) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
-// These narrow unknown JSON objects to the correct model types before any
-// value leaves the network boundary. An `as SomeType[]` cast on an unvalidated
-// array would let malformed rows silently propagate into the render tree and
-// gate logic. Instead, each row is parsed independently — a row that fails
-// validation is dropped rather than crashing the whole page.
-//
-// Contract: every parser returns null for any input that is not a plain object
-// with the required fields. They never throw.
+// All parsers (parseContributionRecord, parseDefaultRecord, parseCircleRound,
+// parsePendingDefault, parseCircleState) have been moved to lib/circleTypes.ts
+// and are imported above. This ensures a single implementation is shared by
+// both the server page and this client component.
 
-function parseContributionRecord(raw: unknown): ContributionRecord | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.amount !== "string") return null;
-  if (typeof r.tx_hash !== "string") return null;
-  return {
-    member_address: r.member_address,
-    amount: r.amount,
-    tx_hash: r.tx_hash,
-  };
-}
-
-function parseDefaultRecord(raw: unknown): DefaultRecord | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.penalty !== "string") return null;
-  return {
-    member_address: r.member_address,
-    penalty: r.penalty,
-  };
-}
-
-/**
- * Parse and validate a single CircleMember row from an unknown API value.
- * Returns null if any required field is missing or malformed.
- */
-function parseCircleMember(raw: unknown): CircleMember | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.payout_order !== "number") return null;
-  if (typeof r.collateral !== "string") return null;
-  if (typeof r.defaults !== "number") return null;
-  if (typeof r.reputation_score !== "number") return null;
-  if (typeof r.total_contributions !== "number") return null;
-  return {
-    member_address: r.member_address,
-    payout_order: r.payout_order,
-    collateral: r.collateral,
-    defaults: r.defaults,
-    joined_at: typeof r.joined_at === "string" ? r.joined_at : null,
-    reputation_score: r.reputation_score,
-    total_contributions: r.total_contributions,
-  };
-}
-
-const VALID_ROUND_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
-
-/**
- * Parse and validate a single CircleRound row from an unknown API value.
- * Returns null if any required field is missing or malformed.
- */
-function parseCircleRound(raw: unknown): CircleRound | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.roundIndex !== "number") return null;
-  if (typeof r.status !== "string" || !VALID_ROUND_STATUSES.has(r.status)) return null;
-  const contributions = Array.isArray(r.contributions)
-    ? r.contributions.map(parseContributionRecord).filter((c): c is ContributionRecord => c !== null)
-    : [];
-  const defaults = Array.isArray(r.defaults)
-    ? r.defaults.map(parseDefaultRecord).filter((d): d is DefaultRecord => d !== null)
-    : [];
-  return {
-    roundIndex: r.roundIndex,
-    status: r.status as CircleRound["status"],
-    recipient: typeof r.recipient === "string" ? r.recipient : null,
-    amount: typeof r.amount === "string" ? r.amount : null,
-    txHash: typeof r.txHash === "string" ? r.txHash : null,
-    contributions,
-    defaults,
-  };
-}
-
-/**
- * Parse and validate a single CirclePendingDefault from an unknown API value.
- * Returns null when the row is missing required fields.
- */
-function parsePendingDefault(raw: unknown): CirclePendingDefault | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.member_address !== "string" || r.member_address.trim() === "") return null;
-  if (typeof r.penalty !== "string") return null;
-  return { member_address: r.member_address, penalty: r.penalty };
-}
-
-/**
- * Parse and validate the CircleState shape from an unknown indexer response.
- * Returns null if the object is missing any required numeric or string field.
- */
-function parseCircleState(raw: unknown): CircleState | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.status !== "string" || r.status.trim() === "") return null;
-  if (typeof r.current_round !== "number") return null;
-  if (typeof r.total_rounds !== "number") return null;
-  if (typeof r.round_amount !== "string") return null;
-  if (typeof r.member_count !== "number") return null;
-  return {
-    status: r.status,
-    current_round: r.current_round,
-    total_rounds: r.total_rounds,
-    round_amount: r.round_amount,
-    member_count: r.member_count,
-    deadline_ledger:
-      typeof r.deadline_ledger === "number" ? r.deadline_ledger : null,
-  };
-}
-
-// ─── fetchCircleData ──────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ fetchCircleData ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Shared fetch logic used both by the initial SSR prop and the client-side
 // manual refresh. Returns the merged data or an error discriminant.
 //
 // Error kinds:
-//   "not_found" — indexer returned 404 (circle does not exist).
-//   "network"   — fetch threw (offline, DNS failure, CORS).
-//   "server"    — indexer returned 5xx or non-ok non-404.
+//   "not_found" ΓÇö indexer returned 404 (circle does not exist).
+//   "network"   ΓÇö fetch threw (offline, DNS failure, CORS).
+//   "server"    ΓÇö indexer returned 5xx or non-ok non-404.
+//   "misconfigured" ΓÇö NEXT_PUBLIC_INDEXER_URL is unusable; nothing was fetched.
+//                 Kept apart from "not_found": a relative URL would otherwise
+//                 hit this Next app, 404, and claim the circle was deleted.
 
-export type RefreshError = "not_found" | "network" | "server";
+export type RefreshError = "not_found" | "network" | "server" | "misconfigured";
 
 export type RefreshResult =
   | { ok: true; data: CircleDetailData; fetchedAtMs: number }
@@ -818,22 +740,22 @@ export async function fetchCircleData(
   circleAddress: string,
   signal?: AbortSignal,
 ): Promise<RefreshResult> {
+  const circleUrl = indexerEndpoint(["circles", circleAddress]);
+  const roundsUrl = indexerEndpoint(["circles", circleAddress, "rounds"]);
+  if (circleUrl === null || roundsUrl === null) {
+    return { ok: false, error: "misconfigured" };
+  }
+
   let circleRes: Response;
   let roundsRes: Response;
 
   try {
     [circleRes, roundsRes] = await Promise.all([
-      fetch(`${INDEXER_URL}/circles/${circleAddress}`, {
-        cache: "no-store",
-        signal,
-      }),
-      fetch(`${INDEXER_URL}/circles/${circleAddress}/rounds`, {
-        cache: "no-store",
-        signal,
-      }),
+      fetch(circleUrl, { cache: "no-store", signal }),
+      fetch(roundsUrl, { cache: "no-store", signal }),
     ]);
   } catch (err) {
-    // AbortError is not a real failure — the component unmounted during refresh
+    // AbortError is not a real failure ΓÇö the component unmounted during refresh
     if (err instanceof DOMException && err.name === "AbortError") {
       return { ok: false, error: "network" };
     }
@@ -864,18 +786,24 @@ export async function fetchCircleData(
     return { ok: false, error: "server" };
   }
 
-  // Issue #496: Use type-safe parsers instead of unsafe `as` casts.
-  // Each row is validated independently so a single malformed entry from the
-  // indexer is dropped rather than propagating incorrect data into gate logic
-  // or causing a runtime exception in the render tree.
+  // Issue #496 / #513: Use type-safe parsers instead of unsafe `as` casts.
   const circleState = parseCircleState(circleJson.circle);
   if (!circleState) {
     return { ok: false, error: "server" };
   }
 
-  const members = Array.isArray(circleJson.members)
-    ? circleJson.members.map(parseCircleMember).filter((m): m is CircleMember => m !== null)
-    : [];
+  // Members go through the shared all-or-nothing parser (lib/circleTypes.ts) that
+  // the server page also uses. A per-row filter is wrong here twice over: the
+  // indexer's /circles/:address rows carry no total_contributions and a null
+  // reputation_score for members without a reputation row, so a strict per-row
+  // check drops every real row; and dropping any single row would shift later
+  // members into the wrong payout slot.
+  const members = parseMemberRows(circleJson.members);
+
+  // parseRoundsResponse handles all four fields (rounds, openRounds,
+  // pendingDefaults, currentRound) with the same null-safe, drop-malformed-rows
+  // strategy used by every other parser.
+  const roundsPayload = parseRoundsResponse(roundsJson);
 
   return {
     ok: true,
@@ -883,49 +811,62 @@ export async function fetchCircleData(
     data: {
       circle: circleState,
       members,
-      rounds: Array.isArray(roundsJson.rounds)
-        ? roundsJson.rounds.map(parseCircleRound).filter((r): r is CircleRound => r !== null)
-        : [],
-      openRounds: Array.isArray(roundsJson.openRounds)
-        ? roundsJson.openRounds.map(parseCircleRound).filter((r): r is CircleRound => r !== null)
-        : [],
-      pendingDefaults: Array.isArray(roundsJson.pendingDefaults)
-        ? roundsJson.pendingDefaults.map(parsePendingDefault).filter((d): d is CirclePendingDefault => d !== null)
-        : [],
+      rounds: roundsPayload.rounds,
+      openRounds: roundsPayload.openRounds,
+      pendingDefaults: roundsPayload.pendingDefaults,
       latestLedger:
         typeof circleJson.latestLedger === "number"
           ? circleJson.latestLedger
           : null,
-      currentRound:
-        roundsJson.currentRound != null &&
-        typeof roundsJson.currentRound === "object"
-          ? parseCircleRound(roundsJson.currentRound)
+      // checkpointTime: ISO-8601 timestamp the indexer embeds to indicate when
+      // it last durably processed a ledger. Absent from older indexer versions —
+      // callers must treat null as "unknown freshness", never as healthy.
+      checkpointTime:
+        typeof circleJson.checkpointTime === "string" && circleJson.checkpointTime.trim() !== ""
+          ? circleJson.checkpointTime
           : null,
+      currentRound: roundsPayload.currentRound,
     },
   };
 }
 
-// ─── Main client component ────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Main client component ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 export function CircleDetailClient({ circleAddress, circleData }: Props) {
-  // ── Wallet load state ──────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Wallet load state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Distinguishes "still loading" from "not connected" so action buttons don't
   // flash on/off during the async wallet check.
   const [walletLoadState, setWalletLoadState] = useState<WalletLoadState>("loading");
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
+  const [networkMismatch, setNetworkMismatch] = useState<NetworkMismatchResult | null>(null);
 
-  // ── Circle data ────────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Circle data ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const [data, setData] = useState<CircleDetailData>(circleData);
+  useEffect(() => {
+    setData(circleData);
+  }, [circleData]);
 
   // Wall-clock timestamp of the last *successful* data fetch.
   // Seeded to Date.now() on mount because circleData comes from a fresh SSR
   // fetch; updated on every successful manual or post-action refresh.
   const [dataFetchedAtMs, setDataFetchedAtMs] = useState<number>(() => Date.now());
 
-  // ── Action state ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    setData(circleData);
+    setDataFetchedAtMs(Date.now());
+  }, [circleData]);
+
+  // ΓöÇΓöÇ Action state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
   const [error,        setError]        = useState<string>("");
+  // Hash of the transaction that produced the current error (set when the
+  // failure happened on-chain after submission) so the banner can link to
+  // the explorer for full diagnostics (Issue #479).
+  const [errorTxHash,  setErrorTxHash]  = useState<string | null>(null);
+  // Typed error from the last failed transaction ΓÇö passed to DiagnosticsPanel
+  // so the bundle captures error kind/code without exposing raw internals.
+  const [errorTypedError, setErrorTypedError] = useState<ContractAppError | null>(null);
   const [success,      setSuccess]      = useState<SuccessState | null>(null);
   const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
@@ -933,13 +874,27 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Issue #499: Guard against concurrent / duplicate submissions.
   // A ref is used (not state) because we need to read it synchronously inside
   // the async action handler without triggering a re-render. When this is true
-  // any call to doAction or doDefault is a no-op — the button's `disabled`
+  // any call to doAction or doDefault is a no-op ΓÇö the button's `disabled`
   // attribute should have prevented it, but this is defence-in-depth against
   // rapid double-clicks, keyboard repeats, or automated test runners.
   const submittingRef = useRef(false);
 
-  // ── UI state ───────────────────────────────────────────────────────────────
-  const [inviteUrl,           setInviteUrl]           = useState("");
+  // Issue #654: AbortController for the in-flight invokeContract call.
+  // Aborted on component unmount so the polling loop stops promptly and no
+  // setState calls fire on an unmounted tree.  A new controller is created
+  // for each doAction / doDefault invocation so signals are never reused
+  // across separate transactions.
+  const txAbortRef = useRef<AbortController | null>(null);
+
+  // ΓöÇΓöÇ UI state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  //
+  // inviteUrl is intentionally initialised to null (not "") so that components
+  // can distinguish "not yet resolved" from "resolved to an empty string".
+  // The value is only ever set inside a useEffect, which never runs during SSR,
+  // so window.location is only accessed in the browser ΓÇö preventing hydration
+  // mismatches and SSR crashes caused by the window object being absent on the
+  // server.  The input placeholder handles the null state visually.
+  const [inviteUrl,           setInviteUrl]           = useState<string | null>(null);
   const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
   const [defaultConfirm,      setDefaultConfirm]      = useState<DefaultConfirmState | null>(null);
   const [inviteCopyState,     setInviteCopyState]     = useState<CopyState>("idle");
@@ -951,7 +906,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Refresh error message when a manual refresh fails
   const [manualRefreshError, setManualRefreshError] = useState<string>("");
 
-  // ── Staleness tracking ─────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Staleness tracking ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Re-evaluated every second so the stale banner appears automatically once
   // data ages past MAX_DATA_AGE_MS, even if the user hasn't interacted.
@@ -961,6 +916,31 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     return () => clearInterval(id);
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (walletLoadState !== "connected") {
+      setNetworkMismatch(null);
+      return;
+    }
+
+    checkNetworkMismatch(NETWORK_PASSPHRASE)
+      .then((result) => {
+        if (!cancelled) setNetworkMismatch(result);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setNetworkMismatch({
+            kind: "provider_error",
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [walletLoadState, walletAddress]);
+
   // Ref for aborting any in-flight manual or post-action refresh when the
   // component unmounts, preventing setState calls on an unmounted tree.
   const refreshAbortRef = useRef<AbortController | null>(null);
@@ -968,6 +948,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   useEffect(() => {
     return () => {
       refreshAbortRef.current?.abort();
+      // Issue #654: abort any in-flight invokeContract call so the polling
+      // loop stops and timers are cleaned up when the component unmounts.
+      txAbortRef.current?.abort();
     };
   }, []);
 
@@ -975,7 +958,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const errorRegionRef   = useRef<HTMLDivElement>(null);
   const successRegionRef = useRef<HTMLDivElement>(null);
 
-  // ── Wallet resolution ──────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Wallet resolution ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   useEffect(() => {
     let cancelled = false;
     getWalletAddress()
@@ -996,10 +979,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     return () => { cancelled = true; };
   }, []);
 
+  // Build the invite URL client-side only.  useEffect never runs on the server,
+  // so window.location is guaranteed to exist here ΓÇö no typeof guard needed.
+  // Keeping this in an effect (rather than useMemo) also means the URL is only
+  // computed after hydration, preventing any server/client HTML mismatch.
+  //
+  // Address guard: circleAddress is validated by isSorobanContractId in both
+  // the server page (CircleDetailPage notFound() guard) and in doAction /
+  // doDefault before any contract call. We repeat the check here so the invite
+  // URL is never constructed from a malformed value ΓÇö the prop is typed as
+  // `string` but a caller outside the normal page render path (tests, Storybook)
+  // could pass an arbitrary string.
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
-    }
+    if (!isSorobanContractId(circleAddress)) return;
+    setInviteUrl(`${window.location.origin}/circles/${circleAddress}`);
   }, [circleAddress]);
 
   // Focus management
@@ -1015,7 +1008,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }, [success]);
 
-  // ── Derived membership state ───────────────────────────────────────────────
+  // ΓöÇΓöÇ Derived membership state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   const isMember = walletAddress
     ? data.members.some((m) => m.member_address === walletAddress)
@@ -1031,11 +1024,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   const currentRound = data.circle.current_round;
 
-  // ── Contribution check ─────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Contribution check ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Prefer the authoritative currentRound contributions list when available.
   // When it is absent (partial data), conservatively treat the contribution as
-  // unknown (false) — this means the Contribute button may appear for a member
+  // unknown (false) ΓÇö this means the Contribute button may appear for a member
   // who already contributed, but the gate will block the double-submit.
   // This is safer than the inverse: treating unknown as "already contributed"
   // would hide the button from a member who genuinely needs to contribute.
@@ -1050,7 +1043,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       )
     : false;
 
-  // ── Data readiness ─────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Data readiness ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // "stale" is evaluated from the ticker so it flips in real-time.
   const isDataStale = nowMs - dataFetchedAtMs >= MAX_DATA_AGE_MS;
@@ -1064,12 +1057,22 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Actions are only allowed when data is fully ready.
   // This is the single authoritative gate for data completeness.
   const actionsEnabled = dataReadiness === "ready" && walletLoadState !== "loading";
+  const networkCheck: NetworkCheckState =
+    networkMismatch?.kind === "mismatch"
+      ? "mismatch"
+      : networkMismatch?.kind === "match"
+      ? "match"
+      : networkMismatch == null
+      ? null
+      : "unknown";
+  const networkWarning = networkMismatch ? describeNetworkMismatch(networkMismatch) : null;
+  const myHasLockedCollateral = hasLockedCollateral;
 
-  // ── Payout gate (for disabled-state display) ───────────────────────────────
+  // ΓöÇΓöÇ Payout gate (for disabled-state display) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Pre-computed with maxSnapshotAgeMs: Infinity so the "round not complete"
   // reason shows up in the button caption even when we're not about to submit.
-  // The staleness check is intentionally skipped here — it's handled by the
+  // The staleness check is intentionally skipped here ΓÇö it's handled by the
   // actionsEnabled gate above.
   //
   // Guard: when members[] is empty, 0 contributions >= 0 members is
@@ -1090,22 +1093,22 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         data.circle.deadline_ledger,
         data.latestLedger,
         data.members.map((m) => m.member_address),
-        myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+        myHasLockedCollateral,
         myContributedThisRound,
         data.currentRound?.contributions.length ?? 0,
-        null, // no network-mismatch data in this context — default null
+        networkCheck,
         dataFetchedAtMs, // use data fetch time, not snapshot build time
       ),
       { maxSnapshotAgeMs: Infinity },
     );
   })();
 
-  // ── Contribute gate (for disabled-state display) ───────────────────────────
+  // ΓöÇΓöÇ Contribute gate (for disabled-state display) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Pre-computed with maxSnapshotAgeMs: Infinity so the "round already
   // contributed" / "deadline passed" reason shows up under the Contribute
   // button even when we're not about to submit. The staleness check is
-  // intentionally skipped here — it's handled by the actionsEnabled gate above.
+  // intentionally skipped here ΓÇö it's handled by the actionsEnabled gate above.
   const contributeGate = computeActionEligibility(
     "contribute",
     buildAppSnapshot(
@@ -1114,11 +1117,43 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       data.circle.deadline_ledger,
       data.latestLedger,
       data.members.map((m) => m.member_address),
-      myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+      myHasLockedCollateral,
       myContributedThisRound,
       data.currentRound?.contributions.length ?? 0,
-      null, // no network-mismatch data in this context — default null
+      networkCheck,
       dataFetchedAtMs, // use data fetch time, not snapshot build time
+    ),
+    { maxSnapshotAgeMs: Infinity },
+  );
+  const joinGate = computeActionEligibility(
+    "join",
+    buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      myHasLockedCollateral,
+      myContributedThisRound,
+      data.currentRound?.contributions.length ?? 0,
+      networkCheck,
+      dataFetchedAtMs,
+    ),
+    { maxSnapshotAgeMs: Infinity },
+  );
+  const closeGate = computeActionEligibility(
+    "close",
+    buildAppSnapshot(
+      data.circle.status,
+      currentRound,
+      data.circle.deadline_ledger,
+      data.latestLedger,
+      data.members.map((m) => m.member_address),
+      myHasLockedCollateral,
+      myContributedThisRound,
+      data.currentRound?.contributions.length ?? 0,
+      networkCheck,
+      dataFetchedAtMs,
     ),
     { maxSnapshotAgeMs: Infinity },
   );
@@ -1129,7 +1164,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     data.latestLedger != null &&
     data.latestLedger > data.circle.deadline_ledger;
 
-  // ── Manual refresh ─────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Manual refresh ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Used by the Stale and Partial data banners. Updates data in place without
   // a full page reload. On success: updates data + resets fetchedAtMs.
@@ -1160,7 +1195,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         network:
           "Could not reach the indexer. Check your connection and try again.",
         server:
-          "The indexer returned an error. This is likely temporary — try again.",
+          "The indexer returned an error. This is likely temporary ΓÇö try again.",
+        misconfigured:
+          "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL, so the page cannot refresh. " +
+          "Set a valid indexer URL in app/.env.local and restart the server.",
       };
       setManualRefreshError(messages[result.error]);
     }
@@ -1168,10 +1206,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setIsManualRefreshing(false);
   }, [circleAddress, isManualRefreshing]);
 
-  // ── Post-action refresh ────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Post-action refresh ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Called after every successful contract write. Uses the shared fetchCircleData
-  // helper so merging is always safe — we replace the whole data object rather
+  // helper so merging is always safe ΓÇö we replace the whole data object rather
   // than patching fields, preventing stale sub-object leaks.
 
   async function postActionRefresh(ctrl: AbortController) {
@@ -1187,7 +1225,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       setDataFetchedAtMs(result.fetchedAtMs);
       setRefreshState("idle");
     } else if (result.error === "network") {
-      // Genuine network failure after action — show warning
+      // Genuine network failure after action ΓÇö show warning
       setRefreshState("error");
     } else {
       // Non-fatal: the action succeeded, refresh just failed
@@ -1195,10 +1233,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
-  // ── Action handler ─────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Action handler ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   const ACTION_SUCCESS_MESSAGES: Record<ActionKey, string> = {
-    join:       "Collateral locked — you have joined the circle!",
+    join:       "Collateral locked ΓÇö you have joined the circle!",
     contribute: "Contribution submitted successfully.",
     payout:     "Payout triggered successfully.",
     default:    "Member marked as defaulted.",
@@ -1209,11 +1247,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // These are distinct from the button labels so the spinner text is always
   // accurate regardless of which action is in flight.
   const ACTION_LOADING_LABELS: Record<ActionKey, string> = {
-    join:       "Locking collateral…",
-    contribute: "Submitting contribution…",
-    payout:     "Triggering payout…",
-    default:    "Marking default…",
-    close:      "Releasing collateral…",
+    join:       "Locking collateralΓÇª",
+    contribute: "Submitting contributionΓÇª",
+    payout:     "Triggering payoutΓÇª",
+    default:    "Marking defaultΓÇª",
+    close:      "Releasing collateralΓÇª",
   };
 
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
@@ -1237,7 +1275,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       return;
     }
 
-    // ── Data completeness guard ────────────────────────────────────────────
+    // ΓöÇΓöÇ Data completeness guard ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     //
     // Even though the buttons are disabled when dataReadiness !== "ready",
     // re-check here as a defence-in-depth measure in case the UI guard is
@@ -1254,15 +1292,22 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setError("");
     setSuccess(null);
     setRetryAction(null);
+    setErrorTypedError(null);
     if (action === "contribute") setContributionReceipt(null);
 
     submittingRef.current = true;
     setLoading(action);
 
+    // Issue #654: create a fresh AbortController for this invocation and
+    // store it so the unmount effect can abort it if the component is torn
+    // down while signing or polling is in flight.
+    const txCtrl = new AbortController();
+    txAbortRef.current = txCtrl;
+
     try {
-      // ── Stale-state gate ───────────────────────────────────────────────────
+      // ΓöÇΓöÇ Stale-state gate ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
       //
-      // Build the snapshot using dataFetchedAtMs — the timestamp when the
+      // Build the snapshot using dataFetchedAtMs ΓÇö the timestamp when the
       // data was actually loaded, NOT Date.now(). This is the fix for the
       // critical bug where the old code passed nowMs=Date.now() into
       // buildAppSnapshot, making fetchedAtMs === nowMs and the stale check
@@ -1276,11 +1321,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         data.circle.deadline_ledger,
         data.latestLedger,
         data.members.map((m) => m.member_address),
-        myMember != null ? BigInt(myMember.collateral || "0") > BigInt(0) : false,
+        myHasLockedCollateral,
         myContributedThisRound,
         currentRoundContributions,
-        null, // networkCheck — no network-mismatch signal here
-        dataFetchedAtMs, // ← correct: when the data was fetched, not now
+        networkCheck,
+        dataFetchedAtMs, // ΓåÉ correct: when the data was fetched, not now
       );
 
       const gate = computeActionEligibility(action, snapshot);
@@ -1292,17 +1337,21 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         return;
       }
 
-      // ── Submit transaction ─────────────────────────────────────────────────
+      // ΓöÇΓöÇ Submit transaction ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+      // Pass txCtrl.signal so the polling loop can be stopped promptly when
+      // the component unmounts or the user navigates away.
       const result = await invokeContract(
         circleAddress,
         action,
         args,
         walletAddress,
+        txCtrl.signal,
       );
 
       if (!result.success) {
         const errMsg = result.typedError?.message || result.error || "Transaction failed";
         setError(errMsg);
+        setErrorTypedError(result.typedError ?? null);
         if (isRetryableError(errMsg)) {
           setRetryAction(() => () => doAction(action, args));
         }
@@ -1326,25 +1375,52 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
+      // Issue #654: handle LocalCancelResult throws from invokeContract.
+      // These are not transaction failures ΓÇö they mean the caller stopped
+      // waiting.  Silently swallow them when the component is unmounting
+      // (txCtrl.signal.aborted); surface a non-blocking advisory when the
+      // signal fired *after* the tx was already broadcast.
+      if (
+        err instanceof Error &&
+        err.cause != null &&
+        typeof err.cause === "object" &&
+        (err.cause as LocalCancelResult).kind === "local_cancel"
+      ) {
+        const cancelInfo = err.cause as LocalCancelResult;
+        if (cancelInfo.submittedBeforeAbort) {
+          // Tx may still confirm ΓÇö show an advisory so the user knows to
+          // check the explorer rather than re-submitting immediately.
+          setError(
+            "You stopped waiting, but the transaction may still confirm on-chain. " +
+              "Check the explorer before retrying to avoid a duplicate submission.",
+          );
+        }
+        // submittedBeforeAbort=false means we cancelled cleanly before
+        // broadcast ΓÇö no message needed, just let the UI reset below.
+        return;
+      }
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doAction(action, args));
       }
     } finally {
       setLoading(null);
       submittingRef.current = false;
+      // Clear the ref so a stale controller doesn't block future actions.
+      if (txAbortRef.current === txCtrl) txAbortRef.current = null;
     }
   }
 
-  // ── Action shortcuts ───────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Action shortcuts ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   const handleJoin       = () => doAction("join",       [new Address(walletAddress!).toScVal()]);
   const handleContribute = () => doAction("contribute", [new Address(walletAddress!).toScVal()]);
   const handlePayout     = () => doAction("payout",     []);
   const handleClose      = () => doAction("close",      [new Address(walletAddress!).toScVal()]);
 
-  // ── Copy helpers ───────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Copy helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   async function handleCopyInvite() {
     if (!inviteUrl) return;
@@ -1370,7 +1446,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
-  // ── Default flow ───────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Default flow ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   function handleMarkDefault(memberAddress: string) {
     setDefaultConfirm({ memberAddress, roundIndex: currentRound });
@@ -1393,7 +1469,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       return;
     }
 
-    // Data completeness guard — same defence-in-depth as doAction
+    // Data completeness guard ΓÇö same defence-in-depth as doAction
     if (dataReadiness !== "ready") {
       setError(
         dataReadiness === "stale"
@@ -1408,6 +1484,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setError("");
     setSuccess(null);
     setRetryAction(null);
+    setErrorTypedError(null);
 
     // Build snapshot for the TARGET member's contribution status
     const targetContributed =
@@ -1426,8 +1503,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       false,
       targetContributed,
       data.currentRound?.contributions.length ?? 0,
-      null, // networkCheck — no network-mismatch signal here
-      dataFetchedAtMs, // ← correct: use data fetch time
+      networkCheck,
+      dataFetchedAtMs, // ΓåÉ correct: use data fetch time
     );
 
     const gate = computeActionEligibility("default", snapshot);
@@ -1452,6 +1529,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       if (!result.success) {
         const errMsg = result.typedError?.message || result.error || "Transaction failed";
         setError(errMsg);
+        setErrorTypedError(result.typedError ?? null);
         if (isRetryableError(errMsg)) {
           setRetryAction(() => () => doDefault(memberAddress));
         }
@@ -1466,6 +1544,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doDefault(memberAddress));
       }
@@ -1475,7 +1554,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
-  // ── Accessibility ──────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Accessibility ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  //
+  // The progressAnnouncement feeds a sr-only live region. When status or round
+  // changes after a post-action refresh the region content changes, but a
+  // static node doesn't guarantee re-announcement in all screen readers.
+  // Using the announcement string as the element's `key` remounts the node on
+  // every change, which reliably triggers the live region in NVDA, JAWS, and
+  // VoiceOver without an extra useEffect.
 
   const totalRounds = data.circle.total_rounds;
   const progressAnnouncement =
@@ -1488,17 +1574,30 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     ? getExplorerLink(ACTIVE_NETWORK, "tx", success.txHash)
     : null;
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Render ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
   return (
     <div className="space-y-8">
 
-      {/* Live announcement of status / round changes */}
-      <p className="sr-only" role="status" aria-live="polite">
+      {/*
+        Live announcement of status / round changes.
+        `key={progressAnnouncement}` remounts the element whenever the text
+        changes (e.g. after a post-action refresh updates the status or round),
+        ensuring screen readers re-announce the new state reliably across NVDA,
+        JAWS, and VoiceOver ΓÇö all of which require the DOM node to be (re)inserted
+        into a live region for the announcement to fire.
+      */}
+      <p
+        key={progressAnnouncement}
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
         {progressAnnouncement}
       </p>
 
-      {/* Data state banners — shown above the action panel so the user
+      {/* Data state banners ΓÇö shown above the action panel so the user
           understands why actions are locked before they try to click */}
       {dataReadiness === "stale" && (
         <StaleDataBanner
@@ -1525,7 +1624,30 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             className="inline-block w-4 h-4 border-2 border-slate-300 border-t-brand-600 rounded-full animate-spin"
             aria-hidden="true"
           />
-          Refreshing circle data…
+          Refreshing circle dataΓÇª
+        </div>
+      )}
+
+      {networkWarning && (
+        <div
+          role={networkMismatch?.kind === "mismatch" ? "alert" : "status"}
+          aria-live="polite"
+          className={clsx(
+            "border rounded-xl px-5 py-4 flex items-start gap-3 text-sm",
+            networkMismatch?.kind === "mismatch"
+              ? "bg-red-50 border-red-200 text-red-700"
+              : "bg-amber-50 border-amber-200 text-amber-800",
+          )}
+        >
+          <span className="text-xl mt-0.5" aria-hidden="true">!</span>
+          <div>
+            <p className="font-semibold">
+              {networkMismatch?.kind === "mismatch"
+                ? "Wrong wallet network"
+                : "Wallet network not verified"}
+            </p>
+            <p className="mt-1">{networkWarning}</p>
+          </div>
         </div>
       )}
 
@@ -1534,7 +1656,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           role="alert"
           className="bg-red-50 border border-red-200 rounded-xl px-5 py-4 flex items-start gap-3 text-sm text-red-700"
         >
-          <span className="text-xl mt-0.5" aria-hidden="true">⚠️</span>
+          <span className="text-xl mt-0.5" aria-hidden="true">ΓÜá∩╕Å</span>
           <div>
             <p className="font-semibold">Refresh failed</p>
             <p className="mt-1">{manualRefreshError}</p>
@@ -1583,6 +1705,18 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           </div>
         )}
 
+        {/* Diagnostics panel ΓÇö shown when there is an active transaction error.
+            Collapsed by default; user must explicitly expand and generate the
+            bundle. Nothing is sent to a server automatically. */}
+        {error && (
+          <div className="mb-3">
+            <DiagnosticsPanel
+              typedError={errorTypedError}
+              txHash={errorTxHash}
+            />
+          </div>
+        )}
+
         {success && (
           <div
             className="bg-brand-50 border border-brand-200 rounded-lg p-3 text-sm text-brand-700 mb-3 space-y-2 focus:outline-none"
@@ -1592,7 +1726,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             tabIndex={-1}
           >
             <p>
-              <span aria-hidden="true">✅ </span>
+              <span aria-hidden="true">Γ£à </span>
               {success.message}
             </p>
             {success.txHash && (
@@ -1621,12 +1755,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   className="inline-block w-3 h-3 border-2 border-brand-300 border-t-brand-600 rounded-full animate-spin"
                   aria-hidden="true"
                 />
-                Refreshing circle data…
+                Refreshing circle dataΓÇª
               </p>
             )}
             {refreshState === "error" && (
               <p className="text-xs text-amber-700">
-                ⚠️ Could not refresh data automatically —{" "}
+                ΓÜá∩╕Å Could not refresh data automatically ΓÇö{" "}
                 <button
                   onClick={handleManualRefresh}
                   disabled={isManualRefreshing}
@@ -1651,7 +1785,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               id="default-confirm-title"
               className="font-semibold text-amber-900 text-sm"
             >
-              ⚠️ Confirm Default
+              ΓÜá∩╕Å Confirm Default
             </h3>
             <dl className="text-sm space-y-1 text-amber-800">
               <div className="flex gap-2">
@@ -1706,7 +1840,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         )}
 
         <div className="action-group">
-          {/* Wallet loading placeholder — prevents layout shift while wallet check is in flight */}
+          {/* Wallet loading placeholder ΓÇö prevents layout shift while wallet check is in flight */}
           {walletLoadState === "loading" && (
             <span
               role="status"
@@ -1717,21 +1851,33 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 className="inline-block w-4 h-4 border-2 border-slate-200 border-t-slate-400 rounded-full animate-spin"
                 aria-hidden="true"
               />
-              Checking wallet…
+              Checking walletΓÇª
             </span>
           )}
 
           {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
             <button
               onClick={handleJoin}
-              disabled={loading !== null || !actionsEnabled}
+              disabled={loading !== null || !actionsEnabled || !joinGate.allowed}
               aria-busy={loading === "join" ? "true" : "false"}
-              aria-disabled={!actionsEnabled}
-              title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
+              aria-disabled={!actionsEnabled || !joinGate.allowed}
+              aria-describedby={!joinGate.allowed ? "join-gate-reason" : undefined}
+              title={
+                !actionsEnabled
+                  ? "Actions unavailable until circle data is fully loaded"
+                  : !joinGate.allowed
+                  ? joinGate.message
+                  : undefined
+              }
               className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
-              {loading === "join" ? "Joining…" : "🔒 Lock Collateral & Join"}
+              {loading === "join" ? "JoiningΓÇª" : "≡ƒöÆ Lock Collateral & Join"}
             </button>
+            {!joinGate.allowed && actionsEnabled && (
+              <p id="join-gate-reason" className="text-xs text-slate-500" role="note">
+                {joinGate.message}
+              </p>
+            )}
           )}
 
           {data.circle.status === "Active" &&
@@ -1754,8 +1900,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   className="bg-brand-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
                 >
                   {loading === "contribute"
-                    ? "Contributing…"
-                    : `💰 Contribute Round ${currentRound}`}
+                    ? "ContributingΓÇª"
+                    : `≡ƒÆ░ Contribute Round ${currentRound}`}
                 </button>
                 {!contributeGate.allowed && actionsEnabled && (
                   <p
@@ -1786,7 +1932,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 }
                 className="bg-blue-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
               >
-                {loading === "payout" ? "Paying out…" : "🎯 Trigger Payout"}
+                {loading === "payout" ? "Paying outΓÇª" : "≡ƒÄ» Trigger Payout"}
               </button>
               {!payoutGate.allowed && actionsEnabled && (
                 <p
@@ -1804,14 +1950,26 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             data.circle.status === "Cancelled") && (
             <button
               onClick={handleClose}
-              disabled={loading !== null || !actionsEnabled}
+              disabled={loading !== null || !actionsEnabled || !closeGate.allowed}
               aria-busy={loading === "close" ? "true" : "false"}
-              aria-disabled={!actionsEnabled}
-              title={!actionsEnabled ? "Actions unavailable until circle data is fully loaded" : undefined}
+              aria-disabled={!actionsEnabled || !closeGate.allowed}
+              aria-describedby={!closeGate.allowed ? "close-gate-reason" : undefined}
+              title={
+                !actionsEnabled
+                  ? "Actions unavailable until circle data is fully loaded"
+                  : !closeGate.allowed
+                  ? closeGate.message
+                  : undefined
+              }
               className="bg-slate-600 text-white px-4 py-2.5 rounded-lg text-sm font-medium hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[44px]"
             >
-              {loading === "close" ? "Closing…" : "🔓 Release Collateral"}
+              {loading === "close" ? "ClosingΓÇª" : "≡ƒöô Release Collateral"}
             </button>
+            {!closeGate.allowed && actionsEnabled && (
+              <p id="close-gate-reason" className="text-xs text-slate-500" role="note">
+                {closeGate.message}
+              </p>
+            )}
           )}
 
           {loading !== null && (
@@ -1839,7 +1997,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           className="bg-white rounded-xl border border-brand-200 p-5"
         >
           <h2 className="font-semibold text-slate-800 mb-3">
-            <span aria-hidden="true">💳 </span>Contribution Receipt
+            <span aria-hidden="true">≡ƒÆ│ </span>Contribution Receipt
           </h2>
           <dl className="space-y-2 text-sm">
             <div className="flex justify-between">
@@ -1900,11 +2058,17 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         deadlineLedger={data.circle.deadline_ledger}
         latestLedger={data.latestLedger}
         status={data.circle.status}
+        fetchedAtMs={dataFetchedAtMs}
+        checkpointTime={data.checkpointTime ?? null}
       />
 
       {/* Rotation view */}
       <div className="bg-white rounded-xl border border-slate-200 p-5">
-        <h2 className="font-semibold text-slate-800 mb-4">🔄 Rotation Order</h2>
+        <h2 className="font-semibold text-slate-800 mb-4">≡ƒöä Rotation Order</h2>
+        {data.members.length === 0 ? (
+          <MemberListFallback memberCount={data.circle.member_count} />
+        ) : (
+        <>
         <div className="space-y-2">
           {data.members.map((member, i) => {
             const isPaid = i < currentRound;
@@ -1955,7 +2119,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                     />
                     {member.defaults > 0 && (
                       <span className="text-xs text-red-600 font-medium">
-                        <span aria-hidden="true">⚠️ </span>
+                        <span aria-hidden="true">ΓÜá∩╕Å </span>
                         {member.defaults} default
                         {member.defaults > 1 ? "s" : ""}
                       </span>
@@ -1966,12 +2130,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 <div className="text-right text-sm shrink-0 max-w-[45%] sm:max-w-none">
                   {isPaid ? (
                     <span className="text-slate-500 text-xs sm:text-sm">
-                      <span aria-hidden="true">✅ </span>
+                      <span aria-hidden="true">Γ£à </span>
                       received ${formatUsdc(roundForMember?.amount ?? "0")}
                     </span>
                   ) : isNext ? (
                     <span className="text-brand-700 font-semibold text-xs sm:text-sm">
-                      <span aria-hidden="true">← </span>
+                      <span aria-hidden="true">ΓåÉ </span>
                       next payout
                     </span>
                   ) : (
@@ -1999,15 +2163,17 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
         {data.circle.status === "Active" && (
           <p className="text-xs text-slate-400 mt-3">
-            Round {currentRound} · contributions shown for the current round only
+            Round {currentRound} ┬╖ contributions shown for the current round only
           </p>
+        )}
+        </>
         )}
       </div>
 
       {/* Round history */}
       {data.rounds.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 p-5">
-          <h2 className="font-semibold text-slate-800 mb-4">📋 Round History</h2>
+          <h2 className="font-semibold text-slate-800 mb-4">≡ƒôï Round History</h2>
           <div className="space-y-4">
             {data.rounds.map((round) => (
               <RoundCard key={round.roundIndex} round={round} />
@@ -2020,7 +2186,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       {data.openRounds.length > 0 && (
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-5">
           <h2 className="font-semibold text-amber-800 mb-1">
-            ⏳ Open Rounds
+            ΓÅ│ Open Rounds
           </h2>
           <p className="text-xs text-amber-700 mb-3">
             These rounds have recorded contributions or defaults but have not
@@ -2040,7 +2206,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       {data.pendingDefaults.length > 0 && (
         <div className="bg-red-50 border border-red-200 rounded-xl p-5">
           <h2 className="font-semibold text-red-800 mb-3">
-            ⚠️ Defaults (current round)
+            ΓÜá∩╕Å Defaults (current round)
           </h2>
           <div className="space-y-2">
             {data.pendingDefaults.map((d) => (
@@ -2058,18 +2224,19 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
       {/* Invite link */}
       <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
-        <h2 className="font-semibold text-slate-700 mb-2">🔗 Invite link</h2>
+        <h2 className="font-semibold text-slate-700 mb-2">≡ƒöù Invite link</h2>
         <p className="text-xs text-slate-500 mb-2">
           Share this link so members can find and join this circle:
         </p>
         <div className="flex gap-2">
           <input
             readOnly
-            value={inviteUrl}
+            value={inviteUrl ?? ""}
             className="flex-1 min-w-0 font-mono text-xs bg-white border border-slate-300 rounded px-3 py-2 text-slate-600 placeholder:text-slate-400"
             onClick={(e) => (e.target as HTMLInputElement).select()}
             aria-label="Invite link for this circle"
-            placeholder="Loading invite link…"
+            aria-busy={inviteUrl === null}
+            placeholder="Loading invite linkΓÇª"
           />
           <button
             onClick={handleCopyInvite}
@@ -2079,7 +2246,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               inviteCopyState === "success"
                 ? "Link copied!"
                 : inviteCopyState === "error"
-                ? "Copy failed — try selecting and copying manually"
+                ? "Copy failed ΓÇö try selecting and copying manually"
                 : "Copy invite link"
             }
           >
@@ -2100,7 +2267,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   );
 }
 
-// ─── RoundCard ────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ RoundCard ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 interface RoundCardProps {
   round: CircleRound;
@@ -2135,6 +2302,7 @@ function RoundCard({ round }: RoundCardProps) {
           {round.status !== "completed" && (
             <span
               className={`text-xs font-medium border rounded-full px-2 py-0.5 ${statusColor[round.status]}`}
+              aria-label={`Round status: ${statusLabel[round.status]}`}
             >
               {statusLabel[round.status]}
             </span>
@@ -2166,7 +2334,7 @@ function RoundCard({ round }: RoundCardProps) {
         round.amount != null &&
         round.recipient != null ? (
         <p className="text-sm text-slate-600">
-          <span aria-hidden="true">🎯 </span>
+          <span aria-hidden="true">≡ƒÄ» </span>
           ${formatUsdc(round.amount)} paid to{" "}
           <span className="font-mono">{shortAddress(round.recipient)}</span>
         </p>
@@ -2179,7 +2347,7 @@ function RoundCard({ round }: RoundCardProps) {
         {round.contributions.length !== 1 ? "s" : ""}
         {round.defaults.length > 0 && (
           <span className="text-red-500 ml-2">
-            · {round.defaults.length} default
+            ┬╖ {round.defaults.length} default
             {round.defaults.length > 1 ? "s" : ""}
           </span>
         )}
@@ -2188,7 +2356,7 @@ function RoundCard({ round }: RoundCardProps) {
   );
 }
 
-// ─── ContributionStatusBadge ──────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ ContributionStatusBadge ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 interface ContributionStatusBadgeProps {
   status: "contributed" | "pending" | "defaulted" | "not_applicable";
@@ -2199,7 +2367,7 @@ function ContributionStatusBadge({ status }: ContributionStatusBadgeProps) {
     case "contributed":
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-green-700 bg-green-50 border border-green-200 rounded-full px-2 py-0.5">
-          <span aria-hidden="true">✓</span>
+          <span aria-hidden="true">Γ£ô</span>
           <span className="sr-only">Contribution status: </span>
           contributed
         </span>
@@ -2207,7 +2375,7 @@ function ContributionStatusBadge({ status }: ContributionStatusBadgeProps) {
     case "pending":
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-full px-2 py-0.5">
-          <span aria-hidden="true">⏳</span>
+          <span aria-hidden="true">ΓÅ│</span>
           <span className="sr-only">Contribution status: </span>
           pending
         </span>
@@ -2215,7 +2383,7 @@ function ContributionStatusBadge({ status }: ContributionStatusBadgeProps) {
     case "defaulted":
       return (
         <span className="inline-flex items-center gap-1 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-full px-2 py-0.5">
-          <span aria-hidden="true">✗</span>
+          <span aria-hidden="true">Γ£ù</span>
           <span className="sr-only">Contribution status: </span>
           defaulted
         </span>
