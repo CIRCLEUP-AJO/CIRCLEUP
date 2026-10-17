@@ -9,7 +9,9 @@
 //
 //   Clients        CircleUpClient (top-level facade), FactoryClient,
 //                  CircleClient, ReputationClient, IndexerClient
-//   Errors         GateError, IndexerError
+//   Errors         GateError, IndexerError (+ IndexerErrorKind)
+//   Indexer wire   INDEXER_RESPONSE_SCHEMAS, validateIndexerResponse,
+//                  listUnknownFields — runtime response-contract checks
 //   Config & types CircleUpConfig, NetworkConfig, NetworkName, CircleStatus,
 //                  CircleConfig, RoundState, CircleFullState, and the indexer
 //                  response types (ApiCircleRow, ApiCircleDetailResponse, …)
@@ -34,4 +36,5 @@ export * from "./constants"; // network URLs/passphrases, getNetworkConfig, unit
 export * from "./types";     // CircleUpConfig, CircleStatus, CircleConfig, RoundState, indexer read models, …
 export * from "./utils";     // usdcToStroops, stroopsToUsdc, formatUsdc, shortAddress, …
 export * from "./gating";    // StateSnapshot, GateResult, computeActionEligibility, buildSnapshot, …
+export * from "./indexerSchema"; // INDEXER_RESPONSE_SCHEMAS, validateIndexerResponse, listUnknownFields
 export * from "./client";    // CircleUpClient, FactoryClient, CircleClient, ReputationClient, IndexerClient, GateError, IndexerError, ScVal encoders
