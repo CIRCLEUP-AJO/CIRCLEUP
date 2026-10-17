@@ -677,14 +677,18 @@ impl CircleContract {
 
         env.storage().instance().remove(&DataKey::Initializing);
 
-        // Event: circle/initialized
-        // Data: (circle_address, member_count, round_amount)
+        // Event: circle/initialized (schema v2)
+        // Data: (circle_address, member_count, round_amount, members)
         //   circle_address — identifies this circle in multi-circle indexer queries
         //   member_count   — number of members configured (equals total rounds)
         //   round_amount   — USDC stroops each member contributes per round
+        //   members        — v2: payout rotation in order (index = payout order),
+        //                    so indexers can create member rows from events alone.
+        //                    Trailing field: v1 consumers that read the first
+        //                    three fields are unaffected (docs/EVENT_COMPATIBILITY.md).
         env.events().publish(
             event_topics(&env, "initialized"),
-            (env.current_contract_address(), member_count, round_amount),
+            (env.current_contract_address(), member_count, round_amount, members),
         );
     }
 
