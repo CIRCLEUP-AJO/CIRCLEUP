@@ -1,4 +1,4 @@
-// ─── Deadline display model (Issue: stale ledger data must not look exact) ───
+﻿// ΓöÇΓöÇΓöÇ Deadline display model (Issue: stale ledger data must not look exact) ΓöÇΓöÇΓöÇ
 //
 // Deadline indicators are derived from ledger estimates (deadline_ledger from
 // the indexer, latestLedger from the indexer's tip). Ledger production (~5 s
@@ -7,10 +7,10 @@
 // the shared display model so every deadline surface communicates freshness
 // honestly:
 //
-//   • "unavailable"  — deadline_ledger or latestLedger is missing → no countdown
-//   • "stale"        — data older than MAX_DATA_AGE_MS → last-known value shown
+//   ΓÇó "unavailable"  ΓÇö deadline_ledger or latestLedger is missing ΓåÆ no countdown
+//   ΓÇó "stale"        ΓÇö data older than MAX_DATA_AGE_MS ΓåÆ last-known value shown
 //                      as a static estimate, never as a live countdown
-//   • "fresh"        → countdown shown, still labelled as an estimate (~5 s/
+//   ΓÇó "fresh"        ΓåÆ countdown shown, still labelled as an estimate (~5 s/
 //                      ledger is an approximation, not a wall-clock promise)
 //
 // Contract validation (lib/gating.ts) remains authoritative for every
@@ -29,7 +29,7 @@ export interface DeadlineDisplay {
   readonly kind: DeadlineDataKind;
   /** Ledgers between the latest indexed ledger and the deadline ledger. */
   readonly ledgersRemaining: number | null;
-  /** Seconds remaining (ledgersRemaining × ~5 s). Always an estimate. */
+  /** Seconds remaining (ledgersRemaining ├ù ~5 s). Always an estimate. */
   readonly secondsRemaining: number | null;
   /** Human-readable duration, e.g. "2h 15m". Null when unavailable. */
   readonly human: string;
@@ -39,8 +39,14 @@ export interface DeadlineDisplay {
   readonly label: string;
   /** Wall-clock age of the data in ms (null when unavailable). */
   readonly dataAgeMs: number | null;
-  /** Wall-clock timing is always an estimate — never presented as exact. */
+  /** Wall-clock timing is always an estimate ΓÇö never presented as exact. */
   readonly isEstimate: true;
+  /**
+   * ISO-8601 checkpoint timestamp from the indexer, forwarded for display.
+   * null when the field was absent from the response — absence must never be
+   * treated as a healthy or "fresh" signal.
+   */
+  readonly checkpointTime: string | null;
 }
 
 export function ledgersToHuman(ledgers: number): string {
@@ -69,6 +75,7 @@ export function computeDeadlineDisplay({
   latestLedger,
   status,
   fetchedAtMs,
+  checkpointTime = null,
   nowMs = Date.now(),
   maxDataAgeMs = DEADLINE_MAX_DATA_AGE_MS,
 }: {
@@ -76,21 +83,23 @@ export function computeDeadlineDisplay({
   latestLedger: number | null | undefined;
   status: string;
   fetchedAtMs: number;
+  checkpointTime?: string | null;
   nowMs?: number;
   maxDataAgeMs?: number;
 }): DeadlineDisplay {
-  // Missing ledger data → never fabricate a countdown.
+  // Missing ledger data ΓåÆ never fabricate a countdown.
   if (deadlineLedger == null || latestLedger == null) {
     return {
       kind: "unavailable",
       ledgersRemaining: null,
       secondsRemaining: null,
-      human: "—",
+      human: "ΓÇö",
       isOverdue: false,
       urgency: "green",
       label: "Deadline data not available",
       dataAgeMs: null,
       isEstimate: true,
+      checkpointTime,
     };
   }
 
@@ -125,5 +134,6 @@ export function computeDeadlineDisplay({
     label: isStale ? `${label} (data may be stale)` : `${label} (estimate)`,
     dataAgeMs,
     isEstimate: true,
+    checkpointTime,
   };
 }
