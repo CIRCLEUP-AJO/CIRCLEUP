@@ -5,7 +5,7 @@ import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/
 import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK, NETWORK_PASSPHRASE } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
 import { isSorobanContractId } from "@/lib/address";
-import { parseContractError, userMessageForError } from "@/lib/contractErrors";
+import { parseContractError, userMessageForError, type ContractAppError } from "@/lib/contractErrors";
 import {
   buildAppSnapshot,
   computeActionEligibility,
@@ -18,6 +18,7 @@ import {
   type NetworkMismatchResult,
 } from "@/lib/walletCapabilities";
 import { ReputationBadge } from "@/components/ReputationBadge";
+import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
 import clsx from "clsx";
 // ─── Shared response contracts (Issue #513) ────────────────────────────────────
 //
@@ -793,6 +794,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // failure happened on-chain after submission) so the banner can link to
   // the explorer for full diagnostics (Issue #479).
   const [errorTxHash,  setErrorTxHash]  = useState<string | null>(null);
+  // Typed error from the last failed transaction — passed to DiagnosticsPanel
+  // so the bundle captures error kind/code without exposing raw internals.
+  const [errorTypedError, setErrorTypedError] = useState<ContractAppError | null>(null);
   const [success,      setSuccess]      = useState<SuccessState | null>(null);
   const [retryAction,  setRetryAction]  = useState<(() => void) | null>(null);
   const [refreshState, setRefreshState] = useState<RefreshState>("idle");
@@ -1218,6 +1222,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setError("");
     setSuccess(null);
     setRetryAction(null);
+    setErrorTypedError(null);
     if (action === "contribute") setContributionReceipt(null);
 
     submittingRef.current = true;
@@ -1276,6 +1281,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       if (!result.success) {
         const errMsg = result.typedError?.message || result.error || "Transaction failed";
         setError(errMsg);
+        setErrorTypedError(result.typedError ?? null);
         if (isRetryableError(errMsg)) {
           setRetryAction(() => () => doAction(action, args));
         }
@@ -1325,6 +1331,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       }
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doAction(action, args));
       }
@@ -1407,6 +1414,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     setError("");
     setSuccess(null);
     setRetryAction(null);
+    setErrorTypedError(null);
 
     // Build snapshot for the TARGET member's contribution status
     const targetContributed =
@@ -1451,6 +1459,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       if (!result.success) {
         const errMsg = result.typedError?.message || result.error || "Transaction failed";
         setError(errMsg);
+        setErrorTypedError(result.typedError ?? null);
         if (isRetryableError(errMsg)) {
           setRetryAction(() => () => doDefault(memberAddress));
         }
@@ -1465,6 +1474,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doDefault(memberAddress));
       }
@@ -1622,6 +1632,18 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 Retry
               </button>
             )}
+          </div>
+        )}
+
+        {/* Diagnostics panel — shown when there is an active transaction error.
+            Collapsed by default; user must explicitly expand and generate the
+            bundle. Nothing is sent to a server automatically. */}
+        {error && (
+          <div className="mb-3">
+            <DiagnosticsPanel
+              typedError={errorTypedError}
+              txHash={errorTxHash}
+            />
           </div>
         )}
 
