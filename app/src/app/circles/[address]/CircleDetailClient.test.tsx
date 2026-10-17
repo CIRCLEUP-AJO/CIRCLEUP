@@ -58,6 +58,7 @@ function makeCurrentRound(contributions: { member_address: string }[] = []): Cir
     recipient: null,
     amount: null,
     txHash: null,
+    ledger: null,
     contributions: contributions.map((c) => ({
       member_address: c.member_address,
       amount: "10000000",

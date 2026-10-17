@@ -12,81 +12,47 @@ import {
 } from "@/lib/gating";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import clsx from "clsx";
+import type {
+  ApiMemberRow,
+  ApiContributionRecord,
+  ApiDefaultRecord,
+  ApiRoundRow,
+  ApiCircleRow,
+} from "@circleup/sdk";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 //
-// These shapes mirror the canonical API model types defined in
-// sdk/src/types.ts (ApiMemberRow, ApiRoundRow, ApiDefaultRecord, etc.).
-// They are re-declared here because the app package does not take a direct
-// dependency on @circleup/sdk; keep them in sync when the indexer schema
-// changes and update sdk/src/types.ts as the source of truth.
+// API wire types are imported from @circleup/sdk (sdk/src/types.ts), the
+// single canonical source of truth for indexer API shapes. Local type
+// aliases preserve the names used throughout this file while pointing at
+// the shared definitions, eliminating the duplicated declarations that
+// previously required manual synchronization.
 
-/** @see ApiMemberRow in sdk/src/types.ts */
-export interface CircleMember {
-  member_address: string;
-  payout_order: number;
-  collateral: string;
-  defaults: number;
-  joined_at: string | null;
-  reputation_score: number;
-  total_contributions: number;
-}
+/** Wire type for a circle member. @see ApiMemberRow in @circleup/sdk */
+export type CircleMember = ApiMemberRow;
 
-/** @see ApiContributionRecord in sdk/src/types.ts */
-export interface ContributionRecord {
-  member_address: string;
-  amount: string;
-  tx_hash: string;
-}
+/** Wire type for a contribution record. @see ApiContributionRecord in @circleup/sdk */
+export type ContributionRecord = ApiContributionRecord;
 
-/** @see ApiDefaultRecord in sdk/src/types.ts */
-export interface DefaultRecord {
-  member_address: string;
-  penalty: string;
-}
+/** Wire type for a default record. @see ApiDefaultRecord in @circleup/sdk */
+export type DefaultRecord = ApiDefaultRecord;
 
-/** @see ApiRoundRow in sdk/src/types.ts */
-export interface CircleRound {
-  roundIndex: number;
-  /**
-   * "completed" — payout row exists for this round.
-   * "current"   — the active in-progress round (no payout yet).
-   * "cancelled" — the current round of a Cancelled circle.
-   * "open"      — unpaid round with activity that is not the current round
-   *               (reorg / partial-ingest edge case; was previously invisible).
-   */
-  status: "completed" | "current" | "cancelled" | "open";
-  /** null when the round has not been paid out yet. */
-  recipient: string | null;
-  /** null when the round has not been paid out yet. */
-  amount: string | null;
-  /** null when the round has not been paid out yet. */
-  txHash: string | null;
-  contributions: ContributionRecord[];
-  defaults: DefaultRecord[];
-}
+/** Wire type for a round. @see ApiRoundRow in @circleup/sdk */
+export type CircleRound = ApiRoundRow;
 
-/** Pending default — a DefaultRecord not yet associated with a payout round.
- *  @see ApiDefaultRecord in sdk/src/types.ts */
-export interface CirclePendingDefault {
-  member_address: string;
-  penalty: string;
-}
+/** Pending default — same wire shape as a default record. @see ApiDefaultRecord in @circleup/sdk */
+export type CirclePendingDefault = ApiDefaultRecord;
 
-/** Subset of ApiCircleRow fields used by the detail view.
- *  @see ApiCircleRow in sdk/src/types.ts */
-export interface CircleState {
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  round_amount: string;
-  member_count: number;
-  /** Computed deadline ledger for the current active round (null if unknown) */
-  deadline_ledger?: number | null;
-}
+/** Subset of ApiCircleRow fields used by the detail view. @see ApiCircleRow in @circleup/sdk */
+export type CircleState = Pick<
+  ApiCircleRow,
+  "status" | "current_round" | "total_rounds" | "round_amount" | "member_count" | "deadline_ledger"
+>;
 
-/** Composite data object for the circle detail page.
- *  @see ApiCircleDetailResponse + ApiRoundsResponse in sdk/src/types.ts */
+/** Composite data object for the circle detail page, merging the circle
+ *  detail response (circle + members + latestLedger) with the rounds
+ *  response (rounds + currentRound + openRounds + pendingDefaults).
+ *  @see ApiCircleDetailResponse + ApiRoundsResponse in @circleup/sdk */
 export interface CircleDetailData {
   circle: CircleState;
   members: CircleMember[];

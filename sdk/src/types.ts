@@ -1051,16 +1051,27 @@ export interface ApiDefaultRecord {
 }
 
 /**
- * A completed payout round as returned by GET /circles/:address/rounds.
+ * A single round as returned by GET /circles/:address/rounds.
+ *
+ * The indexer reconciles payouts, contributions, and defaults into a
+ * per-round view (see indexer/src/groupRounds.ts → GroupedRound). Fields
+ * `recipient`, `amount`, `txHash`, and `ledger` are `null` until the
+ * round is paid out.  `status` classifies the round's lifecycle phase.
+ *
  * `amount` is in stroops (string-serialised).
  */
 export interface ApiRoundRow {
   roundIndex: number;
-  recipient: string;
-  /** Pot paid out, in stroops (string-serialised). */
-  amount: string;
-  txHash: string;
-  ledger?: number;
+  /** Lifecycle phase of this round, as reconciled by the indexer. */
+  status: RoundPhase;
+  /** Payout recipient (G…); `null` until the round is paid out. */
+  recipient: string | null;
+  /** Payout amount, in stroops (string-serialised); `null` until paid out. */
+  amount: string | null;
+  /** Payout transaction hash; `null` until the round is paid out. */
+  txHash: string | null;
+  /** Ledger sequence of the payout (string-serialised u64); `null` until paid out. */
+  ledger: string | null;
   contributions: ApiContributionRecord[];
   defaults: ApiDefaultRecord[];
 }
@@ -1087,8 +1098,13 @@ export interface ApiMembersResponse {
 
 /** Response body for GET /circles/:address/rounds */
 export interface ApiRoundsResponse {
+  /** Completed rounds (have a payout), sorted ascending by roundIndex. */
   rounds: ApiRoundRow[];
-  /** Defaults that belong to a round not yet paid out. */
+  /** The in-progress or cancelled-current round, if any. */
+  currentRound: ApiRoundRow | null;
+  /** Unpaid non-current rounds that still have contributions/defaults. */
+  openRounds: ApiRoundRow[];
+  /** Default rows whose round has no payout yet. */
   pendingDefaults: ApiDefaultRecord[];
 }
 

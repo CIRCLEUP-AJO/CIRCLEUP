@@ -4,23 +4,14 @@ import Link from "next/link";
 import { shortAddress, formatUsdc, formatPot } from "@/lib/config";
 import { isCanonicalStellarAddress } from "@/lib/address";
 import clsx from "clsx";
+import type { ApiCircleRow, ApiCircleStatus } from "@circleup/sdk";
 
-/** Indexer list shape for a circle. Mirrors ApiCircleRow in sdk/src/types.ts.
- *  Keep in sync when the indexer schema changes. */
-export interface Circle {
-  address: string;
-  creator: string;
-  /** Per-member round contribution, in stroops */
-  round_amount: string;
-  member_count: number;
-  /** Canonical values from the contract's CircleStatus enum:
-   *  "Pending" | "Active" | "Completed" | "Cancelled". Kept as string
-   *  because the value arrives from the indexer/RPC untyped. */
-  status: string;
-  current_round: number;
-  total_rounds: number;
-  created_ledger: number;
-}
+/** Indexer list shape for a circle.
+ *  Canonical source: @circleup/sdk → ApiCircleRow. */
+export type Circle = Pick<
+  ApiCircleRow,
+  "address" | "creator" | "round_amount" | "member_count" | "status" | "current_round" | "total_rounds" | "created_ledger"
+>;
 
 interface StatusMeta {
   label: string;
@@ -71,6 +62,19 @@ function isFiniteNonNegativeInt(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 0;
 }
 
+/** Valid circle status values as defined in @circleup/sdk (ApiCircleStatus). */
+const VALID_CIRCLE_STATUSES: readonly string[] = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+];
+
+/** Type guard: narrows an unknown value to ApiCircleStatus. */
+function isApiCircleStatus(value: unknown): value is ApiCircleStatus {
+  return typeof value === "string" && VALID_CIRCLE_STATUSES.includes(value);
+}
+
 /** Validates and narrows an unknown JSON value to a {@link Circle}, or returns
  *  `null` for a malformed row (never throws). */
 export function parseCircleRow(raw: unknown): Circle | null {
@@ -87,7 +91,7 @@ export function parseCircleRow(raw: unknown): Circle | null {
   if (typeof creator !== "string" || !isCanonicalStellarAddress(creator)) return null;
   if (typeof round_amount !== "string" || !/^\d+$/.test(round_amount.trim())) return null;
   if (!isFiniteNonNegativeInt(member_count)) return null;
-  if (typeof status !== "string" || status.trim() === "") return null;
+  if (!isApiCircleStatus(status)) return null;
   if (!isFiniteNonNegativeInt(current_round)) return null;
   if (!isFiniteNonNegativeInt(total_rounds)) return null;
   if (!isFiniteNonNegativeInt(created_ledger)) return null;

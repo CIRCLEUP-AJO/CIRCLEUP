@@ -5,29 +5,15 @@ import { INDEXER_URL, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
 import { isCanonicalStellarAddress } from "@/lib/address";
 
+import type { ApiReputationResponse } from "@circleup/sdk";
+
 // ─── Local type definition ────────────────────────────────────────────────────
 //
-// The app package does not depend on @circleup/sdk directly; types that mirror
-// indexer API shapes are declared here. Keep in sync with:
-//   sdk/src/types.ts → ApiReputationResponse
+// Canonical source: @circleup/sdk → ApiReputationResponse.
+// The local alias preserves the name used throughout this file.
 
-/** @see ApiReputationResponse in sdk/src/types.ts */
-interface ReputationResponse {
-  member: string;
-  /** true when a reputation row exists; false means no activity recorded yet. */
-  found: boolean;
-  score: number;
-  contributions: Array<{
-    circle_address: string;
-    contributions: number;
-    total_rounds: number;
-  }>;
-  defaults: Array<{
-    circle_address: string;
-    count: number;
-  }>;
-  updatedAt: string | null;
-}
+/** @see ApiReputationResponse in @circleup/sdk */
+type ReputationResponse = ApiReputationResponse;
 
 // ─── Data fetching ────────────────────────────────────────────────────────────
 
