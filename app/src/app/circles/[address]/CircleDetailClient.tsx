@@ -344,7 +344,7 @@ function CheckpointAgeRow({ checkpointTime }: { checkpointTime: string | null })
   );
 }
 
-// ─── Partial data banner ──────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Partial data banner ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Shown when data is structurally present but incomplete. Explains why actions
 // are locked and provides a Retry button. Distinct from a network/fetch error ΓÇö
