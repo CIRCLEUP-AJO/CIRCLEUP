@@ -8,6 +8,45 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (SDK)
+- **Strict RPC decoding** (`sdk/src/types.ts`): reads now fail at the
+  decoding boundary, with the method or field named, on wrong variants, absent
+  fields, and out-of-range values. New narrow decoders: `decodeI128`,
+  `decodeU64`, `decodeU32InRange`, `decodeRecord`. `mapRawConfig` enforces
+  distinct members (≤ 256), `round_amount ≥ 1`, and the contract's deadline
+  bounds. `getCollateral` rejects negative values. `assertValidCircleStatus`
+  now accepts the `#[contracttype]` enum wire form (`["Active"]`) that
+  `get_status` actually returns, as well as a bare symbol. `createCircle`
+  only reports a contract address as `circleAddress`.
+- **Write retry safety** (`sdk/src/client.ts`): a write is never rebuilt
+  inside the SDK. `sendTransaction` resends only the identical signed
+  envelope. When a send may have reached the RPC without a reply, the SDK looks
+  the locally computed hash up instead of reporting a retryable error.
+  New `TxErrorCode`s: `outcome_unknown` (not retryable, carries
+  `diagnostics: SubmissionDiagnostics`) and `tx_expired` (retryable — the
+  envelope passed its time bound unincluded). **Behaviour change:** losing
+  connectivity while polling an accepted transaction now returns
+  `outcome_unknown` instead of `network_error`. `network_error` now always
+  means the request never reached the RPC. Added
+  `CircleUpClient.lookupTransaction(hash)`.
+- **Indexer paging** (`IndexerClient`): query options are validated locally
+  (`RangeError`, before any request), unknown keys are rejected instead of
+  dropped, and responses must carry a pagination envelope matching the request.
+  Added the bounded iterators `iterateCircles` / `iterateMemberContributions`
+  (default 10 pages), `GetMemberContributionsParams`, `IndexerPagination`
+  (incl. `hasMore`), `totalAmount` on contributions, and
+  `INDEXER_DEFAULT_PAGE_SIZE` / `INDEXER_MAX_PAGE_SIZE`.
+- **Public API boundary**: `package.json` now declares `exports` (root only) and
+  `files`. Co-located `src/*.test.ts` files are no longer emitted to `dist/`.
+  The test-only helpers `isTransientRpcError` and `withRpcRetry` are no longer
+  exported from the package root. New release check `npm run check:api` (clean
+  build, compile `examples/` against `dist/`, verify documented imports, and
+  block deep imports) runs in CI.
+
+### Fixed (SDK)
+- Restored `formatMismatchMessage`, which `CircleClient.preflight` calls but a
+  merge had removed, leaving `sdk/src/client.ts` unable to compile.
+
 ### Added
 - **Issue 477**: Address validation for every member entry on the create flow
   (`app/src/lib/address.ts`, `app/src/app/create/CreateClient.tsx`)
