@@ -13,6 +13,11 @@
  * CI requirement: a Postgres service (e.g. postgres:16-alpine) must be
  * available at DATABASE_URL before these tests run.  See docker-compose.yml
  * for the service definition used in local development.
+ *
+ * Safety: DATABASE_URL must point at a local or _test/_dev database.
+ * The test will abort immediately if it detects a non-local, non-test target
+ * to prevent accidentally running destructive migration + seed operations
+ * against staging or production.
  */
 
 import { test, before, after } from "node:test";
@@ -21,6 +26,16 @@ import assert from "node:assert/strict";
 const hasDb = Boolean(process.env.DATABASE_URL);
 
 if (hasDb) {
+  // Fail fast if DATABASE_URL points at a non-local, non-test database.
+  // This check runs before any DB connection is opened.
+  const { assertLocalDatabase } = require("./db/dbGuard") as typeof import("./db/dbGuard");
+  try {
+    assertLocalDatabase(process.env.DATABASE_URL, "indexer integration tests");
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const request = require("supertest") as typeof import("supertest");
   const { createApp } = require("./api") as typeof import("./api");

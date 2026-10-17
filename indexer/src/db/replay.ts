@@ -28,6 +28,7 @@
  */
 
 import { pool, withTransaction } from "./pool";
+import { assertLocalDatabase } from "./dbGuard";
 import type { PoolClient } from "pg";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -314,6 +315,14 @@ if (require.main === module) {
     const fromLedger = Number(fromArg.replace("--from=", ""));
     if (!Number.isInteger(fromLedger) || fromLedger < 0) {
       console.error(`[replay] --from must be a non-negative integer, got: "${fromArg}"`);
+      process.exit(1);
+    }
+
+    // Refuse to run against staging or production — this operation wipes tables.
+    try {
+      assertLocalDatabase(process.env.DATABASE_URL, "replay");
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
 
