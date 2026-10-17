@@ -854,6 +854,80 @@ export function sanitizeTxMetadata(input: unknown): TxMetadata | undefined {
   return Object.freeze(out);
 }
 
+// ── Simulation estimates ──────────────────────────────────────────────────────
+//
+// A Soroban write is simulated before it is assembled and signed; the
+// simulation response carries the resource fee and resource usage the network
+// will charge for.  The SDK copies the stable, public parts of that response
+// into a {@link SimulationEstimate} so integrators can diagnose cost and
+// failure without re-simulating.
+//
+// ── Rules ──
+//
+//   • Never fabricated.  Every field is optional and is set only when the RPC
+//     response actually carried a well-formed value for it.  A missing or
+//     malformed field is left `undefined` — never defaulted to `0`.
+//   • Never signed material.  The estimate is derived from the *unsigned*
+//     simulation response only.  It holds plain numbers and decimal strings —
+//     no XDR, no transaction envelope, no auth entries, no signatures, no
+//     return value and no keys.
+//   • Diagnostic only.  Reading or ignoring the estimate has no effect on
+//     submission: the SDK always assembles the transaction from the full
+//     simulation response exactly as before.
+
+/**
+ * A log-safe summary of the resource and fee estimates returned by a Soroban
+ * simulation.
+ *
+ * | Field | Unit | Source (RPC `simulateTransaction`) |
+ * |-------|------|-------------------------------------|
+ * | `minResourceFee` | stroops (decimal string) | `minResourceFee` — the minimum resource fee the network will accept; added on top of the inclusion fee when the transaction is assembled. |
+ * | `inclusionFee` | stroops (decimal string) | The inclusion (base) fee the SDK set on the transaction before simulating; not an RPC field. |
+ * | `cpuInstructions` | CPU instructions (decimal string) | `transactionData.resources.instructions` |
+ * | `readBytes` | bytes | `transactionData.resources.readBytes` (`diskReadBytes` on newer protocols) |
+ * | `writeBytes` | bytes | `transactionData.resources.writeBytes` |
+ * | `readOnlyEntries` | ledger entries | length of the footprint's read-only set |
+ * | `readWriteEntries` | ledger entries | length of the footprint's read-write set |
+ * | `restoreRequired` | — | `true` when the RPC returned a `restorePreamble` (archived state must be restored first) |
+ * | `restoreMinResourceFee` | stroops (decimal string) | `restorePreamble.minResourceFee` |
+ * | `latestLedger` | ledger sequence | `latestLedger` — the ledger the simulation ran against |
+ *
+ * Amounts that are 64-bit on the wire (`minResourceFee`, `inclusionFee`,
+ * `cpuInstructions`, `restoreMinResourceFee`) are kept as decimal strings so
+ * they never lose precision; convert with `BigInt(...)` when doing arithmetic.
+ *
+ * A simulation *failure* usually carries only `inclusionFee` and
+ * `latestLedger`: the RPC does not report resource usage or a resource fee for
+ * a call the host rejected, and the SDK does not invent one.
+ *
+ * Resource fields are also omitted when the RPC returned no
+ * `transactionData` (the Stellar SDK substitutes an all-zero placeholder in
+ * that case, which the SDK recognises and does not report as a real
+ * estimate).
+ */
+export interface SimulationEstimate {
+  /** Minimum resource fee in stroops, as reported by the simulation. */
+  readonly minResourceFee?: string;
+  /** Inclusion fee in stroops the SDK set on the transaction before simulating. */
+  readonly inclusionFee?: string;
+  /** Estimated CPU instructions the invocation consumes. */
+  readonly cpuInstructions?: string;
+  /** Estimated bytes read from the ledger. */
+  readonly readBytes?: number;
+  /** Estimated bytes written to the ledger. */
+  readonly writeBytes?: number;
+  /** Number of ledger entries in the read-only footprint. */
+  readonly readOnlyEntries?: number;
+  /** Number of ledger entries in the read-write footprint. */
+  readonly readWriteEntries?: number;
+  /** `true` when archived state must be restored before this call can succeed. */
+  readonly restoreRequired?: boolean;
+  /** Minimum resource fee in stroops for the required restore, when one is needed. */
+  readonly restoreMinResourceFee?: string;
+  /** Ledger sequence the simulation ran against. */
+  readonly latestLedger?: number;
+}
+
 // ── Tx result ─────────────────────────────────────────────────────────────────
 //
 // A discriminated union so callers can pattern-match on `success` and get
@@ -889,6 +963,12 @@ export interface TxSuccess {
    * confirmed `txHash` back to the UI action that produced it.
    */
   readonly metadata?: TxMetadata;
+  /**
+   * Resource and fee estimates from the simulation that preceded submission.
+   * `undefined` when the simulation response carried none of the documented
+   * fields.  See {@link SimulationEstimate} for units.
+   */
+  readonly estimate?: SimulationEstimate;
 }
 
 /**
@@ -979,6 +1059,15 @@ export interface TxFailure {
    * supplied none or nothing survived sanitisation.
    */
   readonly metadata?: TxMetadata;
+  /**
+   * Resource and fee estimates from the simulation, when the write got that
+   * far.  Absent for failures that happen before simulation (invalid
+   * arguments, missing account, simulation network errors).  On
+   * `"simulation_failed"` it usually carries only `inclusionFee` and
+   * `latestLedger`.  See
+   * {@link SimulationEstimate} for units.
+   */
+  readonly estimate?: SimulationEstimate;
   /** Present when errorCode is "stale_state". Lists the mismatched fields. */
   readonly mismatches?: readonly StateMismatch[];
 }

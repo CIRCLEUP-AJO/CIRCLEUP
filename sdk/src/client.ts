@@ -20,6 +20,7 @@ import type {
   TxFailure,
   TxErrorCode,
   TxMetadata,
+  SimulationEstimate,
   SimulateResult,
   ReadResult,
   ApiCirclesListResponse,
@@ -366,6 +367,146 @@ function attachMetadata<T extends TxResult>(
   metadata: TxMetadata | undefined,
 ): T {
   return metadata ? { ...result, metadata } : result;
+}
+
+/**
+ * Out-parameter through which {@link CircleUpClient.buildAndSendCore} hands
+ * the simulation estimate back to its wrapper.  Exported only because it
+ * appears in that protected signature; subclasses rarely need it.
+ */
+export interface SimulationDiagnostics {
+  estimate?: SimulationEstimate;
+}
+
+/**
+ * Attach a simulation estimate to a result without mutating it.  `undefined`
+ * leaves the result untouched, mirroring {@link attachMetadata}.
+ */
+function attachEstimate<T extends TxResult>(
+  result: T,
+  estimate: SimulationEstimate | undefined,
+): T {
+  return estimate ? { ...result, estimate } : result;
+}
+
+/** A non-negative integer amount, as the decimal string the RPC uses. */
+function readDecimalString(value: unknown): string | undefined {
+  if (typeof value === "string") return /^\d+$/.test(value) ? value : undefined;
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined;
+  }
+  if (typeof value === "bigint") return value >= 0n ? value.toString() : undefined;
+  return undefined;
+}
+
+/** A non-negative safe integer, or `undefined`. */
+function readCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/** Call a zero-argument XDR accessor if it exists, swallowing decode errors. */
+function callAccessor(target: any, name: string): unknown {
+  try {
+    return typeof target?.[name] === "function" ? target[name]() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resource usage read from a simulation's `transactionData`. */
+type ResourceEstimate = Pick<
+  SimulationEstimate,
+  "cpuInstructions" | "readBytes" | "writeBytes" | "readOnlyEntries" | "readWriteEntries"
+>;
+
+/**
+ * Read the resource section of a `SorobanDataBuilder` (or an already-built
+ * `SorobanTransactionData`).
+ *
+ * Returns `undefined` when the data is missing or is the all-zero placeholder
+ * the Stellar SDK substitutes when the RPC omitted `transactionData` — every
+ * real contract invocation touches at least one ledger entry, so an empty
+ * footprint with zero usage means "not reported", not "free".
+ */
+function readResources(transactionData: unknown): ResourceEstimate | undefined {
+  if (!transactionData || typeof transactionData !== "object") return undefined;
+  const data = callAccessor(transactionData, "build") ?? transactionData;
+  const resources = callAccessor(data, "resources");
+  if (!resources) return undefined;
+
+  const footprint = callAccessor(resources, "footprint");
+  const readOnly = callAccessor(footprint, "readOnly");
+  const readWrite = callAccessor(footprint, "readWrite");
+  const instructions = callAccessor(resources, "instructions");
+
+  const out: ResourceEstimate = {
+    cpuInstructions: readDecimalString(instructions),
+    // Protocol 23 renamed `readBytes` to `diskReadBytes`; accept either.
+    readBytes: readCount(
+      callAccessor(resources, "readBytes") ?? callAccessor(resources, "diskReadBytes"),
+    ),
+    writeBytes: readCount(callAccessor(resources, "writeBytes")),
+    readOnlyEntries: Array.isArray(readOnly) ? readOnly.length : undefined,
+    readWriteEntries: Array.isArray(readWrite) ? readWrite.length : undefined,
+  };
+
+  const isPlaceholder =
+    out.cpuInstructions === "0" &&
+    !out.readBytes &&
+    !out.writeBytes &&
+    !out.readOnlyEntries &&
+    !out.readWriteEntries;
+  return isPlaceholder ? undefined : out;
+}
+
+/**
+ * Summarise a Soroban simulation response into a log-safe
+ * {@link SimulationEstimate}.
+ *
+ * Accepts success, restore and error responses alike.  Only the documented
+ * numeric fields are copied: the transaction envelope, auth entries, return
+ * value, events and every other XDR blob are ignored, so the result can be
+ * logged or shown to a user without exposing signed or signable material.
+ * Fields the response does not carry (or carries malformed) are left
+ * `undefined`; nothing is defaulted.
+ *
+ * @param simulation   The (parsed) `simulateTransaction` response.
+ * @param inclusionFee The inclusion fee, in stroops, set on the simulated
+ *                     transaction — echoed as `inclusionFee` when well-formed.
+ * @returns The estimate, or `undefined` when no field could be read.
+ */
+export function summarizeSimulation(
+  simulation: unknown,
+  inclusionFee?: string | number,
+): SimulationEstimate | undefined {
+  if (!simulation || typeof simulation !== "object") return undefined;
+  const sim = simulation as Record<string, any>;
+  const isError = typeof sim.error === "string";
+
+  const estimate: Record<string, unknown> = {
+    inclusionFee: readDecimalString(inclusionFee),
+    latestLedger: readCount(sim.latestLedger),
+  };
+
+  if (!isError) {
+    estimate.minResourceFee = readDecimalString(sim.minResourceFee);
+    Object.assign(estimate, readResources(sim.transactionData));
+
+    const preamble = sim.restorePreamble;
+    if (preamble && typeof preamble === "object") {
+      estimate.restoreRequired = true;
+      estimate.restoreMinResourceFee = readDecimalString(preamble.minResourceFee);
+    }
+  }
+
+  // Drop absent fields so `"field" in estimate` means "the RPC reported it".
+  for (const key of Object.keys(estimate)) {
+    if (estimate[key] === undefined) delete estimate[key];
+  }
+  if (Object.keys(estimate).length === 0) return undefined;
+  return Object.freeze(estimate) as SimulationEstimate;
 }
 
 /**
@@ -920,7 +1061,8 @@ export type TxLogPhase = "simulated" | "submitted" | "confirmed" | "failed";
  *
  * **Safe by construction.** An event carries only the contract address, the
  * method name, the (public) transaction hash, an error code, and the
- * already-sanitised correlation metadata.  It never contains the signing
+ * already-sanitised correlation metadata, plus the numeric simulation
+ * {@link SimulationEstimate}.  It never contains the signing
  * `Keypair`, its secret, the signed transaction XDR, or the raw `ScVal`
  * arguments — none of those are ever passed to the logger.
  */
@@ -939,6 +1081,12 @@ export interface TxLogEvent {
   readonly ledger?: number;
   /** Error category — present on `failed` only. */
   readonly errorCode?: TxErrorCode;
+  /**
+   * Simulation resource and fee estimates — present on `simulated` and on the
+   * terminal event once the write has been simulated.  Log-safe by
+   * construction; see {@link SimulationEstimate}.
+   */
+  readonly estimate?: SimulationEstimate;
   /** Caller correlation metadata (already sanitised), when supplied. */
   readonly metadata?: TxMetadata;
 }
@@ -1036,12 +1184,20 @@ export class CircleUpClient {
     // every log event carry the identical secret-free copy.
     const metadata = sanitizeTxMetadata(options?.metadata);
 
-    const result = await this.buildAndSendCore(
-      sourceKeypair,
-      contractId,
-      method,
-      args,
-      metadata,
+    // The core records the simulation estimate here as soon as it exists, so
+    // every outcome after simulation carries it without each failure branch
+    // having to thread it through by hand.
+    const diagnostics: SimulationDiagnostics = {};
+    const result = attachEstimate(
+      await this.buildAndSendCore(
+        sourceKeypair,
+        contractId,
+        method,
+        args,
+        metadata,
+        diagnostics,
+      ),
+      diagnostics.estimate,
     );
 
     // Exactly one terminal event per call, derived from the final result so it
@@ -1055,6 +1211,7 @@ export class CircleUpClient {
       txHash: result.txHash || undefined,
       ledger: result.success ? result.ledger : undefined,
       errorCode: result.success ? undefined : result.errorCode,
+      estimate: result.estimate,
       metadata,
     });
 
@@ -1068,7 +1225,10 @@ export class CircleUpClient {
    * without repeating that bookkeeping.
    *
    * `metadata` is already sanitised; it is used only to tag the mid-flight
-   * `simulated` / `submitted` log events.
+   * `simulated` / `submitted` log events.  `diagnostics`, when supplied,
+   * receives the {@link SimulationEstimate} once simulation has returned; it
+   * is write-only from the core's point of view and never influences
+   * assembly or submission.
    */
   protected async buildAndSendCore(
     sourceKeypair: Keypair,
@@ -1076,6 +1236,7 @@ export class CircleUpClient {
     method: string,
     args: xdr.ScVal[],
     metadata?: TxMetadata,
+    diagnostics?: SimulationDiagnostics,
   ): Promise<TxResult> {
     // Context string prepended to every error from this invocation so callers
     // can correlate an error back to the contract method without a stack trace.
@@ -1144,6 +1305,12 @@ export class CircleUpClient {
       );
     }
 
+    // Summarise before branching so a rejected simulation still reports the
+    // ledger it ran against.  Diagnostic only: assembly below always uses the
+    // full, untouched `simResult`.
+    const estimate = summarizeSimulation(simResult, tx.fee);
+    if (diagnostics) diagnostics.estimate = estimate;
+
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       const humanMessage = extractSimulationError(simResult.error);
       return txFailure(
@@ -1155,7 +1322,7 @@ export class CircleUpClient {
 
     // Simulation succeeded: the call is valid against current on-chain state.
     // No hash exists yet — that arrives once the network queues the submission.
-    this.emitTxLog({ phase: "simulated", ctx, contractId, method, metadata });
+    this.emitTxLog({ phase: "simulated", ctx, contractId, method, estimate, metadata });
 
     let preparedTx: ReturnType<TransactionBuilder["build"]>;
     try {

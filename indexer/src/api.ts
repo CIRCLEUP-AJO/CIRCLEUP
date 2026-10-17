@@ -15,6 +15,10 @@
  * GET /reputation/:member              → member reputation score
  * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
  * GET /indexer/schema                  → schema versioning and migration status diagnostics
+ * GET /indexer/failures                → open event-handler failures (skipped events)
+ *                                        ?ledger=   restrict to one ledger
+ *                                        ?eventId=  look up one RPC event id
+ *                                        ?limit=    1–100 (default: 20)
  * GET /health                          → health check (db + RPC status)
  *
  * DB helpers used: query<T> (many rows), queryOne<T> (0‥1 rows → T|null),
@@ -30,6 +34,7 @@ import { query, queryOne, queryExact } from "./db/pool";
 import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
+import { isUndefinedTable, listOpenEventFailures } from "./eventFailures";
 import { redactAddress } from "./redact";
 import { logApiCorsRejected, logApiRequest, logApiRequestError } from "./logger";
 import type { MigrationHealth } from "./db/migrate";
@@ -1279,6 +1284,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           processed: metrics.totalEventsProcessed,
           failed: metrics.totalEventsFailed,
           skipped: metrics.totalEventsSkipped,
+          retried: metrics.totalEventsRetried,
         },
         pollCycles: {
           completed: metrics.pollCyclesCompleted,
@@ -1296,6 +1302,50 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     } catch (err) {
       console.error("[api] Failed to load indexer health", err);
       sendError(res, 500, "Failed to load indexer health", getErrorMessage(err));
+    }
+  });
+
+  // Events the indexer skipped because their handler failed, and which have
+  // not since been re-ingested or acknowledged.  Rows carry the event's
+  // identity (RPC event id, ledger, tx hash, contract, type) and a redacted
+  // error — never the event payload.  See docs/INDEXER_RELIABILITY.md for the
+  // safe reprocessing path.
+  app.get("/indexer/failures", detailRateLimiter, async (req: Request, res: Response) => {
+    const limitResult = parseLimit(req.query.limit);
+    if (isParseError(limitResult)) {
+      sendError(res, 400, limitResult.error);
+      return;
+    }
+
+    let ledger: number | undefined;
+    if (req.query.ledger !== undefined) {
+      const n = Number(req.query.ledger);
+      if (!Number.isInteger(n) || n < 0) {
+        sendError(res, 400, "ledger must be a non-negative integer");
+        return;
+      }
+      ledger = n;
+    }
+
+    let eventId: string | undefined;
+    if (req.query.eventId !== undefined) {
+      if (typeof req.query.eventId !== "string" || !/^[0-9A-Za-z:_-]{1,200}$/.test(req.query.eventId)) {
+        sendError(res, 400, "eventId must be an RPC event id");
+        return;
+      }
+      eventId = req.query.eventId;
+    }
+
+    try {
+      const failures = await listOpenEventFailures({ ledger, eventId, limit: limitResult });
+      res.json({ failures, count: failures.length, limit: limitResult });
+    } catch (err) {
+      if (isUndefinedTable(err)) {
+        sendError(res, 503, "event_failures table is missing — run migrations");
+        return;
+      }
+      console.error("[api] Failed to load event failures", err);
+      sendError(res, 500, "Failed to load event failures", getErrorMessage(err));
     }
   });
 

@@ -62,6 +62,12 @@ import {
 } from "./config";
 import { redactAddress, formatAmount } from "./redact";
 import {
+  buildFailureEvidence,
+  eventFailureId,
+  recordLedgerFailureEvidence,
+  type EventFailureEvidence,
+} from "./eventFailures";
+import {
   log,
   logIndexerStarted,
   logIndexerStopped,
@@ -388,7 +394,10 @@ export async function ingestEventInTx(
  * Process all events for one ledger inside a single Postgres transaction.
  *
  * Each event is wrapped in a savepoint: a throwing handler rolls back only its
- * own writes and does not abort the rest of the ledger.  After all events are
+ * own writes and does not abort the rest of the ledger.  The skipped event is
+ * recorded in event_failures (see ./eventFailures) so it stays discoverable
+ * by ledger and identity.  Exception: a *transient* database error aborts the
+ * whole ledger so it is retried instead of skipped.  After all events are
  * attempted the indexer_state cursor is advanced to `ledger` and a
  * ledger_checkpoints record is written — both inside the same transaction, so
  * a crash before COMMIT leaves the DB at the previous ledger boundary with no
@@ -406,11 +415,16 @@ export async function processLedger(
     let processed = 0;
     let failed = 0;
     let skipped = 0;
+    // Evidence for events skipped in this ledger, and the ids of events that
+    // ingested successfully (which resolves any earlier failure of theirs).
+    const failures: EventFailureEvidence[] = [];
+    const succeededEventIds: string[] = [];
 
     for (const { event, handler } of items) {
       const contractId = getContractIdStr(event);
       const topic0 = event.topic?.[0] ? getTopicStr(event, 0) : "";
       const topic1 = event.topic?.[1] ? getTopicStr(event, 1) : "";
+      const eventType = topic0 && topic1 ? `${topic0}/${topic1}` : topic0 || "unknown";
 
       await client.query("SAVEPOINT sp_event");
       try {
@@ -419,22 +433,61 @@ export async function processLedger(
         if (ingested) {
           processed++;
           totalEventsProcessed++;
+          succeededEventIds.push(eventFailureId(event, contractId, eventType));
         } else {
           skipped++;
           totalEventsSkipped++;
         }
       } catch (err) {
+        const evidence = buildFailureEvidence({ event, contractId, eventType, error: err });
+
+        // A database-level error (deadlock, serialization failure, lost
+        // connection, timeout) says nothing about this event.  Skipping it
+        // would lose data, so abort the whole ledger instead: the transaction
+        // rolls back, the cursor stays at the previous ledger, and the poll
+        // loop's backoff retries the ledger from scratch.
+        if (evidence.errorClass === "transient") {
+          totalEventsRetried++;
+          logEventHandlerError({
+            ledger,
+            eventType,
+            contractId: contractId ?? "unknown",
+            txHash: event.txHash,
+            eventId: typeof event.id === "string" ? event.id : undefined,
+            errorClass: evidence.errorClass,
+            error: evidence.errorMessage,
+          });
+          throw err;
+        }
+
         await client.query("ROLLBACK TO SAVEPOINT sp_event");
         failed++;
         totalEventsFailed++;
+        failures.push(evidence);
         logEventHandlerError({
           ledger,
-          eventType: topic0 && topic1 ? `${topic0}/${topic1}` : topic0 || "unknown",
+          eventType,
           contractId: contractId ?? "unknown",
           txHash: event.txHash,
+          eventId: typeof event.id === "string" ? event.id : undefined,
+          errorClass: evidence.errorClass,
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+
+    // Durable, payload-free failure evidence, committed atomically with the
+    // ledger.  Isolated in its own savepoint so a failed evidence write can
+    // never block ingestion.
+    const evidenceRecorded = await recordLedgerFailureEvidence(
+      client,
+      failures,
+      succeededEventIds,
+    );
+    if (!evidenceRecorded) {
+      log("warn", "event_failure_evidence_failed", { ledger, eventsFailed: failed },
+        `Could not record event failure evidence for ledger ${ledger} — ` +
+          `is the event_failures migration applied?`);
     }
 
     // Advance the durable ledger cursor atomically with the event writes.
@@ -1082,6 +1135,9 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
 let totalEventsProcessed = 0;
 let totalEventsFailed = 0;
 let totalEventsSkipped = 0;
+// Handler errors classified as transient: the ledger was rolled back and will
+// be retried, so the event was neither skipped nor counted as failed.
+let totalEventsRetried = 0;
 let pollCyclesCompleted = 0;
 let pollCyclesFailed = 0;
 let lastPollDurationMs = 0;
@@ -1528,6 +1584,7 @@ export function getIndexerMetrics() {
     totalEventsProcessed,
     totalEventsFailed,
     totalEventsSkipped,
+    totalEventsRetried,
     pollCyclesCompleted,
     pollCyclesFailed,
     lastPollDurationMs,

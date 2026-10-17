@@ -21,6 +21,9 @@
 //                  isValidNetwork, USDC_DECIMALS, STROOPS_PER_USDC, LEDGERS_PER_*
 //   Low-level      scAddress, scU32, scI128, scBool, scAddressVec — ScVal
 //                  encoders for advanced callers building raw contract args.
+//   Diagnostics    summarizeSimulation, SimulationEstimate — log-safe
+//                  resource/fee estimates (also attached to every TxResult
+//                  and TxLogEvent once a write has been simulated).
 //
 // Internal modules (test files, and any module not re-exported below) are
 // private: they are excluded from the published build and carry no stability
