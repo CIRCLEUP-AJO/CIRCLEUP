@@ -42,6 +42,7 @@ export interface ComponentHealth {
 
 export interface HealthReport {
   status: "ok" | "degraded";
+  serviceStatus: "healthy" | "degraded" | "unavailable";
   timestamp: string;
   db: ComponentHealth;
   rpc: ComponentHealth;
@@ -53,6 +54,13 @@ export interface HealthReport {
     usdcAddress: string;
     lagAlertLedgers: number;
     driftRoundThreshold: number;
+  };
+  diagnostics: {
+    lastIndexedLedger: number | null;
+    rpcLatestLedger: number | null;
+    lagLedgers: number | null;
+    dbAvailable: boolean;
+    rpcAvailable: boolean;
   };
 }
 
@@ -502,9 +510,29 @@ export async function runAllHealthChecks({
 
   const allComponents = [db, rpcComponent, indexerLag, schema, contractDrift];
   const overallOk = allComponents.every((c) => c.status === "ok");
+  const dbAvailable = db.status !== "error";
+  const rpcAvailable = rpcComponent.status !== "error";
+  const serviceStatus =
+    !dbAvailable ? "unavailable" : overallOk ? "healthy" : "degraded";
+  const lagDetails = indexerLag.details ?? {};
+  const lastIndexedLedger =
+    typeof lagDetails.lastIndexedLedger === "number"
+      ? lagDetails.lastIndexedLedger
+      : null;
+  const latestLedgerForDiagnostics =
+    typeof lagDetails.rpcLatestLedger === "number"
+      ? lagDetails.rpcLatestLedger
+      : rpcLatestLedger;
+  const lagLedgers =
+    typeof lagDetails.lagLedgers === "number"
+      ? lagDetails.lagLedgers
+      : lastIndexedLedger != null && latestLedgerForDiagnostics != null
+      ? latestLedgerForDiagnostics - lastIndexedLedger
+      : null;
 
   return {
     status: overallOk ? "ok" : "degraded",
+    serviceStatus,
     timestamp: new Date().toISOString(),
     db,
     rpc: rpcComponent,
@@ -515,6 +543,13 @@ export async function runAllHealthChecks({
       usdcAddress,
       lagAlertLedgers: INDEXER_LAG_ALERT_LEDGERS,
       driftRoundThreshold: DRIFT_ROUND_THRESHOLD,
+    },
+    diagnostics: {
+      lastIndexedLedger,
+      rpcLatestLedger: latestLedgerForDiagnostics,
+      lagLedgers,
+      dbAvailable,
+      rpcAvailable,
     },
   };
 }

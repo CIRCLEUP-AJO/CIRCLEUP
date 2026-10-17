@@ -58,7 +58,8 @@ import {
 export type WalletErrorReason =
   | "not_installed"
   | "permission_denied"
-  | "unknown";
+  | "unknown"
+  | "unsupported_capability";
 
 export class WalletError extends Error {
   constructor(
@@ -165,6 +166,129 @@ function getRpc() {
   return _rpc;
 }
 
+// ─── Transient RPC retry ──────────────────────────────────────────────────────
+
+/**
+ * Maximum retry attempts for a single RPC call before the error is surfaced
+ * to the caller as a typed failure.
+ *
+ * 3 attempts with a 400 ms base delay (doubling each time, full jitter) gives
+ * a worst-case budget of ~2.8 s per call — short enough to stay inside a
+ * reasonable UX window while surviving most transient blips.
+ */
+const RPC_RETRY_MAX_ATTEMPTS = 3;
+/** Base delay in milliseconds before the first retry. Doubles each attempt. */
+const RPC_RETRY_BASE_DELAY_MS = 400;
+
+/**
+ * Return true when `err` is a transient network or rate-limit condition that
+ * is safe to retry.  Non-transient errors (auth, bad request, etc.) fail
+ * immediately so the user gets feedback right away rather than waiting for
+ * retries to exhaust.
+ */
+export function isTransientRpcError(err: unknown): boolean {
+  if (err == null) return false;
+
+  const code =
+    typeof err === "object" && "code" in err
+      ? String((err as { code?: unknown }).code)
+      : "";
+  const status =
+    typeof err === "object" && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  const message = err instanceof Error ? err.message : String(err);
+  const lower = message.toLowerCase();
+
+  // Node.js / fetch error codes
+  if (
+    code === "ECONNRESET" ||
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND" ||
+    code === "EAI_AGAIN" ||
+    code === "EPIPE" ||
+    code === "EHOSTUNREACH"
+  ) {
+    return true;
+  }
+
+  // HTTP status codes that indicate transient server-side issues
+  if (status === 429 || status === 502 || status === 503 || status === 504) {
+    return true;
+  }
+
+  // String-matched patterns for environments where the error code is absent
+  return (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("econnreset") ||
+    lower.includes("socket hang up") ||
+    lower.includes("network") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("fetch failed") ||
+    lower.includes("temporarily unavailable") ||
+    lower.includes("service unavailable") ||
+    lower.includes("bad gateway") ||
+    lower.includes("gateway timeout")
+  );
+}
+
+/**
+ * Run a single Soroban RPC call with capped exponential backoff + full jitter
+ * on transient failures.
+ *
+ * - Transient errors (network blips, rate-limits, gateway errors) are retried
+ *   up to `maxAttempts` times with a jittered exponential delay.
+ * - Non-transient errors (auth, bad request, simulation errors) propagate
+ *   immediately — burning retry budget on them would only delay user feedback.
+ *
+ * Full jitter: the delay for attempt N is a random value in
+ * [0, baseDelayMs × 2^(N-1)] so concurrent clients spread their retries
+ * rather than thundering-herding the RPC.
+ *
+ * @param label       Short human-readable name for the call, used in logs.
+ * @param fn          The RPC call to execute.
+ * @param maxAttempts Total attempts allowed (first try + retries).
+ * @param baseDelayMs Base delay in ms for the first retry.
+ * @param sleep       Injectable sleep for testing (defaults to setTimeout).
+ */
+export async function withRpcRetry<T>(
+  label: string,
+  fn: () => Promise<T>,
+  maxAttempts: number = RPC_RETRY_MAX_ATTEMPTS,
+  baseDelayMs: number = RPC_RETRY_BASE_DELAY_MS,
+  sleep: (ms: number) => Promise<void> = (ms) =>
+    new Promise((r) => setTimeout(r, ms)),
+): Promise<T> {
+  let lastErr: unknown;
+  const attempts = Math.max(1, maxAttempts);
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const transient = isTransientRpcError(err);
+      if (!transient || attempt === attempts) {
+        break;
+      }
+      // Full jitter: random value in [0, baseDelayMs * 2^(attempt-1)]
+      const ceiling = baseDelayMs * 2 ** (attempt - 1);
+      const delayMs = Math.floor(Math.random() * ceiling);
+      console.warn(
+        `[stellar] Transient RPC failure during ${label} ` +
+          `(attempt ${attempt}/${attempts}) — retrying in ${delayMs}ms`,
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastErr;
+}
+
 // ─── Contract error helpers ───────────────────────────────────────────────────
 
 /** How many polling iterations to allow before giving up. */
@@ -225,6 +349,40 @@ export function formatContractError(raw: string | undefined): string {
 
   // Return the raw error, capitalised, for developer visibility
   return raw.charAt(0).toUpperCase() + raw.slice(1);
+}
+
+/**
+ * Extracts the stable XDR result-code name (e.g. `"txFailed"`, `"txBadSeq"`,
+ * `"txInsufficientFee"`) from a `xdr.TransactionResult` so
+ * {@link parseContractError} can map it to a specific user-facing message
+ * instead of a generic "unexpected error" (Issue #479).
+ *
+ * Returns `undefined` when the result is absent or cannot be inspected so
+ * callers can fall back to a marker string.
+ */
+function extractTxResultCode(
+  errorResult: xdr.TransactionResult | null | undefined,
+): string | undefined {
+  if (!errorResult) return undefined;
+  try {
+    const name = (errorResult as any)?.result?.()?.switch?.()?.name;
+    return typeof name === "string" && name.length > 0 ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Builds the typed error for a transaction that reached the network and was
+ * rejected, preferring the extracted XDR result code.  Unrecognised result
+ * codes still receive the clear on-chain rejection copy rather than the
+ * generic UNKNOWN fallback (Issue #479).
+ */
+function onChainFailureError(code: string | undefined): ContractAppError {
+  const parsed = parseContractError(code ?? "transaction failed");
+  return parsed.code === "UNKNOWN"
+    ? parseContractError("transaction failed")
+    : parsed;
 }
 
 // ─── Typed result types ────────────────────────────────────────────────────────
@@ -306,9 +464,11 @@ export async function simulateContractTx(
   const rpc = getRpc();
 
   // ── Account fetch ────────────────────────────────────────────────────────
+  // Wrapped with withRpcRetry so a single transient network blip doesn't
+  // fail the whole simulation — 3 attempts with jittered exponential backoff.
   let account: Awaited<ReturnType<typeof rpc.getAccount>>;
   try {
-    account = await rpc.getAccount(walletAddress);
+    account = await withRpcRetry("getAccount", () => rpc.getAccount(walletAddress));
   } catch (err: any) {
     const msg: string = err?.message ?? "";
     const isNetwork =
@@ -333,7 +493,26 @@ export async function simulateContractTx(
     .build();
 
   // ── Simulation ───────────────────────────────────────────────────────────
-  const simResult = await rpc.simulateTransaction(tx);
+  // RPC client failures during simulation surface as thrown exceptions —
+  // normalise them into the same typed failure result so callers always
+  // receive structured error feedback instead of an unhandled rejection
+  // (Issue #479).  withRpcRetry absorbs transient blips (network, rate-limit)
+  // before escalating to the typed failure path.
+  let simResult: SorobanRpc.Api.SimulateTransactionResponse;
+  try {
+    simResult = await withRpcRetry("simulateTransaction", () =>
+      rpc.simulateTransaction(tx),
+    );
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(txCtx, "failed", categorizeError(msg));
+    const typedError = parseContractError(msg);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
+  }
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
     // Never forward the raw simResult.error string (may contain contract
@@ -350,11 +529,27 @@ export async function simulateContractTx(
   // ── Telemetry: simulated ─────────────────────────────────────────────────
   emit(txCtx, "simulated");
 
-  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+  // ── Assembly ─────────────────────────────────────────────────────────────
+  // Malformed simulation payloads or resource-limit rejections throw here;
+  // convert them to a typed failure so the user sees a clear message rather
+  // than a raw exception (Issue #479).
+  let preparedXdr: string;
+  try {
+    preparedXdr = SorobanRpc.assembleTransaction(tx, simResult).build().toXDR();
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emit(txCtx, "failed", categorizeError(msg));
+    const typedError = parseContractError(msg);
+    return {
+      success: false,
+      error: userMessageForError(typedError),
+      typedError,
+    };
+  }
 
   return {
     success: true,
-    preparedXdr: preparedTx.toXDR(),
+    preparedXdr,
     simResult: simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse,
   };
 }
@@ -454,10 +649,16 @@ export async function submitContractTx(
   }
 
   // ── Submission ───────────────────────────────────────────────────────────
+  // withRpcRetry covers transient network blips at the submission layer.
+  // Note: we only retry on transient errors (connection reset, rate-limit).
+  // An "ERROR" status from the RPC means the transaction itself was rejected
+  // by the network and must NOT be retried — doing so would submit it again.
   let sendResult: Awaited<ReturnType<typeof rpc.sendTransaction>>;
   try {
-    sendResult = await rpc.sendTransaction(
-      TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
+    sendResult = await withRpcRetry("sendTransaction", () =>
+      rpc.sendTransaction(
+        TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
+      ),
     );
   } catch (err: any) {
     const typedError = parseContractError(err?.message ?? "network error");
@@ -472,9 +673,13 @@ export async function submitContractTx(
 
   if (sendResult.status === "ERROR") {
     // The hash is available at this point; included in the return value for
-    // the user but never forwarded to telemetry.
-    const rawErr = JSON.stringify(sendResult.errorResult);
-    const typedError = parseContractError(rawErr);
+    // the user but never forwarded to telemetry.  Prefer the extracted XDR
+    // result code (e.g. "txFailed") so the user gets specific feedback for
+    // the on-chain rejection (Issue #479); fall back to the serialised
+    // result, then to the canonical "transaction failed" marker.
+    const code = extractTxResultCode(sendResult.errorResult);
+    const rawErr = code ?? JSON.stringify(sendResult.errorResult);
+    const typedError = onChainFailureError(rawErr);
     emit(txCtx, "submission_failed", "on_chain_failed");
     return {
       txHash: sendResult.hash,
@@ -506,7 +711,13 @@ export async function submitContractTx(
       return { txHash: hash, success: true };
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
-      const typedError = parseContractError("transaction failed");
+      // Extract the XDR result code when available so the user sees exactly
+      // why the transaction failed on-chain (contract rule violation, low
+      // fee, sequence mismatch) instead of a generic error (Issue #479).
+      const code = extractTxResultCode(
+        (status as { errorResult?: xdr.TransactionResult }).errorResult,
+      );
+      const typedError = onChainFailureError(code);
       emit(txCtx, "failed", "on_chain_failed");
       return {
         txHash: hash,
@@ -549,17 +760,43 @@ export async function invokeContract(
 ): Promise<InvokeResult> {
   const txCtx = startTx(method);
 
-  const simOutcome = await simulateContractTx(contractId, method, args, walletAddress, txCtx);
-  if (!simOutcome.success) {
+  // Every failure path — including unexpected synchronous exceptions such as
+  // address assertions or SDK client throws — is converted to a typed
+  // InvokeResult so callers always receive structured error feedback instead
+  // of an unhandled rejection (Issue #479).  Unrecognised failures keep the
+  // original message so validation hints stay visible to the user.
+  try {
+    const simOutcome = await simulateContractTx(
+      contractId,
+      method,
+      args,
+      walletAddress,
+      txCtx,
+    );
+    if (!simOutcome.success) {
+      return {
+        txHash: "",
+        success: false,
+        error: simOutcome.error,
+        typedError: simOutcome.typedError,
+      };
+    }
+
+    return await submitContractTx(simOutcome.preparedXdr, txCtx);
+  } catch (err: unknown) {
+    const raw = err instanceof Error ? err.message : String(err);
+    const typedError = parseContractError(raw);
+    emit(txCtx, "failed", categorizeError(raw));
     return {
       txHash: "",
       success: false,
-      error: simOutcome.error,
-      typedError: simOutcome.typedError,
+      error:
+        typedError.kind === "unknown" && raw
+          ? raw
+          : userMessageForError(typedError),
+      typedError,
     };
   }
-
-  return submitContractTx(simOutcome.preparedXdr, txCtx);
 }
 
 // ─── Read-only simulation ─────────────────────────────────────────────────────
@@ -596,7 +833,9 @@ export async function readContract<T>(
     .setTimeout(30)
     .build();
 
-  const simResult = await rpc.simulateTransaction(tx);
+  const simResult = await withRpcRetry("simulateTransaction(read)", () =>
+    rpc.simulateTransaction(tx),
+  );
   if (SorobanRpc.Api.isSimulationError(simResult)) {
     throw new Error(simResult.error);
   }
