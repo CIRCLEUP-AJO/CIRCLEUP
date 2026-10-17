@@ -1,14 +1,14 @@
-// ─── Shared typed response contracts for circle API data (Issue #513) ─────────
+﻿// ΓöÇΓöÇΓöÇ Shared typed response contracts for circle API data (Issue #513) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // This module is the single authoritative source of type definitions and
 // runtime validators for every indexer API response consumed by the app.
 //
 // DESIGN RATIONALE
-// ────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // The app package does not take a runtime dependency on @circleup/sdk so that
 // the Next.js bundle stays lean and independent of the SDK's Node-only
 // internals (Stellar SDK, Buffer polyfills, etc.). However, types defined in
-// sdk/src/types.ts ARE the canonical source of truth for every API shape —
+// sdk/src/types.ts ARE the canonical source of truth for every API shape ΓÇö
 // this file mirrors them under app-friendly names and adds runtime validators
 // so the boundary between untrusted JSON and typed domain objects is enforced
 // consistently across all fetch call sites (page.tsx, CircleDetailClient,
@@ -19,14 +19,14 @@
 // carries a @see JSDoc tag pointing back to the canonical SDK type.
 //
 // NAMING CONVENTION
-// ─────────────────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // App-layer names are kept intentionally close to the SDK names so a grep for
 // "ApiCircleRow" finds both files.  Where the app previously used a shorter
 // alias (e.g. `Circle` instead of `ApiCircleRow`) the legacy alias is
 // preserved as a re-export to avoid a big rename churn in consumers.
 //
 // UNITS
-// ─────
+// ΓöÇΓöÇΓöÇΓöÇΓöÇ
 // All monetary amounts are in stroops (1 USDC = 10 000 000 stroops), serialised
 // as strings to survive JavaScript's Number.MAX_SAFE_INTEGER limit.  Convert
 // to display units only at render time using formatUsdc / formatPot from
@@ -35,7 +35,7 @@
 import { isCanonicalStellarAddress } from "@/lib/address";
 import { isStellarPublicKey, hasValidStrKeyChecksum } from "@/lib/address";
 
-// ─── Status values ────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Status values ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * All lifecycle states a circle can be in, as returned by the indexer.
@@ -51,7 +51,7 @@ export type CircleApiStatus =
   | "Cancelled"
   | "Closed";
 
-/** All recognised status values as a frozen tuple — use for runtime membership checks. */
+/** All recognised status values as a frozen tuple ΓÇö use for runtime membership checks. */
 export const CIRCLE_API_STATUSES = [
   "Pending",
   "Active",
@@ -91,22 +91,22 @@ export interface ProtocolGuarantee {
 
 export const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
   {
-    emoji: "🔒",
+    emoji: "≡ƒöÆ",
     title: "No rug-pulls",
     desc: "The smart contract holds all funds until payout. No single member or organizer can withdraw money prematurely.",
   },
   {
-    emoji: "🔄",
+    emoji: "≡ƒöä",
     title: "Deterministic rotation",
     desc: "Payout order and rotation schedule are fixed on-chain upon circle creation and cannot be tampered with.",
   },
   {
-    emoji: "🛡️",
+    emoji: "≡ƒ¢í∩╕Å",
     title: "Collateral-backed defaults",
     desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
   },
   {
-    emoji: "⭐",
+    emoji: "Γ¡É",
     title: "On-chain reputation",
     desc: "Successful contributions build an immutable reputation score across circles on the Stellar network.",
   },
@@ -134,7 +134,7 @@ export function getBrowseState(
   return { kind: "browse", count: total };
 }
 
-// ─── Circle row (list + detail) ───────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Circle row (list + detail) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * A single circle row as returned by GET /circles and GET /circles/:address.
@@ -170,7 +170,7 @@ export interface CircleRow {
  */
 export type Circle = CircleRow;
 
-// ─── Member row ───────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Member row ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * A member record as returned by GET /circles/:address and
@@ -185,7 +185,7 @@ export interface CircleMemberRow {
   collateral: string;
   defaults: number;
   joined_at: string | null;
-  /** Reputation score aggregated by the reputation contract (0–100). */
+  /** Reputation score aggregated by the reputation contract (0ΓÇô100). */
   reputation_score: number;
   /**
    * Total number of contributions this member has made across all rounds of
@@ -203,7 +203,7 @@ export interface CircleMemberRow {
  */
 export type CircleMember = CircleMemberRow;
 
-// ─── Contribution / Default records ──────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Contribution / Default records ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * A single contribution record within a round.
@@ -230,10 +230,10 @@ export interface DefaultRecord {
   penalty: string;
 }
 
-/** A pending default — a DefaultRecord not yet associated with a payout round. */
+/** A pending default ΓÇö a DefaultRecord not yet associated with a payout round. */
 export type PendingDefault = DefaultRecord;
 
-// ─── Round row ────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Round row ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Lifecycle phase of a single round, as reconciled by the indexer.
@@ -242,7 +242,7 @@ export type PendingDefault = DefaultRecord;
  */
 export type RoundPhase = "completed" | "current" | "cancelled" | "open";
 
-/** Frozen set of valid RoundPhase values — used in runtime checks. */
+/** Frozen set of valid RoundPhase values ΓÇö used in runtime checks. */
 export const ROUND_PHASES = ["completed", "current", "cancelled", "open"] as const;
 
 /**
@@ -254,10 +254,10 @@ export const ROUND_PHASES = ["completed", "current", "cancelled", "open"] as con
 export interface CircleRound {
   roundIndex: number;
   /**
-   * "completed" — payout row exists for this round.
-   * "current"   — the active in-progress round (no payout yet).
-   * "cancelled" — the current round of a Cancelled circle.
-   * "open"      — unpaid round with activity that is not the current round
+   * "completed" ΓÇö payout row exists for this round.
+   * "current"   ΓÇö the active in-progress round (no payout yet).
+   * "cancelled" ΓÇö the current round of a Cancelled circle.
+   * "open"      ΓÇö unpaid round with activity that is not the current round
    *               (reorg / partial-ingest edge case; was previously invisible).
    */
   status: RoundPhase;
@@ -271,7 +271,7 @@ export interface CircleRound {
   defaults: DefaultRecord[];
 }
 
-// ─── API response envelopes ───────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ API response envelopes ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Response body for GET /circles.
@@ -333,6 +333,13 @@ export interface CircleDetailData {
   /** Latest ledger the indexer has processed (used for countdown math). */
   latestLedger?: number | null;
   /**
+   * ISO-8601 timestamp of the last ledger the indexer durably processed.
+   * Present when the indexer embeds a `checkpointTime` field in its response.
+   * Null when the field is absent — callers must treat freshness as unknown
+   * and must not map that to a healthy signal.
+   */
+  checkpointTime?: string | null;
+  /**
    * The in-progress round from the /rounds endpoint. Contains the actual
    * contributions list for the current round, used to determine whether the
    * connected wallet has already contributed this round.
@@ -390,10 +397,10 @@ export interface ReputationResponse {
   }>;
 }
 
-// ─── Runtime validators ────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Runtime validators ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // Each parser takes `unknown` (raw JSON) and returns the typed model or null.
-// They NEVER throw — a null return means the caller should drop the row or
+// They NEVER throw ΓÇö a null return means the caller should drop the row or
 // treat the response as malformed.
 //
 // CONTRACT: parsers are pure functions with no side effects. They do not log,
@@ -412,7 +419,7 @@ function isNonNegativeInt(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v >= 0;
 }
 
-// ─── Contribution / Default parsers ──────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Contribution / Default parsers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Parse and validate a single ContributionRecord from an unknown API value.
@@ -454,7 +461,7 @@ export function parsePendingDefault(raw: unknown): PendingDefault | null {
   return parseDefaultRecord(raw);
 }
 
-// ─── Round parser ────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Round parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Parse and validate a single CircleRound row from an unknown API value.
@@ -485,7 +492,7 @@ export function parseCircleRound(raw: unknown): CircleRound | null {
   };
 }
 
-// ─── CircleState (circle header fields) ──────────────────────────────────────
+// ΓöÇΓöÇΓöÇ CircleState (circle header fields) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Parse and validate the CircleState shape from an unknown indexer response.
@@ -509,7 +516,7 @@ export function parseCircleState(raw: unknown): CircleState | null {
   };
 }
 
-// ─── CircleRow parser ────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ CircleRow parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Validate and narrow an unknown JSON value to a {@link CircleRow}, or return
@@ -551,7 +558,7 @@ export function parseCircleRow(raw: unknown): CircleRow | null {
   };
 }
 
-// ─── Member row parser ────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Member row parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 function toCount(value: unknown): number {
   const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
@@ -566,13 +573,13 @@ function toCount(value: unknown): number {
  * would shift every later member into the wrong slot and mark the wrong person
  * as "next payout". The list is therefore all-or-nothing:
  *
- *   • Returns [] when the field is missing, not an array, or any row fails
+ *   ΓÇó Returns [] when the field is missing, not an array, or any row fails
  *     the structural check (no G-address, no non-negative integer payout_order,
  *     or duplicate address / position).
- *   • Display-only fields (defaults, reputation_score, total_contributions,
+ *   ΓÇó Display-only fields (defaults, reputation_score, total_contributions,
  *     collateral, joined_at) are coerced to safe defaults so one missing score
  *     never hides the whole rotation.
- *   • Rows are sorted by payout_order regardless of the indexer's return order.
+ *   ΓÇó Rows are sorted by payout_order regardless of the indexer's return order.
  */
 export function parseMemberRows(raw: unknown): CircleMemberRow[] {
   if (!Array.isArray(raw)) return [];
@@ -626,7 +633,7 @@ export function parseMemberRows(raw: unknown): CircleMemberRow[] {
   return members.sort((a, b) => a.payout_order - b.payout_order);
 }
 
-// ─── Rounds response parser ───────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Rounds response parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Parse an unknown GET /circles/:address/rounds response body into a typed
@@ -663,7 +670,7 @@ export function parseRoundsResponse(raw: unknown): RoundsResponse {
   };
 }
 
-// ─── Reputation response parser ───────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Reputation response parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 /**
  * Parse an unknown GET /reputation/:member response body into a typed

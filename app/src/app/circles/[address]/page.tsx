@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+﻿import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import {
   indexerEndpoint,
@@ -8,7 +8,7 @@ import {
 } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
 import { getStatusMeta } from "@/components/CircleCard";
-// Issue #513: use shared parsers — eliminates the unsafe `as CircleRound[]`
+// Issue #513: use shared parsers ΓÇö eliminates the unsafe `as CircleRound[]`
 // and `as CircleDetailData["circle"]` casts that were previously here.
 import {
   parseCircleState,
@@ -19,7 +19,7 @@ import {
   type CircleDetailData,
 } from "./CircleDetailClient";
 import CircleErrorBody from "./CircleErrorBody";
-// Canonical address validator — the single source of truth for Soroban contract
+// Canonical address validator ΓÇö the single source of truth for Soroban contract
 // IDs. Replaces the inline `/^C[A-Z2-7]{55}$/` regex that was previously used
 // in generateMetadata only, and extends the guard to the page render path so
 // a malformed address never reaches the indexer, CircleHeader, or
@@ -36,11 +36,11 @@ export async function generateMetadata({
 
   if (!safeAddress) {
     return {
-      title: "Circle — CircleUp",
+      title: "Circle ΓÇö CircleUp",
       description: "Savings circle on CircleUp.",
       twitter: {
         card: "summary",
-        title: "Circle — CircleUp",
+        title: "Circle ΓÇö CircleUp",
         description: "Savings circle on CircleUp.",
       },
     };
@@ -54,34 +54,34 @@ export async function generateMetadata({
       const pot = `$${formatPot(circle.round_amount, circle.member_count)}`;
       const roundAmount = `$${formatUsdc(circle.round_amount)}`;
       return {
-        title: `${roundAmount}/round Circle (${status}) — CircleUp`,
+        title: `${roundAmount}/round Circle (${status}) ΓÇö CircleUp`,
         description:
-          `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}. ` +
+          `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}. ` +
           `Savings circle at ${safeAddress} on CircleUp.`,
         alternates: {
           canonical: `/circles/${safeAddress}`,
         },
         openGraph: {
-          title: `${roundAmount}/round Circle (${status}) — CircleUp`,
+          title: `${roundAmount}/round Circle (${status}) ΓÇö CircleUp`,
           description:
-            `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}.`,
+            `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}.`,
           url: `/circles/${safeAddress}`,
           type: "website",
         },
         twitter: {
           card: "summary",
-          title: `${roundAmount}/round Circle (${status}) — CircleUp`,
+          title: `${roundAmount}/round Circle (${status}) ΓÇö CircleUp`,
           description:
-            `${pot} pot · ${circle.member_count} members · round ${circle.current_round} of ${circle.total_rounds}.`,
+            `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}.`,
         },
       };
     } else if (result.error === "not_found") {
       return {
-        title: "Circle Not Found — CircleUp",
+        title: "Circle Not Found ΓÇö CircleUp",
         description: "The requested savings circle address was not found on CircleUp.",
         twitter: {
           card: "summary",
-          title: "Circle Not Found — CircleUp",
+          title: "Circle Not Found ΓÇö CircleUp",
           description: "The requested savings circle address was not found on CircleUp.",
         },
       };
@@ -92,30 +92,30 @@ export async function generateMetadata({
 
   const shortAddr = safeAddress.slice(0, 8);
   return {
-    title: `Circle ${shortAddr}… — CircleUp`,
+    title: `Circle ${shortAddr}ΓÇª ΓÇö CircleUp`,
     description: `Savings circle at ${safeAddress} on CircleUp. Track rotation order, round progress, and contribution history.`,
     alternates: {
       canonical: `/circles/${safeAddress}`,
     },
     twitter: {
       card: "summary",
-      title: `Circle ${shortAddr}… — CircleUp`,
+      title: `Circle ${shortAddr}ΓÇª ΓÇö CircleUp`,
       description: `Savings circle at ${safeAddress} on CircleUp.`,
     },
   };
 }
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Types ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 type FetchError = "network" | "server" | "parse" | "misconfigured" | "indexer_outage";
 
 // not_found is handled separately: the page calls notFound() which triggers
-// Next.js's built-in 404 route — CircleErrorBody is never rendered for it.
+// Next.js's built-in 404 route ΓÇö CircleErrorBody is never rendered for it.
 type FetchResult =
   | { ok: true; data: CircleDetailData }
   | { ok: false; error: "not_found" | FetchError };
 
-// ─── Data fetching ────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Data fetching ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 async function getCircleDetail(address: string): Promise<FetchResult> {
   // Guard against a misconfigured NEXT_PUBLIC_INDEXER_URL before touching the
@@ -176,7 +176,7 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
 
   // Validate the shape we depend on to avoid runtime errors in the render tree.
   // Issue #513: parseCircleState replaces the bare `as CircleDetailData["circle"]`
-  // cast — if the indexer returns a malformed object, we return a parse error
+  // cast ΓÇö if the indexer returns a malformed object, we return a parse error
   // rather than letting a broken value propagate into the render tree.
   if (
     typeof circleData.circle !== "object" ||
@@ -190,14 +190,14 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
     return { ok: false, error: "parse" };
   }
 
-  // Members are optional — if the indexer omits the field (e.g. during
+  // Members are optional ΓÇö if the indexer omits the field (e.g. during
   // re-indexing or for very new circles) or sends rows we cannot trust, we
   // fall back to an empty array and CircleDetailClient renders its "member
   // data unavailable" fallback in the rotation view instead of crashing.
   const members = parseMemberRows(circleData.members);
 
   // Issue #513: parseRoundsResponse replaces the four inline `as CircleRound[]`
-  // and `as CirclePendingDefault[]` casts — validates rounds, openRounds,
+  // and `as CirclePendingDefault[]` casts ΓÇö validates rounds, openRounds,
   // pendingDefaults and currentRound, dropping malformed rows rather than
   // surfacing them in the render tree.
   const roundsPayload = parseRoundsResponse(roundsData);
@@ -217,21 +217,25 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
         typeof circleData.latestLedger === "number"
           ? circleData.latestLedger
           : null,
+      checkpointTime:
+        typeof circleData.checkpointTime === "string" && circleData.checkpointTime.trim() !== ""
+          ? circleData.checkpointTime
+          : null,
       // currentRound from the /rounds response contains the actual
-      // contributions list for the in-progress round — used by
+      // contributions list for the in-progress round ΓÇö used by
       // CircleDetailClient to accurately gate the Contribute button.
       currentRound: roundsPayload.currentRound,
     },
   };
 }
 
-// ─── Read-only circle header ──────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Read-only circle header ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
-// Always rendered — even when the data fetch fails — so the user always sees
+// Always rendered ΓÇö even when the data fetch fails ΓÇö so the user always sees
 // the circle address and a coherent page structure instead of a blank screen.
 //
 // When `circle` is provided the real stats are shown; when it is absent
-// (error / not-found) each stat cell renders a muted "—" placeholder so the
+// (error / not-found) each stat cell renders a muted "ΓÇö" placeholder so the
 // layout is preserved and clearly communicates "unknown, not broken UI".
 
 interface CircleHeaderProps {
@@ -256,7 +260,7 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
           </span>
         );
       })() : (
-        <span className="text-slate-300" aria-hidden="true">—</span>
+        <span className="text-slate-300" aria-hidden="true">ΓÇö</span>
       ),
     },
     {
@@ -264,7 +268,7 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
       value: circle ? (
         `${circle.current_round} / ${circle.total_rounds}`
       ) : (
-        <span className="text-slate-300" aria-hidden="true">—</span>
+        <span className="text-slate-300" aria-hidden="true">ΓÇö</span>
       ),
     },
     {
@@ -272,7 +276,7 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
       value: circle ? (
         circle.member_count
       ) : (
-        <span className="text-slate-300" aria-hidden="true">—</span>
+        <span className="text-slate-300" aria-hidden="true">ΓÇö</span>
       ),
     },
     {
@@ -280,7 +284,7 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
       value: circle ? (
         `$${formatPot(circle.round_amount, circle.member_count)}`
       ) : (
-        <span className="text-slate-300" aria-hidden="true">—</span>
+        <span className="text-slate-300" aria-hidden="true">ΓÇö</span>
       ),
     },
   ];
@@ -288,7 +292,7 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
   return (
     <div className="mb-8" aria-label="Circle overview">
       <div className="flex items-start gap-3 mb-2">
-        <span className="text-3xl" aria-hidden="true">🔄</span>
+        <span className="text-3xl" aria-hidden="true">≡ƒöä</span>
         <div className="min-w-0">
           <h1 className="text-xl sm:text-2xl font-bold text-slate-900 leading-snug">
             {circle
@@ -316,19 +320,19 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
   );
 }
 
-// ─── Page ─────────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇΓöÇ Page ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 export default async function CircleDetailPage({
   params,
 }: {
   params: { address: string };
 }) {
-  // ── Address validation ──────────────────────────────────────────────────────
+  // ΓöÇΓöÇ Address validation ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Validate params.address before any network call. Without this guard a
   // malformed segment (e.g. "/circles/../../etc/passwd", a G-key mistakenly
   // pasted into a circle URL, or a truncated address) would:
-  //   1. Reach indexerEndpoint() — which URL-encodes it and fires a real fetch.
+  //   1. Reach indexerEndpoint() ΓÇö which URL-encodes it and fires a real fetch.
   //   2. Be displayed verbatim in CircleHeader's monospace address field.
   //   3. Be passed to CircleDetailClient, which guards its action buttons but
   //      not the invite-URL builder or the address display.
@@ -336,7 +340,7 @@ export default async function CircleDetailPage({
   // isSorobanContractId is the canonical check for circle addresses; it is the
   // same rule used in getCircleStatus / getCircleConfig in stellar.ts and in
   // getMalformedContractAddresses in config.ts.  A 404 is the correct HTTP
-  // signal — it matches what the indexer would return for an unknown address,
+  // signal ΓÇö it matches what the indexer would return for an unknown address,
   // and it keeps the not-found.tsx error UI consistent.
   if (!isSorobanContractId(params.address)) {
     notFound();

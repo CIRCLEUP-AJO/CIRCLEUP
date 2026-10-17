@@ -91,6 +91,7 @@ export type LogEventKey =
   | "event_ingested"
   | "event_skipped"                 // duplicate — already in ingested_events
   | "event_handler_error"           // handler threw; savepoint rolled back
+  | "event_failure_evidence_failed" // could not persist event_failures evidence
   // RPC
   | "rpc_retry"                     // transient error, retrying with backoff
   | "rpc_failed"                    // all retry attempts exhausted
@@ -177,6 +178,10 @@ export interface EventHandlerErrorCtx {
   eventType: string;
   contractId: string;         // REDACTED before log
   txHash?: string;            // REDACTED before log
+  /** RPC event id — payload-free; matches event_failures.event_id. */
+  eventId?: string;
+  /** "transient" (ledger rolled back, will retry) or "permanent" (skipped). */
+  errorClass?: "transient" | "permanent";
   error: string;
 }
 
@@ -459,8 +464,10 @@ export function logEventSkipped(ctx: EventSkippedCtx): void {
 
 /** An event handler threw; savepoint was rolled back. */
 export function logEventHandlerError(ctx: EventHandlerErrorCtx): void {
+  const outcome =
+    ctx.errorClass === "transient" ? " (transient — ledger will be retried)" : "";
   log("error", "event_handler_error", ctx as LogContext,
-    `Failed to process ${ctx.eventType} event at ledger ${ctx.ledger}: ${ctx.error}`);
+    `Failed to process ${ctx.eventType} event at ledger ${ctx.ledger}${outcome}: ${ctx.error}`);
 }
 
 /** A transient RPC call is being retried. */

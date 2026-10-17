@@ -20,6 +20,7 @@ import type {
   TxFailure,
   TxErrorCode,
   TxMetadata,
+  SimulationEstimate,
   SimulateResult,
   ReadResult,
   ApiCirclesListResponse,
@@ -31,8 +32,16 @@ import type {
   ApiHealthResponse,
   ApiAuditEventsResponse,
   GetCirclesParams,
+  ApiCircleStatus,
+  CircleSortField,
   StateMismatch,
+  SubmissionDiagnostics,
+  TxLookup,
+  IndexerPagination,
+  GetMemberContributionsParams,
+  PaginateOptions,
 } from "./types";
+import { INDEXER_MAX_PAGE_SIZE } from "./constants";
 import {
   validateCircleUpConfig,
   isValidContractAddress,
@@ -41,7 +50,7 @@ import {
   mapRawRoundState,
   assertValidCircleStatus,
   decodeU32,
-  decodeBigInt,
+  decodeI128,
   decodeBoolean,
   decodeAddress,
   decodeAddressList,
@@ -70,7 +79,17 @@ import type {
 
 /**
  * Build a human-readable summary of which on-chain fields diverged during a
-
+ * stale-write preflight check.
+ *
+ * Used by {@link CircleClient.preflight} to populate {@link PreflightStale.message}.
+ */
+function formatMismatchMessage(mismatches: readonly StateMismatch[]): string {
+  if (mismatches.length === 0) return "State is fresh.";
+  const parts = mismatches.map(
+    (m) => `${m.field} changed from ${JSON.stringify(m.expected)} to ${JSON.stringify(m.actual)}`,
+  );
+  return `On-chain state has changed since you last loaded this page: ${parts.join("; ")}. Refresh and try again.`;
+}
 
 // ─── Polling configuration ────────────────────────────────────────────────────
 
@@ -336,6 +355,101 @@ export async function withRpcRetry<T>(
   throw lastErr;
 }
 
+// ─── Retry safety by operation ────────────────────────────────────────────────
+//
+// | RPC call              | Kind  | Recovery on a transient failure                     |
+// |-----------------------|-------|-----------------------------------------------------|
+// | getAccount            | read  | Retry freely (withRpcRetry).                        |
+// | simulateTransaction   | read  | Retry freely — a simulation never touches the chain.|
+// | getTransaction        | read  | Retry / keep polling by hash.                       |
+// | sendTransaction       | write | Resend only the *same signed envelope* (same hash,  |
+// |                       |       | same sequence number, so the network applies it at  |
+// |                       |       | most once). Never rebuild or re-sign inside the SDK.|
+//
+// A failed send is only "safe to rebuild" when the request provably never
+// reached the RPC. Otherwise the transaction may have been accepted, and a
+// rebuilt one would carry the next sequence number and execute the write a
+// second time. Those ambiguous cases are resolved by looking the original hash
+// up, and reported as "outcome_unknown" when the lookup cannot settle them.
+
+/** Attempts (first try + resends of the identical envelope) for sendTransaction. */
+const SEND_MAX_ATTEMPTS = 3;
+
+/**
+ * Return `false` only when `err` proves the request never reached the RPC, so
+ * the transaction cannot have been accepted. Returns `true` whenever that
+ * cannot be ruled out.
+ *
+ * "Never reached" covers failures to open a connection (DNS, refused,
+ * unreachable host), a rate-limit rejection, and a JSON-RPC error object —
+ * the server parsed the request and refused it. Timeouts, resets, hang-ups,
+ * gateway errors, and anything unrecognised are treated as possibly delivered.
+ *
+ * Exported for unit testing.
+ */
+export function mayHaveReachedServer(err: unknown): boolean {
+  if (err == null) return true;
+  const code =
+    typeof err === "object" && "code" in err ? (err as { code?: unknown }).code : undefined;
+  const status =
+    typeof err === "object" && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  const lower = (err instanceof Error ? err.message : String(err)).toLowerCase();
+
+  if (
+    code === "ECONNREFUSED" ||
+    code === "ENOTFOUND" ||
+    code === "EAI_AGAIN" ||
+    code === "EHOSTUNREACH" ||
+    lower.includes("econnrefused") ||
+    lower.includes("connection refused") ||
+    lower.includes("enotfound") ||
+    lower.includes("getaddrinfo") ||
+    lower.includes("ehostunreach")
+  ) {
+    return false;
+  }
+  if (status === 429) return false;
+  // JSON-RPC error objects carry a negative integer code (e.g. -32602).
+  if (typeof code === "number" && Number.isInteger(code) && code < 0) return false;
+  return true;
+}
+
+/** Outcome of submitting one signed envelope, possibly more than once. */
+type SendOutcome =
+  | {
+      kind: "response";
+      response: SorobanRpc.Api.SendTransactionResponse;
+      /** An earlier attempt failed in a way that may have delivered it. */
+      priorAmbiguous: boolean;
+      attempts: number;
+      lastError?: string;
+    }
+  | { kind: "not_submitted"; attempts: number; lastError: string }
+  | { kind: "ambiguous"; attempts: number; lastError: string };
+
+/**
+ * Read the `latestLedgerCloseTime` (unix seconds) an RPC attaches to
+ * `getTransaction` responses. Accepts the numeric-string form older RPC
+ * versions send. `undefined` when absent or malformed.
+ */
+function readLatestLedgerCloseTime(response: unknown): number | undefined {
+  const value = (response as { latestLedgerCloseTime?: unknown } | null)
+    ?.latestLedgerCloseTime;
+  const n = typeof value === "string" ? Number(value) : value;
+  return typeof n === "number" && Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Unix time (seconds) after which `tx` can no longer be included in a ledger,
+ * or `undefined` when it carries no upper time bound.
+ */
+function readValidUntil(tx: { timeBounds?: { maxTime: string } }): number | undefined {
+  const max = Number(tx.timeBounds?.maxTime);
+  return Number.isFinite(max) && max > 0 ? max : undefined;
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /** Build a typed failure result. */
@@ -343,8 +457,11 @@ function txFailure(
   txHash: string,
   errorMessage: string,
   errorCode: TxErrorCode = "unknown",
+  diagnostics?: SubmissionDiagnostics,
 ): TxFailure {
-  return { success: false, txHash, errorMessage, errorCode };
+  return diagnostics
+    ? { success: false, txHash, errorMessage, errorCode, diagnostics }
+    : { success: false, txHash, errorMessage, errorCode };
 }
 
 /** Build a typed success result. */
@@ -368,6 +485,146 @@ function attachMetadata<T extends TxResult>(
   metadata: TxMetadata | undefined,
 ): T {
   return metadata ? { ...result, metadata } : result;
+}
+
+/**
+ * Out-parameter through which {@link CircleUpClient.buildAndSendCore} hands
+ * the simulation estimate back to its wrapper.  Exported only because it
+ * appears in that protected signature; subclasses rarely need it.
+ */
+export interface SimulationDiagnostics {
+  estimate?: SimulationEstimate;
+}
+
+/**
+ * Attach a simulation estimate to a result without mutating it.  `undefined`
+ * leaves the result untouched, mirroring {@link attachMetadata}.
+ */
+function attachEstimate<T extends TxResult>(
+  result: T,
+  estimate: SimulationEstimate | undefined,
+): T {
+  return estimate ? { ...result, estimate } : result;
+}
+
+/** A non-negative integer amount, as the decimal string the RPC uses. */
+function readDecimalString(value: unknown): string | undefined {
+  if (typeof value === "string") return /^\d+$/.test(value) ? value : undefined;
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : undefined;
+  }
+  if (typeof value === "bigint") return value >= 0n ? value.toString() : undefined;
+  return undefined;
+}
+
+/** A non-negative safe integer, or `undefined`. */
+function readCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/** Call a zero-argument XDR accessor if it exists, swallowing decode errors. */
+function callAccessor(target: any, name: string): unknown {
+  try {
+    return typeof target?.[name] === "function" ? target[name]() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Resource usage read from a simulation's `transactionData`. */
+type ResourceEstimate = Pick<
+  SimulationEstimate,
+  "cpuInstructions" | "readBytes" | "writeBytes" | "readOnlyEntries" | "readWriteEntries"
+>;
+
+/**
+ * Read the resource section of a `SorobanDataBuilder` (or an already-built
+ * `SorobanTransactionData`).
+ *
+ * Returns `undefined` when the data is missing or is the all-zero placeholder
+ * the Stellar SDK substitutes when the RPC omitted `transactionData` — every
+ * real contract invocation touches at least one ledger entry, so an empty
+ * footprint with zero usage means "not reported", not "free".
+ */
+function readResources(transactionData: unknown): ResourceEstimate | undefined {
+  if (!transactionData || typeof transactionData !== "object") return undefined;
+  const data = callAccessor(transactionData, "build") ?? transactionData;
+  const resources = callAccessor(data, "resources");
+  if (!resources) return undefined;
+
+  const footprint = callAccessor(resources, "footprint");
+  const readOnly = callAccessor(footprint, "readOnly");
+  const readWrite = callAccessor(footprint, "readWrite");
+  const instructions = callAccessor(resources, "instructions");
+
+  const out: ResourceEstimate = {
+    cpuInstructions: readDecimalString(instructions),
+    // Protocol 23 renamed `readBytes` to `diskReadBytes`; accept either.
+    readBytes: readCount(
+      callAccessor(resources, "readBytes") ?? callAccessor(resources, "diskReadBytes"),
+    ),
+    writeBytes: readCount(callAccessor(resources, "writeBytes")),
+    readOnlyEntries: Array.isArray(readOnly) ? readOnly.length : undefined,
+    readWriteEntries: Array.isArray(readWrite) ? readWrite.length : undefined,
+  };
+
+  const isPlaceholder =
+    out.cpuInstructions === "0" &&
+    !out.readBytes &&
+    !out.writeBytes &&
+    !out.readOnlyEntries &&
+    !out.readWriteEntries;
+  return isPlaceholder ? undefined : out;
+}
+
+/**
+ * Summarise a Soroban simulation response into a log-safe
+ * {@link SimulationEstimate}.
+ *
+ * Accepts success, restore and error responses alike.  Only the documented
+ * numeric fields are copied: the transaction envelope, auth entries, return
+ * value, events and every other XDR blob are ignored, so the result can be
+ * logged or shown to a user without exposing signed or signable material.
+ * Fields the response does not carry (or carries malformed) are left
+ * `undefined`; nothing is defaulted.
+ *
+ * @param simulation   The (parsed) `simulateTransaction` response.
+ * @param inclusionFee The inclusion fee, in stroops, set on the simulated
+ *                     transaction — echoed as `inclusionFee` when well-formed.
+ * @returns The estimate, or `undefined` when no field could be read.
+ */
+export function summarizeSimulation(
+  simulation: unknown,
+  inclusionFee?: string | number,
+): SimulationEstimate | undefined {
+  if (!simulation || typeof simulation !== "object") return undefined;
+  const sim = simulation as Record<string, any>;
+  const isError = typeof sim.error === "string";
+
+  const estimate: Record<string, unknown> = {
+    inclusionFee: readDecimalString(inclusionFee),
+    latestLedger: readCount(sim.latestLedger),
+  };
+
+  if (!isError) {
+    estimate.minResourceFee = readDecimalString(sim.minResourceFee);
+    Object.assign(estimate, readResources(sim.transactionData));
+
+    const preamble = sim.restorePreamble;
+    if (preamble && typeof preamble === "object") {
+      estimate.restoreRequired = true;
+      estimate.restoreMinResourceFee = readDecimalString(preamble.minResourceFee);
+    }
+  }
+
+  // Drop absent fields so `"field" in estimate` means "the RPC reported it".
+  for (const key of Object.keys(estimate)) {
+    if (estimate[key] === undefined) delete estimate[key];
+  }
+  if (Object.keys(estimate).length === 0) return undefined;
+  return Object.freeze(estimate) as SimulationEstimate;
 }
 
 /**
@@ -922,7 +1179,8 @@ export type TxLogPhase = "simulated" | "submitted" | "confirmed" | "failed";
  *
  * **Safe by construction.** An event carries only the contract address, the
  * method name, the (public) transaction hash, an error code, and the
- * already-sanitised correlation metadata.  It never contains the signing
+ * already-sanitised correlation metadata, plus the numeric simulation
+ * {@link SimulationEstimate}.  It never contains the signing
  * `Keypair`, its secret, the signed transaction XDR, or the raw `ScVal`
  * arguments — none of those are ever passed to the logger.
  */
@@ -941,6 +1199,12 @@ export interface TxLogEvent {
   readonly ledger?: number;
   /** Error category — present on `failed` only. */
   readonly errorCode?: TxErrorCode;
+  /**
+   * Simulation resource and fee estimates — present on `simulated` and on the
+   * terminal event once the write has been simulated.  Log-safe by
+   * construction; see {@link SimulationEstimate}.
+   */
+  readonly estimate?: SimulationEstimate;
   /** Caller correlation metadata (already sanitised), when supplied. */
   readonly metadata?: TxMetadata;
 }
@@ -1150,12 +1414,20 @@ export class CircleUpClient {
     // every log event carry the identical secret-free copy.
     const metadata = sanitizeTxMetadata(options?.metadata);
 
-    const result = await this.buildAndSendCore(
-      sourceKeypair,
-      contractId,
-      method,
-      args,
-      metadata,
+    // The core records the simulation estimate here as soon as it exists, so
+    // every outcome after simulation carries it without each failure branch
+    // having to thread it through by hand.
+    const diagnostics: SimulationDiagnostics = {};
+    const result = attachEstimate(
+      await this.buildAndSendCore(
+        sourceKeypair,
+        contractId,
+        method,
+        args,
+        metadata,
+        diagnostics,
+      ),
+      diagnostics.estimate,
     );
 
     // Exactly one terminal event per call, derived from the final result so it
@@ -1169,6 +1441,7 @@ export class CircleUpClient {
       txHash: result.txHash || undefined,
       ledger: result.success ? result.ledger : undefined,
       errorCode: result.success ? undefined : result.errorCode,
+      estimate: result.estimate,
       metadata,
     });
 
@@ -1182,7 +1455,10 @@ export class CircleUpClient {
    * without repeating that bookkeeping.
    *
    * `metadata` is already sanitised; it is used only to tag the mid-flight
-   * `simulated` / `submitted` log events.
+   * `simulated` / `submitted` log events.  `diagnostics`, when supplied,
+   * receives the {@link SimulationEstimate} once simulation has returned; it
+   * is write-only from the core's point of view and never influences
+   * assembly or submission.
    */
   protected async buildAndSendCore(
     sourceKeypair: Keypair,
@@ -1190,6 +1466,7 @@ export class CircleUpClient {
     method: string,
     args: xdr.ScVal[],
     metadata?: TxMetadata,
+    diagnostics?: SimulationDiagnostics,
   ): Promise<TxResult> {
     // Context string prepended to every error from this invocation so callers
     // can correlate an error back to the contract method without a stack trace.
@@ -1258,6 +1535,12 @@ export class CircleUpClient {
       );
     }
 
+    // Summarise before branching so a rejected simulation still reports the
+    // ledger it ran against.  Diagnostic only: assembly below always uses the
+    // full, untouched `simResult`.
+    const estimate = summarizeSimulation(simResult, tx.fee);
+    if (diagnostics) diagnostics.estimate = estimate;
+
     if (SorobanRpc.Api.isSimulationError(simResult)) {
       const humanMessage = extractSimulationError(simResult.error);
       return txFailure(
@@ -1269,7 +1552,7 @@ export class CircleUpClient {
 
     // Simulation succeeded: the call is valid against current on-chain state.
     // No hash exists yet — that arrives once the network queues the submission.
-    this.emitTxLog({ phase: "simulated", ctx, contractId, method, metadata });
+    this.emitTxLog({ phase: "simulated", ctx, contractId, method, estimate, metadata });
 
     let preparedTx: ReturnType<TransactionBuilder["build"]>;
     try {
@@ -1284,21 +1567,36 @@ export class CircleUpClient {
       );
     }
 
-    let sendResult: Awaited<ReturnType<typeof this.rpc.sendTransaction>>;
-    try {
-      // withRpcRetry only retries transient errors (connection reset, rate-limit).
-      // An "ERROR" status means the transaction was network-rejected and must
-      // NOT be retried — resubmission would attempt a duplicate.
-      sendResult = await withRpcRetry("sendTransaction", () =>
-        this.rpc.sendTransaction(preparedTx),
-      );
-    } catch (err: any) {
+    // The hash is a pure function of the signed envelope, so it is known before
+    // the RPC answers — which is what lets an ambiguous submission be looked up
+    // instead of rebuilt.
+    const localHash = preparedTx.hash().toString("hex");
+    const validUntil = readValidUntil(preparedTx);
+
+    const sent = await this.submitEnvelope(preparedTx);
+
+    if (sent.kind === "not_submitted") {
       return txFailure(
         "",
-        `Network error while submitting ${ctx}: ${formatRpcError(err?.message ?? "unknown", this.config.rpcUrl)}`,
+        `Network error while submitting ${ctx}: ${sent.lastError} ` +
+          `The request never reached the RPC, so nothing was submitted.`,
         "network_error",
       );
     }
+
+    if (sent.kind === "ambiguous") {
+      // The RPC may have accepted the transaction without us seeing the reply.
+      // Rebuilding now would sign the *next* sequence number and could apply
+      // the write twice, so settle the original hash instead.
+      return this.awaitConfirmation(localHash, ctx, {
+        submission: "unknown",
+        sendAttempts: sent.attempts,
+        validUntil,
+        lastSendError: sent.lastError,
+      });
+    }
+
+    const sendResult = sent.response;
 
     if (sendResult.status === "ERROR") {
       // errorResult is an XDR TransactionResult.  The most useful part for
@@ -1312,39 +1610,134 @@ export class CircleUpClient {
       } catch {
         // If XDR serialisation fails, omit the detail rather than crashing.
       }
-      return txFailure(
+      const rejected = txFailure(
         sendResult.hash,
         `Transaction rejected by the Stellar network for ${ctx}.${detail} ` +
           `This usually means the fee is too low, the sequence number is wrong, ` +
           `or the transaction expired. Try again.`,
         "tx_rejected",
       );
+      if (!sent.priorAmbiguous) return rejected;
+      // A rejected *resend* does not prove the write did not happen: if the
+      // first attempt landed, the resend fails on its now-used sequence number.
+      return this.awaitConfirmation(localHash, ctx, {
+        submission: "unknown",
+        sendAttempts: sent.attempts,
+        validUntil,
+        lastSendError: sent.lastError,
+        ifNeverApplied: rejected,
+      });
     }
 
     if (sendResult.status === "TRY_AGAIN_LATER") {
-      // The RPC is congested and has *not* queued the transaction. Polling for
-      // a hash the network never accepted would burn the whole timeout budget
-      // and then report a misleading "timeout", so return immediately with the
-      // code that tells the caller to resubmit.
-      return txFailure(
+      // The RPC is congested and has *not* queued this attempt. Polling for a
+      // hash the network never accepted would burn the whole timeout budget and
+      // then report a misleading "timeout", so return immediately — unless an
+      // earlier attempt may already have delivered the same envelope.
+      const congested = txFailure(
         sendResult.hash,
         `The RPC asked us to try ${ctx} again later — it is congested and did not ` +
           `queue the transaction. Wait a few seconds and resubmit.`,
         "try_again_later",
       );
+      if (!sent.priorAmbiguous) return congested;
+      return this.awaitConfirmation(localHash, ctx, {
+        submission: "unknown",
+        sendAttempts: sent.attempts,
+        validUntil,
+        lastSendError: sent.lastError,
+        ifNeverApplied: congested,
+      });
     }
 
     // Remaining statuses are PENDING and DUPLICATE. DUPLICATE means this exact
     // transaction is already in flight from an earlier submission, so the
-    // confirmation poll below is the correct next step for both.
-
-    // Poll for confirmation with exponential backoff + full jitter
+    // confirmation poll is the correct next step for both.
     const hash = sendResult.hash;
 
     // The network has queued the transaction and a hash now exists — this is the
     // first point a UI action can be tied to an on-chain identifier.
     this.emitTxLog({ phase: "submitted", ctx, contractId, method, txHash: hash, metadata });
 
+    return this.awaitConfirmation(hash, ctx, {
+      submission: "accepted",
+      sendAttempts: sent.attempts,
+      validUntil,
+      latestLedger: readLatestLedger(sendResult),
+    });
+  }
+
+  /**
+   * Submit one signed envelope, resending the *identical* envelope on a
+   * transient failure.
+   *
+   * Resending is safe because the hash and sequence number never change, so
+   * the network applies the transaction at most once (a resend of an accepted
+   * envelope comes back as DUPLICATE or as a bad-sequence rejection). What is
+   * never done here is rebuilding or re-signing, which would consume the next
+   * sequence number and could apply the write a second time.
+   *
+   * Each failure is classified with {@link mayHaveReachedServer} so the caller
+   * knows whether "no response" also means "not submitted".
+   */
+  private async submitEnvelope(
+    tx: ReturnType<TransactionBuilder["build"]>,
+  ): Promise<SendOutcome> {
+    let priorAmbiguous = false;
+    let lastError = "unknown";
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const response = await this.rpc.sendTransaction(tx);
+        return {
+          kind: "response",
+          response,
+          priorAmbiguous,
+          attempts: attempt,
+          lastError: priorAmbiguous ? lastError : undefined,
+        };
+      } catch (err: any) {
+        lastError = formatRpcError(err?.message ?? String(err), this.config.rpcUrl);
+        if (mayHaveReachedServer(err)) priorAmbiguous = true;
+        if (!isTransientRpcError(err) || attempt >= SEND_MAX_ATTEMPTS) {
+          return priorAmbiguous
+            ? { kind: "ambiguous", attempts: attempt, lastError }
+            : { kind: "not_submitted", attempts: attempt, lastError };
+        }
+        const ceiling = 400 * 2 ** (attempt - 1);
+        await new Promise((r) => setTimeout(r, Math.floor(Math.random() * ceiling)));
+      }
+    }
+  }
+
+  /**
+   * Poll `getTransaction(hash)` until the transaction's fate is known or the
+   * poll budget runs out.
+   *
+   * Used both after the RPC accepted a submission (`submission: "accepted"`)
+   * and after a submission whose delivery could not be confirmed
+   * (`submission: "unknown"`). In the second case the poll *is* the lookup: a
+   * SUCCESS or FAILED result settles it like any other confirmation.
+   *
+   * A NOT_FOUND result is definitive once the RPC has closed a ledger later
+   * than the envelope's upper time bound — after that the transaction can never
+   * be included — and is reported as `ifNeverApplied` (or `tx_expired`), both
+   * safe to rebuild. Any outcome that leaves the write's fate open is reported
+   * as `outcome_unknown` with {@link SubmissionDiagnostics}, never as a code
+   * that invites an automatic resubmission.
+   */
+  private async awaitConfirmation(
+    hash: string,
+    ctx: string,
+    opts: {
+      submission: SubmissionDiagnostics["submission"];
+      sendAttempts: number;
+      validUntil?: number;
+      lastSendError?: string;
+      latestLedger?: number;
+      ifNeverApplied?: TxFailure;
+    },
+  ): Promise<TxResult> {
     const { timeoutMs, initialIntervalMs, maxIntervalMs, backoffFactor, maxConsecutiveErrors } =
       this.pollConfig;
     const start = Date.now();
@@ -1353,8 +1746,27 @@ export class CircleUpClient {
     // Highest ledger the RPC has reported so far. A healthy endpoint advances
     // this every few seconds; one that does not is stale and will never
     // observe our transaction.
-    let lastLedger: number | undefined = readLatestLedger(sendResult);
+    let lastLedger: number | undefined = opts.latestLedger;
     let unchangedLedgerPolls = 0;
+    let lookup: SubmissionDiagnostics["lookup"] = "not_attempted";
+    let lastPollError: string | undefined;
+
+    const outcomeUnknown = (message: string): TxFailure => {
+      const lastError = lastPollError ?? opts.lastSendError;
+      return txFailure(hash, message, "outcome_unknown", {
+        txHash: hash,
+        submission: opts.submission,
+        sendAttempts: opts.sendAttempts,
+        lookup,
+        ...(lastLedger !== undefined ? { latestLedger: lastLedger } : {}),
+        ...(opts.validUntil !== undefined ? { validUntil: opts.validUntil } : {}),
+        ...(lastError !== undefined ? { lastError } : {}),
+      });
+    };
+    const fate =
+      opts.submission === "accepted"
+        ? "The transaction may still confirm"
+        : "The RPC may or may not have received the transaction";
 
     while (Date.now() - start < timeoutMs) {
       // Wait the current backoff interval before polling.
@@ -1369,15 +1781,15 @@ export class CircleUpClient {
         consecutiveErrors = 0; // reset streak on a successful poll
       } catch (err: any) {
         consecutiveErrors++;
+        lastPollError = formatRpcError(err?.message ?? "unknown", this.config.rpcUrl);
+        if (lookup === "not_attempted") lookup = "failed";
         if (consecutiveErrors >= maxConsecutiveErrors) {
           // Too many consecutive polling failures — likely a persistent RPC
           // issue; surface it rather than silently looping until timeout.
-          return txFailure(
-            hash,
+          return outcomeUnknown(
             `Lost RPC connectivity while waiting for ${ctx} (tx: ${hash}). ` +
-              `Last error: ${formatRpcError((err as any)?.message ?? "unknown", this.config.rpcUrl)}. ` +
-              `The transaction may still confirm — check Stellar Expert before retrying.`,
-            "network_error",
+              `Last error: ${lastPollError}. ` +
+              `${fate} — look the hash up before deciding to resubmit.`,
           );
         }
         // Transient polling error — back off and keep trying
@@ -1408,10 +1820,32 @@ export class CircleUpClient {
         );
       }
 
-      // NOT_FOUND — the transaction has not been included yet. Before waiting
-      // again, check that the RPC itself is still making progress: a stuck
-      // endpoint reports NOT_FOUND forever and is indistinguishable from a
-      // slow ledger unless the reported ledger height is compared across polls.
+      // NOT_FOUND — the transaction has not been included (yet).
+      lookup = "not_found";
+
+      // Once the RPC has closed a ledger past the envelope's time bound, the
+      // transaction can never be included, so "not found" becomes "never applied".
+      const closeTime = readLatestLedgerCloseTime(status);
+      if (
+        opts.validUntil !== undefined &&
+        closeTime !== undefined &&
+        closeTime > opts.validUntil
+      ) {
+        return (
+          opts.ifNeverApplied ??
+          txFailure(
+            hash,
+            `Transaction ${hash} for ${ctx} expired without being included in a ledger ` +
+              `(valid until ${opts.validUntil}, RPC ledger closed at ${closeTime}). ` +
+              `It was never applied, so it is safe to rebuild and resubmit.`,
+            "tx_expired",
+          )
+        );
+      }
+
+      // Check that the RPC itself is still making progress: a stuck endpoint
+      // reports NOT_FOUND forever and is indistinguishable from a slow ledger
+      // unless the reported ledger height is compared across polls.
       const latestLedger = readLatestLedger(status);
       if (latestLedger !== undefined) {
         if (latestLedger === lastLedger) {
@@ -1436,6 +1870,13 @@ export class CircleUpClient {
       currentInterval = Math.min(maxIntervalMs, currentInterval * backoffFactor);
     }
 
+    if (opts.submission === "unknown") {
+      return outcomeUnknown(
+        `Could not determine whether ${ctx} (tx: ${hash}) was submitted: the RPC did not ` +
+          `answer the submission and the hash was not found within ${timeoutMs / 1000}s. ` +
+          `Look the hash up before deciding to resubmit.`,
+      );
+    }
     return txFailure(
       hash,
       `Timed out waiting for confirmation of ${ctx} (tx: ${hash}) after ` +
@@ -1443,6 +1884,69 @@ export class CircleUpClient {
         `check Stellar Expert before retrying.`,
       "timeout",
     );
+  }
+
+  /**
+   * Look a transaction up by hash, without submitting anything.
+   *
+   * This is the recovery step for a write that came back as
+   * `"outcome_unknown"`, `"timeout"`, or `"stale_rpc"`: check what happened to
+   * the original hash (`result.txHash` or `result.diagnostics.txHash`) before
+   * deciding whether a new transaction is needed. Only a `"not_found"` lookup
+   * made after `diagnostics.validUntil` has passed proves the write was never
+   * applied.
+   *
+   * A read, so transient RPC failures are retried. Never throws.
+   */
+  async lookupTransaction(txHash: string): Promise<ReadResult<TxLookup>> {
+    if (typeof txHash !== "string" || !/^[0-9a-f]{64}$/i.test(txHash)) {
+      return {
+        ok: false,
+        error: `lookupTransaction: ${JSON.stringify(txHash)} is not a transaction hash (64 hex characters).`,
+      };
+    }
+    let status: Awaited<ReturnType<typeof this.rpc.getTransaction>>;
+    try {
+      status = await withRpcRetry("getTransaction", () => this.rpc.getTransaction(txHash));
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: `Failed to look up ${txHash}: ${formatRpcError(err?.message ?? "unknown", this.config.rpcUrl)}`,
+      };
+    }
+    const latestLedger = readLatestLedger(status);
+    const latestLedgerCloseTime = readLatestLedgerCloseTime(status);
+    const observed = {
+      ...(latestLedger !== undefined ? { latestLedger } : {}),
+      ...(latestLedgerCloseTime !== undefined ? { latestLedgerCloseTime } : {}),
+    };
+    switch (status.status) {
+      case SorobanRpc.Api.GetTransactionStatus.SUCCESS:
+        return {
+          ok: true,
+          value: {
+            status: "success",
+            txHash,
+            ledger: status.ledger,
+            returnValue: decodeReturnValue(status),
+            ...observed,
+          },
+        };
+      case SorobanRpc.Api.GetTransactionStatus.FAILED:
+        return {
+          ok: true,
+          value: { status: "failed", txHash, ledger: status.ledger, ...observed },
+        };
+      case SorobanRpc.Api.GetTransactionStatus.NOT_FOUND:
+        return { ok: true, value: { status: "not_found", txHash, ...observed } };
+      default:
+        return {
+          ok: false,
+          error: `lookupTransaction: the RPC returned an unrecognised status ${JSON.stringify(
+            (status as { status?: unknown }).status,
+          )} for ${txHash}.`,
+        };
+    }
   }
 
   /**
@@ -1906,11 +2410,14 @@ export class FactoryClient extends CircleUpClient {
       options,
     );
 
-    if (!result.success || !isValidStellarAddress(result.returnValue)) {
+    // The factory returns the new circle's contract Address; an account key or
+    // any other value is not a circle, so it is never reported as one.
+    const created = result.success ? result.returnValue : undefined;
+    if (typeof created !== "string" || !isValidContractAddress(created)) {
       return { result };
     }
 
-    return { result, circleAddress: result.returnValue };
+    return { result, circleAddress: created };
   }
 
   async getCircles(): Promise<string[]> {
@@ -2442,7 +2949,8 @@ export class CircleClient extends CircleUpClient {
       "get_collateral",
       [scAddress(member)],
     );
-    return decodeBigInt(raw, "getCollateral");
+    // i128 on the wire; the contract clamps penalty deductions at zero.
+    return decodeI128(raw, "getCollateral", { min: 0n });
   }
 
   async getDefaults(member: string): Promise<number> {
@@ -2850,6 +3358,176 @@ function assertPositiveTimeout(value: number, label: string): void {
   }
 }
 
+// ── Indexer query validation ─────────────────────────────────────────────────
+//
+// Mirrors the parsers in indexer/src/api.ts so a bad option fails locally,
+// naming the field, instead of costing a round-trip for an HTTP 400 — and so an
+// unrecognised key (a typo such as `pageSize`) is rejected rather than dropped.
+
+const CIRCLE_STATUS_FILTERS: readonly ApiCircleStatus[] = [
+  "Pending",
+  "Active",
+  "Completed",
+  "Cancelled",
+  "Closed",
+];
+const CIRCLE_SORT_FIELDS: readonly CircleSortField[] = [
+  "created_ledger",
+  "updated_at",
+  "round_amount",
+  "member_count",
+  "status",
+];
+const DEFAULT_MAX_PAGES = 10;
+const MAX_PAGES_LIMIT = 1_000;
+
+/** Collects every problem with one options object, then throws them together. */
+class QueryProblems {
+  private readonly problems: string[] = [];
+
+  constructor(private readonly method: string) {}
+
+  /** Narrow `value` to a plain options object, or record why it is not one. */
+  options(value: unknown, allowed: readonly string[]): Record<string, unknown> {
+    if (value === undefined || value === null) return {};
+    if (typeof value !== "object" || Array.isArray(value)) {
+      this.problems.push(`options must be an object, got ${describeOption(value)}.`);
+      return {};
+    }
+    for (const key of Object.keys(value)) {
+      if (!allowed.includes(key)) {
+        this.problems.push(
+          `unknown option "${key}" (supported: ${allowed.join(", ")}). ` +
+            `It would not be sent to the indexer.`,
+        );
+      }
+    }
+    return value as Record<string, unknown>;
+  }
+
+  /** Record a problem unless `value` is `undefined` or a whole number in range. */
+  integer(field: string, value: unknown, min: number, max: number): void {
+    if (value === undefined) return;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
+      this.problems.push(
+        `${field} must be an integer between ${min} and ${max}, got ${describeOption(value)}.`,
+      );
+    }
+  }
+
+  /** Record a problem unless `value` is `undefined` or one of `allowed`. */
+  oneOf(field: string, value: unknown, allowed: readonly string[]): void {
+    if (value === undefined) return;
+    if (typeof value !== "string" || !allowed.includes(value)) {
+      this.problems.push(
+        `${field} must be one of ${allowed.map((a) => `"${a}"`).join(", ")}, got ${describeOption(value)}.`,
+      );
+    }
+  }
+
+  /** Record a free-form problem. */
+  add(problem: string): void {
+    this.problems.push(problem);
+  }
+
+  /** @throws `RangeError` listing every recorded problem. */
+  throwIfAny(): void {
+    if (this.problems.length > 0) {
+      throw new RangeError(
+        `${this.method}: invalid options:\n${this.problems.map((p) => `  • ${p}`).join("\n")}`,
+      );
+    }
+  }
+}
+
+function describeOption(value: unknown): string {
+  if (value === undefined) return "undefined";
+  if (typeof value === "bigint") return `${value}n`;
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** Serialise `entries` (skipping `undefined`) into a `?a=b` suffix, or `""`. */
+function toQuery(entries: Record<string, string | number | undefined>): string {
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(entries)) {
+    if (value !== undefined) qs.set(key, String(value));
+  }
+  const s = qs.toString();
+  return s ? `?${s}` : "";
+}
+
+/** Validate {@link GetCirclesParams} and build the `GET /circles` query. */
+function buildCirclesQuery(
+  method: string,
+  params: GetCirclesParams | undefined,
+): { query: string; page: number; limit?: number } {
+  const check = new QueryProblems(method);
+  const p = check.options(params, ["status", "sort", "order", "page", "limit"]);
+  check.oneOf("status", p.status, CIRCLE_STATUS_FILTERS);
+  check.oneOf("sort", p.sort, CIRCLE_SORT_FIELDS);
+  check.oneOf("order", p.order, ["asc", "desc"]);
+  check.integer("page", p.page, 1, Number.MAX_SAFE_INTEGER);
+  check.integer("limit", p.limit, 1, INDEXER_MAX_PAGE_SIZE);
+  check.throwIfAny();
+
+  const page = (p.page as number | undefined) ?? 1;
+  const limit = p.limit as number | undefined;
+  return {
+    query: toQuery({
+      status: p.status as string | undefined,
+      sort: p.sort as string | undefined,
+      order: p.order as string | undefined,
+      page: p.page as number | undefined,
+      limit,
+    }),
+    page,
+    limit,
+  };
+}
+
+/** Validate {@link GetMemberContributionsParams} and build its query. */
+function buildContributionsQuery(
+  method: string,
+  options: GetMemberContributionsParams | undefined,
+): { query: string; page: number; limit?: number } {
+  const check = new QueryProblems(method);
+  const o = check.options(options, ["circle", "page", "limit"]);
+  if (o.circle !== undefined && !isValidStellarAddress(o.circle)) {
+    check.add(
+      `circle must be a Stellar address (G… or C…, 56 characters), got ${describeOption(o.circle)}.`,
+    );
+  }
+  check.integer("page", o.page, 1, Number.MAX_SAFE_INTEGER);
+  check.integer("limit", o.limit, 1, INDEXER_MAX_PAGE_SIZE);
+  check.throwIfAny();
+
+  const page = (o.page as number | undefined) ?? 1;
+  const limit = o.limit as number | undefined;
+  return {
+    query: toQuery({
+      circle: o.circle as string | undefined,
+      page: o.page as number | undefined,
+      limit,
+    }),
+    page,
+    limit,
+  };
+}
+
+/** Validate {@link PaginateOptions} and return the effective page bound. */
+function resolveMaxPages(method: string, options: PaginateOptions | undefined): number {
+  const check = new QueryProblems(method);
+  const o = check.options(options, ["maxPages"]);
+  check.integer("maxPages", o.maxPages, 1, MAX_PAGES_LIMIT);
+  check.throwIfAny();
+  return (o.maxPages as number | undefined) ?? DEFAULT_MAX_PAGES;
+}
+
 /**
  * Typed HTTP client for the CircleUp indexer REST API.
  *
@@ -2930,11 +3608,89 @@ export class IndexerClient {
    * timeout and by the caller's `signal`. Throws {@link IndexerError} with a
    * distinct `kind` for each failure category.
    */
-  private async get<T>(
+  private async get<T>(path: string): Promise<T> {
+    return (await this.request<T>(path)).body;
+  }
+
+  /**
+   * Fetch one page from a paged list endpoint and check its envelope: the
+   * item list must be an array no longer than the page size, and the
+   * pagination metadata must be present, well-formed, and match the page (and
+   * explicit limit) that was requested.
+   *
+   * @throws {@link IndexerError} when the envelope is missing or disagrees with
+   *   the request — e.g. a proxy that dropped the query string and served page
+   *   1 in place of page 3.
+   */
+  private async getPage<T extends { pagination: IndexerPagination }>(
     path: string,
-    spec: EnvelopeSpec,
-    options?: IndexerRequestOptions,
+    itemsKey: keyof T & string,
+    requested: { page: number; limit?: number },
   ): Promise<T> {
+    const { body, status, url } = await this.request<T>(path);
+    const fail = (problem: string): never => {
+      throw new IndexerError(
+        `Indexer response from ${url} has an invalid page envelope: ${problem}`,
+        status,
+        url,
+      );
+    };
+
+    if (body === null || typeof body !== "object") fail("the body is not an object.");
+    const items = (body as Record<string, unknown>)[itemsKey];
+    if (!Array.isArray(items)) fail(`"${itemsKey}" is not an array.`);
+
+    const p = (body as { pagination?: unknown }).pagination as
+      | Record<string, unknown>
+      | undefined;
+    if (p === null || typeof p !== "object") fail(`"pagination" metadata is missing.`);
+    const isCount = (v: unknown, min: number) =>
+      typeof v === "number" && Number.isInteger(v) && v >= min;
+    const bad = [
+      !isCount(p!.page, 1) && "page",
+      !isCount(p!.limit, 1) && "limit",
+      !isCount(p!.total, 0) && "total",
+      !isCount(p!.totalPages, 0) && "totalPages",
+      p!.hasMore !== undefined && typeof p!.hasMore !== "boolean" && "hasMore",
+    ].filter(Boolean);
+    if (bad.length > 0) fail(`pagination field(s) ${bad.join(", ")} are malformed.`);
+
+    const pagination = p as unknown as IndexerPagination;
+    if (pagination.page !== requested.page) {
+      fail(`requested page ${requested.page} but the server returned page ${pagination.page}.`);
+    }
+    if (requested.limit !== undefined && pagination.limit !== requested.limit) {
+      fail(`requested limit ${requested.limit} but the server applied ${pagination.limit}.`);
+    }
+    if ((items as unknown[]).length > pagination.limit) {
+      fail(`${(items as unknown[]).length} rows exceed the page limit of ${pagination.limit}.`);
+    }
+    return body;
+  }
+
+  /**
+   * Walk pages starting at `startPage`, yielding each page response intact
+   * (rows plus metadata), until the server reports no further pages, returns
+   * an empty page, or `maxPages` pages have been fetched.
+   */
+  private async *paginate<T extends { pagination: IndexerPagination }>(
+    method: string,
+    startPage: number,
+    options: PaginateOptions | undefined,
+    itemsOf: (page: T) => readonly unknown[],
+    fetchPage: (page: number) => Promise<T>,
+  ): AsyncGenerator<T, void, undefined> {
+    const maxPages = resolveMaxPages(method, options);
+    for (let page = startPage, fetched = 0; fetched < maxPages; page++, fetched++) {
+      const response = await fetchPage(page);
+      yield response;
+      const { totalPages, hasMore } = response.pagination;
+      if (hasMore === false || page >= totalPages || itemsOf(response).length === 0) return;
+    }
+  }
+
+  /** Fetch `path` and return the parsed body with the status and URL it came from. */
+  private async request<T>(path: string): Promise<{ body: T; status: number; url: string }> {
     const url = `${this.baseUrl}${path}`;
     const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
     assertPositiveTimeout(timeoutMs, "timeoutMs");
@@ -2996,61 +3752,27 @@ export class IndexerClient {
         );
       }
 
-      if (!response.ok) {
-        let detail = "";
-        try {
-          const body = await bounded(response.json() as Promise<Record<string, unknown>>);
-          const msg = body?.error;
-          detail = typeof msg === "string" ? ` — ${msg.slice(0, MAX_ERROR_DETAIL_LENGTH)}` : "";
-        } catch {
-          if (failure) throw failure;
-          // Ignore parse failure for error bodies (HTML error pages, empty bodies)
-        }
-        throw new IndexerError(
-          `Indexer returned HTTP ${response.status} for ${url}${detail}`,
-          response.status,
-          url,
-          "http",
-        );
-      }
-
-      let body: unknown;
-      try {
-        body = await bounded(response.json());
-      } catch (err: any) {
-        if (failure) throw failure;
-        throw new IndexerError(
-          `Failed to parse JSON response from ${url}: ${err?.name === "SyntaxError" ? "body is not valid JSON" : (err?.message ?? "invalid JSON")}`,
-          response.status,
-          url,
-          "json",
-        );
-      }
-
-      const problem = validateEnvelope(body, spec);
-      if (problem) {
-        throw new IndexerError(
-          `Unexpected response shape from ${url}: ${problem}. ` +
-          "The indexer and SDK versions may be incompatible.",
-          response.status,
-          url,
-          "schema",
-        );
-      }
-      return body as T;
-    } finally {
-      clearTimeout(timer);
-      callerSignal?.removeEventListener("abort", onCallerAbort);
+    try {
+      return { body: (await response.json()) as T, status: response.status, url };
+    } catch (err: any) {
+      throw new IndexerError(
+        `Failed to parse JSON response from ${url}: ${err?.message ?? "invalid JSON"}`,
+        response.status,
+        url,
+      );
     }
   }
 
   // ── Public API ────────────────────────────────────────────────────────────
 
   /**
-   * Fetch circles known to the indexer, ordered newest first by default.
+   * Fetch **one page** of circles known to the indexer, ordered newest first
+   * by default. The response keeps the server's `pagination` metadata; use
+   * `pagination.totalPages` to request further pages, or
+   * {@link iterateCircles} to walk them.
    *
-   * All parameters are optional — omitting them returns the first page of all
-   * circles sorted by `created_ledger DESC`.
+   * All parameters are optional — omitting them returns page 1 (20 rows) of
+   * all circles sorted by `created_ledger DESC`.
    *
    * @example
    * // All circles, default pagination
@@ -3063,22 +3785,46 @@ export class IndexerClient {
    * const { circles, pagination } = await indexer.getCircles({ status: "Pending", page: 2 });
    *
    * Equivalent to `GET /circles` with optional query parameters.
+   *
+   * @throws `RangeError` before any request when `params` holds an unknown key
+   *   or a value the indexer does not accept (see {@link GetCirclesParams}).
+   * @throws {@link IndexerError} on an HTTP/network failure, or when the
+   *   response's page envelope is missing or does not match the request.
    */
-  async getCircles(
+  async getCircles(params?: GetCirclesParams): Promise<ApiCirclesListResponse> {
+    const { query, page, limit } = buildCirclesQuery("getCircles", params);
+    return this.getPage<ApiCirclesListResponse>(`/circles${query}`, "circles", { page, limit });
+  }
+
+  /**
+   * Walk the pages of `GET /circles`, yielding each page response (rows plus
+   * `pagination` metadata) in order, starting at `params.page` (default 1).
+   *
+   * Bounded: stops after `options.maxPages` pages (default 10, max 1000), so it
+   * never fetches an unbounded result set. Compare the last page's
+   * `pagination.page` with `pagination.totalPages` to tell whether the bound
+   * cut the walk short.
+   *
+   * @example
+   * for await (const { circles } of indexer.iterateCircles({ status: "Active", limit: 100 })) {
+   *   render(circles);
+   * }
+   *
+   * @throws `RangeError` before any request on invalid `params` or `options`.
+   * @throws {@link IndexerError} as {@link getCircles}.
+   */
+  iterateCircles(
     params?: GetCirclesParams,
-    options?: IndexerRequestOptions,
-  ): Promise<ApiCirclesListResponse> {
-    const qs = new URLSearchParams();
-    if (params?.status != null) qs.set("status", params.status);
-    if (params?.sort != null) qs.set("sort", params.sort);
-    if (params?.order != null) qs.set("order", params.order);
-    if (params?.page != null) qs.set("page", String(params.page));
-    if (params?.limit != null) qs.set("limit", String(params.limit));
-    const query = qs.toString();
-    return this.get<ApiCirclesListResponse>(
-      `/circles${query ? `?${query}` : ""}`,
-      { circles: "array" },
+    options?: PaginateOptions,
+  ): AsyncGenerator<ApiCirclesListResponse, void, undefined> {
+    const { page } = buildCirclesQuery("iterateCircles", params);
+    resolveMaxPages("iterateCircles", options);
+    return this.paginate(
+      "iterateCircles",
+      page,
       options,
+      (r) => r.circles,
+      (p) => this.getCircles({ ...params, page: p }),
     );
   }
 
@@ -3179,11 +3925,13 @@ export class IndexerClient {
   }
 
   /**
-   * Fetch the raw contribution history for a member.
+   * Fetch **one page** of a member's raw contribution history, newest first.
    *
    * Unlike {@link getReputation} (counts only) or {@link getRounds} (nested
-   * under payouts), this returns every indexed contribution row for building
-   * a personal history view.
+   * under payouts), this returns indexed contribution rows for building a
+   * personal history view. The response keeps the server's `pagination`
+   * metadata and `totalAmount` (summed over all pages); use
+   * {@link iterateMemberContributions} to walk the pages.
    *
    * Pass `circle` to restrict results to one circle. An unknown circle address
    * yields a 404; a member with no contributions yields an empty list.
@@ -3192,21 +3940,46 @@ export class IndexerClient {
    *
    * @param member Stellar public key of the member.
    * @param options Optional circle filter and pagination.
+   * @throws `RangeError` before any request on an unknown option key, a
+   *   `circle` that is not a Stellar address, or an invalid `page` / `limit`.
+   * @throws {@link IndexerError} on an HTTP/network failure, or when the
+   *   response's page envelope is missing or does not match the request.
    */
   async getMemberContributions(
     member: string,
-    options?: { circle?: string; page?: number; limit?: number },
-    requestOptions?: IndexerRequestOptions,
+    options?: GetMemberContributionsParams,
   ): Promise<ApiMemberContributionsResponse> {
-    const params = new URLSearchParams();
-    if (options?.circle) params.set("circle", options.circle);
-    if (options?.page != null) params.set("page", String(options.page));
-    if (options?.limit != null) params.set("limit", String(options.limit));
-    const qs = params.toString();
-    return this.get<ApiMemberContributionsResponse>(
-      `/members/${encodeURIComponent(member)}/contributions${qs ? `?${qs}` : ""}`,
-      { contributions: "array" },
-      requestOptions,
+    const { query, page, limit } = buildContributionsQuery("getMemberContributions", options);
+    return this.getPage<ApiMemberContributionsResponse>(
+      `/members/${encodeURIComponent(member)}/contributions${query}`,
+      "contributions",
+      { page, limit },
+    );
+  }
+
+  /**
+   * Walk the pages of a member's contribution history, yielding each page
+   * response (rows plus metadata) in order, starting at `options.page`
+   * (default 1).
+   *
+   * Bounded: stops after `paginate.maxPages` pages (default 10, max 1000).
+   *
+   * @throws `RangeError` before any request on invalid options.
+   * @throws {@link IndexerError} as {@link getMemberContributions}.
+   */
+  iterateMemberContributions(
+    member: string,
+    options?: GetMemberContributionsParams,
+    paginate?: PaginateOptions,
+  ): AsyncGenerator<ApiMemberContributionsResponse, void, undefined> {
+    const { page } = buildContributionsQuery("iterateMemberContributions", options);
+    resolveMaxPages("iterateMemberContributions", paginate);
+    return this.paginate(
+      "iterateMemberContributions",
+      page,
+      paginate,
+      (r) => r.contributions,
+      (p) => this.getMemberContributions(member, { ...options, page: p }),
     );
   }
 
