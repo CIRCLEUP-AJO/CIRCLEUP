@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
-import { getWalletAddress, invokeContract } from "@/lib/stellar";
+import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/stellar";
 import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK, NETWORK_PASSPHRASE } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
 import { isSorobanContractId } from "@/lib/address";
@@ -805,6 +805,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // rapid double-clicks, keyboard repeats, or automated test runners.
   const submittingRef = useRef(false);
 
+  // Issue #654: AbortController for the in-flight invokeContract call.
+  // Aborted on component unmount so the polling loop stops promptly and no
+  // setState calls fire on an unmounted tree.  A new controller is created
+  // for each doAction / doDefault invocation so signals are never reused
+  // across separate transactions.
+  const txAbortRef = useRef<AbortController | null>(null);
+
   // ── UI state ───────────────────────────────────────────────────────────────
   //
   // inviteUrl is intentionally initialised to null (not "") so that components
@@ -867,6 +874,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   useEffect(() => {
     return () => {
       refreshAbortRef.current?.abort();
+      // Issue #654: abort any in-flight invokeContract call so the polling
+      // loop stops and timers are cleaned up when the component unmounts.
+      txAbortRef.current?.abort();
     };
   }, []);
 
@@ -1213,6 +1223,12 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     submittingRef.current = true;
     setLoading(action);
 
+    // Issue #654: create a fresh AbortController for this invocation and
+    // store it so the unmount effect can abort it if the component is torn
+    // down while signing or polling is in flight.
+    const txCtrl = new AbortController();
+    txAbortRef.current = txCtrl;
+
     try {
       // ── Stale-state gate ───────────────────────────────────────────────────
       //
@@ -1247,11 +1263,14 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       }
 
       // ── Submit transaction ─────────────────────────────────────────────────
+      // Pass txCtrl.signal so the polling loop can be stopped promptly when
+      // the component unmounts or the user navigates away.
       const result = await invokeContract(
         circleAddress,
         action,
         args,
         walletAddress,
+        txCtrl.signal,
       );
 
       if (!result.success) {
@@ -1280,6 +1299,30 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
+      // Issue #654: handle LocalCancelResult throws from invokeContract.
+      // These are not transaction failures — they mean the caller stopped
+      // waiting.  Silently swallow them when the component is unmounting
+      // (txCtrl.signal.aborted); surface a non-blocking advisory when the
+      // signal fired *after* the tx was already broadcast.
+      if (
+        err instanceof Error &&
+        err.cause != null &&
+        typeof err.cause === "object" &&
+        (err.cause as LocalCancelResult).kind === "local_cancel"
+      ) {
+        const cancelInfo = err.cause as LocalCancelResult;
+        if (cancelInfo.submittedBeforeAbort) {
+          // Tx may still confirm — show an advisory so the user knows to
+          // check the explorer rather than re-submitting immediately.
+          setError(
+            "You stopped waiting, but the transaction may still confirm on-chain. " +
+              "Check the explorer before retrying to avoid a duplicate submission.",
+          );
+        }
+        // submittedBeforeAbort=false means we cancelled cleanly before
+        // broadcast — no message needed, just let the UI reset below.
+        return;
+      }
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
       if (isRetryableError(message)) {
@@ -1288,6 +1331,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     } finally {
       setLoading(null);
       submittingRef.current = false;
+      // Clear the ref so a stale controller doesn't block future actions.
+      if (txAbortRef.current === txCtrl) txAbortRef.current = null;
     }
   }
 
