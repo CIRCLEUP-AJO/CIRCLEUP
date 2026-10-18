@@ -48,6 +48,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
   merge had removed, leaving `sdk/src/client.ts` unable to compile.
 
 ### Added
+- **Issue #710**: Added a secret-safe, read-only mainnet readiness gate with
+  explicit mainnet confirmation, manifest/address/token checks, artifact hash
+  verification, and funding checks. The generic contract deployer is now
+  testnet-only.
+- **Issue #709**: New deployment manifests use schema 2 and checksum the full
+  document. Schema 1 remains explicitly readable; unknown versions and network
+  names fail validation.
+- **Issue #707**: Added weekly Dependabot proposals and CI-enforced npm/Cargo
+  license inventories with fail-closed SPDX policy.
+- **Issue #708**: Declared supported Node.js/npm and pinned Rust/Soroban/WASM
+  toolchains, added early Node/npm validation, and aligned CI and setup docs.
 - **Issue 32**: Bounded timeouts and categorised failures for SDK indexer
   requests (`sdk/src/client.ts`) — every `IndexerClient` request (connect,
   headers and body) is bounded by `DEFAULT_INDEXER_TIMEOUT_MS` (10 s,

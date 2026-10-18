@@ -60,8 +60,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
+
+      - name: Select supported npm line
+        run: npm install --global npm@10
 
       - name: Install Node dependencies
         run: npm ci
