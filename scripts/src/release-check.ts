@@ -309,6 +309,7 @@ function checkSdkVersionAlignment(): CheckResult {
  * "dry-run is safe for contributor machines" acceptance criterion.
  */
 function checkNoCommittedEnvFiles(): CheckResult {
+
   const envFiles = [
     path.join(ROOT, 'app', '.env'),
     path.join(ROOT, 'indexer', '.env'),
@@ -329,6 +330,198 @@ function checkNoCommittedEnvFiles(): CheckResult {
   return pass('no-committed-env', 'No .env files found on disk (secrets safe)');
 }
 
+/**
+ * Check 6 — Deployment order guidance for coordinated schema + code changes.
+ *
+ * When [Unreleased] includes both migration/schema references and SDK/app/indexer
+ * changes, operators need explicit ordering to avoid deploying an incompatible
+ * combination.  Fails when no ordering guidance is present.
+ *
+ * Accepts optional `overrideContent` for testing without touching the filesystem.
+ */
+export function checkDeploymentOrderGuidance(overrideContent?: string): CheckResult {
+  const changelogPath = path.join(ROOT, 'CHANGELOG.md');
+  const changelog = overrideContent ?? (readFile(changelogPath) ?? '');
+
+  const lines = changelog.split('\n');
+  const unreleasedIdx = lines.findIndex(l => /^##\s+\[Unreleased\]/i.test(l));
+  if (unreleasedIdx === -1) {
+    return pass('deployment-order', 'No [Unreleased] section — deployment order check skipped');
+  }
+
+  const block: string[] = [];
+  for (let i = unreleasedIdx + 1; i < lines.length; i++) {
+    if (/^##\s+\[/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  const unreleased = block.join('\n');
+
+  const hasMigration = /migrat/i.test(unreleased) || /schema/i.test(unreleased);
+  const hasCodeChange =
+    /\bsdk\b/i.test(unreleased) || /\bapp\b/i.test(unreleased) || /\bindexer\b/i.test(unreleased);
+
+  if (!hasMigration || !hasCodeChange) {
+    return pass(
+      'deployment-order',
+      'No coordinated schema + code changes detected — deployment order guidance not required',
+    );
+  }
+
+  const orderPatterns = [
+    /deploy.*order/i,
+    /order.*deploy/i,
+    /before.*deploy/i,
+    /deploy.*before/i,
+    /step\s+\d/i,
+    /migration.*first/i,
+    /first.*migrat/i,
+    /\b1\.\s+\w/,
+  ];
+
+  if (orderPatterns.some(p => p.test(unreleased))) {
+    return pass(
+      'deployment-order',
+      '[Unreleased] contains deployment order guidance for the coordinated change',
+    );
+  }
+
+  return fail(
+    'deployment-order',
+    '[Unreleased] has coordinated schema + code changes but no deployment order guidance',
+    'Add an explicit deployment sequence to [Unreleased] so operators know whether to apply\n' +
+      'migrations before or after deploying the new code.\n' +
+      'Example: "1. Run indexer migrations. 2. Deploy indexer. 3. Deploy app."',
+  );
+}
+
+/**
+ * Check 7 — SDK compatibility notes when the [Unreleased] SDK section is present.
+ *
+ * When [Unreleased] contains a "### Changed (SDK)" heading or a "breaking"
+ * keyword, consumer apps and scripts need to know the minimum SDK version and
+ * whether their integration code requires changes.
+ *
+ * Accepts optional `overrideContent` for testing without touching the filesystem.
+ */
+export function checkSdkCompatibilityNotes(overrideContent?: string): CheckResult {
+  const changelogPath = path.join(ROOT, 'CHANGELOG.md');
+  const changelog = overrideContent ?? (readFile(changelogPath) ?? '');
+
+  const lines = changelog.split('\n');
+  const unreleasedIdx = lines.findIndex(l => /^##\s+\[Unreleased\]/i.test(l));
+  if (unreleasedIdx === -1) {
+    return pass('sdk-compatibility', 'No [Unreleased] section — SDK compatibility check skipped');
+  }
+
+  const block: string[] = [];
+  for (let i = unreleasedIdx + 1; i < lines.length; i++) {
+    if (/^##\s+\[/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  const unreleased = block.join('\n');
+
+  const hasSdkSection = /###\s+Changed\s*\(SDK\)/i.test(unreleased);
+  const hasBreaking = /\bbreaking\b/i.test(unreleased);
+
+  if (!hasSdkSection && !hasBreaking) {
+    return pass(
+      'sdk-compatibility',
+      'No SDK changes or breaking keywords in [Unreleased] — compatibility note not required',
+    );
+  }
+
+  const compatPatterns = [
+    /compat/i,
+    /upgrade/i,
+    /consumers?\s+must/i,
+    /update.*sdk/i,
+    /sdk.*version/i,
+    /minimum.*version/i,
+    /backwards.compat/i,
+    /backward.compat/i,
+  ];
+
+  if (compatPatterns.some(p => p.test(unreleased))) {
+    return pass(
+      'sdk-compatibility',
+      '[Unreleased] contains SDK compatibility notes alongside the SDK changes',
+    );
+  }
+
+  return fail(
+    'sdk-compatibility',
+    '[Unreleased] has SDK changes but no compatibility or upgrade notes',
+    'Add a compatibility note to [Unreleased] describing:\n' +
+      '  • Whether existing SDK consumers need to update their integration code\n' +
+      '  • Minimum SDK version required after this release\n' +
+      '  • Whether the change is backwards-compatible',
+  );
+}
+
+/**
+ * Check 8 — Artifact hash documentation when contract changes are present.
+ *
+ * When [Unreleased] references contracts, WASM, or Cargo (signals a contract
+ * change), the release notes must reference artifact hashes so operators can
+ * verify they deployed the correct WASM build.
+ *
+ * Accepts optional `overrideContent` for testing without touching the filesystem.
+ */
+export function checkArtifactHashDocumentation(overrideContent?: string): CheckResult {
+  const changelogPath = path.join(ROOT, 'CHANGELOG.md');
+  const changelog = overrideContent ?? (readFile(changelogPath) ?? '');
+
+  const lines = changelog.split('\n');
+  const unreleasedIdx = lines.findIndex(l => /^##\s+\[Unreleased\]/i.test(l));
+  if (unreleasedIdx === -1) {
+    return pass('artifact-hashes', 'No [Unreleased] section — artifact hash check skipped');
+  }
+
+  const block: string[] = [];
+  for (let i = unreleasedIdx + 1; i < lines.length; i++) {
+    if (/^##\s+\[/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  const unreleased = block.join('\n');
+
+  const hasContractChange =
+    /\bcontract\b/i.test(unreleased) ||
+    /\bwasm\b/i.test(unreleased) ||
+    /\bcargo\b/i.test(unreleased);
+
+  if (!hasContractChange) {
+    return pass(
+      'artifact-hashes',
+      'No contract changes detected — artifact hash documentation not required',
+    );
+  }
+
+  const hashPatterns = [
+    /\bhash\b/i,
+    /sha[-_]?256/i,
+    /expected-hashes/i,
+    /\bartifact\b/i,
+    /verify.*build/i,
+    /build.*verif/i,
+  ];
+
+  if (hashPatterns.some(p => p.test(unreleased))) {
+    return pass(
+      'artifact-hashes',
+      '[Unreleased] references artifact hashes alongside contract changes',
+    );
+  }
+
+  return fail(
+    'artifact-hashes',
+    '[Unreleased] has contract changes but no artifact hash documentation',
+    'Add an artifact verification step to [Unreleased], for example:\n' +
+      '  npm run verify-artifacts --workspace=scripts\n' +
+      'Or reference the contracts/expected-hashes.json file so operators can\n' +
+      'confirm they built and deployed the correct WASM.',
+  );
+}
+
 // ── Runner ────────────────────────────────────────────────────────────────────
 
 function runChecks(): void {
@@ -340,6 +533,9 @@ function runChecks(): void {
     checkMigrationNotes,
     checkSdkVersionAlignment,
     checkNoCommittedEnvFiles,
+    checkDeploymentOrderGuidance,
+    checkSdkCompatibilityNotes,
+    checkArtifactHashDocumentation,
   ];
 
   const results: CheckResult[] = checks.map(fn => {
@@ -377,4 +573,6 @@ function runChecks(): void {
   }
 }
 
-runChecks();
+if (require.main === module) {
+  runChecks();
+}
