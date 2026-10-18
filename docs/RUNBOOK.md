@@ -31,6 +31,7 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Checking Schema Health](#checking-schema-health)
   - [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)
 - [Database Backup and Restore](#database-backup-and-restore)
+- [Indexer Retention and Archival](./INDEXER_RETENTION.md)
   - [Backup](#backup)
   - [Restore drill — isolated target](#restore-drill--isolated-target)
   - [Post-restore verification](#post-restore-verification)
@@ -503,7 +504,11 @@ Replay is atomic: it wraps the wipe and cursor reset in a single transaction. If
 
 ## Database Backup and Restore
 
-Although the indexer database is a derived read-model that can be fully reconstructed by replaying Soroban events from the deployment ledger, a tested backup and restore path reduces outage time and protects checkpoint correctness.
+See [Indexer Retention and Archival](./INDEXER_RETENTION.md) for online-data
+classes, growth measurements, archive integrity checks, and the no-pruning
+policy.
+
+The indexer database is a derived read-model and can be reconstructed by replaying Soroban events only when the RPC still serves the complete required ledger range or a validated raw-event archive exists. The indexer does not currently store complete event payloads; see [Indexer Retention and Archival](./INDEXER_RETENTION.md). A tested backup and restore path reduces outage time and protects checkpoint correctness.
 
 The procedure below is deliberately structured as an **isolated drill**, not a direct production overwrite. Every step targets a separate restore database (`circleup_restore`) so the production database remains untouched until you have verified the backup is coherent and the schema is clean. Only after passing all verification steps should you decide whether to promote the restore target or fall back to a chain replay.
 

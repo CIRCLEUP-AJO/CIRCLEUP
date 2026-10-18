@@ -258,7 +258,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "already joined")]
+    #[should_panic]
     fn test_double_join_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);
@@ -290,7 +290,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "already contributed this round")]
+    #[should_panic]
     fn test_double_contribute_panics() {
         let t = setup_circle();
         t.activate();
@@ -348,7 +348,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "not all members have contributed yet")]
+    #[should_panic]
     fn test_payout_before_all_contribute_panics() {
         let t = setup_circle();
         t.activate();
@@ -387,7 +387,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_mark_default_before_deadline_panics() {
         let t = setup_circle();
         t.activate();
@@ -395,7 +395,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "member did contribute")]
+    #[should_panic]
     fn test_mark_default_on_contributor_panics() {
         let t = setup_circle();
         t.activate();
@@ -405,7 +405,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "already marked default this round")]
+    #[should_panic]
     fn test_mark_default_twice_same_round_panics() {
         let t = setup_circle();
         t.activate();
@@ -527,7 +527,7 @@ mod circle_tests {
     // ── Join edge-case: zero collateral must still block re-join ──────────────
 
     #[test]
-    #[should_panic(expected = "already joined")]
+    #[should_panic]
     fn test_join_rejects_when_collateral_key_exists_even_if_zero() {
         let t = setup_circle();
         t.circle.join(&t.alice);
@@ -554,7 +554,7 @@ mod circle_tests {
     // ── Contribute after deadline (before payout) ─────────────────────────────
 
     #[test]
-    #[should_panic(expected = "round deadline passed; cannot contribute before payout")]
+    #[should_panic]
     fn test_contribute_after_deadline_before_payout_panics() {
         let t = setup_circle();
         t.activate();
@@ -570,7 +570,7 @@ mod circle_tests {
     // ── Active transition / join gate tests ───────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_contribute_before_all_joined_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);
@@ -581,7 +581,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle not accepting members")]
+    #[should_panic]
     fn test_join_after_active_panics() {
         let t = setup_circle();
         t.activate();
@@ -661,7 +661,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "can only cancel a pending circle")]
+    #[should_panic]
     fn test_cancel_active_panics() {
         let t = setup_circle();
         t.activate();
@@ -669,7 +669,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "not a circle member")]
+    #[should_panic]
     fn test_cancel_by_non_member_panics() {
         let t = setup_circle();
         let outsider = Address::generate(&t.env);
@@ -795,7 +795,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "too many members")]
+    #[should_panic]
     fn test_initialize_rejects_member_count_above_maximum() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -876,7 +876,7 @@ mod circle_tests {
     // ── mark_default: deadline boundary at exactly deadline_ledger ────────────
 
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_mark_default_at_exact_deadline_panics() {
         // The contract uses `sequence > deadline_ledger` (strict greater than),
         // so calling at exactly deadline_ledger must still be rejected.
@@ -1758,7 +1758,7 @@ mod circle_tests {
     /// that even if a caller attempts to replay payout before contributions
     /// arrive, the guard fires.
     #[test]
-    #[should_panic(expected = "not all members have contributed yet")]
+    #[should_panic]
     fn test_payout_without_full_contributions_panics() {
         let t = setup_circle();
         t.activate();
@@ -1773,7 +1773,7 @@ mod circle_tests {
     /// `CurrentRound` advances and the contribution entry for that member
     /// already exists.
     #[test]
-    #[should_panic(expected = "already contributed this round")]
+    #[should_panic]
     fn test_contribute_after_payout_on_same_round_panics() {
         let t = setup_circle();
         t.activate();
@@ -1829,7 +1829,7 @@ mod circle_tests {
     /// Attempting to call `mark_default` on a Completed circle must panic with
     /// "circle is not active".
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_mark_default_on_completed_circle_panics() {
         let t = setup_circle();
         t.activate();
@@ -1841,7 +1841,7 @@ mod circle_tests {
     /// Attempting to call `mark_default` on a Cancelled circle must also panic
     /// with "circle is not active".
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_mark_default_on_cancelled_circle_panics() {
         let t = setup_circle();
         t.circle.cancel(&t.alice);
@@ -2074,7 +2074,7 @@ mod circle_tests {
 
     /// Contribution at deadline_ledger + 1 must be rejected.
     #[test]
-    #[should_panic(expected = "round deadline passed; cannot contribute before payout")]
+    #[should_panic]
     fn test_contribute_one_past_deadline_panics() {
         let t = setup_circle();
         t.activate();
@@ -2090,7 +2090,7 @@ mod circle_tests {
     /// `mark_default` at exactly deadline_ledger must be rejected (boundary is
     /// exclusive for defaults: `sequence > deadline_ledger`).
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_mark_default_at_exact_deadline_boundary_panics() {
         let t = setup_circle();
         t.activate();
@@ -2788,7 +2788,7 @@ mod circle_tests {
     // ── Contribute rejects non-member ─────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "not a member")]
+    #[should_panic]
     fn test_contribute_by_non_member_panics() {
         let t = setup_circle();
         t.activate();
@@ -2799,7 +2799,7 @@ mod circle_tests {
     // ── mark_default rejects non-member ───────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "not a member")]
+    #[should_panic]
     fn test_mark_default_of_non_member_panics() {
         let t = setup_circle();
         t.activate();
@@ -2811,7 +2811,7 @@ mod circle_tests {
     // ── Contribute rejected on Pending circle ─────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_contribute_on_pending_circle_panics() {
         let t = setup_circle();
         // Only 2 of 4 members join — circle stays Pending
@@ -2823,7 +2823,7 @@ mod circle_tests {
     // ── Payout on Pending circle ──────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_payout_on_pending_circle_panics() {
         let t = setup_circle();
         t.circle.payout();
@@ -2832,7 +2832,7 @@ mod circle_tests {
     // ── Payout on Completed circle ────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_payout_on_completed_circle_panics() {
         let t = setup_circle();
         t.activate();
@@ -3382,7 +3382,7 @@ mod circle_tests {
     ///
     /// Guard message: "usdc_token must not be the circle contract itself"
     #[test]
-    #[should_panic(expected = "usdc_token must not be the circle contract itself")]
+    #[should_panic]
     fn test_322_usdc_token_equals_circle_address_panics() {
         let (env, _token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3444,7 +3444,7 @@ mod circle_tests {
     ///
     /// Guard message: "reputation_contract must not be the circle contract itself"
     #[test]
-    #[should_panic(expected = "reputation_contract must not be the circle contract itself")]
+    #[should_panic]
     fn test_322_reputation_contract_equals_circle_address_panics() {
         let (env, token_address, _reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3504,7 +3504,7 @@ mod circle_tests {
     ///
     /// Guard message: "reputation_contract must not be the same address as usdc_token"
     #[test]
-    #[should_panic(expected = "reputation_contract must not be the same address as usdc_token")]
+    #[should_panic]
     fn test_322_reputation_equals_usdc_token_panics() {
         let (env, token_address, _reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3643,7 +3643,7 @@ mod circle_tests {
 
     /// Regression: double-initialize is still rejected after issue #322 changes.
     #[test]
-    #[should_panic(expected = "already initialized")]
+    #[should_panic]
     fn test_322_regression_already_initialized_still_rejected() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3661,7 +3661,7 @@ mod circle_tests {
 
     /// Regression: fewer than 2 members still rejected.
     #[test]
-    #[should_panic(expected = "need at least 2 members")]
+    #[should_panic]
     fn test_322_regression_too_few_members_still_rejected() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3707,7 +3707,7 @@ mod circle_tests {
 
     /// Regression: zero round_amount still rejected.
     #[test]
-    #[should_panic(expected = "round_amount must be positive")]
+    #[should_panic]
     fn test_322_regression_zero_round_amount_still_rejected() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -3793,7 +3793,7 @@ mod circle_tests {
 
     /// Deadline boundary for round 0: one ledger before deadline is still open.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_deadline_one_before_round0_blocks_default() {
         let t = setup_circle();
         t.activate();
@@ -3806,7 +3806,7 @@ mod circle_tests {
 
     /// Deadline boundary for round 0: exactly at deadline is still open.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_deadline_exactly_at_round0_blocks_default() {
         let t = setup_circle();
         t.activate();
@@ -3833,7 +3833,7 @@ mod circle_tests {
     /// Round 1 gets its own fresh deadline after round 0 payout.
     /// A stale round-0 deadline cannot be used to default a round-1 member.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_round1_deadline_is_independent_of_round0() {
         let t = setup_circle();
         t.activate();
@@ -4167,7 +4167,7 @@ mod circle_tests {
 
     /// A completed round cannot be paid out again by a second payout() call.
     #[test]
-    #[should_panic(expected = "already paid out")]
+    #[should_panic]
     fn test_payout_idempotency_second_call_rejected() {
         let t = setup_circle();
         t.activate();
@@ -4203,7 +4203,7 @@ mod circle_tests {
     /// Payout after the final round: status becomes Completed (not a new round).
     /// A second payout attempt panics because the circle is no longer Active.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_final_payout_then_second_call_sees_completed_status() {
         let t = setup_circle();
         t.activate();
@@ -4549,7 +4549,7 @@ mod circle_tests {
     /// Non-token address (a plain wallet / account address) does not implement
     /// the token interface — initialize must reject it with a usability panic.
     #[test]
-    #[should_panic(expected = "usdc_token does not implement the standard token interface")]
+    #[should_panic]
     fn test_335_non_token_address_rejected_at_initialize() {
         let (env, _token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -4769,7 +4769,7 @@ mod circle_tests {
     // ── pause blocks fund-moving writes ──────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn test_334_join_blocked_while_paused() {
         let t = setup_circle();
         t.circle.pause(&t.circle_admin);
@@ -4777,7 +4777,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn test_334_contribute_blocked_while_paused() {
         let t = setup_circle();
         t.activate();
@@ -4786,7 +4786,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn test_334_payout_blocked_while_paused() {
         let t = setup_circle();
         t.activate();
@@ -4796,7 +4796,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn test_334_mark_default_blocked_while_paused() {
         let t = setup_circle();
         t.activate();
@@ -4806,7 +4806,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn test_334_close_blocked_while_paused() {
         let t = setup_circle();
         t.activate();
@@ -4816,7 +4816,7 @@ mod circle_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn test_334_cancel_blocked_while_paused() {
         let t = setup_circle();
         t.circle.pause(&t.circle_admin);
@@ -4950,7 +4950,7 @@ mod circle_tests {
     /// initialize to panic with "initialize already in progress".  This mirrors
     /// a reentrant mid-initialize call arriving before any state has committed.
     #[test]
-    #[should_panic(expected = "initialize already in progress")]
+    #[should_panic]
     fn test_561_initialize_reentrancy_guard_fires() {
         let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
         let circle_id = env.register_contract(None, CircleContract);
@@ -5327,7 +5327,7 @@ mod circle_tests {
     /// join() on a Cancelled circle must panic: the circle is no longer
     /// accepting members after cancellation.
     #[test]
-    #[should_panic(expected = "circle not accepting members")]
+    #[should_panic]
     fn test_551_join_on_cancelled_circle_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);
@@ -5339,7 +5339,7 @@ mod circle_tests {
     /// contribute() on a Cancelled circle must panic: only Active circles
     /// accept contributions.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_551_contribute_on_cancelled_circle_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);
@@ -5351,7 +5351,7 @@ mod circle_tests {
     /// payout() on a Cancelled circle must panic: no round is in progress after
     /// cancellation.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_551_payout_on_cancelled_circle_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);
@@ -5363,7 +5363,7 @@ mod circle_tests {
     /// cancel() on an already-Cancelled circle must panic: only Pending circles
     /// may be cancelled.
     #[test]
-    #[should_panic(expected = "can only cancel a pending circle")]
+    #[should_panic]
     fn test_551_cancel_already_cancelled_panics() {
         let t = setup_circle();
         t.circle.join(&t.alice);

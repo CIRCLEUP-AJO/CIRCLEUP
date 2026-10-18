@@ -6,6 +6,8 @@ for new methods.
 
 See also: [`docs/API_INVARIANTS.md`](./API_INVARIANTS.md) for the full
 invariant catalog, [`docs/EVENTS.md`](./EVENTS.md) for event payload shapes.
+Storage keys, persisted values, and error discriminants are reviewed under
+[`docs/UPGRADE_COMPATIBILITY.md`](./UPGRADE_COMPATIBILITY.md).
 
 ---
 
