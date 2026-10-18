@@ -383,3 +383,61 @@ the factory must be redeployed:
    The indexer will begin tracking circles created by the new factory; circles
    created by the old factory remain in the database and their historical data
    is preserved.
+
+---
+
+## Contract Artifact Verification, Provenance, and Review Requirements
+
+The compiled Soroban WASM artifacts deployed on-chain (`reputation.wasm`,
+`circle_factory.wasm`, `circle.wasm`) represent the definitive executable
+contracts of CircleUp. Differences in compiler version, target flags, or
+optimization profiles can produce binaries that diverge from audited source.
+
+To prevent silent supply-chain drift, unexpected compiler differences, and
+unauthorized bytecode deployment, CircleUp implements a strict cryptographic
+provenance and reproducibility pipeline.
+
+### 1. Key Components
+
+| Component | File Path | Function |
+|---|---|---|
+| **Pinned Toolchain** | `contracts/rust-toolchain.toml` | Pinned Rust compiler channel (e.g. `1.81.0`) and `wasm32-unknown-unknown` target. |
+| **Expected Hashes** | `contracts/expected-hashes.json` | Committed SHA-256 hashes of the release WASMs built from the repository source. |
+| **Build Provenance** | `contracts/provenance.json` | Machine-readable metadata capturing Git commit SHA, branch, dirty flag, toolchain, compiler version (`rustc`, `cargo`), artifact sizes, and hashes. |
+| **Verification Tooling** | `scripts/src/check-artifact-hashes.ts` | CLI utility to verify hashes, generate provenance, and update expected hashes. |
+| **Reproducibility CI** | `.github/workflows/reproducibility.yml` | Two-pass clean build workflow that asserts byte-for-byte determinism, verifies against `expected-hashes.json`, and uploads provenance metadata. |
+
+### 2. The Verification Workflow
+
+On every push and pull request touching `contracts/**`:
+
+1. CI initializes the pinned Rust toolchain from `contracts/rust-toolchain.toml`.
+2. First-pass build compiles all contracts in release mode (`--release --target wasm32-unknown-unknown`).
+3. `scripts/src/check-artifact-hashes.ts --provenance` generates full provenance metadata.
+4. `scripts/src/check-artifact-hashes.ts` validates that every artifact SHA-256 matches `contracts/expected-hashes.json`. If any hash differs or is unpopulated, CI fails immediately.
+5. A second build is performed from a clean cache (`cargo clean`) to prove byte-for-byte determinism across builds.
+6. Provenance metadata (`contracts/provenance.json`) and release binaries are published as GitHub Actions artifacts for auditability.
+
+### 3. Review Procedure for Intentional Hash Changes
+
+When contract source code is changed, dependencies are updated, or the Rust
+toolchain is upgraded:
+
+1. **Local Build & Hash Update**:
+   - Build with the pinned toolchain:
+     ```bash
+     cargo build --release --target wasm32-unknown-unknown --manifest-path contracts/Cargo.toml
+     ```
+   - Re-generate `expected-hashes.json` and `provenance.json`:
+     ```bash
+     npm run hash-artifacts --workspace=scripts
+     ```
+2. **Pull Request Inclusion**:
+   - The updated `contracts/expected-hashes.json` (and `contracts/rust-toolchain.toml` if the toolchain was modified) **must be committed in the same PR** as the source code changes.
+   - Standalone PRs that update `expected-hashes.json` without corresponding source or toolchain changes are strictly rejected.
+3. **Mandatory Review Criteria**:
+   - Reviewers must trace every hash change back to the concrete contract diffs in the PR.
+   - At least two maintainers must approve the PR before merging.
+   - The GitHub Actions `reproducibility` workflow must pass with green checks on both build passes.
+4. **Release Provenance Verification**:
+   - Prior to deploying contracts to testnet or mainnet, the release engineer must verify that the Git commit SHA recorded in the CI build provenance artifact matches the release git tag.
