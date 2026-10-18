@@ -111,23 +111,10 @@ New-Item -ItemType Directory -Force -Path scripts/archive | Out-Null
 Copy-Item scripts/deployed-manifest.json $dest
 ```
 
-Add a `supersededAt` and `supersededBy` field to the archived copy to make its
-status self-describing:
-
-```json
-{
-  "manifestVersion": "1",
-  "network": "testnet",
-  ...
-  "supersededAt": "2026-10-16T14:30:00Z",
-  "supersededBy": "deployed-manifest-20261016T143100Z.json"
-}
-```
-
-These two fields are not part of the `DeploymentManifest` interface validated
-by `validateManifest()` — they are metadata added only to archived copies.
-`validateManifest()` ignores unknown fields, so the archived copy remains
-parseable.
+Do not edit the archived JSON. Its schema-versioned checksum covers its
+contents, and archives are immutable copies of the deployment record. Record
+`supersededAt`, `supersededBy`, and the reason in the deployment history and
+CHANGELOG instead.
 
 ### Step 2 — Update the active manifest
 
@@ -209,7 +196,7 @@ timestamp is the moment the archive copy was written, not the deployment time
 | Archived manifests (`scripts/archive/`) | **Permanent** | Contains WASM hash, deploy tx hash, deployer public key, git commit, and network passphrase. Needed to verify reproducibility claims and trace any on-chain contract to its source build. |
 | `deployTxHash` per contract | **Permanent** (in manifest) | The transaction hash proves the deployment happened and when. It is the chain of custody from source code to on-chain contract. |
 | `wasmHash` per contract | **Permanent** (in manifest) | Links the on-chain WASM to the build artifact verified by `contracts/expected-hashes.json` and the reproducibility CI. |
-| `integrityHash` | **Permanent** (in manifest) | SHA-256 over core manifest fields; detects post-archive tampering. |
+| `integrityHash` | **Permanent** (in manifest) | Schema 2 SHA-256 over all manifest fields except the checksum itself; detects accidental or unsophisticated changes, not authorship. |
 | `gitCommit` in manifest | Permanent when available | Links the deployment to the exact source commit. The deploy script populates this automatically when run inside a git repository. |
 | Incident notes and post-mortems | **Permanent** | If a superseded deployment was retired due to a bug or incident, the post-mortem or issue link belongs in the CHANGELOG entry and optionally in the runbook. |
 | Operator `.env` files | Do **not** commit to git | These contain network-specific values and may reference secrets; the profile files serve as the committed reference. |
@@ -246,9 +233,23 @@ CIRCLEUP_PROFILE=production npx ts-node scripts/src/validate-env.ts
 
 ### Manifest network guard
 
-`validateManifest()` rejects a manifest whose `network` field does not match
-the caller's expected network. Use this guard in deployment scripts and CI jobs
-that consume a manifest:
+`validateManifest()` supports schema 1 (the historical field set and checksum)
+and schema 2 (the current complete manifest shape and checksum). New manifests
+are always written as schema 2. Unsupported versions and unknown network names
+fail validation; consumers must not guess or silently reinterpret a schema.
+Schema 1 remains readable for deployed history, but its historical checksum
+does not cover every field. Use schema 2 for new release records.
+
+The SHA-256 checksum is an integrity consistency check, not a signature. Anyone
+who can edit a manifest can recompute an unkeyed checksum, so it does not prove
+who created the manifest, that it came from a trusted build, or that an on-chain
+deployment is authentic. Authenticity and provenance still require trusted
+release controls, reviewed source/build records, and independent on-chain
+verification. No signing key is configured by this project today.
+
+`validateManifest()` also rejects a manifest whose `network` field does not
+match the caller's expected network. Use this guard in deployment scripts and
+CI jobs that consume a manifest:
 
 ```typescript
 import { validateManifest } from "./deployment-manifest";
@@ -275,8 +276,9 @@ manifest:
   run: npx ts-node scripts/src/deployment-manifest.ts scripts/deployed-manifest.json ${{ env.NETWORK }}
 ```
 
-The script exits non-zero on any validation failure, blocking the job before
-stale or tampered addresses can propagate.
+The script exits non-zero on validation failures, blocking the job before
+stale addresses or checksum-inconsistent manifests can propagate. The checksum
+is not an authenticity proof; see the schema and integrity guarantees above.
 
 ### Runtime identity verification (SDK)
 
@@ -336,13 +338,11 @@ including deployed contracts. After a testnet reset:
 
 1. All previous testnet deployments are effectively unreachable (the ledger
    no longer exists), but their archived manifests remain valid historical records.
-2. Add a note to the archived manifest:
+2. Leave the archived manifest unchanged and record the reset in the deployment
+   history and CHANGELOG:
 
-   ```json
-   "supersededAt": "2026-10-16T00:00:00Z",
-   "supersededBy": "testnet-reset",
-   "supersededReason": "Stellar testnet reset — ledger history no longer accessible"
-   ```
+   Include the reset date, the superseded manifest filename, and the reason
+   (`Stellar testnet reset — ledger history no longer accessible`).
 
 3. Run a fresh testnet deployment following the standard procedure.
 4. Update `profiles/testnet.env` with the new addresses.
@@ -359,8 +359,9 @@ the normal notice period:
 
 1. Follow Steps 1–5 of [Marking a deployment superseded](#marking-a-deployment-superseded)
    as quickly as possible.
-2. In the archived manifest, set `supersededReason` to a brief description of
-   the issue (avoid disclosing exploit details before coordinated disclosure).
+2. In the deployment history, record a brief supersession reason without
+   modifying the archived manifest or disclosing exploit details before
+   coordinated disclosure.
 3. Add a `### Security` entry in `CHANGELOG.md` referencing the new addresses
    and the disclosure timeline.
 4. Notify integrators via the coordinated disclosure process in `SECURITY.md`.
