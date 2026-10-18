@@ -54,6 +54,8 @@ mod tests; // tests are in tests.rs
 #[cfg(test)]
 mod prop_tests; // property-based / fuzz-style harness (issue #167)
 #[cfg(test)]
+mod financial_invariant_tests; // financial invariants (#641)
+#[cfg(test)]
 mod mutation_guards; // explicit guard-removal / mutation tests
 #[cfg(test)]
 mod adversarial_tests; // adversarial authorization tests (issue #87)
