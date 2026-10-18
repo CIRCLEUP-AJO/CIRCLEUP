@@ -71,10 +71,25 @@ mod transfer_failure_tests; // failed token transfer handling (issue #573)
 mod issue_fixes_tests; // targeted fixes: #552 #553 #554 #555
 #[cfg(test)]
 mod lifecycle_invariant_tests; // settle_round, deadline boundary, close arithmetic, reputation rollback (issue #631)
+#[cfg(test)]
+mod cancellation_invariants_tests; // cancellation and collateral recovery invariants (issue #689)
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror, token, Address, Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ReputationError {
+    NotInitialized = 1,
+    CallerRevoked = 2,
+    UnauthorizedCaller = 3,
+}
+
+#[contractclient(name = "ReputationClient")]
+pub trait ReputationInterface {
+    fn increment(env: Env, circle: Address, member: Address) -> Result<(), ReputationError>;
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -416,7 +431,7 @@ impl CircleContract {
     /// unregistered circle (`UnauthorizedCaller`) from an uninitialized
     /// reputation contract (`NotInitialized`) without replaying the trace.
     fn award_reputation(env: &Env, reputation_contract: &Address, recipient: &Address) {
-        let rep_client = reputation::ReputationContractClient::new(env, reputation_contract);
+        let rep_client = ReputationClient::new(env, reputation_contract);
         match rep_client.try_increment(&env.current_contract_address(), recipient) {
             Ok(Ok(())) => {}
             Err(Ok(err)) => panic!(

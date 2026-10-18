@@ -60,9 +60,11 @@ use soroban_sdk::{
     Address, Bytes, BytesN, Env, Symbol, Vec,
 };
 
-// Re-export circle constants so factory validation stays in sync with the
-// circle contract without hard-coding the numbers here.
-use circle::{MAX_MEMBERS, MIN_ROUND_DEADLINE_LEDGERS, MAX_ROUND_DEADLINE_LEDGERS};
+// Circle protocol constants — must match circle contract invariants exactly.
+pub const MAX_MEMBERS: u32 = 256;
+pub const MIN_ROUND_DEADLINE_LEDGERS: u32 = 100;
+pub const MAX_ROUND_DEADLINE_LEDGERS: u32 = 1_036_800;
+pub const PENALTY_BPS: i128 = 2_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -154,7 +156,7 @@ fn validate_create_inputs(
         .checked_mul(member_count as i128)
         .unwrap_or_else(|| panic!("round_amount too large: overflows pot calculation"));
     round_amount
-        .checked_mul(circle::PENALTY_BPS)
+        .checked_mul(PENALTY_BPS)
         .unwrap_or_else(|| panic!("round_amount too large: overflows penalty calculation"));
 
     // Deadline bounds — must match circle contract's accepted range exactly.

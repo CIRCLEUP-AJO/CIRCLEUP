@@ -19,7 +19,7 @@ mod issue_fixes_tests {
     };
     use reputation::{ReputationContract, ReputationContractClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Ledger, Events as _},
         token::{Client as TokenClient, StellarAssetClient},
         Address, Env, Vec,
     };
