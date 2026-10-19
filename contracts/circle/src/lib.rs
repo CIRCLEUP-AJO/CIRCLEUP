@@ -1931,8 +1931,8 @@ impl CircleContract {
     ///
     /// Only the stored `admin` address (set at initialization) may call this.
     /// A paused circle accepts no `join`, `contribute`, `payout`, `mark_default`,
-    /// or `close` calls.  All read-only views remain available so indexers and
-    /// front-ends can display the current state and the pause reason to members.
+    /// `settle_round`, or `close` calls. All read-only views remain available so
+    /// indexers and front-ends can display the current state and pause reason.
     ///
     /// # Authorization
     /// `admin.require_auth()` is called inside this function; the admin must sign

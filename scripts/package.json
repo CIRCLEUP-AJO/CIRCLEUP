@@ -6,6 +6,7 @@
     "deploy:testnet": "ts-node src/deploy.ts",
     "mainnet:readiness": "ts-node src/mainnet-readiness.ts",
     "seed:demo": "ts-node src/seed-demo.ts",
+    "test:seed": "node -r ts-node/register --test src/seed-demo-policy.test.ts",
     "release-check": "ts-node src/release-check.ts",
     "validate-env": "ts-node src/validate-env.ts",
     "hash-artifacts": "ts-node src/check-artifact-hashes.ts --update",
