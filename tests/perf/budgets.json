@@ -1,11 +1,19 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$comment": "Versioned performance budgets for CircleUp. Update only with measurement evidence.",
-  "version": "1.0.0",
-  "updatedAt": "2026-08-26",
+  "version": "1.1.0",
+  "updatedAt": "2026-10-19",
+
+  "environmentVariance": {
+    "description": "Standardized environment variance considerations for reproducible CI gating without flaky dependencies",
+    "ciVarianceFactor": 1.5,
+    "measurementTiming": "process.hrtime.bigint (sub-millisecond resolution)",
+    "isolation": "In-memory deterministic fixtures to eliminate network and live database jitter",
+    "notes": "Budgets represent upper tolerance ceilings (p99 bounds) designed to catch algorithmic and serialization regressions without false positives under virtualized CI scheduling."
+  },
 
   "api": {
-    "$comment": "Indexer query and response budgets measured against the fixture dataset (50 circles, 10 members each)",
+    "$comment": "Indexer query and serialization budgets measured against deterministic fixture datasets",
     "circleList": {
       "queryMs": 50,
       "$comment": "Max DB query time for GET /circles with 50 rows",
@@ -16,13 +24,61 @@
       "queryMs": 20,
       "payloadKb": 1
     },
+    "circleList10": {
+      "queryMs": 25,
+      "payloadKb": 10
+    },
+    "circleList50": {
+      "queryMs": 50,
+      "payloadKb": 32
+    },
+    "circleList100": {
+      "queryMs": 80,
+      "payloadKb": 65
+    },
     "circleDetail": {
       "queryMs": 30,
       "payloadKb": 8
     },
+    "circleDetailMinimal": {
+      "queryMs": 15,
+      "payloadKb": 2
+    },
+    "circleDetail10Members": {
+      "queryMs": 30,
+      "payloadKb": 8
+    },
+    "circleDetailMax256Members": {
+      "queryMs": 60,
+      "payloadKb": 50
+    },
+    "reputationProfile": {
+      "queryMs": 25,
+      "payloadKb": 4
+    },
+    "reputationProfileNew": {
+      "queryMs": 15,
+      "payloadKb": 2
+    },
+    "reputationProfileActive": {
+      "queryMs": 25,
+      "payloadKb": 4
+    },
     "memberContributions": {
       "queryMs": 30,
       "payloadKb": 16
+    },
+    "memberContributions10": {
+      "queryMs": 20,
+      "payloadKb": 8
+    },
+    "memberContributions50": {
+      "queryMs": 35,
+      "payloadKb": 25
+    },
+    "memberContributions100": {
+      "queryMs": 60,
+      "payloadKb": 50
     }
   },
 
@@ -49,16 +105,21 @@
   },
 
   "render": {
-    "$comment": "Component render time budgets in ms measured in jsdom (vitest). These are ceiling values, not targets.",
+    "$comment": "Component and data preparation time budgets in ms measured in Node.js runtime. These are ceiling values, not targets.",
     "circleCardMs": 10,
     "reputationBadgeMs": 5,
-    "circleListSkeleton6CardsMs": 20
+    "circleListSkeleton6CardsMs": 20,
+    "circleGrid12CardsMs": 25,
+    "circleDetailPreparationMs": 15,
+    "reputationProfilePreparationMs": 10,
+    "contributionHistoryTableMs": 15
   },
 
   "payload": {
     "$comment": "Wire payload size budgets (uncompressed) for the initial circle list in different states",
     "emptyListBytes": 50,
     "populatedList50CirclesKb": 40,
-    "populatedList10CirclesKb": 10
+    "populatedList10CirclesKb": 10,
+    "populatedList100CirclesKb": 80
   }
 }

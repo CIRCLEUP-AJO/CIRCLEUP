@@ -78,7 +78,13 @@ import {
   logLedgerProcessed,
   logEventHandlerError,
   logRpcRetry,
+  logLedgerContradiction,
 } from "./logger";
+import {
+  detectLedgerSequenceRegression,
+  detectEventRangeContradiction,
+  LedgerContradictionError,
+} from "./ledgerContradiction";
 
 export const rpc = new SorobanRpc.Server(STELLAR_RPC_URL, {
   allowHttp: true,
@@ -585,7 +591,7 @@ export function parseInitializedEvent(value: unknown): {
   }
   if (roundAmountBig <= 0n) {
     throw new Error(
-      `circle/initialized: round_amount must be > 0, got ${roundAmountBig}`,
+      `circle/initialized: round_amount must be a positive bigint, round_amount must be > 0, got ${roundAmountBig}`,
     );
   }
 
@@ -1178,6 +1184,103 @@ export async function runEventHandler(
 
 // ─── Main poll cycle ──────────────────────────────────────────────────────────
 
+export interface FetchAllEventsOptions {
+  fromLedger: number;
+  toLedger: number;
+  filters: SorobanRpc.Server.GetEventsRequest["filters"];
+  limit?: number;
+  label?: string;
+  maxPages?: number;
+}
+
+/**
+ * Fetch all pages of contract events across the ledger range [fromLedger, toLedger].
+ *
+ * Issue 97: Verify event poller pagination before advancing the ledger cursor.
+ * - Soroban RPC pagination specification:
+ *   - The initial request supplies `startLedger` and omits `cursor`.
+ *   - Subsequent requests supply `cursor` (from the last event's `pagingToken` or `id`) and MUST omit `startLedger`.
+ *   - Queries continue until:
+ *     1. An empty events array is returned.
+ *     2. Fewer than `limit` events are returned.
+ *     3. All events on the current page have `ledger > toLedger`.
+ *     4. Cursor does not progress (loop guard).
+ * - If ANY page fetch fails, the entire function throws without returning partial events.
+ *   This ensures that the poll cycle aborts and the cursor in indexer_state is NOT advanced,
+ *   preserving un-ingested events for safe replay.
+ * - Monotonic ordering: Events are bounded to `<= toLedger`. Duplicate delivery is safe
+ *   because `processLedger` uses atomic transactions and deduplication against `ingested_events`.
+ */
+export async function fetchAllEventsWithPagination(
+  rpcClient: Pick<SorobanRpc.Server, "getEvents">,
+  options: FetchAllEventsOptions,
+): Promise<SdkEvent[]> {
+  const {
+    fromLedger,
+    toLedger,
+    filters,
+    limit = EVENTS_LIMIT,
+    label = "getEvents(paginated)",
+    maxPages = 1000,
+  } = options;
+
+  const allEvents: SdkEvent[] = [];
+  let cursor: string | undefined = undefined;
+  let pageCount = 0;
+  let previousCursor: string | undefined = undefined;
+
+  while (pageCount < maxPages) {
+    pageCount++;
+    const currentCursor = cursor;
+    const isFirstPage = currentCursor === undefined;
+
+    // Soroban RPC rejects queries containing BOTH startLedger and cursor.
+    const queryParams: SorobanRpc.Server.GetEventsRequest = isFirstPage
+      ? { startLedger: fromLedger, filters, limit }
+      : { cursor: currentCursor, filters, limit };
+
+    const pageLabel = `${label}[page=${pageCount}]`;
+
+    const response = await withRpcRetry(pageLabel, () =>
+      rpcClient.getEvents(queryParams),
+    );
+
+    const events = response.events || [];
+    if (events.length === 0) {
+      break;
+    }
+
+    let reachedBeyondWindow = false;
+    for (const ev of events) {
+      if (ev.ledger <= toLedger) {
+        allEvents.push(ev);
+      } else {
+        reachedBeyondWindow = true;
+      }
+    }
+
+    if (reachedBeyondWindow) {
+      break;
+    }
+
+    if (events.length < limit) {
+      break;
+    }
+
+    const lastEvent = events[events.length - 1];
+    const nextCursor = (response as any).cursor || (lastEvent as any).pagingToken || lastEvent.id;
+
+    if (!nextCursor || nextCursor === previousCursor) {
+      break;
+    }
+
+    previousCursor = nextCursor;
+    cursor = nextCursor;
+  }
+
+  return allEvents;
+}
+
 /**
  * Fetch all relevant events for [fromLedger, toLedger], build canonical
  * (event, handler) pairs sorted by ledger then event id, and process each
@@ -1191,28 +1294,35 @@ export async function runEventHandler(
  * After all event-carrying ledgers are done, setLastLedger advances the
  * cursor to toLedger to cover any trailing empty ledgers.
  */
-async function processEvents(fromLedger: number, toLedger: number) {
+export async function processEvents(fromLedger: number, toLedger: number) {
   const startedAt = Date.now();
 
-  // ── 1. Fetch factory + reputation events ────────────────────────────────
-  const factoryResponse = await withRpcRetry("getEvents(factory+reputation)", () =>
-    rpc.getEvents({
-      startLedger: fromLedger,
-      filters: [
-        {
-          type: "contract",
-          contractIds: [FACTORY, REPUTATION],
-        },
-      ],
-      limit: EVENTS_LIMIT,
-    }),
-  );
+  // ── 1. Fetch factory + reputation events (with full pagination) ──────────
+  const factoryEvents = await fetchAllEventsWithPagination(rpc, {
+    fromLedger,
+    toLedger,
+    filters: [
+      {
+        type: "contract",
+        contractIds: [FACTORY, REPUTATION],
+      },
+    ],
+    limit: EVENTS_LIMIT,
+    label: "getEvents(factory+reputation)",
+  });
+
+  // Verify range consistency (Issue 98)
+  const factoryContradiction = detectEventRangeContradiction(factoryEvents, fromLedger, toLedger);
+  if (factoryContradiction) {
+    logLedgerContradiction(factoryContradiction);
+    throw new LedgerContradictionError(factoryContradiction);
+  }
 
   // ── 2. Pre-extract new circle addresses from factory events ──────────────
   // Doing this before any DB writes lets us include newly-created circles in
   // the circle-event query even before their circle_created event is committed.
   const newCircleAddrs: string[] = [];
-  for (const event of factoryResponse.events) {
+  for (const event of factoryEvents) {
     if (!event.topic || event.topic.length < 2) continue;
     if (getTopicStr(event, 0) === "factory" && getTopicStr(event, 1) === "circle_created") {
       try {
@@ -1230,23 +1340,29 @@ async function processEvents(fromLedger: number, toLedger: number) {
     ...new Set([...existingCircles.map((c) => c.address), ...newCircleAddrs]),
   ];
 
-  // ── 4. Fetch circle contract events ──────────────────────────────────────
-  const circleEvents: SdkEvent[] = [];
+  // ── 4. Fetch circle contract events (with full pagination) ───────────────
+  let circleEvents: SdkEvent[] = [];
   if (allCircleAddrs.length > 0) {
-    const circleResponse = await withRpcRetry("getEvents(circles)", () =>
-      rpc.getEvents({
-        startLedger: fromLedger,
-        filters: [{ type: "contract", contractIds: allCircleAddrs }],
-        limit: EVENTS_LIMIT,
-      }),
-    );
-    circleEvents.push(...circleResponse.events);
+    circleEvents = await fetchAllEventsWithPagination(rpc, {
+      fromLedger,
+      toLedger,
+      filters: [{ type: "contract", contractIds: allCircleAddrs }],
+      limit: EVENTS_LIMIT,
+      label: "getEvents(circles)",
+    });
+
+    // Verify range consistency (Issue 98)
+    const circleContradiction = detectEventRangeContradiction(circleEvents, fromLedger, toLedger);
+    if (circleContradiction) {
+      logLedgerContradiction(circleContradiction);
+      throw new LedgerContradictionError(circleContradiction);
+    }
   }
 
   // ── 5. Build (event, handler) pairs ──────────────────────────────────────
   const items: EventHandler[] = [];
 
-  for (const event of factoryResponse.events) {
+  for (const event of factoryEvents) {
     if (!event.topic || event.topic.length < 2) continue;
     const t0 = getTopicStr(event, 0);
     const t1 = getTopicStr(event, 1);
@@ -1411,13 +1527,20 @@ const backoffState = createBackoffState();
  * outages don't cause a hot loop or process exit. The backoff state resets
  * after any successful poll.
  */
-async function runPollCycle(): Promise<void> {
+export async function runPollCycle(): Promise<void> {
   const cycleStartedAt = Date.now();
   let lastLedger = await getLastLedger();
   if (lastLedger === 0) lastLedger = START_LEDGER;
 
   const latestLedger = await withRpcRetry("getLatestLedger", () => rpc.getLatestLedger());
   const toLedger = latestLedger.sequence;
+
+  // Issue 98: Detect contradictory ledger sequence regression
+  const contradiction = detectLedgerSequenceRegression(lastLedger, toLedger, latestLedger.id);
+  if (contradiction) {
+    logLedgerContradiction(contradiction);
+    throw new LedgerContradictionError(contradiction);
+  }
 
   if (toLedger > lastLedger) {
     await processEvents(lastLedger + 1, toLedger);
