@@ -1195,6 +1195,32 @@ mod tests {
     }
 
     #[test]
+    fn issue_713_increment_renews_persistent_score_ttl() {
+        let s = setup();
+        let member = Address::generate(&s.env);
+        s.client.add_authorized_caller(&s.admin, &s.contract_id);
+        s.client.increment(&s.contract_id, &member);
+
+        let initial_ttl = s.env.as_contract(&s.contract_id, || {
+            s.env.storage().persistent().get_ttl(&DataKey::Score(member.clone()))
+        });
+        assert!(initial_ttl >= 200_000);
+
+        s.env.ledger().with_mut(|ledger| ledger.sequence_number += initial_ttl - 99_999);
+        let near_expiry_ttl = s.env.as_contract(&s.contract_id, || {
+            s.env.storage().persistent().get_ttl(&DataKey::Score(member.clone()))
+        });
+        assert!(near_expiry_ttl < 100_000);
+
+        s.client.increment(&s.contract_id, &member);
+        let renewed_ttl = s.env.as_contract(&s.contract_id, || {
+            s.env.storage().persistent().get_ttl(&DataKey::Score(member.clone()))
+        });
+        assert!(renewed_ttl >= 200_000);
+        assert_eq!(s.client.score(&member), 2);
+    }
+
+    #[test]
     fn test_increment_multiple_times() {
         let s = setup();
         let member = Address::generate(&s.env);

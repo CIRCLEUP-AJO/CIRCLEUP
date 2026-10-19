@@ -7,7 +7,11 @@ that is true before and after every operation — if an invariant is ever false
 in production it is a bug.
 
 See [`docs/EVENTS.md`](./EVENTS.md) for event shapes,
-[`docs/RUNBOOK.md`](./RUNBOOK.md) for operational procedures.
+[`docs/RUNBOOK.md`](./RUNBOOK.md) for operational procedures, and
+[`docs/PROTOCOL_INVARIANTS.md`](./PROTOCOL_INVARIANTS.md) for contract-level
+guarantees linked to both enforcing code and executable tests. That reference
+is authoritative for the evidence status of authorization, collateral,
+contribution order, deadlines, defaults, payout, pause, cancellation, and close.
 
 ---
 
