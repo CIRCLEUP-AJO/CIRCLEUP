@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Install the exact Rust toolchain declared in contracts/rust-toolchain.toml.
       # The toolchain file is picked up automatically by rustup.
