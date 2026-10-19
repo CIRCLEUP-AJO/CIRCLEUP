@@ -131,6 +131,11 @@ type CopyState = "idle" | "success" | "error";
 //
 // Re-exported from lib/deadline.ts so the page-level staleness threshold and
 // the deadline display model share a single source of truth.
+import {
+  computeDeadlineDisplay,
+  DEADLINE_MAX_DATA_AGE_MS as MAX_DATA_AGE_MS,
+  SECONDS_PER_LEDGER,
+} from "@/lib/deadline";
 export { DEADLINE_MAX_DATA_AGE_MS as MAX_DATA_AGE_MS } from "@/lib/deadline";
 
 // ΓöÇΓöÇΓöÇ Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
@@ -1900,6 +1905,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
           )}
 
           {data.circle.status === "Pending" && isMember && !hasLockedCollateral && (
+            <>
             <button
               onClick={handleJoin}
               disabled={loading !== null || !actionsEnabled || !joinGate.allowed}
@@ -1922,6 +1928,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 {joinGate.message}
               </p>
             )}
+            </>
           )}
 
           {data.circle.status === "Active" &&
@@ -1992,6 +1999,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
           {(data.circle.status === "Completed" ||
             data.circle.status === "Cancelled") && (
+            <>
             <button
               onClick={handleClose}
               disabled={loading !== null || !actionsEnabled || !closeGate.allowed}
@@ -2014,6 +2022,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 {closeGate.message}
               </p>
             )}
+            </>
           )}
 
           {loading !== null && (

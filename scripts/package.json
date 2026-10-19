@@ -2,6 +2,7 @@
   "name": "@circleup/scripts",
   "version": "0.1.0",
   "scripts": {
+    "typecheck": "tsc --noEmit --module es2022 --moduleResolution bundler",
     "deploy:testnet": "ts-node src/deploy.ts",
     "mainnet:readiness": "ts-node src/mainnet-readiness.ts",
     "seed:demo": "ts-node src/seed-demo.ts",

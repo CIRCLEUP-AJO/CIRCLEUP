@@ -180,7 +180,7 @@ describe("send outcome is ambiguous", () => {
         lookup: "failed",
       });
       expect(result.diagnostics?.validUntil).toEqual(expect.any(Number));
-      expect(result.diagnostics?.lastError).toContain("socket hang up");
+      expect(result.diagnostics?.lastError).toContain("did not respond in time");
     }
     expectNotRebuilt();
   });

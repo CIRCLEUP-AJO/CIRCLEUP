@@ -909,6 +909,10 @@ export function formatPreflightReport(p: ReplayPreflightResult): string[] {
 
 if (require.main === module) {
   (async () => {
+    const finish = async (code: number): Promise<never> => {
+      await pool.end();
+      process.exit(code);
+    };
     const args = process.argv.slice(2);
     const fromArg = [...args].reverse().find((a) => a.startsWith("--from="));
     const confirmArg = [...args].reverse().find((a) => a.startsWith("--confirm="));
@@ -955,8 +959,7 @@ if (require.main === module) {
         }
       }
       console.log("[replay] Dry run complete — no changes made.");
-      await pool.end();
-      process.exit(code);
+      return finish(0);
     };
 
     try {

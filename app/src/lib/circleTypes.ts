@@ -371,6 +371,7 @@ export interface CircleState {
 export interface ReputationEvent {
   type: string;
   delta: number;
+  timestamp?: string;
 }
 
 export interface ReputationResponse {
@@ -390,11 +391,6 @@ export interface ReputationResponse {
   }>;
   events?: ReputationEvent[];
   updatedAt: string | null;
-  events?: Array<{
-    type: string;
-    delta: number;
-    timestamp?: string;
-  }>;
 }
 
 // ΓöÇΓöÇΓöÇ Runtime validators ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
