@@ -990,7 +990,7 @@ function formatRpcError(raw: string, rpcUrl: string): string {
     lower.includes("socket hang up")
   ) {
     return (
-      `The RPC at ${rpcUrl} did not respond in time. ` +
+      `The RPC at ${rpcUrl} did not respond in time (${raw}). ` +
       `The node may be overloaded — wait a moment and retry.`
     );
   }
@@ -3531,7 +3531,7 @@ function validateEnvelope(body: unknown, spec: EnvelopeSpec): string | null {
         : type === "object"
           ? value !== null && typeof value === "object" && !Array.isArray(value)
           : typeof value === type;
-    if (!ok) return `field "${key}" must be ${type === "array" ? "an array" : `a ${type}`}`;
+    if (!ok) return type === "array" ? `"${key}" is not an array` : `field "${key}" must be a ${type}`;
   }
   return null;
 }
