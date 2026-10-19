@@ -262,8 +262,8 @@ npm run dev:app
 ### 7. Seed the demo circle
 
 ```bash
-npm run seed:demo
-# Creates a 4-member $100/round testnet circle
+npm run seed:demo --workspace=scripts -- --always-create
+# Creates a new 4-member $100/round testnet circle; each run creates fresh state.
 # Runs Round 1 (all contribute → Alice receives $400)
 # Shows Round 2 default for Dave
 ```
