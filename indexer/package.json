@@ -42,7 +42,7 @@
     "license-checker": "^25.0.1",
     "supertest": "^7.3.1",
     "ts-node-dev": "^2.0.0",
-    "typescript": "^5.4.5",
+    "typescript": "^7.0.2",
     "vitest": "^5.0.5"
   }
 }
