@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/stellar";
@@ -897,8 +897,17 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [inviteUrl,           setInviteUrl]           = useState<string | null>(null);
   const [contributionReceipt, setContributionReceipt] = useState<ContributionReceipt | null>(null);
   const [defaultConfirm,      setDefaultConfirm]      = useState<DefaultConfirmState | null>(null);
+  const defaultConfirmRef = useRef<HTMLDivElement>(null);
+  const defaultConfirmTriggerRef = useRef<HTMLElement | null>(null);
   const [inviteCopyState,     setInviteCopyState]     = useState<CopyState>("idle");
   const [receiptCopyState,    setReceiptCopyState]    = useState<CopyState>("idle");
+
+  const dismissDefaultConfirm = useCallback(() => {
+    setDefaultConfirm(null);
+    if (defaultConfirmTriggerRef.current && typeof defaultConfirmTriggerRef.current.focus === "function") {
+      defaultConfirmTriggerRef.current.focus();
+    }
+  }, []);
 
   // Whether a manual refresh (triggered by Stale or Partial banners) is running
   const [isManualRefreshing, setIsManualRefreshing] = useState(false);
@@ -1446,11 +1455,63 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
   }
 
-  // ΓöÇΓöÇ Default flow ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+  // ── Default flow ──────────────────────────────────────────────────────────
 
   function handleMarkDefault(memberAddress: string) {
+    if (typeof document !== "undefined") {
+      defaultConfirmTriggerRef.current = document.activeElement as HTMLElement | null;
+    }
     setDefaultConfirm({ memberAddress, roundIndex: currentRound });
   }
+
+  useEffect(() => {
+    if (!defaultConfirm) return;
+
+    const dialog = defaultConfirmRef.current;
+    if (dialog) {
+      const focusable = dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      if (focusable.length > 0) {
+        focusable[0].focus();
+      }
+    }
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        dismissDefaultConfirm();
+        return;
+      }
+
+      if (e.key === "Tab" && dialog) {
+        const focusable = Array.from(
+          dialog.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), [tabindex]:not([tabindex="-1"])'
+          )
+        );
+        if (focusable.length === 0) return;
+
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+
+        if (e.shiftKey) {
+          if (document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+          }
+        } else {
+          if (document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+          }
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [defaultConfirm, dismissDefaultConfirm]);
 
   async function doDefault(memberAddress: string) {
     if (!walletAddress) {
@@ -1776,16 +1837,18 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
         {defaultConfirm && (
           <div
+            ref={defaultConfirmRef}
             role="alertdialog"
-            aria-modal="false"
+            aria-modal="true"
             aria-labelledby="default-confirm-title"
-            className="bg-amber-50 border border-amber-300 rounded-lg p-4 mb-3 space-y-3"
+            tabIndex={-1}
+            className="bg-amber-50 border border-amber-300 rounded-lg p-4 mb-3 space-y-3 outline-none"
           >
             <h3
               id="default-confirm-title"
               className="font-semibold text-amber-900 text-sm"
             >
-              ΓÜá∩╕Å Confirm Default
+              ⚠️ Confirm Default
             </h3>
             <dl className="text-sm space-y-1 text-amber-800">
               <div className="flex gap-2">
@@ -1819,19 +1882,21 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
             </p>
             <div className="flex gap-2">
               <button
-                onClick={() => setDefaultConfirm(null)}
-                className="px-3 py-2 text-sm rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors"
+                type="button"
+                onClick={dismissDefaultConfirm}
+                className="px-3 py-2 text-sm rounded-lg border border-amber-400 text-amber-800 hover:bg-amber-100 transition-colors focus:ring-2 focus:ring-amber-500 focus:outline-none"
               >
                 Cancel
               </button>
               <button
+                type="button"
                 onClick={() => {
                   const addr = defaultConfirm.memberAddress;
-                  setDefaultConfirm(null);
+                  dismissDefaultConfirm();
                   doDefault(addr);
                 }}
                 disabled={loading !== null || !actionsEnabled}
-                className="px-3 py-2 text-sm rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className="px-3 py-2 text-sm rounded-lg bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors focus:ring-2 focus:ring-red-500 focus:outline-none"
               >
                 Confirm &amp; Sign
               </button>

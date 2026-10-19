@@ -111,23 +111,10 @@ New-Item -ItemType Directory -Force -Path scripts/archive | Out-Null
 Copy-Item scripts/deployed-manifest.json $dest
 ```
 
-Add a `supersededAt` and `supersededBy` field to the archived copy to make its
-status self-describing:
-
-```json
-{
-  "manifestVersion": "1",
-  "network": "testnet",
-  ...
-  "supersededAt": "2026-10-16T14:30:00Z",
-  "supersededBy": "deployed-manifest-20261016T143100Z.json"
-}
-```
-
-These two fields are not part of the `DeploymentManifest` interface validated
-by `validateManifest()` — they are metadata added only to archived copies.
-`validateManifest()` ignores unknown fields, so the archived copy remains
-parseable.
+Do not edit the archived JSON. Its schema-versioned checksum covers its
+contents, and archives are immutable copies of the deployment record. Record
+`supersededAt`, `supersededBy`, and the reason in the deployment history and
+CHANGELOG instead.
 
 ### Step 2 — Update the active manifest
 
@@ -209,7 +196,7 @@ timestamp is the moment the archive copy was written, not the deployment time
 | Archived manifests (`scripts/archive/`) | **Permanent** | Contains WASM hash, deploy tx hash, deployer public key, git commit, and network passphrase. Needed to verify reproducibility claims and trace any on-chain contract to its source build. |
 | `deployTxHash` per contract | **Permanent** (in manifest) | The transaction hash proves the deployment happened and when. It is the chain of custody from source code to on-chain contract. |
 | `wasmHash` per contract | **Permanent** (in manifest) | Links the on-chain WASM to the build artifact verified by `contracts/expected-hashes.json` and the reproducibility CI. |
-| `integrityHash` | **Permanent** (in manifest) | SHA-256 over core manifest fields; detects post-archive tampering. |
+| `integrityHash` | **Permanent** (in manifest) | Schema 2 SHA-256 over all manifest fields except the checksum itself; detects accidental or unsophisticated changes, not authorship. |
 | `gitCommit` in manifest | Permanent when available | Links the deployment to the exact source commit. The deploy script populates this automatically when run inside a git repository. |
 | Incident notes and post-mortems | **Permanent** | If a superseded deployment was retired due to a bug or incident, the post-mortem or issue link belongs in the CHANGELOG entry and optionally in the runbook. |
 | Operator `.env` files | Do **not** commit to git | These contain network-specific values and may reference secrets; the profile files serve as the committed reference. |
@@ -246,9 +233,23 @@ CIRCLEUP_PROFILE=production npx ts-node scripts/src/validate-env.ts
 
 ### Manifest network guard
 
-`validateManifest()` rejects a manifest whose `network` field does not match
-the caller's expected network. Use this guard in deployment scripts and CI jobs
-that consume a manifest:
+`validateManifest()` supports schema 1 (the historical field set and checksum)
+and schema 2 (the current complete manifest shape and checksum). New manifests
+are always written as schema 2. Unsupported versions and unknown network names
+fail validation; consumers must not guess or silently reinterpret a schema.
+Schema 1 remains readable for deployed history, but its historical checksum
+does not cover every field. Use schema 2 for new release records.
+
+The SHA-256 checksum is an integrity consistency check, not a signature. Anyone
+who can edit a manifest can recompute an unkeyed checksum, so it does not prove
+who created the manifest, that it came from a trusted build, or that an on-chain
+deployment is authentic. Authenticity and provenance still require trusted
+release controls, reviewed source/build records, and independent on-chain
+verification. No signing key is configured by this project today.
+
+`validateManifest()` also rejects a manifest whose `network` field does not
+match the caller's expected network. Use this guard in deployment scripts and
+CI jobs that consume a manifest:
 
 ```typescript
 import { validateManifest } from "./deployment-manifest";
@@ -275,8 +276,9 @@ manifest:
   run: npx ts-node scripts/src/deployment-manifest.ts scripts/deployed-manifest.json ${{ env.NETWORK }}
 ```
 
-The script exits non-zero on any validation failure, blocking the job before
-stale or tampered addresses can propagate.
+The script exits non-zero on validation failures, blocking the job before
+stale addresses or checksum-inconsistent manifests can propagate. The checksum
+is not an authenticity proof; see the schema and integrity guarantees above.
 
 ### Runtime identity verification (SDK)
 
@@ -336,13 +338,11 @@ including deployed contracts. After a testnet reset:
 
 1. All previous testnet deployments are effectively unreachable (the ledger
    no longer exists), but their archived manifests remain valid historical records.
-2. Add a note to the archived manifest:
+2. Leave the archived manifest unchanged and record the reset in the deployment
+   history and CHANGELOG:
 
-   ```json
-   "supersededAt": "2026-10-16T00:00:00Z",
-   "supersededBy": "testnet-reset",
-   "supersededReason": "Stellar testnet reset — ledger history no longer accessible"
-   ```
+   Include the reset date, the superseded manifest filename, and the reason
+   (`Stellar testnet reset — ledger history no longer accessible`).
 
 3. Run a fresh testnet deployment following the standard procedure.
 4. Update `profiles/testnet.env` with the new addresses.
@@ -359,8 +359,9 @@ the normal notice period:
 
 1. Follow Steps 1–5 of [Marking a deployment superseded](#marking-a-deployment-superseded)
    as quickly as possible.
-2. In the archived manifest, set `supersededReason` to a brief description of
-   the issue (avoid disclosing exploit details before coordinated disclosure).
+2. In the deployment history, record a brief supersession reason without
+   modifying the archived manifest or disclosing exploit details before
+   coordinated disclosure.
 3. Add a `### Security` entry in `CHANGELOG.md` referencing the new addresses
    and the disclosure timeline.
 4. Notify integrators via the coordinated disclosure process in `SECURITY.md`.
@@ -383,3 +384,61 @@ the factory must be redeployed:
    The indexer will begin tracking circles created by the new factory; circles
    created by the old factory remain in the database and their historical data
    is preserved.
+
+---
+
+## Contract Artifact Verification, Provenance, and Review Requirements
+
+The compiled Soroban WASM artifacts deployed on-chain (`reputation.wasm`,
+`circle_factory.wasm`, `circle.wasm`) represent the definitive executable
+contracts of CircleUp. Differences in compiler version, target flags, or
+optimization profiles can produce binaries that diverge from audited source.
+
+To prevent silent supply-chain drift, unexpected compiler differences, and
+unauthorized bytecode deployment, CircleUp implements a strict cryptographic
+provenance and reproducibility pipeline.
+
+### 1. Key Components
+
+| Component | File Path | Function |
+|---|---|---|
+| **Pinned Toolchain** | `contracts/rust-toolchain.toml` | Pinned Rust compiler channel (e.g. `1.81.0`) and `wasm32-unknown-unknown` target. |
+| **Expected Hashes** | `contracts/expected-hashes.json` | Committed SHA-256 hashes of the release WASMs built from the repository source. |
+| **Build Provenance** | `contracts/provenance.json` | Machine-readable metadata capturing Git commit SHA, branch, dirty flag, toolchain, compiler version (`rustc`, `cargo`), artifact sizes, and hashes. |
+| **Verification Tooling** | `scripts/src/check-artifact-hashes.ts` | CLI utility to verify hashes, generate provenance, and update expected hashes. |
+| **Reproducibility CI** | `.github/workflows/reproducibility.yml` | Two-pass clean build workflow that asserts byte-for-byte determinism, verifies against `expected-hashes.json`, and uploads provenance metadata. |
+
+### 2. The Verification Workflow
+
+On every push and pull request touching `contracts/**`:
+
+1. CI initializes the pinned Rust toolchain from `contracts/rust-toolchain.toml`.
+2. First-pass build compiles all contracts in release mode (`--release --target wasm32-unknown-unknown`).
+3. `scripts/src/check-artifact-hashes.ts --provenance` generates full provenance metadata.
+4. `scripts/src/check-artifact-hashes.ts` validates that every artifact SHA-256 matches `contracts/expected-hashes.json`. If any hash differs or is unpopulated, CI fails immediately.
+5. A second build is performed from a clean cache (`cargo clean`) to prove byte-for-byte determinism across builds.
+6. Provenance metadata (`contracts/provenance.json`) and release binaries are published as GitHub Actions artifacts for auditability.
+
+### 3. Review Procedure for Intentional Hash Changes
+
+When contract source code is changed, dependencies are updated, or the Rust
+toolchain is upgraded:
+
+1. **Local Build & Hash Update**:
+   - Build with the pinned toolchain:
+     ```bash
+     cargo build --release --target wasm32-unknown-unknown --manifest-path contracts/Cargo.toml
+     ```
+   - Re-generate `expected-hashes.json` and `provenance.json`:
+     ```bash
+     npm run hash-artifacts --workspace=scripts
+     ```
+2. **Pull Request Inclusion**:
+   - The updated `contracts/expected-hashes.json` (and `contracts/rust-toolchain.toml` if the toolchain was modified) **must be committed in the same PR** as the source code changes.
+   - Standalone PRs that update `expected-hashes.json` without corresponding source or toolchain changes are strictly rejected.
+3. **Mandatory Review Criteria**:
+   - Reviewers must trace every hash change back to the concrete contract diffs in the PR.
+   - At least two maintainers must approve the PR before merging.
+   - The GitHub Actions `reproducibility` workflow must pass with green checks on both build passes.
+4. **Release Provenance Verification**:
+   - Prior to deploying contracts to testnet or mainnet, the release engineer must verify that the Git commit SHA recorded in the CI build provenance artifact matches the release git tag.

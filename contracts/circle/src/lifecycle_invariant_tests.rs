@@ -345,7 +345,7 @@ mod lifecycle_invariant_tests {
         // Must not panic — the deadline ledger itself is still on-time.
         t.circle.contribute(&t.alice);
         assert!(
-            t.circle.has_contributed(&t.alice, 0),
+            t.circle.has_contributed(&t.alice, &0),
             "contribution at deadline_ledger must be accepted"
         );
     }
@@ -772,7 +772,7 @@ mod lifecycle_invariant_tests {
 
         // Should succeed after resume.
         t.circle.contribute(&t.alice);
-        assert!(t.circle.has_contributed(&t.alice, 0));
+        assert!(t.circle.has_contributed(&t.alice, &0));
     }
 
     #[test]

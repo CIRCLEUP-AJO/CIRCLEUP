@@ -10,6 +10,9 @@
     "scripts"
   ],
   "scripts": {
+    "preinstall": "node scripts/check-node.cjs",
+    "check:node": "node scripts/check-node.cjs",
+    "check:toolchain": "ts-node scripts/src/validate-toolchain.ts",
     "install:all": "npm install",
     "build:sdk": "npm run build --workspace=sdk",
     "build:app": "npm run build --workspace=app",
@@ -17,6 +20,7 @@
     "dev:indexer": "npm run dev --workspace=indexer",
     "dev": "npm run dev:indexer & npm run dev:app",
     "deploy:testnet": "npm run deploy:testnet --workspace=scripts",
+    "mainnet:readiness": "npm run --workspace=scripts mainnet:readiness --",
     "seed:demo": "npm run seed:demo --workspace=scripts",
     "migrate": "npm run migrate:dev --workspace=indexer",
     "hash-artifacts": "npm run hash-artifacts --workspace=scripts",
@@ -26,13 +30,15 @@
     "lint": "npm run lint --workspace=app",
     "test": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
     "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
+    "test:keyboard": "node --experimental-strip-types --test tests/keyboard-navigation.test.ts",
     "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.4.5"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.18.0 <19 || >=22 <23 || >=24 <25",
+    "npm": ">=9 <12"
   },
   "repository": {
     "type": "git",
