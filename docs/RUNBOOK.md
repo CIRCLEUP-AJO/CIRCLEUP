@@ -1,4 +1,4 @@
-﻿# CircleUp Operational Runbook
+# CircleUp Operational Runbook
 
 This document is the primary operational and contributor reference for the full CircleUp stack. It covers architecture, local development, deployment, environment configuration, data flow, troubleshooting, and common failure recovery procedures.
 
@@ -967,6 +967,30 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 4. For `partial`: locate the missing migration files. Do not re-run the runner blindly ΓÇö it will try to apply files it thinks are pending and may duplicate or conflict.
 
 The indexer continues serving data in a `drifted` or `partial` state; the warning is surfaced so it is not missed before the next deploy.
+
+---
+
+### Indexer: "LEDGER_CONTRADICTION" / "ledger_contradiction_detected"
+
+**Symptom:** Indexer logs an error with `[LEDGER_CONTRADICTION] SEQUENCE_REGRESSION` or `INCONSISTENT_EVENT_RANGE` and engages backoff without advancing the cursor.
+
+**Meaning:**
+- The Soroban RPC endpoint returned a `latestLedger.sequence` that is strictly less than the indexer's durable `last_ledger` stored in Postgres, or returned events outside the queried window.
+- This is commonly caused by routing to a lagging RPC replica in a load-balanced cluster, or a validator node that fell behind the network consensus.
+
+**Resolution:**
+1. Check RPC sequence across individual cluster nodes:
+   ```bash
+   curl -s -X POST -H "Content-Type: application/json" \
+     --data '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}' \
+     "$STELLAR_RPC_URL" | jq '.result.sequence'
+   ```
+2. Verify committed cursor in indexer database:
+   ```sql
+   SELECT last_ledger, updated_at FROM indexer_state;
+   ```
+3. If an individual RPC node is lagging: Remove it from the cluster upstream pool or failover to an in-sync RPC node.
+4. **DO NOT** execute manual rollbacks or decrement `last_ledger`. Stellar consensus is strictly monotonic; the indexer will automatically resume once the RPC endpoint reaches or exceeds `last_ledger`.
 
 ---
 

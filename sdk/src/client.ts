@@ -818,7 +818,7 @@ function formatRpcError(raw: string, rpcUrl: string): string {
     lower.includes("socket hang up")
   ) {
     return (
-      `The RPC at ${rpcUrl} did not respond in time. ` +
+      `The RPC at ${rpcUrl} did not respond in time (${raw}). ` +
       `The node may be overloaded — wait a moment and retry.`
     );
   }
@@ -3347,7 +3347,7 @@ function validateEnvelope(body: unknown, spec: EnvelopeSpec): string | null {
         : type === "object"
           ? value !== null && typeof value === "object" && !Array.isArray(value)
           : typeof value === type;
-    if (!ok) return `field "${key}" must be ${type === "array" ? "an array" : `a ${type}`}`;
+    if (!ok) return type === "array" ? `"${key}" is not an array` : `field "${key}" must be a ${type}`;
   }
   return null;
 }
@@ -3608,8 +3608,8 @@ export class IndexerClient {
    * timeout and by the caller's `signal`. Throws {@link IndexerError} with a
    * distinct `kind` for each failure category.
    */
-  private async get<T>(path: string): Promise<T> {
-    return (await this.request<T>(path)).body;
+  private async get<T>(path: string, spec: EnvelopeSpec = {}, options?: IndexerRequestOptions): Promise<T> {
+    return (await this.request<T>(path, spec, options)).body;
   }
 
   /**
@@ -3626,8 +3626,10 @@ export class IndexerClient {
     path: string,
     itemsKey: keyof T & string,
     requested: { page: number; limit?: number },
+    spec: EnvelopeSpec = {},
+    options?: IndexerRequestOptions,
   ): Promise<T> {
-    const { body, status, url } = await this.request<T>(path);
+    const { body, status, url } = await this.request<T>(path, spec, options);
     const fail = (problem: string): never => {
       throw new IndexerError(
         `Indexer response from ${url} has an invalid page envelope: ${problem}`,
@@ -3690,7 +3692,11 @@ export class IndexerClient {
   }
 
   /** Fetch `path` and return the parsed body with the status and URL it came from. */
-  private async request<T>(path: string): Promise<{ body: T; status: number; url: string }> {
+  private async request<T>(
+    path: string,
+    spec: EnvelopeSpec = {},
+    options?: IndexerRequestOptions,
+  ): Promise<{ body: T; status: number; url: string }> {
     const url = `${this.baseUrl}${path}`;
     const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
     assertPositiveTimeout(timeoutMs, "timeoutMs");
@@ -3752,14 +3758,52 @@ export class IndexerClient {
         );
       }
 
-    try {
-      return { body: (await response.json()) as T, status: response.status, url };
-    } catch (err: any) {
-      throw new IndexerError(
-        `Failed to parse JSON response from ${url}: ${err?.message ?? "invalid JSON"}`,
-        response.status,
-        url,
-      );
+      if (!response.ok) {
+        let detail = "";
+        try {
+          const body = (await bounded(response.json())) as Record<string, unknown>;
+          const msg = body?.error;
+          detail = typeof msg === "string" ? ` — ${msg.slice(0, MAX_ERROR_DETAIL_LENGTH)}` : "";
+        } catch {
+          if (failure) throw failure;
+          // Ignore parse failure for error bodies (HTML error pages, empty bodies)
+        }
+        throw new IndexerError(
+          `Indexer returned HTTP ${response.status} for ${url}${detail}`,
+          response.status,
+          url,
+          "http",
+        );
+      }
+
+      let body: unknown;
+      try {
+        body = await bounded(response.json());
+      } catch (err: any) {
+        if (failure) throw failure;
+        throw new IndexerError(
+          `Failed to parse JSON response from ${url}: ${err?.name === "SyntaxError" ? "body is not valid JSON" : (err?.message ?? "invalid JSON")}`,
+          response.status,
+          url,
+          "json",
+        );
+      }
+
+      const problem = validateEnvelope(body, spec);
+      if (problem) {
+        throw new IndexerError(
+          `Unexpected response shape from ${url}: ${problem}. ` +
+          "The indexer and SDK versions may be incompatible.",
+          response.status,
+          url,
+          "schema",
+        );
+      }
+
+      return { body: body as T, status: response.status, url };
+    } finally {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
     }
   }
 
@@ -3791,9 +3835,18 @@ export class IndexerClient {
    * @throws {@link IndexerError} on an HTTP/network failure, or when the
    *   response's page envelope is missing or does not match the request.
    */
-  async getCircles(params?: GetCirclesParams): Promise<ApiCirclesListResponse> {
+  async getCircles(
+    params?: GetCirclesParams,
+    options?: IndexerRequestOptions,
+  ): Promise<ApiCirclesListResponse> {
     const { query, page, limit } = buildCirclesQuery("getCircles", params);
-    return this.getPage<ApiCirclesListResponse>(`/circles${query}`, "circles", { page, limit });
+    return this.getPage<ApiCirclesListResponse>(
+      `/circles${query}`,
+      "circles",
+      { page, limit },
+      { circles: "array" },
+      options,
+    );
   }
 
   /**
@@ -3948,12 +4001,15 @@ export class IndexerClient {
   async getMemberContributions(
     member: string,
     options?: GetMemberContributionsParams,
+    requestOptions?: IndexerRequestOptions,
   ): Promise<ApiMemberContributionsResponse> {
     const { query, page, limit } = buildContributionsQuery("getMemberContributions", options);
     return this.getPage<ApiMemberContributionsResponse>(
       `/members/${encodeURIComponent(member)}/contributions${query}`,
       "contributions",
       { page, limit },
+      { contributions: "array" },
+      requestOptions,
     );
   }
 

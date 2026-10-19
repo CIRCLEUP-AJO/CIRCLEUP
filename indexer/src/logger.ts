@@ -87,6 +87,7 @@ export type LogEventKey =
   // Ledger processing
   | "ledger_processed"
   | "ledger_gap_detected"           // ledgers with no events in the range
+  | "ledger_contradiction_detected" // sequence regression or contradictory response
   // Soroban event ingest
   | "event_ingested"
   | "event_skipped"                 // duplicate — already in ingested_events
@@ -158,6 +159,14 @@ export interface LedgerGapCtx {
   gaps: number[];
   fromLedger: number;
   toLedger: number;
+}
+
+export interface LedgerContradictionCtx {
+  type: string;
+  durableLedger: number;
+  observedLedger: number;
+  detail: string;
+  observedId?: string;
 }
 
 export interface EventIngestedCtx {
@@ -252,7 +261,7 @@ export interface ApiCorsRejectedCtx {
 }
 
 // Generic fallback for events without a specific shape
-export type LogContext = Record<string, unknown>;
+export type LogContext = Record<string, any>;
 
 // ─── Transport ────────────────────────────────────────────────────────────────
 
@@ -448,6 +457,12 @@ export function logLedgerProcessed(ctx: LedgerProcessedCtx): void {
 export function logLedgerGaps(ctx: LedgerGapCtx): void {
   log("debug", "ledger_gap_detected", ctx as LogContext,
     `${ctx.gaps.length} ledger gap(s) in ${ctx.fromLedger}-${ctx.toLedger}`);
+}
+
+/** Contradictory ledger response detected from RPC. */
+export function logLedgerContradiction(ctx: LedgerContradictionCtx): void {
+  log("error", "ledger_contradiction_detected", ctx as LogContext,
+    `[LEDGER_CONTRADICTION] ${ctx.type}: observed ledger ${ctx.observedLedger} contradicts durable ledger ${ctx.durableLedger}. ${ctx.detail}`);
 }
 
 /** A Soroban event was successfully ingested. */

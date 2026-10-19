@@ -248,6 +248,52 @@ POLL_BACKOFF_MULTIPLIER=2.0
 POLL_INTERVAL_MS=5000
 ```
 
+## Ledger Finality Assumptions & Contradiction Handling (Issue 98)
+
+### Supported-Network Finality Assumptions
+
+Stellar operates under the **Stellar Consensus Protocol (SCP)**, a Federated Byzantine Agreement (FBA) system:
+1. **Immediate Deterministic Finality**: Once a quorum of validators externalizes a ledger slot, the ledger is definitive and final. Unlike Proof-of-Work networks (Bitcoin/Ethereum) which rely on probabilistic finality and longest-chain rules, Stellar does not experience natural reorganizations, orphaned blocks, or uncle forks.
+2. **Monotonic Sequences**: Ledger sequence numbers on-chain increase strictly monotonically (`L_{n+1} = L_n + 1`).
+3. **No Automatic Rollback Guarantees**: Because Stellar state transitions are irreversible and consensus does not reorg, the CircleUp indexer does **not** support or implement automated rollbacks of committed state. Once ledger `N` is committed to Postgres, data is durable. Implementing automated state rollback on a lag signal from an RPC node would risk corrupting valid, finalized state.
+
+### Detectable Contradiction Conditions
+
+While the blockchain consensus is immutable, indexers communicate with the network via **Soroban RPC providers** (which are typically distributed clusters with load balancers, caching proxies, and multiple replica nodes). Observable contradictions can occur:
+- **Sequence Regression (`SEQUENCE_REGRESSION`)**: A poll cycle queries `rpc.getLatestLedger()` and observes a sequence $S_{observed} < S_{durable}$ where $S_{durable}$ is the committed `last_ledger` cursor in `indexer_state`.
+  - *Cause*: Request routed to a lagging RPC node replica, a replica restoring from backup, or node desynchronization.
+- **Inconsistent Event Range (`INCONSISTENT_EVENT_RANGE`)**: A `getEvents` query returns events whose ledger is strictly less than the requested `fromLedger` or strictly greater than the bounded `toLedger`.
+  - *Cause*: RPC node filter bug or desynchronized event indexing pipeline.
+- **Ledger Identity Mismatch (`LEDGER_IDENTITY_CONFLICT`)**: A ledger sequence returns a different closed timestamp or hash than previously observed.
+
+### Defensive Poller Policy
+
+The indexer refuses to silently advance or overwrite state when a contradiction is detected:
+1. **Refusal to Advance Cursor**: On detecting sequence regression or range contradiction, the indexer throws `LedgerContradictionError` and refuses to update `last_ledger`.
+2. **Structured Alerting**: The poller logs an error event `ledger_contradiction_detected` containing the durable ledger, observed ledger, contradiction type, and remediation steps.
+3. **Exponential Backoff**: The failure increments `consecutiveFailures`, entering backoff to allow lagging RPC replicas time to synchronize or for load-balancer health checks to remove stale nodes.
+4. **No Destructive Action**: The database cursor and committed projections remain intact.
+
+### Operator Investigation & Safe Replay Guidance
+
+When a `ledger_contradiction_detected` alert fires:
+1. **Check RPC Cluster Sync**:
+   ```bash
+   curl -s -X POST -H "Content-Type: application/json" \
+     --data '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}' \
+     "$STELLAR_RPC_URL" | jq '.result.sequence'
+   ```
+   Query multiple direct replica endpoints behind the load balancer to identify lagging nodes.
+2. **Verify Database State**:
+   ```sql
+   SELECT last_ledger, updated_at FROM indexer_state;
+   SELECT MAX(ledger) FROM ledger_checkpoints;
+   ```
+3. **Remediation**:
+   - If a specific RPC replica is stale: Remove it from the load balancer target pool. Once all routed endpoints report sequence $\ge S_{durable}$, the indexer automatically resumes polling without manual intervention.
+   - If an RPC provider was migrated to a different network or testnet reset: The cursor in `indexer_state` must be reset deliberately by an operator after validating the contract addresses.
+   - Safe Replay: If events in a range need re-processing, replay is safe because event ingestion uses `ON CONFLICT DO NOTHING` on `(tx_hash, event_index)`.
+
 ## Testing
 
 ### Backoff Tests

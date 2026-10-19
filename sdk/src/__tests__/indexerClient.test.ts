@@ -463,7 +463,7 @@ describe("IndexerClient transport", () => {
   });
 
   it("passes an AbortSignal to fetch", async () => {
-    const mockFetch = mockOk({ circles: [] });
+    const mockFetch = mockOk(circlesPage([]));
     vi.stubGlobal("fetch", mockFetch);
 
     await new IndexerClient(BASE_CONFIG).getCircles();
