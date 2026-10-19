@@ -8,6 +8,30 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Issue #715**: Added `docs/CONTRACT_REFERENCE.md` as the canonical reference for
+  all public methods, error codes, and authorization rules across the
+  `circle_factory`, `circle`, and `reputation` contracts.  The README Contracts
+  Reference section now links to it.  A coverage-drift check command is included
+  so undocumented public entry-points are caught before they land.
+- **Issue #716**: Added explicit secret-redaction guidance to `SECURITY.md`,
+  `SUPPORT.md`, and the bug-report issue template.  Each surface now names the
+  prohibited items (seeds, private keys, signed XDR, API credentials, production
+  wallet addresses) with safe substitutes.  Vulnerabilities are routed to the
+  private GitHub Security Advisory process.
+- **Issue #717**: Added a "Protocol and Wire-Format Changes" section to
+  `CONTRIBUTING.md` with per-category checklists covering contract events,
+  method signatures, database schema, API response fields, SDK exports, and
+  artifact-hash updates.  Each checklist item links to the affected file and
+  includes a verification command.
+- **Issue #718**: Added `docs/CONTRACT_SECURITY_CHECKLIST.md` — a structured
+  review prompt for contract PRs covering authorization, arithmetic, token
+  transfers, reentrancy, lifecycle, events, storage cost, and rollback
+  semantics.  The PR template now includes an expandable contract-security
+  section and two new checklist items; `CONTRIBUTING.md` Governance References
+  links to the checklist.  The document explicitly states that completing the
+  checklist does not replace a specialist security audit.
+
 ### Changed (SDK)
 - **Strict RPC decoding** (`sdk/src/types.ts`): reads now fail at the
   decoding boundary, with the method or field named, on wrong variants, absent

@@ -498,6 +498,8 @@ formatPot("10000000", 4);      // → "4.00"
 
 ## Contracts Reference
 
+> **Full reference:** [`docs/CONTRACT_REFERENCE.md`](./docs/CONTRACT_REFERENCE.md) — canonical entry-point signatures, error codes, authorization rules, and links to event payload tables for all three contracts.
+
 ### `circle_factory`
 
 | Function | Auth | Parameters | Returns | Description |
