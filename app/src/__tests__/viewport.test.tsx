@@ -53,7 +53,7 @@ vi.mock("next/link", () => ({
   ),
 }));
 
-import { CreateClient } from "@/app/create/CreateClient";
+import CreateClient from "@/app/create/CreateClient";
 import { CircleCard, type Circle } from "@/components/CircleCard";
 
 const baseCircle: Circle = {
@@ -73,7 +73,7 @@ describe("viewport — create form", () => {
     const name = screen.getByLabelText(/circle name/i);
     const amount = screen.getByLabelText(/contribution amount/i);
     const days = screen.getByLabelText(/round duration/i);
-    const member1 = screen.getByLabelText(/member 1 of/);
+    const member1 = screen.getByRole("textbox", { name: /member 1 of/i });
 
     for (const el of [name, amount, days, member1]) {
       expect(el).not.toHaveAttribute("disabled");
@@ -83,7 +83,7 @@ describe("viewport — create form", () => {
 
   it("keeps long member addresses legible on narrow viewports (input stacks full-width)", () => {
     render(<CreateClient />);
-    const member1 = screen.getByLabelText(/member 1 of/) as HTMLInputElement;
+    const member1 = screen.getByRole("textbox", { name: /member 1 of/i }) as HTMLInputElement;
     expect(member1.className).toContain("w-full");
     expect(member1.className).toContain("sm:flex-1");
     expect(member1.className).toContain("font-mono");
@@ -95,7 +95,7 @@ describe("viewport — create form", () => {
       document.querySelectorAll('input:not([disabled]), button:not([disabled])'),
     );
     const labels = focusable.map((el) => el.getAttribute("aria-label") ?? el.getAttribute("placeholder") ?? el.textContent ?? "");
-    const firstMember = labels.find((l) => /member 1 of/.test(l ?? ""));
+    const firstMember = labels.find((l) => /member 1 of/i.test(l ?? ""));
     const submit = labels.find((l) => /create circle/i.test(l ?? ""));
     expect(firstMember).toBeDefined();
     expect(submit).toBeDefined();
@@ -113,7 +113,8 @@ describe("viewport — create form", () => {
 describe("viewport — circle card", () => {
   it("truncates long addresses with the full value available via title", () => {
     render(<CircleCard circle={baseCircle} />);
-    const address = screen.getByText(/CCIR…D2KM/);
+    const shortenedAddress = `${baseCircle.address.slice(0, 4)}…${baseCircle.address.slice(-4)}`;
+    const address = screen.getByText(shortenedAddress);
     expect(address).toHaveAttribute("title", baseCircle.address);
     expect(address).toHaveClass("truncate");
   });

@@ -720,6 +720,7 @@ export function checkWalletCapabilities(): ContractAppError | null {
  */
 export async function submitContractTx(
   preparedXdr: string,
+  accountToSign: string,
   txCtx: ReturnType<typeof startTx>,
   signal?: AbortSignal,
 ): Promise<InvokeResult> {
@@ -751,6 +752,7 @@ export async function submitContractTx(
   try {
     signedXdr = await signTransaction(preparedXdr, {
       networkPassphrase: NETWORK_PASSPHRASE,
+      accountToSign,
     });
   } catch (err: any) {
     const msg: string = err?.message ?? "";
@@ -996,7 +998,7 @@ export async function invokeContract(
       };
     }
 
-    return await submitContractTx(simOutcome.preparedXdr, txCtx, signal);
+    return await submitContractTx(simOutcome.preparedXdr, walletAddress, txCtx, signal);
   } catch (err: unknown) {
     // Re-throw LocalCancelResult causes so UI layers can distinguish
     // "stopped waiting" from a genuine transaction failure.

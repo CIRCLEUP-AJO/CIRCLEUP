@@ -525,7 +525,7 @@ describe("IndexerClient transport", () => {
   });
 
   it("does not call fetch when the caller's signal is already aborted", async () => {
-    const mockFetch = mockOk({ circles: [] });
+    const mockFetch = mockOk(circlesPage());
     vi.stubGlobal("fetch", mockFetch);
     const controller = new AbortController();
     controller.abort();

@@ -432,6 +432,7 @@ interface CircleMemberRow {
 
 interface CircleMemberWithContributionsRow extends CircleMemberRow {
   total_contributions: string;
+  has_contributed_current_round: boolean;
 }
 
 interface CircleMemberTotalsRow {
@@ -793,7 +794,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         return;
       }
 
-      const [members, [totals]] = await Promise.all([
+      const [members, totals] = await Promise.all([
         query<CircleMemberWithContributionsRow>(
           `SELECT cm.member_address, cm.payout_order, cm.join_order, cm.collateral,
                   cm.defaults, cm.joined_at,
@@ -803,7 +804,13 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
                      WHERE c2.circle_address = cm.circle_address
                        AND c2.member_address = cm.member_address),
                     0
-                  ) as total_contributions
+                  ) as total_contributions,
+                  EXISTS(
+                    SELECT 1 FROM contributions c3
+                    WHERE c3.circle_address = cm.circle_address
+                      AND c3.member_address = cm.member_address
+                      AND c3.round_index = $2
+                  ) as has_contributed_current_round
            FROM circle_members cm
            LEFT JOIN reputation r ON r.member_address = cm.member_address
            WHERE cm.circle_address = $1

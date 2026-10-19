@@ -7,7 +7,7 @@ import {
   formatPot,
 } from "@/lib/config";
 import { parseMemberRows } from "@/lib/members";
-import { getStatusMeta } from "@/components/CircleCard";
+import { getCircleStatusMeta } from "@/lib/circleStatus";
 // Issue #513: use shared parsers ΓÇö eliminates the unsafe `as CircleRound[]`
 // and `as CircleDetailData["circle"]` casts that were previously here.
 import {
@@ -36,11 +36,11 @@ export async function generateMetadata({
 
   if (!safeAddress) {
     return {
-      title: "Circle ΓÇö CircleUp",
+      title: "Circle \u2014 CircleUp",
       description: "Savings circle on CircleUp.",
       twitter: {
         card: "summary",
-        title: "Circle ΓÇö CircleUp",
+        title: "Circle \u2014 CircleUp",
         description: "Savings circle on CircleUp.",
       },
     };
@@ -54,34 +54,34 @@ export async function generateMetadata({
       const pot = `$${formatPot(circle.round_amount, circle.member_count)}`;
       const roundAmount = `$${formatUsdc(circle.round_amount)}`;
       return {
-        title: `${roundAmount}/round Circle (${status}) ΓÇö CircleUp`,
+        title: `${roundAmount}/round Circle (${status}) \u2014 CircleUp`,
         description:
-          `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}. ` +
+          `${pot} pot \u00b7 ${circle.member_count} members \u00b7 round ${circle.current_round} of ${circle.total_rounds}. ` +
           `Savings circle at ${safeAddress} on CircleUp.`,
         alternates: {
           canonical: `/circles/${safeAddress}`,
         },
         openGraph: {
-          title: `${roundAmount}/round Circle (${status}) ΓÇö CircleUp`,
+          title: `${roundAmount}/round Circle (${status}) \u2014 CircleUp`,
           description:
-            `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}.`,
+            `${pot} pot \u00b7 ${circle.member_count} members \u00b7 round ${circle.current_round} of ${circle.total_rounds}.`,
           url: `/circles/${safeAddress}`,
           type: "website",
         },
         twitter: {
           card: "summary",
-          title: `${roundAmount}/round Circle (${status}) ΓÇö CircleUp`,
+          title: `${roundAmount}/round Circle (${status}) \u2014 CircleUp`,
           description:
             `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}.`,
         },
       };
     } else if (result.error === "not_found") {
       return {
-        title: "Circle Not Found ΓÇö CircleUp",
+        title: "Circle Not Found \u2014 CircleUp",
         description: "The requested savings circle address was not found on CircleUp.",
         twitter: {
           card: "summary",
-          title: "Circle Not Found ΓÇö CircleUp",
+          title: "Circle Not Found \u2014 CircleUp",
           description: "The requested savings circle address was not found on CircleUp.",
         },
       };
@@ -248,7 +248,7 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
     {
       label: "Status",
       value: circle ? (() => {
-        const s = getStatusMeta(circle.status);
+        const s = getCircleStatusMeta(circle.status);
         return (
           <span
             className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${s.chipClasses}`}

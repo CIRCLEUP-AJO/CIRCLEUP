@@ -30,15 +30,11 @@ import {
   computeDataReadiness,
   fetchCircleData,
   MAX_DATA_AGE_MS,
-  CircleDetailClient,
   type CircleDetailData,
   type CircleRound,
   type CircleMember,
   type RefreshResult,
-  CircleDetailClient,
 } from "./CircleDetailClient";
-import { buildAppSnapshot, computeActionEligibility } from "@/lib/gating";
-import * as stellarMock from "@/lib/stellar";
 
 import { Keypair } from "@stellar/stellar-sdk";
 
@@ -462,8 +458,6 @@ vi.mock("@/lib/stellar", () => ({
 
 
 describe("CircleDetailClient render — data readiness banners", () => {
-
-describe("CircleDetailClient render — data readiness banners", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     // Default: wallet not connected
@@ -512,8 +506,9 @@ describe("CircleDetailClient render — data readiness banners", () => {
 
     render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
 
-    // During wallet loading, the spinner should appear
-    expect(screen.getByText(/Checking wallet…/i)).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("status").some((status) => /Checking wallet/i.test(status.textContent ?? "")),
+    ).toBe(true);
   });
 
   test("Trigger Payout button is disabled when members array is empty", async () => {
@@ -768,14 +763,14 @@ describe("Issue #480 — invite URL SSR-safe initialisation", () => {
     const { container } = render(
       <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
-    expect(html).toContain('value=""');
+    expect(container.querySelector<HTMLInputElement>("input[aria-label='Invite link for this circle']")?.value).toBe("");
   });
 
   test("invite input shows aria-busy=true while URL not yet resolved", async () => {
     const { container } = render(
       <CircleDetailClient circleAddress="invalid" circleData={makeReadyData()} />,
     );
-    expect(html).toContain('aria-busy="true"');
+    expect(container.querySelector("input[aria-label='Invite link for this circle']")).toHaveAttribute("aria-busy", "true");
   });
 
   test("copy button is disabled while invite URL is not yet resolved", async () => {
@@ -901,7 +896,7 @@ describe("Duplicate submission guard", () => {
     render(<CircleDetailClient circleAddress={CONTRACT} circleData={data} />);
 
     await waitFor(() => {
-      expect(screen.getByText(/Contribute Round 0/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /contribute round/i })).toBeInTheDocument();
     });
 
     const btn = screen.getByRole("button", { name: /contribute round/i });
