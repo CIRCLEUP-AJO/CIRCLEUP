@@ -1374,6 +1374,45 @@ mod circle_tests {
         assert_eq!(initialized.len(), 1, "expected one 'initialized' event");
     }
 
+    /// Schema v2 of `circle/initialized` appends the payout rotation so the
+    /// indexer can create one member row per slot from events alone.  The
+    /// first three fields are unchanged (v1 consumers keep working) and the
+    /// trailing `members` field preserves rotation order exactly.
+    #[test]
+    fn test_initialized_event_carries_rotation_as_trailing_field() {
+        let (env, token_address, reputation_id) = setup_env_with_token_and_reputation();
+        let circle_id = env.register_contract(None, CircleContract);
+        let circle = CircleContractClient::new(&env, &circle_id);
+
+        let member_a = Address::generate(&env);
+        let member_b = Address::generate(&env);
+        let member_c = Address::generate(&env);
+        let mut members = Vec::new(&env);
+        members.push_back(member_a);
+        members.push_back(member_b);
+        members.push_back(member_c);
+
+        let circle_admin = Address::generate(&env);
+        circle.initialize(
+            &circle_admin,
+            &members,
+            &ROUND_AMOUNT,
+            &token_address,
+            &reputation_id,
+            &ROUND_DEADLINE,
+        );
+
+        let initialized = events_named(&env, "initialized");
+        assert_eq!(initialized.len(), 1, "expected one 'initialized' event");
+
+        let (emitter, member_count, round_amount, rotation): (Address, u32, i128, Vec<Address>) =
+            soroban_sdk::FromVal::from_val(&env, &initialized[0]);
+        assert_eq!(emitter, circle_id, "field 0 must be the emitting circle");
+        assert_eq!(member_count, 3);
+        assert_eq!(round_amount, ROUND_AMOUNT);
+        assert_eq!(rotation, members, "field 3 must be the rotation in payout order");
+    }
+
     // ── get_pot_amount tests ──────────────────────────────────────────────────
     //
     // get_pot_amount is a pure read-only view that returns round_amount × member_count.

@@ -86,6 +86,9 @@ lifecycle.
 | `total_rounds` | INTEGER | NOT NULL | `circle/initialized` data[1] `member_count` | `circle.total_rounds` | Equal to `member_count`. Written as `0` initially, backfilled by `circle/initialized`. |
 | `created_ledger` | BIGINT | NOT NULL | `factory/circle_created` ledger | `circle.created_ledger` | Ledger at which the factory event was processed |
 | `round_deadline_ledgers` | BIGINT | NULL (legacy) | `circle/initialized` — sourced from `round_deadline_ledgers` factory arg | `circle.round_deadline_ledgers` | Added by migration 001. NULL for circles indexed before migration 001 was applied. Number of ledgers per round (~5 s/ledger). |
+| `paused` | BOOLEAN | NOT NULL | `circle/paused` → `TRUE`, `circle/resumed` → `FALSE` | — | Added by migration 007. Default `FALSE`. |
+| `total_released` | NUMERIC | NULL until closed | `circle/closed` data[2] `total_released` | — | Added by migration 007. Stroops returned to members by `close`. |
+| `close_reason` | TEXT | NULL until closed | `circle/closed` data[4] `reason` | — | Added by migration 007. `'completed'` or `'cancelled'`. |
 | `updated_at` | TIMESTAMPTZ | NOT NULL | *(indexer write time)* | `circle.updated_at` | Set to `NOW()` on every row update. Not derived from on-chain data; not stable across replays. |
 
 **Status transition map**
@@ -120,8 +123,8 @@ joined\_at).
 |---|---|---|---|---|---|
 | `id` | SERIAL | NOT NULL | — | *(internal)* | Surrogate key |
 | `circle_address` | TEXT | NOT NULL | `circle/initialized` | `member.circle_address` | FK → `circles.address` |
-| `member_address` | TEXT | NOT NULL | `circle/initialized` data[0..N] members list | `member.member_address` | G-prefix wallet address |
-| `payout_order` | INTEGER | NOT NULL | `circle/initialized` — position in the members list | `member.payout_order` | **0-based** rotation index. `payout_order = 0` receives the first payout. Immutable after row creation. |
+| `member_address` | TEXT | NOT NULL | `circle/initialized` (v2) data[3] `members` | `member.member_address` | G-prefix wallet address. Circles initialized by a v1 contract build (no `members` field) get no member rows; their `circle/joined` events are recorded in `event_failures` instead of being silently dropped. |
+| `payout_order` | INTEGER | NOT NULL | `circle/initialized` (v2) — index in `members` | `member.payout_order` | **0-based** rotation index. `payout_order = 0` receives the first payout. Immutable after row creation. |
 | `join_order` | INTEGER | NULL when unjoined | `circle/joined` data[2] `order` | `member.join_order` | **1-based** join-queue position. NULL until the member calls `join`. Set to `NULL` again on replay until the `joined` event is re-processed. |
 | `collateral` | NUMERIC | NOT NULL | `circle/joined` data[3] `collateral` | `member.collateral` | USDC locked by this member in **stroops**. Default `0` until the member joins. Reduced by penalties when `mark_default` events are processed. |
 | `defaults` | INTEGER | NOT NULL | `circle/default` — incremented per event | `member.defaults` | Count of rounds this member defaulted. Default `0`. |
@@ -222,15 +225,17 @@ because the dedup table guards against duplicate ingestion).
 ## reputation
 
 **Purpose:** One row per wallet that has ever received a reputation increment.
-Upserted by `reputation/increment` events (which carry the member address in
-`topic[2]`).
+Upserted by `reputation/score_updated` events (data `(member, new_total_score)`),
+and by the legacy `reputation/increment` shape (member in `topic[2]`) when
+replaying ledgers that contain it.
 
-**Rebuildable:** Yes — all fields derive from `reputation/increment`.
+**Rebuildable:** Yes — all fields derive from `reputation/score_updated`
+(or legacy `reputation/increment`).
 
 | Column | Type | Null? | Source event | API field | Notes |
 |---|---|---|---|---|---|
-| `member_address` | TEXT | NOT NULL | `reputation/increment` topic[2] | `reputation.member` | Primary key; G-prefix wallet address |
-| `score` | INTEGER | NOT NULL | `reputation/increment` data `score` | `reputation.score` | Cumulative completed-round count. Monotonically non-decreasing. Default `0` on INSERT; overwritten on each UPSERT. |
+| `member_address` | TEXT | NOT NULL | `reputation/score_updated` data[0] (legacy: `reputation/increment` topic[2]) | `reputation.member` | Primary key; G-prefix wallet address |
+| `score` | INTEGER | NOT NULL | `reputation/score_updated` data[1] (legacy: `reputation/increment` data) | `reputation.score` | Cumulative completed-round count. Monotonically non-decreasing. Default `0` on INSERT; overwritten on each UPSERT. |
 | `updated_at` | TIMESTAMPTZ | NOT NULL | *(indexer write time)* | `reputation.updatedAt` | Not stable across replays |
 
 **Uniqueness / constraints**
@@ -239,11 +244,11 @@ Upserted by `reputation/increment` events (which carry the member address in
 - Score is written by the indexer as the absolute value from the event, not
   as an increment — the contract is the incrementing authority.
 
-**Note on `score_updated`:** The `reputation/score_updated` event carries the
-same score value as `reputation/increment`. The indexer processes only
-`reputation/increment`; `score_updated` is reserved for external subscribers
-that want a self-contained notification. Both events are emitted in the same
-transaction; only one upsert is performed.
+**Note on `score_updated`:** Current reputation contracts emit only
+`reputation/score_updated` on a successful `increment`; no
+`reputation/increment` event is published any more. The indexer therefore
+projects `score_updated`, and keeps the `increment` handler solely so historical
+ledgers still replay (see docs/EVENT_COMPATIBILITY.md).
 
 ---
 
