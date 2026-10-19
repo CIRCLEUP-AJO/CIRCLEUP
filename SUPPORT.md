@@ -19,6 +19,16 @@ Please include:
 - Steps to reproduce
 - Your environment (OS, Node version, network)
 
+**Never include in a public issue:**
+- Secret seed phrases, mnemonic words, or private keys
+- Signed XDR transactions or raw envelopes
+- API keys, database credentials, or environment secrets
+- Real production wallet addresses that contain funds you do not control
+
+Use placeholder values (e.g. `GAAAA...`, `"testnet contract"`) instead of real
+production data.  If your report accidentally contains any of the above, close
+the issue immediately and open a private report via [SECURITY.md](./SECURITY.md).
+
 ---
 
 ## 💡 Have a Feature Idea?
