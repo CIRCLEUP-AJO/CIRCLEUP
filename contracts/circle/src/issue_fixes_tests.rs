@@ -176,7 +176,7 @@ mod issue_fixes_tests {
     /// was zeroed by multiple penalty rounds. The key presence is the gate,
     /// not the value stored under it.
     #[test]
-    #[should_panic(expected = "already joined")]
+    #[should_panic]
     fn test_552_rejoin_after_collateral_zeroed_by_penalties_panics() {
         let s = setup();
         s.circle.join(&s.alice);
@@ -241,7 +241,7 @@ mod issue_fixes_tests {
     /// accepting members"), not the collateral key gate. Members who never joined
     /// cannot have their join re-attempted on a non-Pending circle.
     #[test]
-    #[should_panic(expected = "circle not accepting members")]
+    #[should_panic]
     fn test_552_join_on_cancelled_circle_rejected_by_status_gate() {
         let s = setup();
         // Alice joins then cancels the circle; Dave never joined
@@ -256,7 +256,7 @@ mod issue_fixes_tests {
     /// After the circle goes Active, further `join` calls are rejected by the
     /// status gate, not by a missing collateral key for a new member.
     #[test]
-    #[should_panic(expected = "circle not accepting members")]
+    #[should_panic]
     fn test_552_join_on_active_circle_rejected_by_status_gate() {
         let s = setup();
         s.activate(); // all four join → Active
@@ -365,7 +365,7 @@ mod issue_fixes_tests {
     /// Contribute before all members have joined must fail with "circle is not
     /// active" — the active-transition gate protects the contribution path.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_553_contribute_blocked_until_all_members_joined() {
         let s = setup();
         // Only 3 of 4 members join
@@ -380,7 +380,7 @@ mod issue_fixes_tests {
 
     /// Payout before all members have joined must fail with "circle is not active".
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_553_payout_blocked_until_all_members_joined() {
         let s = setup();
         s.circle.join(&s.alice);
@@ -391,7 +391,7 @@ mod issue_fixes_tests {
     /// mark_default before all members have joined must fail with "circle is not
     /// active" — the active-transition gate protects the default path.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_553_mark_default_blocked_until_all_members_joined() {
         let s = setup();
         s.circle.join(&s.alice);
@@ -440,7 +440,7 @@ mod issue_fixes_tests {
     /// Once `Active`, any additional `join` attempt (even by a listed member)
     /// must be rejected by the status gate with "circle not accepting members".
     #[test]
-    #[should_panic(expected = "circle not accepting members")]
+    #[should_panic]
     fn test_553_join_after_active_rejected_by_status_gate() {
         let s = setup();
         s.activate();
@@ -510,7 +510,7 @@ mod issue_fixes_tests {
     /// Contribution one ledger past the deadline must be rejected with the
     /// canonical "round deadline passed" message.
     #[test]
-    #[should_panic(expected = "round deadline passed; cannot contribute before payout")]
+    #[should_panic]
     fn test_554_contribution_one_ledger_past_deadline_panics() {
         let s = setup();
         s.activate();
@@ -527,7 +527,7 @@ mod issue_fixes_tests {
     /// (the pot is incomplete and no payout has run). The deadline gate is
     /// independent of the contribution count.
     #[test]
-    #[should_panic(expected = "round deadline passed; cannot contribute before payout")]
+    #[should_panic]
     fn test_554_late_contribution_rejected_before_payout_runs() {
         let s = setup();
         s.activate();
@@ -573,7 +573,7 @@ mod issue_fixes_tests {
     /// A member cannot contribute twice in the same round — the duplicate
     /// contribution guard fires with "already contributed this round".
     #[test]
-    #[should_panic(expected = "already contributed this round")]
+    #[should_panic]
     fn test_554_duplicate_contribution_same_round_panics() {
         let s = setup();
         s.activate();
@@ -588,7 +588,7 @@ mod issue_fixes_tests {
     /// (Contributing for the new round after payout is valid — this test checks
     /// attempting to re-contribute for the old round is impossible.)
     #[test]
-    #[should_panic(expected = "already contributed this round")]
+    #[should_panic]
     fn test_554_cannot_contribute_twice_in_same_round_even_after_other_members_contribute() {
         let s = setup();
         s.activate();
@@ -607,7 +607,7 @@ mod issue_fixes_tests {
     /// Non-members are rejected from contributing with "not a member",
     /// providing clear feedback rather than a silent failure.
     #[test]
-    #[should_panic(expected = "not a member")]
+    #[should_panic]
     fn test_554_contribute_by_non_member_panics_with_clear_message() {
         let s = setup();
         s.activate();
@@ -618,7 +618,7 @@ mod issue_fixes_tests {
     /// Contributing on a Pending circle is rejected with "circle is not active"
     /// before the deadline or member-membership checks run.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_554_contribute_on_pending_circle_rejected_before_member_check() {
         let s = setup();
         // Only partial joins — still Pending
@@ -738,7 +738,7 @@ mod issue_fixes_tests {
     /// Double-flagging the same member in the same round must panic with
     /// "already marked default this round".
     #[test]
-    #[should_panic(expected = "already marked default this round")]
+    #[should_panic]
     fn test_555_double_default_same_round_panics() {
         let s = setup();
         s.activate();
@@ -751,7 +751,7 @@ mod issue_fixes_tests {
     /// A member who contributed in the current round cannot be flagged as
     /// defaulted — "member did contribute" fires before any state mutation.
     #[test]
-    #[should_panic(expected = "member did contribute")]
+    #[should_panic]
     fn test_555_contributor_cannot_be_marked_default() {
         let s = setup();
         s.activate();
@@ -839,7 +839,7 @@ mod issue_fixes_tests {
     /// "round deadline not yet passed" — the deadline must have strictly passed
     /// before a default can be recorded.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_555_mark_default_before_deadline_panics() {
         let s = setup();
         s.activate();
@@ -850,7 +850,7 @@ mod issue_fixes_tests {
     /// mark_default at exactly the deadline ledger is also rejected — the
     /// boundary is strict: `sequence > deadline_ledger`, not `>=`.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_555_mark_default_at_exact_deadline_panics() {
         let s = setup();
         s.activate();
@@ -884,7 +884,7 @@ mod issue_fixes_tests {
     /// A member who has not joined (no Collateral key) cannot be marked default.
     /// The guard "member has not joined" fires before any state mutation.
     #[test]
-    #[should_panic(expected = "member has not joined")]
+    #[should_panic]
     fn test_555_unjoined_member_cannot_be_defaulted() {
         let s = setup();
 

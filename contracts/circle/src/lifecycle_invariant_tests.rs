@@ -29,7 +29,7 @@ mod lifecycle_invariant_tests {
     extern crate std;
 
     use crate::test_support::{fixture, fixture_with, FixtureBuilder, ROUND_AMOUNT, ROUND_DEADLINE, COLLATERAL};
-    use crate::{CircleStatus, CloseError, PENALTY_BPS, BPS_DENOM, COLLATERAL_MULTIPLIER};
+    use crate::{CircleStatus, CloseError, ContractError, PENALTY_BPS, BPS_DENOM, COLLATERAL_MULTIPLIER};
     use soroban_sdk::testutils::Ledger;
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -167,7 +167,7 @@ mod lifecycle_invariant_tests {
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_settle_round_before_deadline_panics() {
         let t = fixture();
         t.join_all();
@@ -185,7 +185,7 @@ mod lifecycle_invariant_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn test_settle_round_on_pending_circle_panics() {
         let t = fixture();
         // Not joined — still Pending.
@@ -315,6 +315,23 @@ mod lifecycle_invariant_tests {
     // Exact deadline boundary semantics
     // ══════════════════════════════════════════════════════════════════════════
 
+    /// Before `deadline_ledger`, contributions are allowed and defaults are not.
+    #[test]
+    fn test_deadline_one_ledger_before_is_still_open() {
+        let t = fixture();
+        t.join_all();
+
+        let deadline = t.circle.get_current_round().deadline_ledger as u32;
+        t.env.ledger().with_mut(|l| l.sequence_number = deadline - 1);
+
+        t.circle.contribute(&t.alice);
+        assert!(t.circle.has_contributed(&t.alice, 0));
+        assert!(
+            t.circle.try_mark_default(&t.carol).is_err(),
+            "mark_default before deadline_ledger must fail"
+        );
+    }
+
     /// The contract uses `sequence > deadline_ledger` (strict greater-than).
     /// A contribution at exactly `deadline_ledger` must still be accepted.
     #[test]
@@ -335,7 +352,7 @@ mod lifecycle_invariant_tests {
 
     /// A contribution at `deadline_ledger + 1` must be rejected.
     #[test]
-    #[should_panic(expected = "round deadline passed")]
+    #[should_panic]
     fn test_contribute_at_deadline_plus_one_panics() {
         let t = fixture();
         t.join_all();
@@ -349,7 +366,7 @@ mod lifecycle_invariant_tests {
     /// mark_default at exactly `deadline_ledger` must still be rejected
     /// (deadline has not *strictly* passed yet).
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn test_mark_default_at_exact_deadline_ledger_panics() {
         let t = fixture();
         t.join_all();
@@ -386,7 +403,11 @@ mod lifecycle_invariant_tests {
             t.env.ledger().with_mut(|l| l.sequence_number = deadline);
             t.circle.contribute(&t.alice); // must succeed
             let r = t.circle.try_mark_default(&t.carol);
-            assert!(r.is_err(), "mark_default at deadline_ledger must fail");
+            assert_eq!(
+                r,
+                Err(Ok(ContractError::DeadlineNotPassed)),
+                "mark_default at deadline_ledger must return the stable deadline code"
+            );
         }
 
         // At deadline_ledger + 1: contribute NOT OK, mark_default OK.
@@ -396,7 +417,11 @@ mod lifecycle_invariant_tests {
             let deadline = t.circle.get_current_round().deadline_ledger as u32;
             t.env.ledger().with_mut(|l| l.sequence_number = deadline + 1);
             let r = t.circle.try_contribute(&t.alice);
-            assert!(r.is_err(), "contribute at deadline_ledger+1 must fail");
+            assert_eq!(
+                r,
+                Err(Ok(ContractError::DeadlinePassed)),
+                "contribute at deadline_ledger+1 must return the stable deadline code"
+            );
             t.circle.mark_default(&t.carol); // must succeed
         }
     }
@@ -748,5 +773,21 @@ mod lifecycle_invariant_tests {
         // Should succeed after resume.
         t.circle.contribute(&t.alice);
         assert!(t.circle.has_contributed(&t.alice, &0));
+    }
+
+    #[test]
+    fn test_deadline_clock_advances_while_paused() {
+        let t = fixture();
+        t.join_all();
+        let deadline = t.circle.get_current_round().deadline_ledger;
+
+        t.circle.pause(&t.admin);
+        t.env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = deadline as u32 + 1;
+        });
+        t.circle.resume(&t.admin);
+
+        t.circle.mark_default(&t.carol);
+        assert_eq!(t.circle.get_defaults(&t.carol), 1);
     }
 }

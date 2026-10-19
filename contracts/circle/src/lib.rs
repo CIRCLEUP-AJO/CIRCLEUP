@@ -157,16 +157,10 @@ pub enum DataKey {
 
 // ─── Initialization-specific error type ──────────────────────────────────────
 //
-// `initialize` is a mutating entry-point that uses `panic!` for most
-// guard violations (consistent with every other mutating entry-point in
-// this contract — Soroban rolls the whole invocation back on panic and
-// surfaces the message to the caller).  These `InitError` variants
-// complement the panic messages by giving callers a stable, machine-readable
-// code they can match on when calling `try_initialize` from an SDK or
-// integration test, without requiring a string parse on the diagnostic.
-//
-// The variant names mirror the panic messages one-to-one so auditors can
-// cross-reference them without ambiguity.
+// Deterministic initialization validation uses `panic_with_error` so Soroban
+// consumers receive a stable code while the host still rolls back the call.
+// Infrastructure and cross-contract failures that cannot be classified here
+// remain host diagnostics.
 
 /// Typed errors that `initialize` returns via `contracterror` when called
 /// through `try_initialize`.
@@ -211,6 +205,8 @@ pub enum InitError {
     /// Accepting an unusable token would strand all member deposits with no
     /// recovery path.
     UnusableTokenContract = 13,
+    /// `initialize` was re-entered while initialization was in progress.
+    InitializeInProgress = 14,
 }
 
 // ─── Pause / emergency-recovery error type ───────────────────────────────────
@@ -351,15 +347,9 @@ pub struct ProtocolParams {
 
 // ─── Contract errors ───────────────────────────────────────────────────────────
 //
-// Used by the public read-only views so callers receive a typed, inspectable
-// error code rather than an opaque panic when the contract has not been
-// initialised or is called in an invalid state.
-//
-// Mutating entry-points (initialize, join, contribute, …) intentionally use
-// `panic!` because Soroban rolls back the whole invocation on panic anyway, and
-// the panic message propagates back to the caller as a diagnostic string via
-// the simulation result.  Read-only views that are frequently called from the
-// SDK/indexer use `contracterror` so consumers can handle them gracefully.
+// Stable contract error codes for views and common deterministic mutation
+// guards. Soroban still rolls the whole invocation back on `panic_with_error`;
+// external host and cross-contract failures remain explicit diagnostics.
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -375,6 +365,28 @@ pub enum ContractError {
     /// should prevent it in practice, but the view returns a typed error rather
     /// than panicking so read-only callers can handle it gracefully.
     PotOverflow = 3,
+    /// Caller is not a configured circle member.
+    NotMember = 4,
+    /// Member has already joined or contributed for the relevant round.
+    DuplicateAction = 5,
+    /// The operation is not valid in the circle's current lifecycle state.
+    WrongStatus = 6,
+    /// The circle is paused and fund-moving actions are disabled.
+    CirclePaused = 7,
+    /// The contribution deadline has passed.
+    DeadlinePassed = 8,
+    /// The contribution deadline has not passed yet.
+    DeadlineNotPassed = 9,
+    /// The current round has already been paid out.
+    AlreadyPaidOut = 10,
+    /// Not all members have contributed; use settlement only when eligible.
+    IncompleteRound = 11,
+    /// Member has no locked collateral and has not joined.
+    MemberNotJoined = 12,
+    /// Member was already marked in default for this round.
+    AlreadyDefaulted = 13,
+    /// Member contributed and is therefore ineligible for default.
+    MemberContributed = 14,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -480,7 +492,7 @@ impl CircleContract {
             .get::<DataKey, bool>(&DataKey::Paused)
             .unwrap_or(false)
         {
-            panic!("circle is paused: no fund-moving operations are allowed until an admin resumes it");
+            env.panic_with_error(ContractError::CirclePaused);
         }
     }
 
@@ -513,25 +525,18 @@ impl CircleContract {
     ///
     /// All validation runs before any persistent state is written.  An invalid
     /// configuration makes no state changes — the reentrancy guard is the only
-    /// key touched before the checks, and it is cleared on any panic path.
+    /// key touched before the checks, and Soroban rolls it back on any error.
     ///
-    /// | Check | Condition | Panic message |
+    /// | Check | Condition | Stable `InitError` code |
     /// |---|---|---|
-    /// | Double-init | `Config` key present | `"already initialized"` |
-    /// | Reentrancy | `Initializing` flag present | `"initialize already in progress"` |
-    /// | Min members | `members.len() < 2` | `"need at least 2 members"` |
-    /// | Max members | `members.len() > MAX_MEMBERS` | `"too many members"` |
-    /// | Duplicate members | any two entries equal | `"duplicate members"` |
-    /// | Positive amount | `round_amount <= 0` | `"round_amount must be positive"` |
-    /// | Pot overflow | `round_amount * member_count` overflows `i128` | `"round_amount too large: overflows pot calculation for this member count"` |
-    /// | Penalty overflow | `round_amount * PENALTY_BPS` overflows `i128` | `"round_amount too large: overflows penalty calculation"` |
-    /// | Min deadline | `round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS` | `"round_deadline_ledgers below minimum"` |
-    /// | Max deadline | `round_deadline_ledgers > MAX_ROUND_DEADLINE_LEDGERS` | `"round_deadline_ledgers above maximum"` |
-    /// | Token address | `usdc_token == current contract` | `"usdc_token must not be the circle contract itself"` |
-    /// | Reputation address | `reputation_contract == current contract` | `"reputation_contract must not be the circle contract itself"` |
-    /// | Reputation ≠ token | `reputation_contract == usdc_token` | `"reputation_contract must not be the same address as usdc_token"` |
-    /// | Token usability | `token.try_balance` fails | `"usdc_token does not implement the standard token interface"` |
-    /// | Rotation consistency | `members.len() == 0` after validation passes | (defensive; unreachable in practice) |
+    /// | Check | Condition | Code |
+    /// |---|---|---|
+    /// | Double-init / reentrancy | `Config` present / `Initializing` set | 1 / 14 |
+    /// | Member count / uniqueness | outside `[2, MAX_MEMBERS]` / duplicate | 2 / 3 / 4 |
+    /// | Amount | non-positive / pot overflow / penalty overflow | 5 / 6 / 7 |
+    /// | Deadline | below minimum / above maximum | 8 / 9 |
+    /// | Addresses | invalid token / invalid reputation address | 10 / 11 |
+    /// | Token usability / rotation | unusable token / inconsistent rotation | 13 / 12 |
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -542,7 +547,7 @@ impl CircleContract {
         round_deadline_ledgers: u32,
     ) {
         if env.storage().instance().has(&DataKey::Config) {
-            panic!("already initialized");
+            env.panic_with_error(InitError::AlreadyInitialized);
         }
 
         // Reentrancy guard: flip an explicit "initializing" flag before any
@@ -551,7 +556,7 @@ impl CircleContract {
         // cross-contract call here) — the flag is checked and set atomically
         // as the very first action, and cleared once setup fully commits.
         if env.storage().instance().has(&DataKey::Initializing) {
-            panic!("initialize already in progress");
+            env.panic_with_error(InitError::InitializeInProgress);
         }
         env.storage().instance().set(&DataKey::Initializing, &true);
 
@@ -563,25 +568,25 @@ impl CircleContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
 
         if members.len() < 2 {
-            panic!("need at least 2 members");
+            env.panic_with_error(InitError::TooFewMembers);
         }
         if members.len() > MAX_MEMBERS {
-            panic!("too many members");
+            env.panic_with_error(InitError::TooManyMembers);
         }
         Self::assert_unique_members(&env, &members);
         if round_amount <= 0 {
-            panic!("round_amount must be positive");
+            env.panic_with_error(InitError::InvalidRoundAmount);
         }
         // round_amount is later multiplied by member_count (payout's pot) and
         // by PENALTY_BPS (mark_default's penalty). Reject configurations that
         // would overflow i128 in those paths instead of deferring the failure
         // to a runtime panic deep in an unrelated call.
-        round_amount
-            .checked_mul(members.len() as i128)
-            .unwrap_or_else(|| panic!("round_amount too large: overflows pot calculation for this member count"));
-        round_amount
-            .checked_mul(PENALTY_BPS)
-            .unwrap_or_else(|| panic!("round_amount too large: overflows penalty calculation"));
+        if round_amount.checked_mul(members.len() as i128).is_none() {
+            env.panic_with_error(InitError::RoundAmountPotOverflow);
+        }
+        if round_amount.checked_mul(PENALTY_BPS).is_none() {
+            env.panic_with_error(InitError::RoundAmountPenaltyOverflow);
+        }
         if round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS {
             env.panic_with_error(InitError::DeadlineBelowMinimum);
         }
@@ -607,13 +612,13 @@ impl CircleContract {
         // (self-referential or aliased addresses) rather than null inputs.
         let self_address = env.current_contract_address();
         if usdc_token == self_address {
-            panic!("usdc_token must not be the circle contract itself");
+            env.panic_with_error(InitError::InvalidTokenAddress);
         }
         if reputation_contract == self_address {
-            panic!("reputation_contract must not be the circle contract itself");
+            env.panic_with_error(InitError::InvalidReputationAddress);
         }
         if reputation_contract == usdc_token {
-            panic!("reputation_contract must not be the same address as usdc_token");
+            env.panic_with_error(InitError::InvalidReputationAddress);
         }
 
         // ── Token identity / usability probe ──────────────────────────────────
@@ -639,7 +644,7 @@ impl CircleContract {
             .try_balance(&env.current_contract_address())
             .is_err()
         {
-            panic!("usdc_token does not implement the standard token interface; verify the token contract address");
+            env.panic_with_error(InitError::UnusableTokenContract);
         }
 
         // ── Rotation consistency check ────────────────────────────────────────
@@ -656,7 +661,7 @@ impl CircleContract {
         // its value is as documentation and a future-proofing guard.
         let member_count = members.len();
         if member_count == 0 {
-            panic!("rotation length is zero: members list must have at least 2 entries");
+            env.panic_with_error(InitError::InconsistentRotation);
         }
 
         let config = CircleConfig {
@@ -741,11 +746,11 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Pending {
-            panic!("circle not accepting members");
+            env.panic_with_error(ContractError::WrongStatus);
         }
 
         if !config.members.contains(&member) {
-            panic!("not a circle member");
+            env.panic_with_error(ContractError::NotMember);
         }
 
         // Use `has` (not collateral > 0) so a member whose balance was later
@@ -755,7 +760,7 @@ impl CircleContract {
         // transfer cannot double-pull funds.
         let collateral_key = DataKey::Collateral(member.clone());
         if env.storage().persistent().has(&collateral_key) {
-            panic!("already joined");
+            env.panic_with_error(ContractError::DuplicateAction);
         }
 
         // Collateral is COLLATERAL_MULTIPLIER × round_amount.
@@ -864,11 +869,11 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Pending {
-            panic!("can only cancel a pending circle");
+            env.panic_with_error(ContractError::WrongStatus);
         }
 
         if !config.members.contains(&caller) {
-            panic!("not a circle member");
+            env.panic_with_error(ContractError::NotMember);
         }
 
         env.storage()
@@ -910,7 +915,7 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
-            panic!("circle is not active");
+            env.panic_with_error(ContractError::WrongStatus);
         }
 
         let mut round: RoundState = env
@@ -920,7 +925,7 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
         if round.paid_out {
-            panic!("round already paid out");
+            env.panic_with_error(ContractError::AlreadyPaidOut);
         }
 
         // Reject late contributions even when payout has not run yet (e.g. the
@@ -928,18 +933,18 @@ impl CircleContract {
         // Uses the centralized deadline_passed predicate so the boundary
         // semantics are identical to mark_default (strict greater-than).
         if Self::deadline_passed(&env, &round) {
-            panic!("round deadline passed; cannot contribute before payout");
+            env.panic_with_error(ContractError::DeadlinePassed);
         }
 
         if !config.members.contains(&member) {
-            panic!("not a member");
+            env.panic_with_error(ContractError::NotMember);
         }
 
         // Persistent so the record survives past the round deadline and
         // `mark_default` can accurately tell who missed the current round.
         let key = DataKey::Contributed(member.clone(), round.round_index);
         if env.storage().persistent().has(&key) {
-            panic!("already contributed this round");
+            env.panic_with_error(ContractError::DuplicateAction);
         }
 
         // Transfer round amount from member to contract
@@ -1042,7 +1047,7 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
-            panic!("circle is not active");
+            env.panic_with_error(ContractError::WrongStatus);
         }
 
         let mut round: RoundState = env
@@ -1055,12 +1060,12 @@ impl CircleContract {
         // This flag is written to storage BEFORE any external call (CEI) so
         // that a reentrant payout attempt hits this guard immediately.
         if round.paid_out {
-            panic!("already paid out");
+            env.panic_with_error(ContractError::AlreadyPaidOut);
         }
 
         let member_count = config.members.len();
         if round.contributions_received != member_count {
-            panic!("not all members have contributed yet");
+            env.panic_with_error(ContractError::IncompleteRound);
         }
 
         // Strong invariant: contribution counter must match persisted records.
@@ -1268,7 +1273,7 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
-            panic!("circle is not active");
+            env.panic_with_error(ContractError::WrongStatus);
         }
 
         let round: RoundState = env
@@ -1278,7 +1283,7 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
         if round.paid_out {
-            panic!("round already paid out");
+            env.panic_with_error(ContractError::AlreadyPaidOut);
         }
 
         // Uses the centralized deadline_passed predicate — strict greater-than
@@ -1286,11 +1291,11 @@ impl CircleContract {
         // the first moment to default.  This is the same boundary used by
         // contribute() so the two entry-points are always consistent.
         if !Self::deadline_passed(&env, &round) {
-            panic!("round deadline not yet passed");
+            env.panic_with_error(ContractError::DeadlineNotPassed);
         }
 
         if !config.members.contains(&member) {
-            panic!("not a member");
+            env.panic_with_error(ContractError::NotMember);
         }
 
         // Must have joined (locked collateral) to be flaggable
@@ -1300,19 +1305,19 @@ impl CircleContract {
             .get(&DataKey::Collateral(member.clone()))
             .unwrap_or(0);
         if collateral <= 0 {
-            panic!("member has not joined");
+            env.panic_with_error(ContractError::MemberNotJoined);
         }
 
         // Only the current round — refuse if already flagged for this round_index
         let defaulted_key = DataKey::Defaulted(member.clone(), round.round_index);
         if env.storage().persistent().has(&defaulted_key) {
-            panic!("already marked default this round");
+            env.panic_with_error(ContractError::AlreadyDefaulted);
         }
 
         // Make sure they actually missed the current round
         let contrib_key = DataKey::Contributed(member.clone(), round.round_index);
         if env.storage().persistent().has(&contrib_key) {
-            panic!("member did contribute");
+            env.panic_with_error(ContractError::MemberContributed);
         }
 
         // Deduct penalty from collateral.
@@ -1463,7 +1468,7 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: Status missing — storage inconsistency"));
 
         if status != CircleStatus::Active {
-            panic!("circle is not active");
+            env.panic_with_error(ContractError::WrongStatus);
         }
 
         let mut round: RoundState = env
@@ -1473,18 +1478,18 @@ impl CircleContract {
             .unwrap_or_else(|| panic!("circle: CurrentRound missing for an Active circle — storage inconsistency"));
 
         if round.paid_out {
-            panic!("round already paid out");
+            env.panic_with_error(ContractError::AlreadyPaidOut);
         }
 
         // Deadline must have strictly passed before exceptional settlement is allowed.
         if !Self::deadline_passed(&env, &round) {
-            panic!("round deadline not yet passed; use payout once all members have contributed");
+            env.panic_with_error(ContractError::DeadlineNotPassed);
         }
 
         // If everyone has already contributed, the normal payout path works fine.
         let member_count = config.members.len();
         if round.contributions_received == member_count {
-            panic!("all members have contributed; use payout instead of settle_round");
+            env.panic_with_error(ContractError::IncompleteRound);
         }
 
         // ── Phase 1: penalise all non-contributors who haven't been flagged yet ──
