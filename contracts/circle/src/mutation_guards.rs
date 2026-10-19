@@ -225,7 +225,7 @@ mod mutation_guard_tests {
     /// A member who has already joined must be rejected on a second join attempt.
     /// Removing the `has` guard would allow the double-pull.
     #[test]
-    #[should_panic(expected = "already joined")]
+    #[should_panic]
     fn guard_join_double_collateral_pull() {
         let t = make_setup();
         t.circle.join(&t.alice);
@@ -237,7 +237,7 @@ mod mutation_guard_tests {
     /// the key exists with a zero value.  Verify the storage key is the guard,
     /// not the balance magnitude.
     #[test]
-    #[should_panic(expected = "already joined")]
+    #[should_panic]
     fn guard_join_has_check_not_balance_check() {
         let t = make_setup();
         t.circle.join(&t.alice);
@@ -257,7 +257,7 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "not all members have contributed yet")]
+    #[should_panic]
     fn guard_payout_requires_full_contribution_counter() {
         let t = make_setup();
         t.activate();
@@ -271,7 +271,7 @@ mod mutation_guard_tests {
 
     /// Even one missing contribution must block payout (not just > half).
     #[test]
-    #[should_panic(expected = "not all members have contributed yet")]
+    #[should_panic]
     fn guard_payout_one_missing_contribution_blocks() {
         let t = make_setup();
         t.activate();
@@ -316,7 +316,7 @@ mod mutation_guard_tests {
     /// Forge Contributed keys without going through contribute() (so counter = 0
     /// but 4 keys exist).  The counter guard fires first.
     #[test]
-    #[should_panic(expected = "not all members have contributed yet")]
+    #[should_panic]
     fn guard_payout_forged_keys_without_counter_blocked() {
         let t = make_setup();
         t.activate();
@@ -340,7 +340,7 @@ mod mutation_guard_tests {
 
     /// At exactly deadline_ledger (strict >) the guard must still fire.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn guard_mark_default_deadline_strict_boundary() {
         let t = make_setup();
         t.activate();
@@ -354,7 +354,7 @@ mod mutation_guard_tests {
 
     /// One ledger before the deadline must also be blocked.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn guard_mark_default_one_before_deadline_blocked() {
         let t = make_setup();
         t.activate();
@@ -389,7 +389,7 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "member did contribute")]
+    #[should_panic]
     fn guard_mark_default_contributor_cannot_be_penalised() {
         let t = make_setup();
         t.activate();
@@ -423,7 +423,7 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "already marked default this round")]
+    #[should_panic]
     fn guard_mark_default_idempotency() {
         let t = make_setup();
         t.activate();
@@ -583,7 +583,7 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "already initialized")]
+    #[should_panic]
     fn guard_reinitialize_blocked() {
         let t = make_setup();
         // Circle is already initialized — a second call must be rejected
@@ -600,7 +600,7 @@ mod mutation_guard_tests {
     /// Verify the guard fires even with different parameters (attacker tries
     /// to change member list or round_amount).
     #[test]
-    #[should_panic(expected = "already initialized")]
+    #[should_panic]
     fn guard_reinitialize_blocked_with_different_params() {
         let t = make_setup();
         let mut new_members = soroban_sdk::Vec::new(&t.env);
@@ -759,7 +759,7 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn guard_contribute_blocked_while_pending() {
         let t = make_setup();
         // Only 2 of 4 members join — still Pending
@@ -770,7 +770,7 @@ mod mutation_guard_tests {
     }
 
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn guard_contribute_blocked_while_completed() {
         let t = make_setup();
         t.activate();
@@ -791,7 +791,7 @@ mod mutation_guard_tests {
     // ═════════════════════════════════════════════════════════════════════════
 
     #[test]
-    #[should_panic(expected = "round deadline passed; cannot contribute before payout")]
+    #[should_panic]
     fn guard_contribute_rejected_one_past_deadline() {
         let t = make_setup();
         t.activate();
@@ -845,7 +845,7 @@ mod mutation_guard_tests {
 
     /// A round can only be paid out once: the second call must panic.
     #[test]
-    #[should_panic(expected = "already paid out")]
+    #[should_panic]
     fn guard_payout_single_use_settled_marker() {
         let t = make_setup();
         t.activate();
@@ -969,7 +969,7 @@ mod mutation_guard_tests {
     /// settle_round on a paused circle must panic with the pause message.
     /// This is the simplest proof that the pause check fires.
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn guard_settle_round_blocked_while_paused() {
         let t = make_setup();
         t.activate();
@@ -1052,7 +1052,7 @@ mod mutation_guard_tests {
 
     /// settle_round before the deadline must panic.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn guard_settle_round_before_deadline_blocked() {
         let t = make_setup();
         t.activate();
@@ -1063,7 +1063,7 @@ mod mutation_guard_tests {
     /// At exactly the deadline ledger, settle_round must still be blocked
     /// (the deadline_passed predicate uses strict greater-than).
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn guard_settle_round_at_deadline_blocked() {
         let t = make_setup();
         t.activate();

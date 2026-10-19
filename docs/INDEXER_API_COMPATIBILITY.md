@@ -26,6 +26,11 @@ Covered endpoints: `GET /circles` (list), `GET /circles/:address` (detail),
 `GET /members/:member/contributions` (history), `GET /reputation/:member`,
 `GET /circles/:address/audit`, `GET /health`, `GET /indexer/state`.
 
+Not covered (operator/download endpoints, documented in their modules):
+`GET /circles/:address/export.csv` (column contract in `indexer/src/csvExport.ts`
+— columns are only ever appended) and `GET /circles/:address/reconciliation`
+(diagnostic report shape in `indexer/src/circleReconciliation.ts`).
+
 ## Wire types
 
 The TypeScript interfaces in `sdk/src/types.ts` describe *meaning*; the

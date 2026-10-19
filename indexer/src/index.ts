@@ -15,10 +15,15 @@ import type { Server } from "http";
 
 let shuttingDown = false;
 
+// Track which shutdown phase completed so the force-exit timer can log
+// exactly where the process hung when it fires.
+type ShutdownPhase = "not_started" | "poller" | "http" | "pool" | "complete";
+let shutdownPhase: ShutdownPhase = "not_started";
+
 async function gracefulShutdown(server: Server, signal: string): Promise<void> {
   if (shuttingDown) {
     console.log(
-      `[circleup-indexer] ${signal} received but shutdown already in progress`,
+      `[circleup-indexer] ${signal} received but shutdown already in progress (phase: ${shutdownPhase})`,
     );
     return;
   }
@@ -44,8 +49,18 @@ async function gracefulShutdown(server: Server, signal: string): Promise<void> {
   const abortController = new AbortController();
   const forceExitTimer = setTimeout(() => {
     abortController.abort();
+    // Log which phase the shutdown was stuck in so operators know exactly
+    // what resource failed to drain within the grace period.
+    const stuck: Record<ShutdownPhase, string> = {
+      not_started: "shutdown never began",
+      poller:      "event poller did not finish in-flight work",
+      http:        "HTTP server did not drain open connections",
+      pool:        "Postgres pool did not release connections",
+      complete:    "unexpected: shutdown appeared complete but timer fired",
+    };
     console.error(
-      `[circleup-indexer] Shutdown did not complete within ${SHUTDOWN_GRACE_PERIOD_MS}ms — forcing exit`,
+      `[circleup-indexer] Shutdown did not complete within ${SHUTDOWN_GRACE_PERIOD_MS}ms ` +
+        `— stuck at phase "${shutdownPhase}": ${stuck[shutdownPhase]}. Forcing exit.`,
     );
     process.exit(1);
   }, SHUTDOWN_GRACE_PERIOD_MS);
@@ -55,24 +70,35 @@ async function gracefulShutdown(server: Server, signal: string): Promise<void> {
     // 1. Stop the poller first: refuse new ticks and wait for any in-flight
     //    ledger ingest to finish so we never exit mid-transaction.  Pass the
     //    AbortSignal so a stuck RPC call does not block past the grace period.
+    shutdownPhase = "poller";
     await stopIndexer(abortController.signal);
 
-    // 2. Stop accepting new HTTP requests.  Existing connections are allowed
-    //    to finish (Node drains keep-alive sockets automatically when the
-    //    server is closed).
+    // 2. Stop accepting new HTTP requests.  server.close() prevents new
+    //    connections but does not terminate existing keep-alive sockets — those
+    //    would hold the server open indefinitely.  closeAllConnections() forces
+    //    all idle keep-alive sockets closed immediately so active in-flight
+    //    requests finish but persistent connections do not stall the shutdown.
+    shutdownPhase = "http";
     await new Promise<void>((resolve, reject) => {
       server.close((err) => {
         if (err) reject(err);
         else resolve();
       });
     });
+    // Close idle keep-alive connections that server.close() leaves open.
+    // Available in Node 18.2+; guard so older Node versions don't throw.
+    if (typeof (server as { closeAllConnections?: () => void }).closeAllConnections === "function") {
+      (server as { closeAllConnections: () => void }).closeAllConnections();
+    }
     console.log("[circleup-indexer] HTTP server closed");
 
     // 3. Release all Postgres connections only after both the poller and the
     //    HTTP server have stopped issuing queries.
+    shutdownPhase = "pool";
     await pool.end();
     console.log("[circleup-indexer] Database pool closed");
 
+    shutdownPhase = "complete";
     clearTimeout(forceExitTimer);
     console.log("[circleup-indexer] Shutdown complete");
     process.exit(0);
@@ -133,10 +159,15 @@ async function main() {
   // Register signal handlers before startIndexer so a SIGTERM that races
   // the very first poll tick is still caught and handled cleanly rather than
   // being delivered to a process with no handler registered yet.
-  process.once("SIGTERM", () => {
+  //
+  // process.on (not process.once) so a second SIGTERM/SIGINT — which the OS or
+  // a deployment system may send if the first doesn't produce a prompt exit —
+  // is also received. gracefulShutdown() is idempotent: repeated calls log
+  // "already in progress" and return without starting a second teardown.
+  process.on("SIGTERM", () => {
     void gracefulShutdown(server, "SIGTERM");
   });
-  process.once("SIGINT", () => {
+  process.on("SIGINT", () => {
     void gracefulShutdown(server, "SIGINT");
   });
 

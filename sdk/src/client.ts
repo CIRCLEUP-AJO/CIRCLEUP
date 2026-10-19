@@ -37,6 +37,7 @@ import type {
   StateMismatch,
   SubmissionDiagnostics,
   TxLookup,
+  ContractErrorDiagnostic,
   IndexerPagination,
   GetMemberContributionsParams,
   PaginateOptions,
@@ -458,10 +459,66 @@ function txFailure(
   errorMessage: string,
   errorCode: TxErrorCode = "unknown",
   diagnostics?: SubmissionDiagnostics,
+  contractError?: ContractErrorDiagnostic,
 ): TxFailure {
-  return diagnostics
-    ? { success: false, txHash, errorMessage, errorCode, diagnostics }
-    : { success: false, txHash, errorMessage, errorCode };
+  return {
+    success: false,
+    txHash,
+    errorMessage,
+    errorCode,
+    ...(diagnostics ? { diagnostics } : {}),
+    ...(contractError ? { contractError } : {}),
+  };
+}
+
+function contractErrorCategory(
+  code: number,
+  method: string,
+  contract: ContractErrorDiagnostic["contract"],
+): ContractErrorDiagnostic["category"] {
+  if (contract === "circle") {
+    if (method === "initialize") return code >= 1 && code <= 14 ? "initialization" : "unknown";
+    if (method === "pause" || method === "resume") {
+      return code === 1 || code === 4 ? "authorization" : code >= 2 && code <= 3 ? "state" : "unknown";
+    }
+    if (method === "close") {
+      return code === 3 ? "authorization" : code >= 1 && code <= 4 ? "state" : "unknown";
+    }
+    if (["join", "cancel", "contribute", "payout", "mark_default", "settle_round"].includes(method)) {
+      if (code === 4 || code === 12) return "authorization";
+      if (code === 8 || code === 9) return "deadline";
+      return code >= 5 && code <= 14 ? "state" : "unknown";
+    }
+    if (["get_config", "get_current_round", "get_pot_amount"].includes(method)) {
+      return code >= 1 && code <= 3 ? "state" : "unknown";
+    }
+  }
+  if (contract === "factory") {
+    if (method === "initialize" && (code === 108 || code === 109)) return "initialization";
+    if (method === "create_circle" && code >= 100 && code <= 107) return "validation";
+  }
+  if (contract === "reputation") {
+    if (method === "initialize" && (code === 7 || code === 8)) return "initialization";
+    if (["increment", "add_authorized_caller", "remove_authorized_caller"].includes(method)) {
+      if (code === 1 || code === 2 || code === 5) return "authorization";
+      if (code === 3) return "state";
+      if (code === 4 || code === 7 || code === 8) return "initialization";
+      if (code === 6) return "validation";
+    }
+  }
+  return "unknown";
+}
+
+function contractErrorFromSimulation(
+  raw: string,
+  method: string,
+  contract: ContractErrorDiagnostic["contract"],
+  message: string,
+): ContractErrorDiagnostic | undefined {
+  const match = raw.match(/Error\(Contract,\s*#(\d+)\)/);
+  if (!match) return undefined;
+  const code = Number(match[1]);
+  return { contract, method, code, category: contractErrorCategory(code, method, contract), message };
 }
 
 /** Build a typed success result. */
@@ -732,7 +789,11 @@ function validateInvocation(
  * 4. Known host-error patterns translated to plain English
  * 5. Fall back to the full string trimmed to 300 chars
  */
-function extractSimulationError(raw: string): string {
+function extractSimulationError(
+  raw: string,
+  method?: string,
+  contractKind: "circle" | "factory" | "reputation" = "circle",
+): string {
   // Priority 1: Contract debug log — e.g. Event contract log (debug): "already joined"
   const logMatch = raw.match(/contract\s+log\s+\(debug\):\s+"([^"]+)"/i);
   if (logMatch) return logMatch[1];
@@ -744,6 +805,117 @@ function extractSimulationError(raw: string): string {
   // Priority 3: ContractError enum variant — Error(Contract, #N)
   const errCodeMatch = raw.match(/Error\(Contract,\s*#(\d+)\)/);
   if (errCodeMatch) {
+    const errCode = Number(errCodeMatch[1]);
+    if (method === "initialize" && contractKind === "circle") {
+      const initDiagnostics: Record<number, string> = {
+        1: "already initialized",
+        2: "at least two members are required",
+        3: "the member limit was exceeded",
+        4: "member addresses must be unique",
+        5: "round amount must be positive",
+        6: "round amount overflows the payout pot",
+        7: "round amount overflows the penalty calculation",
+        8: "round deadline is below the minimum",
+        9: "round deadline is above the maximum",
+        10: "the token address is invalid",
+        11: "the reputation contract address is invalid",
+        12: "the member rotation is inconsistent",
+        13: "the token contract does not implement the required interface",
+        14: "initialization is already in progress",
+      };
+      const diagnostic = initDiagnostics[errCode];
+      if (diagnostic) return `Circle initialization failed: ${diagnostic}.`;
+    }
+    if (contractKind === "circle" && (method === "pause" || method === "resume")) {
+      const pauseDiagnostics: Record<number, string> = {
+        1: "only the circle admin may pause or resume",
+        2: "the circle is already paused",
+        3: "the circle is not paused",
+        4: "the circle is not initialized",
+      };
+      const diagnostic = pauseDiagnostics[errCode];
+      if (diagnostic) return `Circle ${method} failed: ${diagnostic}.`;
+    }
+    if (contractKind === "circle" && method === "close") {
+      const closeDiagnostics: Record<number, string> = {
+        1: "the circle has already been closed",
+        2: "the circle is not in a terminal state",
+        3: "the caller is not authorized to close this circle",
+        4: "not all rounds have completed",
+      };
+      const diagnostic = closeDiagnostics[errCode];
+      if (diagnostic) return `Circle close failed: ${diagnostic}.`;
+    }
+    if (
+      contractKind === "circle" &&
+      ["get_config", "get_current_round", "get_pot_amount"].includes(method ?? "")
+    ) {
+      const viewDiagnostics: Record<number, string> = {
+        1: "the circle has not been initialized",
+        2: "the circle is not active",
+        3: "the payout pot overflows the supported amount",
+      };
+      const diagnostic = viewDiagnostics[errCode];
+      if (diagnostic) return `Circle read failed: ${diagnostic}.`;
+    }
+    if (method === "create_circle" || (method === "initialize" && contractKind === "factory")) {
+      const factoryDiagnostics: Record<number, string> = {
+        100: "at least two members are required",
+        101: "the member limit was exceeded",
+        102: "member addresses must be unique",
+        103: "round amount must be positive",
+        104: "round amount overflows the payout pot",
+        105: "round amount overflows the penalty calculation",
+        106: "round deadline is below the minimum",
+        107: "round deadline is above the maximum",
+        108: "the factory has already been initialized",
+        109: "factory initialization is already in progress",
+      };
+      const diagnostic = factoryDiagnostics[errCode];
+      if (diagnostic) {
+        return method === "initialize"
+          ? `Factory initialization failed: ${diagnostic}.`
+          : `Circle creation failed: ${diagnostic}.`;
+      }
+    }
+    if (
+      ["increment", "add_authorized_caller", "remove_authorized_caller"].includes(method ?? "") ||
+      (method === "initialize" && contractKind === "reputation")
+    ) {
+      const reputationDiagnostics: Record<number, string> = {
+        1: "the calling circle is not authorized",
+        2: "only the reputation admin can change authorized callers",
+        3: "the circle is not currently authorized",
+        4: "the reputation contract is not initialized",
+        5: "the circle was permanently revoked",
+        6: "the member score reached its maximum value",
+        7: "the reputation contract has already been initialized",
+        8: "reputation initialization is already in progress",
+      };
+      const diagnostic = reputationDiagnostics[errCode];
+      if (diagnostic) {
+        return method === "initialize"
+          ? `Reputation initialization failed: ${diagnostic}.`
+          : `Reputation operation failed: ${diagnostic}.`;
+      }
+    }
+    if (["join", "cancel", "contribute", "payout", "mark_default", "settle_round", "close"].includes(method ?? "")) {
+      const mutationDiagnostics: Record<number, string> = {
+        4: "the caller is not a circle member",
+        5: "this action has already been completed",
+        6: "the circle is not in the required state",
+        7: "the circle is paused",
+        8: "the contribution deadline has passed",
+        9: "the contribution deadline has not passed yet",
+        10: "the round has already been paid out",
+        11: "the round is not eligible for this settlement action",
+        12: "the member has not joined",
+        13: "the member was already marked in default for this round",
+        14: "the member contributed and cannot be marked in default",
+      };
+      const diagnostic = mutationDiagnostics[errCode];
+      if (diagnostic) return `Circle operation failed: ${diagnostic}.`;
+    }
     return `Contract error code ${errCodeMatch[1]}. Check that the operation is valid for the current circle state.`;
   }
 
@@ -1542,11 +1714,18 @@ export class CircleUpClient {
     if (diagnostics) diagnostics.estimate = estimate;
 
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      const humanMessage = extractSimulationError(simResult.error);
+      const contractKind = contractId === this.config.contracts.circleFactory
+        ? "factory"
+        : contractId === this.config.contracts.reputation
+          ? "reputation"
+          : "circle";
+      const humanMessage = extractSimulationError(simResult.error, method, contractKind);
       return txFailure(
         "",
         `Simulation failed for ${ctx}: ${humanMessage}`,
         "simulation_failed",
+        undefined,
+        contractErrorFromSimulation(simResult.error, method, contractKind, humanMessage),
       );
     }
 
@@ -2038,7 +2217,12 @@ export class CircleUpClient {
     }
 
     if (SorobanRpc.Api.isSimulationError(simResult)) {
-      return { ok: false, error: extractSimulationError(simResult.error) };
+      const contractKind = contractId === this.config.contracts.circleFactory
+        ? "factory"
+        : contractId === this.config.contracts.reputation
+          ? "reputation"
+          : "circle";
+      return { ok: false, error: extractSimulationError(simResult.error, method, contractKind) };
     }
 
     if (!("result" in simResult) || !simResult.result) {
@@ -3608,8 +3792,22 @@ export class IndexerClient {
    * timeout and by the caller's `signal`. Throws {@link IndexerError} with a
    * distinct `kind` for each failure category.
    */
-  private async get<T>(path: string, spec: EnvelopeSpec = {}, options?: IndexerRequestOptions): Promise<T> {
-    return (await this.request<T>(path, spec, options)).body;
+  private async get<T>(
+    path: string,
+    spec: EnvelopeSpec,
+    options?: IndexerRequestOptions,
+  ): Promise<T> {
+    const { body, status, url } = await this.request<T>(path, options);
+    const invalid = validateEnvelope(body, spec);
+    if (invalid) {
+      throw new IndexerError(
+        `Indexer response from ${url} has an invalid envelope: ${invalid}.`,
+        status,
+        url,
+        "schema",
+      );
+    }
+    return body;
   }
 
   /**
@@ -3626,15 +3824,15 @@ export class IndexerClient {
     path: string,
     itemsKey: keyof T & string,
     requested: { page: number; limit?: number },
-    spec: EnvelopeSpec = {},
     options?: IndexerRequestOptions,
   ): Promise<T> {
-    const { body, status, url } = await this.request<T>(path, spec, options);
+    const { body, status, url } = await this.request<T>(path, options);
     const fail = (problem: string): never => {
       throw new IndexerError(
         `Indexer response from ${url} has an invalid page envelope: ${problem}`,
         status,
         url,
+        "schema",
       );
     };
 
@@ -3694,7 +3892,6 @@ export class IndexerClient {
   /** Fetch `path` and return the parsed body with the status and URL it came from. */
   private async request<T>(
     path: string,
-    spec: EnvelopeSpec = {},
     options?: IndexerRequestOptions,
   ): Promise<{ body: T; status: number; url: string }> {
     const url = `${this.baseUrl}${path}`;
@@ -3758,49 +3955,39 @@ export class IndexerClient {
         );
       }
 
-      if (!response.ok) {
-        let detail = "";
-        try {
-          const body = (await bounded(response.json())) as Record<string, unknown>;
-          const msg = body?.error;
-          detail = typeof msg === "string" ? ` — ${msg.slice(0, MAX_ERROR_DETAIL_LENGTH)}` : "";
-        } catch {
-          if (failure) throw failure;
-          // Ignore parse failure for error bodies (HTML error pages, empty bodies)
+      let body: T;
+      try {
+        body = (await bounded(response.json())) as T;
+      } catch (err) {
+        if (failure) throw failure;
+        if (!response.ok) {
+          throw new IndexerError(
+            `Indexer returned HTTP ${response.status} for ${url}.`,
+            response.status,
+            url,
+            "http",
+          );
         }
         throw new IndexerError(
-          `Indexer returned HTTP ${response.status} for ${url}${detail}`,
-          response.status,
-          url,
-          "http",
-        );
-      }
-
-      let body: unknown;
-      try {
-        body = await bounded(response.json());
-      } catch (err: any) {
-        if (failure) throw failure;
-        throw new IndexerError(
-          `Failed to parse JSON response from ${url}: ${err?.name === "SyntaxError" ? "body is not valid JSON" : (err?.message ?? "invalid JSON")}`,
+          `Indexer response from ${url} was not valid JSON.`,
           response.status,
           url,
           "json",
         );
       }
-
-      const problem = validateEnvelope(body, spec);
-      if (problem) {
+      if (!response.ok) {
+        const detail =
+          body && typeof body === "object" && "error" in body && typeof body.error === "string"
+            ? body.error.slice(0, MAX_ERROR_DETAIL_LENGTH)
+            : `HTTP ${response.status}`;
         throw new IndexerError(
-          `Unexpected response shape from ${url}: ${problem}. ` +
-          "The indexer and SDK versions may be incompatible.",
+          `Indexer returned HTTP ${response.status}: ${detail}`,
           response.status,
           url,
-          "schema",
+          "http",
         );
       }
-
-      return { body: body as T, status: response.status, url };
+      return { body, status: response.status, url };
     } finally {
       clearTimeout(timer);
       callerSignal?.removeEventListener("abort", onCallerAbort);
@@ -3844,7 +4031,6 @@ export class IndexerClient {
       `/circles${query}`,
       "circles",
       { page, limit },
-      { circles: "array" },
       options,
     );
   }
@@ -4008,7 +4194,6 @@ export class IndexerClient {
       `/members/${encodeURIComponent(member)}/contributions${query}`,
       "contributions",
       { page, limit },
-      { contributions: "array" },
       requestOptions,
     );
   }

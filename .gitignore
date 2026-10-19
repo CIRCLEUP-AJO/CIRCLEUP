@@ -12,6 +12,7 @@ sdk/dist/
 indexer/dist/
 scripts/dist/
 contracts/target/
+artifacts/
 
 # Environment files
 .env

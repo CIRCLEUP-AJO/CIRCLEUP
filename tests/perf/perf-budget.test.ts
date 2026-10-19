@@ -112,6 +112,23 @@ function makeContributionFixture(i: number) {
   };
 }
 
+/**
+ * Maximum-size circle fixture (256 members per protocol constant MAX_MEMBERS).
+ * Used to measure resource budgets for boundary cases.
+ */
+function makeMaxSizeCircleFixture(i: number) {
+  return {
+    address: `CCIRCLEMAX${String(i).padStart(48, "0")}`,
+    creator: `GCREATORMAX${String(i).padStart(47, "0")}`,
+    round_amount: "100000000",
+    member_count: 256,  // MAX_MEMBERS from protocol
+    status: i % 2 === 0 ? "Active" : "Pending",
+    current_round: i % 10,
+    total_rounds: 10,
+    created_ledger: 1000 + i,
+  };
+}
+
 // ─── API payload tests ────────────────────────────────────────────────────────
 
 describe("API payload budgets", () => {
@@ -691,3 +708,102 @@ describe("Query time budgets", () => {
     );
   });
 });
+
+// ─── Maximum-size circle resource budgets ────────────────────────────────────
+// Tests for boundary-case circles with 256 members (MAX_MEMBERS protocol constant).
+// These measure storage serialization, payload sizes, and processing costs to
+// ensure maximum-size circles are practical on the target network.
+
+describe("Maximum-size circle resource budgets", () => {
+  test("single 256-member circle payload measurements documented", () => {
+    const circle = makeMaxSizeCircleFixture(0);
+    const payload = JSON.stringify({ circles: [circle] });
+    const kb = Buffer.byteLength(payload, "utf8") / 1024;
+    
+    // Document the measured size for budgets.json
+    console.log(`  [api:maxSizeCircle] measured payload: ${kb.toFixed(2)} KB`);
+    assert.ok(kb < 1, "single 256-member circle should be small; actual structure may need review");
+  });
+
+  test("processing a 256-member circle fixture measurements documented", () => {
+    const circle = makeMaxSizeCircleFixture(0);
+
+    const start = process.hrtime.bigint();
+    // Simulate processing 256-member circle: status lookup, formatting
+    const status = circle.status?.trim().toLowerCase();
+    const amount = BigInt(circle.round_amount);
+    const whole = amount / STROOP;
+    const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
+    const _formatted = `${whole}.${frac}`;
+    const _progress = circle.total_rounds > 0
+      ? Math.round((circle.current_round / circle.total_rounds) * 100)
+      : 0;
+    void status; void _formatted; void _progress;
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+
+    // Document the measured time for budgets.json
+    console.log(`  [render:maxSizeCircleCard] measured time: ${elapsedMs.toFixed(3)} ms`);
+    assert.ok(elapsedMs < 100, "processing should complete in reasonable time");
+  });
+
+  test("serialising a 256-member circle measurements documented", () => {
+    const circle = makeMaxSizeCircleFixture(0);
+    const start = process.hrtime.bigint();
+    const _payload = JSON.stringify({ circles: [circle] });
+    void _payload;
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+
+    // Document the measured time for budgets.json
+    console.log(`  [query:maxSizeCircle] measured serialization time: ${elapsedMs.toFixed(3)} ms`);
+    assert.ok(elapsedMs < 100, "serialization should complete quickly");
+  });
+
+  test("contribution list for 256-member circle (all members) measurements documented", () => {
+    const contributions = Array.from({ length: 256 }, (_, i) => ({
+      member: `GMEMBER${String(i).padStart(49, "0")}`,
+      round: 0,
+      amount: "100000000",
+      txHash: "a".repeat(64),
+      ledger: 1000 + i,
+    }));
+    const payload = JSON.stringify({ contributions });
+    const kb = Buffer.byteLength(payload, "utf8") / 1024;
+
+    // Document the measured payload size for budgets.json
+    console.log(`  [api:maxSizeCircleContributions] measured payload: ${kb.toFixed(2)} KB`);
+    assert.ok(kb < 500, "256 member contributions should be under 500 KB");
+  });
+
+  test("document storage overhead for 256-member circle collateral tracking", () => {
+    // Calculate expected storage overhead:
+    // - 1 Config entry (instance)
+    // - 1 Status entry (instance)
+    // - 1 CurrentRound entry (instance)
+    // - 1 RoundsCompleted entry (instance)
+    // - 256 Collateral entries (persistent, one per member)
+    // - 256 Defaults entries (persistent, one per member)
+    //
+    // Per Soroban: instance entries ~500B each, persistent entries ~200-300B each
+    // Estimated total: (4 × 500B) + (512 × 250B) ≈ 2KB + 128KB = ~130KB per circle
+    //
+    // This is documented but not strictly enforced by this test — it serves as
+    // a baseline for storage planning. Actual costs vary by ledger state.
+
+    const instanceOverhead = 4 * 500;           // 4 instance entries @ 500B each
+    const persistentEntriesPerMember = 2;       // Collateral + Defaults
+    const bytesPerPersistentEntry = 250;        // Average persistent entry size
+    const memberCount = 256;
+    const persistentOverhead = persistentEntriesPerMember * memberCount * bytesPerPersistentEntry;
+
+    const estimatedTotalBytes = instanceOverhead + persistentOverhead;
+    const estimatedTotalKb = estimatedTotalBytes / 1024;
+
+    // Log for documentation purposes; this test always passes but records the estimate
+    console.log(
+      `  [storage:maxSizeCircle] estimated per-circle overhead: ${estimatedTotalKb.toFixed(1)} KB ` +
+      `(4 instance + ${persistentEntriesPerMember * memberCount} persistent entries)`,
+    );
+    assert.ok(true, "Storage estimate documented");
+  });
+});
+

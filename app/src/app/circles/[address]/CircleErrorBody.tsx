@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { useState } from "react";
 
 export type FetchError =
@@ -81,6 +82,11 @@ export default function CircleErrorBody({
             {retrying ? "Retrying…" : "Try again"}
           </button>
         )}
+        <p className="mt-3 text-xs">
+          <Link href="/" className="underline text-amber-800 hover:text-amber-900">
+            Back to circles
+          </Link>
+        </p>
       </div>
     </div>
   );

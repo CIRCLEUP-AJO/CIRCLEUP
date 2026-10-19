@@ -15,6 +15,11 @@ These guarantees are enforced through:
 2. **Canonical event identity** — database-level deduplication
 3. **Exponential backoff with cancellation** — graceful handling of transient failures
 
+Retention, archive integrity, and the current RPC-history dependency are
+documented in [`INDEXER_RETENTION.md`](./INDEXER_RETENTION.md). The indexer
+does not currently archive complete event payloads; do not prune indexed rows
+or assume a database snapshot can replace missing RPC event history.
+
 ## Atomic Ledger Processing (Issue 31)
 
 ### Design

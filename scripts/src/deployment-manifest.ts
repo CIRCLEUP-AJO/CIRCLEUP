@@ -22,7 +22,8 @@ import crypto from "crypto";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MANIFEST_VERSION = "1";
+const MANIFEST_VERSION = "2";
+const SUPPORTED_MANIFEST_VERSIONS = ["1", "2"] as const;
 
 const KNOWN_NETWORKS: Record<string, string> = {
   testnet:  "Test SDF Network ; September 2015",
@@ -45,7 +46,7 @@ export interface ContractEntry {
 
 export interface DeploymentManifest {
   /** Schema version — bump when the shape changes */
-  manifestVersion: string;
+  manifestVersion: typeof SUPPORTED_MANIFEST_VERSIONS[number];
   /** Network name: "testnet" | "mainnet" | "futurenet" */
   network: string;
   /** Stellar network passphrase (for consumer validation — not a secret) */
@@ -90,9 +91,22 @@ export interface ManifestInput {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Compute an integrity hash over the core fields so tampering is detectable. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/** Schema 1 keeps its historical checksum; schema 2 covers every manifest field. */
 function computeIntegrityHash(manifest: Omit<DeploymentManifest, "integrityHash">): string {
-  const payload = JSON.stringify({
+  const legacyPayload = JSON.stringify({
     network:           manifest.network,
     networkPassphrase: manifest.networkPassphrase,
     reputation:        manifest.contracts.reputation.contractId,
@@ -101,6 +115,7 @@ function computeIntegrityHash(manifest: Omit<DeploymentManifest, "integrityHash"
     usdc:              manifest.contracts.usdc,
     deployedAt:        manifest.deployedAt,
   });
+  const payload = manifest.manifestVersion === "1" ? legacyPayload : canonicalJson(manifest);
   return crypto.createHash("sha256").update(payload).digest("hex");
 }
 
@@ -109,6 +124,10 @@ function computeIntegrityHash(manifest: Omit<DeploymentManifest, "integrityHash"
  */
 function resolvePassphrase(networkOrPassphrase: string): string {
   return KNOWN_NETWORKS[networkOrPassphrase] ?? networkOrPassphrase;
+}
+
+function isSha256Hash(value: string): boolean {
+  return /^[a-f0-9]{64}$/i.test(value);
 }
 
 // ── Write ─────────────────────────────────────────────────────────────────────
@@ -120,6 +139,10 @@ function resolvePassphrase(networkOrPassphrase: string): string {
  * deployments cannot produce a manifest that looks complete.
  */
 export function writeManifest(input: ManifestInput, outputPath: string): DeploymentManifest {
+  if (!Object.prototype.hasOwnProperty.call(KNOWN_NETWORKS, input.network)) {
+    throw new Error(`[manifest] Unsupported network "${input.network}". Expected: ${Object.keys(KNOWN_NETWORKS).join(", ")}`);
+  }
+
   // Validate required fields — fail loudly before writing anything
   const required: Array<[string, unknown]> = [
     ["network",                        input.network],
@@ -148,8 +171,21 @@ export function writeManifest(input: ManifestInput, outputPath: string): Deploym
     );
   }
 
+  const hashes: Array<[string, string]> = [
+    ["reputation.wasmHash", input.reputation.wasmHash],
+    ["circleFactory.wasmHash", input.circleFactory.wasmHash],
+    ["circlWasmHash", input.circlWasmHash],
+  ];
+  const invalidHashes = hashes.filter(([, value]) => !isSha256Hash(value)).map(([field]) => field);
+  if (invalidHashes.length > 0) {
+    throw new Error(`[manifest] Invalid SHA-256 hash: ${invalidHashes.join(", ")}`);
+  }
+
   const networkPassphrase =
     input.networkPassphrase ?? resolvePassphrase(input.network);
+  if (networkPassphrase !== KNOWN_NETWORKS[input.network]) {
+    throw new Error(`[manifest] Network passphrase does not match the declared network "${input.network}".`);
+  }
 
   const deployedAt = new Date().toISOString();
 
@@ -182,8 +218,12 @@ export function writeManifest(input: ManifestInput, outputPath: string): Deploym
   const tmpOut = path.join(dir, `.manifest-${Date.now()}.tmp.json`);
 
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(tmpOut, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf-8" });
-  fs.renameSync(tmpOut, outputPath);
+  try {
+    fs.writeFileSync(tmpOut, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf-8" });
+    fs.renameSync(tmpOut, outputPath);
+  } finally {
+    fs.rmSync(tmpOut, { force: true });
+  }
 
   return manifest;
 }
@@ -220,13 +260,25 @@ export function validateManifest(
     };
   }
 
-  let manifest: DeploymentManifest;
+  let parsed: unknown;
   try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as DeploymentManifest;
+    parsed = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
   } catch (e) {
     return {
       ok: false,
       errors: [`Failed to parse manifest JSON: ${(e as Error).message}`],
+    };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, errors: ["Manifest must be a JSON object."] };
+  }
+  const manifest = parsed as DeploymentManifest;
+
+  if (!SUPPORTED_MANIFEST_VERSIONS.includes(manifest.manifestVersion)) {
+    return {
+      ok: false,
+      errors: [`Unsupported manifestVersion "${String(manifest.manifestVersion)}". Supported versions: ${SUPPORTED_MANIFEST_VERSIONS.join(", ")}.`],
     };
   }
 
@@ -256,8 +308,42 @@ export function validateManifest(
     }
   }
 
+  if (manifest.manifestVersion === "2") {
+    const checkFields = (value: unknown, label: string, allowed: string[]): void => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      for (const field of Object.keys(value)) {
+        if (!allowed.includes(field)) errors.push(`Unknown schema 2 field: ${label}.${field}`);
+      }
+    };
+    checkFields(manifest, "manifest", [
+      "manifestVersion", "network", "networkPassphrase", "build", "deployerPublicKey",
+      "contracts", "deployedAt", "integrityHash",
+    ]);
+    checkFields(manifest.build, "build", ["rustToolchain", "sorobanSdkVersion", "gitCommit"]);
+    checkFields(manifest.contracts, "contracts", ["reputation", "circleFactory", "circlWasmHash", "usdc"]);
+    checkFields(manifest.contracts?.reputation, "contracts.reputation", [
+      "contractId", "wasmHash", "deployTxHash", "deployedAtLedger",
+    ]);
+    checkFields(manifest.contracts?.circleFactory, "contracts.circleFactory", [
+      "contractId", "wasmHash", "deployTxHash", "deployedAtLedger",
+    ]);
+  }
+
   if (errors.length > 0) {
     return { ok: false, manifest, errors };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(KNOWN_NETWORKS, manifest.network)) {
+    errors.push(`Unsupported network "${manifest.network}". Known networks: ${Object.keys(KNOWN_NETWORKS).join(", ")}.`);
+  }
+
+  for (const [label, entry] of [
+    ["contracts.reputation", manifest.contracts.reputation],
+    ["contracts.circleFactory", manifest.contracts.circleFactory],
+  ] as const) {
+    if (!Number.isInteger(entry.deployedAtLedger) || entry.deployedAtLedger < 0) {
+      errors.push(`Invalid ${label}.deployedAtLedger: expected a non-negative integer.`);
+    }
   }
 
   // 3. Integrity hash
@@ -265,7 +351,7 @@ export function validateManifest(
   const expectedHash = computeIntegrityHash(rest as Omit<DeploymentManifest, "integrityHash">);
   if (integrityHash !== expectedHash) {
     errors.push(
-      `Integrity hash mismatch — manifest may have been tampered with.\n` +
+      `Integrity hash mismatch — manifest content is inconsistent with its stored checksum.\n` +
       `  stored  : ${integrityHash}\n` +
       `  expected: ${expectedHash}`,
     );
