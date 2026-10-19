@@ -47,7 +47,12 @@ describe("deadline — missing ledger data (unavailable)", () => {
   });
 
   it("is unavailable when both are undefined", () => {
-    const d = displayFor({ deadlineLedger: undefined, latestLedger: undefined });
+    const d = computeDeadlineDisplay({
+      deadlineLedger: undefined,
+      latestLedger: undefined,
+      status: "Active",
+      fetchedAtMs: NOW,
+    });
     expect(d.kind).toBe("unavailable");
   });
 
@@ -116,6 +121,8 @@ describe("deadline — ledger math and thresholds", () => {
   it("is overdue exactly at the deadline (boundary)", () => {
     const d = displayFor({ deadlineLedger: 5000, latestLedger: 5000 });
     expect(d.isOverdue).toBe(true);
+    expect(d.isEstimate).toBe(true);
+    expect(d.label).toMatch(/estimate/i);
   });
 
   it("is not overdue one ledger before the deadline", () => {

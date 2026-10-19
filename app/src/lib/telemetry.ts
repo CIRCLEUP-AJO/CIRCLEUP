@@ -213,13 +213,23 @@ export function looksLikeSensitiveString(value: unknown): boolean {
  * Applied to the event payload before it reaches the transport so a
  * future code change that accidentally passes an address through cannot
  * leak it.
+ *
+ * Patterns detected and dropped:
+ *   - Stellar addresses (G- or C- strkey, 56 chars)
+ *   - Transaction hashes (64-char lowercase hex)
+ *   - Long strings likely to be XDR or encoded args (> 100 chars)
+ *   - Seed phrases (8+ space-separated lowercase 3–8-char tokens)
  */
 export function scrubPayload(
   obj: Record<string, unknown>,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj)) {
-    if (looksLikeAddress(value) || looksLikeSensitiveString(value)) {
+    if (
+      looksLikeAddress(value) ||
+      looksLikeSensitiveString(value) ||
+      looksLikeSeedPhrase(value)
+    ) {
       // Drop the field entirely — do not replace with a placeholder that
       // might still carry structural information (e.g. length).
       continue;
@@ -364,4 +374,140 @@ export function categorizeError(raw: string | undefined): TxErrorCategory {
 /** Returns the current enabled state. Useful in tests that override the env. */
 export function isTelemetryEnabled(): boolean {
   return TELEMETRY_ENABLED;
+}
+
+// ─── Seed-phrase detection ────────────────────────────────────────────────────
+
+/**
+ * Returns true when `value` looks like a BIP-39 mnemonic seed phrase or
+ * similar secret that must never appear in a telemetry payload.
+ *
+ * Heuristics:
+ *   - 8 or more space-separated tokens of 3–8 lowercase ASCII letters each.
+ *     This matches 12-word and 24-word BIP-39 phrases without requiring the
+ *     full wordlist, which would bloat the bundle.
+ *
+ * False-positive rate is intentionally high: we prefer to drop a harmless
+ * string over leaking a seed phrase.
+ */
+export function looksLikeSeedPhrase(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const tokens = value.trim().split(/\s+/);
+  if (tokens.length < 8) return false;
+  const wordLike = /^[a-z]{3,8}$/;
+  const matchingTokens = tokens.filter((t) => wordLike.test(t));
+  return matchingTokens.length >= 8;
+}
+
+// ─── Product event allowlist ──────────────────────────────────────────────────
+
+/**
+ * The complete set of product events that may be collected.
+ *
+ * # Privacy allowlist
+ *
+ * Only events in this set are emitted by `emitProduct`. Any event name that is
+ * not on this list is silently dropped. Adding a new event name requires an
+ * explicit code change here and a corresponding privacy review.
+ *
+ * # What each event means
+ *
+ *   page_view              — a page loaded (no user identity attached)
+ *   circle_detail_viewed   — user viewed a circle detail page
+ *   reputation_viewed      — user viewed a reputation page
+ *   create_form_started    — user opened the create-circle form
+ *   create_form_submitted  — user submitted the create-circle form (outcome in stage)
+ *   wallet_connect_clicked — user clicked the wallet connect button
+ *
+ * # What is never collected
+ *
+ *   - Wallet addresses, seeds, or any key material
+ *   - Circle or contract addresses
+ *   - Transaction hashes, amounts, or signed XDR
+ *   - Raw wallet input or member lists
+ *   - Any value that could link activity to an individual
+ *
+ * # Opt-in model
+ *
+ * Product events use the same `NEXT_PUBLIC_TELEMETRY_ENABLED` flag as
+ * transaction telemetry. Both are disabled by default and require an explicit
+ * opt-in environment variable.
+ *
+ * # Retention and disable
+ *
+ * Events are passed to the configured transport (default: console.debug).
+ * No retention policy is enforced at the SDK level — retention is the
+ * responsibility of the transport / analytics backend.
+ *
+ * To disable: remove `NEXT_PUBLIC_TELEMETRY_ENABLED=true` from the app
+ * environment. No code change is required.
+ */
+export const ALLOWED_PRODUCT_EVENTS = new Set([
+  "page_view",
+  "circle_detail_viewed",
+  "reputation_viewed",
+  "create_form_started",
+  "create_form_submitted",
+  "wallet_connect_clicked",
+] as const);
+
+export type AllowedProductEventName = typeof ALLOWED_PRODUCT_EVENTS extends Set<infer T>
+  ? T
+  : never;
+
+/**
+ * A single product analytics event.
+ *
+ * Fields are limited to the same low-risk set as transaction events:
+ * no addresses, hashes, XDR, or user-entered values.
+ */
+export interface ProductEvent {
+  /** Canonical event name — must be in ALLOWED_PRODUCT_EVENTS. */
+  readonly name: string;
+  /**
+   * Optional page or section identifier (e.g. "circle_detail", "reputation").
+   * Must not contain addresses or sensitive identifiers.
+   */
+  readonly page?: string;
+  /**
+   * Network passphrase — separates testnet from mainnet funnels.
+   * Does not identify any individual.
+   */
+  readonly network: string;
+}
+
+/**
+ * Emit a product analytics event.
+ *
+ * Guards applied before emission:
+ *   1. Telemetry must be enabled (NEXT_PUBLIC_TELEMETRY_ENABLED === "true").
+ *   2. The event name must be in ALLOWED_PRODUCT_EVENTS; unlisted names are
+ *      silently dropped — never an error, to avoid affecting the calling path.
+ *   3. The payload is scrubbed for addresses, tx hashes, XDR blobs, and
+ *      seed phrases before reaching the transport.
+ *
+ * Fire-and-forget: transport errors are swallowed and never re-thrown.
+ *
+ * @param name    The product event name (must be in ALLOWED_PRODUCT_EVENTS).
+ * @param extras  Optional additional safe fields (page, etc.).
+ */
+export function emitProduct(
+  name: string,
+  extras: Omit<ProductEvent, "name" | "network"> = {},
+): void {
+  if (!TELEMETRY_ENABLED) return;
+  if (!ALLOWED_PRODUCT_EVENTS.has(name as AllowedProductEventName)) return;
+
+  try {
+    const rawEvent: ProductEvent = {
+      name,
+      network: _network,
+      ...extras,
+    };
+
+    const scrubbed = scrubPayload(rawEvent as unknown as Record<string, unknown>);
+    _transport(scrubbed as unknown as TxTelemetryEvent);
+  } catch {
+    // Transport errors are silently swallowed.
+  }
 }

@@ -22,6 +22,18 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { StrKey } from "@stellar/stellar-sdk";
+
+function fixtureContractAddress(label: string): string {
+  const seed = createHash("sha256").update(label).digest();
+  return StrKey.encodeContract(seed);
+}
+
+function fixtureMemberAddress(label: string): string {
+  const seed = createHash("sha256").update(label).digest();
+  return StrKey.encodeEd25519PublicKey(seed);
+}
 
 const hasDb = Boolean(process.env.DATABASE_URL);
 
@@ -67,7 +79,7 @@ if (hasDb) {
     } = {},
   ) {
     const {
-      creator       = "GCREATOR_DB_TEST",
+      creator       = fixtureMemberAddress("creator"),
       roundAmount   = 100,
       memberCount   = 2,
       status        = "Active",
@@ -129,7 +141,7 @@ if (hasDb) {
   // ── GET /circles ─────────────────────────────────────────────────────────────
 
   test("GET /circles returns 200 with pagination envelope", async () => {
-    const addr = "CDBTEST_LIST_CIRCLE";
+    const addr = fixtureContractAddress("list-circle");
     await seedCircle(addr);
     try {
       const res = await request(app).get("/circles");
@@ -149,8 +161,8 @@ if (hasDb) {
   });
 
   test("GET /circles filters by status", async () => {
-    const pending   = "CDBTEST_STATUS_PENDING";
-    const completed = "CDBTEST_STATUS_COMPLETED";
+    const pending   = fixtureContractAddress("status-pending");
+    const completed = fixtureContractAddress("status-completed");
     await seedCircle(pending,   { status: "Pending" });
     await seedCircle(completed, { status: "Completed" });
 
@@ -183,7 +195,7 @@ if (hasDb) {
   });
 
   test("GET /circles pagination: page 2 returns the next slice", async () => {
-    const addrs = ["CDBTEST_PAGEA", "CDBTEST_PAGEB", "CDBTEST_PAGEC"];
+    const addrs = ["page-a", "page-b", "page-c"].map(fixtureContractAddress);
     for (const addr of addrs) await seedCircle(addr, { status: "Pending" });
 
     try {
@@ -210,7 +222,7 @@ if (hasDb) {
   // ── GET /circles/summary ─────────────────────────────────────────────────────
 
   test("GET /circles/summary returns counts by status with a total", async () => {
-    const addr = "CDBTEST_SUMMARY_CIRCLE";
+    const addr = fixtureContractAddress("summary-circle");
     await seedCircle(addr, { status: "Active" });
 
     try {
@@ -228,8 +240,8 @@ if (hasDb) {
   // ── GET /circles/:address ────────────────────────────────────────────────────
 
   test("GET /circles/:address returns circle detail with members", async () => {
-    const addr   = "CDBTEST_DETAIL_CIRCLE";
-    const member = "GDBTEST_DETAIL_MEMBER";
+    const addr   = fixtureContractAddress("detail-circle");
+    const member = fixtureMemberAddress("detail-member");
     await seedCircle(addr);
     await seedMember(addr, member, 0);
 
@@ -246,7 +258,7 @@ if (hasDb) {
   });
 
   test("GET /circles/:address returns 404 for unknown address", async () => {
-    const res = await request(app).get("/circles/CDBTEST_UNKNOWN_ADDR");
+    const res = await request(app).get(`/circles/${fixtureContractAddress("unknown-address")}`);
     assert.equal(res.status, 404);
   });
 
@@ -261,9 +273,9 @@ if (hasDb) {
   // ── GET /circles/:address/members ────────────────────────────────────────────
 
   test("GET /circles/:address/members returns member list with totals", async () => {
-    const addr    = "CDBTEST_MEMBERS_CIRCLE";
-    const member1 = "GDBTEST_MEMBERS_M1";
-    const member2 = "GDBTEST_MEMBERS_M2";
+    const addr    = fixtureContractAddress("members-circle");
+    const member1 = fixtureMemberAddress("members-1");
+    const member2 = fixtureMemberAddress("members-2");
     await seedCircle(addr);
     await seedMember(addr, member1, 0);
     await seedMember(addr, member2, 1);
@@ -280,13 +292,13 @@ if (hasDb) {
   });
 
   test("GET /circles/:address/members returns 404 for unknown circle", async () => {
-    const res = await request(app).get("/circles/CDBTEST_NO_SUCH_CIRCLE/members");
+    const res = await request(app).get(`/circles/${fixtureContractAddress("no-such-circle")}/members`);
     assert.equal(res.status, 404);
   });
 
   test("GET /circles/:address/members includes hasContributedCurrentRound per member (#539)", async () => {
-    const addr   = "CDBTEST_MEM_HASCONTRIB";
-    const member = "GDBTEST_MEM_HASCONTRIB";
+    const addr   = fixtureContractAddress("member-has-contributed-circle");
+    const member = fixtureMemberAddress("member-has-contributed");
     await seedCircle(addr, { status: "Active", currentRound: 0 });
     await seedMember(addr, member, 0);
     await seedContribution(addr, member, 0, 1001);
@@ -309,8 +321,8 @@ if (hasDb) {
   });
 
   test("GET /circles/:address/members reports false hasContributedCurrentRound when not contributed (#539)", async () => {
-    const addr   = "CDBTEST_MEM_NOTCONTRIB";
-    const member = "GDBTEST_MEM_NOTCONTRIB";
+    const addr   = fixtureContractAddress("member-not-contributed-circle");
+    const member = fixtureMemberAddress("member-not-contributed");
     await seedCircle(addr, { status: "Active", currentRound: 0 });
     await seedMember(addr, member, 0);
 
@@ -334,15 +346,15 @@ if (hasDb) {
   // ── GET /members/:member/contributions ───────────────────────────────────────
 
   test("GET /members/:member/contributions returns empty list for unknown member", async () => {
-    const res = await request(app).get("/members/GDBTEST_UNKNOWN_MEMBER/contributions");
+    const res = await request(app).get(`/members/${fixtureMemberAddress("unknown-member")}/contributions`);
     assert.equal(res.status, 200);
     assert.deepEqual(res.body.contributions, []);
     assert.equal(res.body.pagination.total, 0);
   });
 
   test("GET /members/:member/contributions returns contribution history", async () => {
-    const addr   = "CDBTEST_CONTRIBS_CIRCLE";
-    const member = "GDBTEST_CONTRIBS_MEMBER";
+    const addr   = fixtureContractAddress("contributions-circle");
+    const member = fixtureMemberAddress("contributions-member");
     await seedCircle(addr);
     await seedMember(addr, member, 0);
     await seedContribution(addr, member, 0, 1001);
@@ -360,8 +372,8 @@ if (hasDb) {
   });
 
   test("GET /members/:member/contributions returns totalAmount aggregate (#541)", async () => {
-    const addr   = "CDBTEST_CONT_AMT_CIRCLE";
-    const member = "GDBTEST_CONT_AMT_MEMBER";
+    const addr   = fixtureContractAddress("contribution-amount-circle");
+    const member = fixtureMemberAddress("contribution-amount-member");
     await seedCircle(addr);
     await seedMember(addr, member, 0);
     await seedContribution(addr, member, 0, 1001);
@@ -382,8 +394,8 @@ if (hasDb) {
   });
 
   test("GET /members/:member/contributions returns hasMore=false on last page (#541)", async () => {
-    const addr   = "CDBTEST_CONT_HASMORE";
-    const member = "GDBTEST_CONT_HASMORE";
+    const addr   = fixtureContractAddress("contribution-has-more-circle");
+    const member = fixtureMemberAddress("contribution-has-more-member");
     await seedCircle(addr);
     await seedMember(addr, member, 0);
     await seedContribution(addr, member, 0, 1001);
@@ -398,8 +410,8 @@ if (hasDb) {
   });
 
   test("GET /members/:member/contributions paginates correctly", async () => {
-    const addr   = "CDBTEST_CONT_PAG_CIRCLE";
-    const member = "GDBTEST_CONT_PAG_MEMBER";
+    const addr   = fixtureContractAddress("contribution-pagination-circle");
+    const member = fixtureMemberAddress("contribution-pagination-member");
     await seedCircle(addr);
     await seedMember(addr, member, 0);
     for (let i = 0; i < 5; i++) {
@@ -419,29 +431,29 @@ if (hasDb) {
   });
 
   test("GET /members/:member/contributions filters by ?circle= and returns 404 for unknown circle", async () => {
-    const member = "GDBTEST_CIRCLE_FILTER_M";
+    const member = fixtureMemberAddress("circle-filter-member");
     const res = await request(app).get(
-      `/members/${member}/contributions?circle=CDBTEST_NONEXISTENT`,
+      `/members/${member}/contributions?circle=${fixtureContractAddress("nonexistent-filter")}`,
     );
     assert.equal(res.status, 404, "unknown ?circle= filter must return 404");
   });
 
   test("GET /members/:member/contributions returns 400 for invalid limit", async () => {
-    const res = await request(app).get("/members/GMEMBER/contributions?limit=abc");
+    const res = await request(app).get(`/members/${fixtureMemberAddress("invalid-limit")}/contributions?limit=abc`);
     assert.equal(res.status, 400);
   });
 
   // ── GET /reputation/:member ───────────────────────────────────────────────────
 
   test("GET /reputation/:member returns score 0 and found=false for unknown member", async () => {
-    const res = await request(app).get("/reputation/GDBTEST_REP_UNKNOWN");
+    const res = await request(app).get(`/reputation/${fixtureMemberAddress("unknown-reputation")}`);
     assert.equal(res.status, 200);
     assert.equal(res.body.score, 0);
     assert.equal(res.body.found, false);
   });
 
   test("GET /reputation/:member returns correct score for a known member", async () => {
-    const member = "GDBTEST_REP_KNOWN";
+    const member = fixtureMemberAddress("known-reputation");
     await seedReputation(member, 3);
 
     try {
@@ -468,9 +480,9 @@ if (hasDb) {
   // ── GET /circles/:address/rounds ─────────────────────────────────────────────
 
   test("GET /circles/:address/rounds returns 200 with status metadata on every round (issue #529)", async () => {
-    const addr    = "CDBTEST_ROUNDS_STATUS";
-    const member1 = "GDBTEST_ROUNDS_STATUS_M1";
-    const member2 = "GDBTEST_ROUNDS_STATUS_M2";
+    const addr    = fixtureContractAddress("round-status-circle");
+    const member1 = fixtureMemberAddress("round-status-member-1");
+    const member2 = fixtureMemberAddress("round-status-member-2");
     const VALID_STATUSES = new Set(["completed", "current", "cancelled", "open"]);
 
     // Active 2-member circle: round 0 paid out, round 1 in progress
@@ -560,8 +572,8 @@ if (hasDb) {
   });
 
   test("GET /circles/:address/rounds returns status='cancelled' for currentRound of a Cancelled circle (issue #529)", async () => {
-    const addr   = "CDBTEST_ROUNDS_CANCELLED";
-    const member = "GDBTEST_ROUNDS_CANCELLED_M";
+    const addr   = fixtureContractAddress("rounds-cancelled-circle");
+    const member = fixtureMemberAddress("rounds-cancelled-member");
 
     await seedCircle(addr, {
       status:       "Cancelled",
@@ -594,7 +606,7 @@ if (hasDb) {
   });
 
   test("GET /circles/:address/rounds: 404 for unknown circle", async () => {
-    const res = await request(app).get("/circles/CDBTEST_NO_ROUNDS_CIRCLE/rounds");
+    const res = await request(app).get(`/circles/${fixtureContractAddress("no-rounds-circle")}/rounds`);
     assert.equal(res.status, 404);
   });
   test("GET /circles returns 400 for invalid sort field", async () => {
@@ -610,8 +622,8 @@ if (hasDb) {
   // ── #530 GET /circles/:address/members — stable totals for empty contributions ─
 
   test("GET /circles/:address/members returns numeric totalContributions=0 when no contributions are seeded", async () => {
-    const addr   = "CDBTEST_EMPTY_CONTRIB_CIRCLE";
-    const member = "GDBTEST_EMPTY_CONTRIB_MEMBER";
+    const addr   = fixtureContractAddress("empty-contribution-circle");
+    const member = fixtureMemberAddress("empty-contribution-member");
     await seedCircle(addr);
     await seedMember(addr, member, 0);
 
@@ -646,7 +658,7 @@ if (hasDb) {
   // ── #531 GET /indexer/state — entity counts ───────────────────────────────────
 
   test("GET /indexer/state includes entityCounts with numeric totals and circlesByStatus", async () => {
-    const addr = "CDBTEST_STATE_ENTITY_CIRCLE";
+    const addr = fixtureContractAddress("state-entity-circle");
     await seedCircle(addr, { status: "Active" });
 
     try {

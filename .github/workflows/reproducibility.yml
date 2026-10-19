@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Install the exact Rust toolchain declared in contracts/rust-toolchain.toml.
       # The toolchain file is picked up automatically by rustup.
@@ -63,8 +63,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
+
+      - name: Select supported npm line
+        run: npm install --global npm@10
 
       - name: Install Node dependencies
         run: npm ci

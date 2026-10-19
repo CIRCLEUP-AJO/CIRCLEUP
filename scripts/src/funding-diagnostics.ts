@@ -93,6 +93,10 @@ function stroopsToUsdc(stroops: bigint): string {
   return `$${whole}.${frac.toString().padStart(7, "0").slice(0, 2)} USDC`;
 }
 
+export function hasSufficientBalance(actualStroops: bigint | null, requiredStroops: bigint): boolean {
+  return actualStroops !== null && actualStroops >= requiredStroops;
+}
+
 /** Validate that a string is a G... Stellar public key. */
 function isValidPublicKey(key: string): boolean {
   try {
@@ -263,8 +267,7 @@ export async function runFundingDiagnostics(
     checkType:       "xlm",
     actualStroops:   deployerXlm,
     requiredStroops: MIN_DEPLOYER_STROOPS,
-    sufficient:
-      deployerXlm !== null && deployerXlm >= MIN_DEPLOYER_STROOPS,
+    sufficient: hasSufficientBalance(deployerXlm, MIN_DEPLOYER_STROOPS),
   };
 
   if (deployerXlm === null) {
@@ -304,7 +307,7 @@ export async function runFundingDiagnostics(
     }
 
     const bal = await getXlmBalanceStroops(horizonUrl, memberKey);
-    const sufficient = bal !== null && bal >= MIN_MEMBER_STROOPS;
+    const sufficient = hasSufficientBalance(bal, MIN_MEMBER_STROOPS);
 
     const check: BalanceDiagnostic = {
       label:           `member (${memberKey.slice(0, 8)}…)`,
@@ -342,8 +345,7 @@ export async function runFundingDiagnostics(
         usdcContractId,
         memberKey,
       );
-      const sufficient =
-        usdcBal !== null && usdcBal >= MIN_MEMBER_USDC_STROOPS;
+      const sufficient = hasSufficientBalance(usdcBal, MIN_MEMBER_USDC_STROOPS);
 
       const check: BalanceDiagnostic = {
         label:           `member-usdc (${memberKey.slice(0, 8)}…)`,

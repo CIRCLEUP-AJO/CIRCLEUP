@@ -31,6 +31,24 @@ Send a report with the subject `[SECURITY] CircleUp Vulnerability` to the mainta
 - Potential impact (e.g. funds at risk, collateral bypass, payout manipulation, unauthorized default)
 - Suggested fix if you have one
 
+### What NOT to Include
+
+Redact the following before sending your report.  If you accidentally include
+any of these, let us know immediately so we can treat the report as confidential.
+
+| Item | Safe substitute |
+|------|-----------------|
+| Secret seed phrases or mnemonic words | Describe the wallet type (e.g. "a Freighter wallet on testnet") |
+| Private keys (`S`-prefix Stellar addresses) | Use a synthetic key or omit entirely |
+| Signed XDR transactions | Describe the transaction intent in plain text |
+| Production API keys or credentials | Note that credentials were present, not their values |
+| Real user wallet addresses from production | Use a placeholder like `GAAAA...` or "the affected member address" |
+| Contract IDs from a private deployment | Use "the deployed contract address" |
+| Database connection strings or passwords | Describe the database role (e.g. "indexer read-only user") |
+
+These items are not necessary to demonstrate a vulnerability and exposing them
+in a report increases the risk to users and infrastructure.
+
 ---
 
 ## Response Timeline

@@ -344,7 +344,7 @@ export function resetLogger(): void {
 export function log(
   level: LogLevel,
   event: LogEventKey,
-  ctx: LogContext = {},
+  ctx: object = {},
   msg?: string,
 ): void {
   if (LEVEL_RANK[level] < LEVEL_RANK[_minLevel]) return;
@@ -374,7 +374,7 @@ export function log(
  * `memberAddress`, `creator`, and `recipient`.  Other fields pass through
  * unchanged.
  */
-function redactContext(ctx: LogContext): LogContext {
+function redactContext(ctx: object): LogContext {
   const ADDRESS_KEYS = new Set([
     "contractId", "circleAddress", "memberAddress", "creator", "recipient",
   ]);
@@ -407,7 +407,7 @@ function redactContext(ctx: LogContext): LogContext {
 
 /** Indexer process started. */
 export function logIndexerStarted(ctx: IndexerStartedCtx): void {
-  log("info", "indexer_started", ctx as LogContext,
+  log("info", "indexer_started", ctx,
     `CircleUp indexer started (poll: ${ctx.pollIntervalMs}ms, limit: ${ctx.eventsLimit})`);
 }
 
@@ -426,7 +426,7 @@ export function logPollCompleted(ctx: PollCompletedCtx): void {
   log(
     ctx.eventsFailed > 0 ? "warn" : "info",
     "poll_completed",
-    ctx as LogContext,
+    ctx,
     `Processed ledgers ${ctx.fromLedger}-${ctx.toLedger}: ` +
       `${ctx.eventsProcessed} event(s), ${ctx.eventsFailed} failed, ${ctx.durationMs}ms`,
   );
@@ -434,13 +434,13 @@ export function logPollCompleted(ctx: PollCompletedCtx): void {
 
 /** A poll cycle failed (after retries). */
 export function logPollFailed(ctx: PollFailedCtx): void {
-  log("error", "poll_failed", ctx as LogContext,
+  log("error", "poll_failed", ctx,
     `Poll error (consecutive failures: ${ctx.consecutiveFailures}): ${ctx.error}`);
 }
 
 /** Repeated poll failures — backoff is active. */
 export function logPollBackoff(ctx: PollBackoffCtx): void {
-  log("warn", "poll_backoff", ctx as LogContext,
+  log("warn", "poll_backoff", ctx,
     `Poll has failed ${ctx.consecutiveFailures} consecutive times. ` +
       `Backoff interval: ${Math.floor(ctx.currentIntervalMs / 1000)}s`);
 }
@@ -449,13 +449,13 @@ export function logPollBackoff(ctx: PollBackoffCtx): void {
 export function logLedgerProcessed(ctx: LedgerProcessedCtx): void {
   const latencyStr = ctx.latencyMs !== undefined ? `, ${ctx.latencyMs}ms` : "";
   const skippedStr = ctx.skipped !== undefined && ctx.skipped > 0 ? `, ${ctx.skipped} skipped` : "";
-  log("debug", "ledger_processed", ctx as LogContext,
+  log("debug", "ledger_processed", ctx,
     `Ledger ${ctx.ledger}: ${ctx.processed} processed, ${ctx.failed} failed${skippedStr}${latencyStr}`);
 }
 
 /** Ledger gaps detected in a poll range. */
 export function logLedgerGaps(ctx: LedgerGapCtx): void {
-  log("debug", "ledger_gap_detected", ctx as LogContext,
+  log("debug", "ledger_gap_detected", ctx,
     `${ctx.gaps.length} ledger gap(s) in ${ctx.fromLedger}-${ctx.toLedger}`);
 }
 
@@ -467,13 +467,13 @@ export function logLedgerContradiction(ctx: LedgerContradictionCtx): void {
 
 /** A Soroban event was successfully ingested. */
 export function logEventIngested(ctx: EventIngestedCtx): void {
-  log("debug", "event_ingested", ctx as LogContext,
+  log("debug", "event_ingested", ctx,
     `Event ingested: ${ctx.eventType} at ledger ${ctx.ledger}`);
 }
 
 /** A Soroban event was skipped as a duplicate. */
 export function logEventSkipped(ctx: EventSkippedCtx): void {
-  log("debug", "event_skipped", ctx as LogContext,
+  log("debug", "event_skipped", ctx,
     `Event skipped (duplicate): ${ctx.eventType} at ledger ${ctx.ledger}`);
 }
 
@@ -481,20 +481,20 @@ export function logEventSkipped(ctx: EventSkippedCtx): void {
 export function logEventHandlerError(ctx: EventHandlerErrorCtx): void {
   const outcome =
     ctx.errorClass === "transient" ? " (transient — ledger will be retried)" : "";
-  log("error", "event_handler_error", ctx as LogContext,
+  log("error", "event_handler_error", ctx,
     `Failed to process ${ctx.eventType} event at ledger ${ctx.ledger}${outcome}: ${ctx.error}`);
 }
 
 /** A transient RPC call is being retried. */
 export function logRpcRetry(ctx: RpcRetryCtx): void {
-  log("warn", "rpc_retry", ctx as LogContext,
+  log("warn", "rpc_retry", ctx,
     `Transient RPC failure during ${ctx.label} ` +
       `(attempt ${ctx.attempt}/${ctx.maxAttempts}): ${ctx.error} — retrying in ${ctx.delayMs}ms`);
 }
 
 /** All RPC retry attempts exhausted. */
 export function logRpcFailed(ctx: RpcFailedCtx): void {
-  log("error", "rpc_failed", ctx as LogContext,
+  log("error", "rpc_failed", ctx,
     `Soroban RPC ${ctx.label} failed after ${ctx.attempts} attempt(s): ${ctx.error}`);
 }
 
@@ -503,7 +503,7 @@ export function logHealthCheck(ctx: HealthCheckCompletedCtx): void {
   log(
     ctx.status === "ok" ? "debug" : "warn",
     ctx.status === "ok" ? "health_check_completed" : "health_check_degraded",
-    ctx as LogContext,
+    ctx,
     `Health check: ${ctx.status} (${ctx.durationMs}ms)`,
   );
 }
@@ -516,13 +516,13 @@ export function logConfigMissing(vars: string[]): void {
 
 /** A migration was applied. */
 export function logMigrationApplied(ctx: MigrationCtx): void {
-  log("info", "migration_applied", ctx as LogContext,
+  log("info", "migration_applied", ctx,
     `Migration applied: ${ctx.version ?? "unknown"}`);
 }
 
 /** A migration failed. */
 export function logMigrationFailed(ctx: MigrationCtx): void {
-  log("fatal", "migration_failed", ctx as LogContext,
+  log("fatal", "migration_failed", ctx,
     `Migration failed: ${ctx.error ?? "unknown error"}`);
 }
 
@@ -531,7 +531,7 @@ export function logApiRequest(ctx: ApiRequestCtx): void {
   log(
     ctx.statusCode >= 500 ? "error" : ctx.statusCode >= 400 ? "warn" : "info",
     "api_request",
-    ctx as LogContext,
+    ctx,
     `${ctx.method} ${ctx.path} -> ${ctx.statusCode} (${ctx.durationMs}ms)`,
   );
 }
@@ -541,7 +541,7 @@ export function logApiRequestError(ctx: ApiRequestErrorCtx): void {
   log(
     "error",
     "api_request_error",
-    ctx as LogContext,
+    ctx,
     `${ctx.method} ${ctx.path} failed: ${ctx.error}`,
   );
 }
@@ -551,7 +551,7 @@ export function logApiCorsRejected(ctx: ApiCorsRejectedCtx): void {
   log(
     "warn",
     "api_cors_rejected",
-    ctx as LogContext,
+    ctx,
     `CORS rejected for ${ctx.method} ${ctx.path}${ctx.origin ? ` from ${ctx.origin}` : ""}`,
   );
 }

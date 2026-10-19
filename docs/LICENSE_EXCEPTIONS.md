@@ -1,7 +1,7 @@
 # License Exceptions
 
 This file records explicit exceptions to the default license policy defined in
-`scripts/license-inventory.sh`.
+`scripts/license-inventory.sh` and `contracts/deny.toml`.
 
 ## Policy summary
 
@@ -26,3 +26,6 @@ Prohibited: `GPL-*`, `LGPL-*`, `AGPL-*`, `CC-BY-NC-*`, `BUSL-1.1`,
    justification (e.g. "dev-only dependency, not distributed in production
    build").
 4. Have the exception reviewed by a second contributor before merging.
+5. Add the exact SPDX license to the appropriate checked-in allowlist and keep
+   the documented reviewer, date, and rationale in this file. CI must fail
+   until both the documentation and enforcement policy are updated.

@@ -66,7 +66,7 @@ function safeFormatPot(stroops: string, memberCount: number): string {
 // have not changed.
 
 export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle }) {
-  const status = getStatusMeta(circle.status);
+  const status = getCircleStatusMeta(circle.status);
   const totalRounds = circle.total_rounds > 0 ? circle.total_rounds : 0;
   const currentRound = Math.max(0, circle.current_round);
   const progressPct =

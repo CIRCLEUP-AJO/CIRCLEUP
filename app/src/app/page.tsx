@@ -7,12 +7,6 @@ import { CircleCard, parseCircleRow } from "@/components/CircleCard";
 import type { Circle } from "@/components/CircleCard";
 import { RetryableCirclesList } from "@/components/RetryableCirclesList";
 import { CircleStatusFilter as CircleStatusFilterNav } from "@/components/CircleStatusFilter";
-import {
-  isValidStatusFilter,
-  getBrowseState,
-  type CircleStatusFilter,
-} from "@/lib/circleTypes";
-
 export const metadata: Metadata = {
   title: "CircleUp — Trustless Savings Circles on Stellar",
   description:
@@ -36,10 +30,8 @@ export const metadata: Metadata = {
 };
 
 import {
-  CIRCLE_STATUS_OPTIONS,
   isValidStatusFilter,
   isValidUrl,
-  PROTOCOL_GUARANTEES,
   getBrowseState,
   type CircleStatusFilter as StatusFilterType,
   type BrowseState,
@@ -521,7 +513,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
             without a full page reload. The active value is read back from
             searchParams on the server so the correct circles are streamed
             immediately, even on a direct URL visit or a hard refresh.        */}
-        <CircleStatusFilter activeStatus={activeStatus} />
+        <CircleStatusFilterNav activeStatus={activeStatus} />
       </div>
 
       <Suspense fallback={<CircleListSkeleton />}>
