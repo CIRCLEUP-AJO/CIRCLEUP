@@ -111,6 +111,10 @@ function resolvePassphrase(networkOrPassphrase: string): string {
   return KNOWN_NETWORKS[networkOrPassphrase] ?? networkOrPassphrase;
 }
 
+function isSha256Hash(value: string): boolean {
+  return /^[a-f0-9]{64}$/i.test(value);
+}
+
 // ── Write ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -148,6 +152,16 @@ export function writeManifest(input: ManifestInput, outputPath: string): Deploym
     );
   }
 
+  const hashes: Array<[string, string]> = [
+    ["reputation.wasmHash", input.reputation.wasmHash],
+    ["circleFactory.wasmHash", input.circleFactory.wasmHash],
+    ["circlWasmHash", input.circlWasmHash],
+  ];
+  const invalidHashes = hashes.filter(([, value]) => !isSha256Hash(value)).map(([field]) => field);
+  if (invalidHashes.length > 0) {
+    throw new Error(`[manifest] Invalid SHA-256 hash: ${invalidHashes.join(", ")}`);
+  }
+
   const networkPassphrase =
     input.networkPassphrase ?? resolvePassphrase(input.network);
 
@@ -182,8 +196,12 @@ export function writeManifest(input: ManifestInput, outputPath: string): Deploym
   const tmpOut = path.join(dir, `.manifest-${Date.now()}.tmp.json`);
 
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(tmpOut, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf-8" });
-  fs.renameSync(tmpOut, outputPath);
+  try {
+    fs.writeFileSync(tmpOut, JSON.stringify(manifest, null, 2) + "\n", { encoding: "utf-8" });
+    fs.renameSync(tmpOut, outputPath);
+  } finally {
+    fs.rmSync(tmpOut, { force: true });
+  }
 
   return manifest;
 }
@@ -253,6 +271,17 @@ export function validateManifest(
   for (const [field, value] of required) {
     if (!value || (typeof value === "string" && value.trim() === "")) {
       errors.push(`Missing or empty field: ${field}`);
+    }
+  }
+
+  const hashes: Array<[string, unknown]> = [
+    ["contracts.reputation.wasmHash", manifest.contracts?.reputation?.wasmHash],
+    ["contracts.circleFactory.wasmHash", manifest.contracts?.circleFactory?.wasmHash],
+    ["contracts.circlWasmHash", manifest.contracts?.circlWasmHash],
+  ];
+  for (const [field, value] of hashes) {
+    if (typeof value === "string" && !isSha256Hash(value)) {
+      errors.push(`Invalid SHA-256 hash: ${field}`);
     }
   }
 

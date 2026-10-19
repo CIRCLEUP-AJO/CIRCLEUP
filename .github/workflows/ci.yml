@@ -28,42 +28,9 @@ jobs:
         run: cd contracts && cargo test
         # Failure here blocks merge: names the failed crate in cargo output.
 
-  # ── TypeScript SDK ──────────────────────────────────────────────────────────
-  sdk:
-    name: SDK
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build SDK
-        run: npm run build --workspace=sdk
-
-      - name: Test SDK
-        run: npm run test --workspace=sdk
-
-      # Issue #464: Run contract fixture tests as an explicit, named step so a
-      # signature change surfaces as "Contract fixture tests" in the CI summary
-      # rather than disappearing into the general test output.
-      - name: Contract fixture tests (Issue #464)
-        run: npm run test --workspace=sdk -- contractFixtures.test.ts contractFixtures.extended.test.ts --run
-
-      # Clean build, then compile examples/ against dist/ and verify that every
-      # documented symbol imports from the package root, no internal helper or
-      # test file is published, and nothing in the repo uses a deep import.
-      - name: Public API check
-        run: npm run check:api --workspace=sdk
-
-  # ── Indexer ─────────────────────────────────────────────────────────────────
-  indexer:
-    name: Indexer
+  # ── TypeScript workspaces ───────────────────────────────────────────────────
+  typescript:
+    name: TypeScript workspaces
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -84,14 +51,20 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Typecheck SDK
+        run: npm run typecheck --workspace=sdk
+
       - name: Build indexer
         run: npm run build --workspace=indexer
+
+      - name: Typecheck indexer
+        run: npm run typecheck --workspace=indexer
 
       - name: Run indexer tests
         env:
@@ -104,23 +77,23 @@ jobs:
           NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
         run: npm run test --workspace=indexer
 
-  # ── Frontend app ─────────────────────────────────────────────────────────────
-  app:
-    name: App
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Build SDK
+        run: npm run build --workspace=sdk
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: npm
+      - name: Test SDK
+        run: npm run test --workspace=sdk
 
-      - name: Install dependencies
-        run: npm ci
+      - name: SDK example typecheck
+        run: npm run typecheck:examples --workspace=sdk
+
+      - name: SDK public API check
+        run: npm run check:api --workspace=sdk
 
       - name: Lint app
         run: npm run lint --workspace=app
+
+      - name: Typecheck app
+        run: npm run typecheck --workspace=app
 
       - name: Build app
         # Contract addresses may be empty in CI — the app allows this in dev mode.
@@ -136,20 +109,23 @@ jobs:
       - name: Test app
         run: npm run test --workspace=app
 
-  # ── Deployment scripts ───────────────────────────────────────────────────────
-  scripts:
-    name: Scripts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: Install Chromium and Linux dependencies
+        run: npx playwright install --with-deps chromium
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: npm
+      - name: App visual regression tests
+        run: npm run test:visual --workspace=app
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Typecheck deployment scripts
+        run: npm run typecheck --workspace=scripts
 
-      - name: Typecheck scripts
-        run: cd scripts && npx tsc --noEmit
+      - name: Test deployment scripts offline
+        run: npm run test --workspace=scripts
+
+      - name: Root demo journey tests
+        run: npm run test:e2e
+
+      - name: Root keyboard navigation tests
+        run: npm run test:keyboard
+
+      - name: Root performance budgets
+        run: npm run test:perf

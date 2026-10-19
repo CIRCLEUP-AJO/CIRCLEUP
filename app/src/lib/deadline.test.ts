@@ -47,7 +47,12 @@ describe("deadline — missing ledger data (unavailable)", () => {
   });
 
   it("is unavailable when both are undefined", () => {
-    const d = displayFor({ deadlineLedger: undefined, latestLedger: undefined });
+    const d = computeDeadlineDisplay({
+      deadlineLedger: undefined,
+      latestLedger: undefined,
+      status: "Active",
+      fetchedAtMs: NOW,
+    });
     expect(d.kind).toBe("unavailable");
   });
 

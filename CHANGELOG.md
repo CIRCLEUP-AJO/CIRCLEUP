@@ -8,6 +8,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Issues #706, #704, #703, #701**: CI now runs explicit per-workspace
+  TypeScript build, typecheck, lint, test, example, visual, performance, and
+  contract reproducibility gates. Added offline deployment preflight and
+  manifest tests, deterministic desktop/mobile route screenshots, and mocked
+  Freighter lifecycle/signing coverage that binds each signature to the
+  transaction's member address. No production credentials are used in CI.
+
 ### Changed (SDK)
 - **Strict RPC decoding** (`sdk/src/types.ts`): reads now fail at the
   decoding boundary, with the method or field named, on wrong variants, absent

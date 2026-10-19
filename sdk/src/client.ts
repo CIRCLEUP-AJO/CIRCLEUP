@@ -3608,8 +3608,22 @@ export class IndexerClient {
    * timeout and by the caller's `signal`. Throws {@link IndexerError} with a
    * distinct `kind` for each failure category.
    */
-  private async get<T>(path: string): Promise<T> {
-    return (await this.request<T>(path)).body;
+  private async get<T>(
+    path: string,
+    spec: EnvelopeSpec,
+    options?: IndexerRequestOptions,
+  ): Promise<T> {
+    const { body, status, url } = await this.request<T>(path, options);
+    const problem = validateEnvelope(body, spec);
+    if (problem) {
+      throw new IndexerError(
+        `Indexer response from ${url} has an invalid envelope: ${problem}.`,
+        status,
+        url,
+        "schema",
+      );
+    }
+    return body;
   }
 
   /**
@@ -3626,13 +3640,15 @@ export class IndexerClient {
     path: string,
     itemsKey: keyof T & string,
     requested: { page: number; limit?: number },
+    options?: IndexerRequestOptions,
   ): Promise<T> {
-    const { body, status, url } = await this.request<T>(path);
+    const { body, status, url } = await this.request<T>(path, options);
     const fail = (problem: string): never => {
       throw new IndexerError(
         `Indexer response from ${url} has an invalid page envelope: ${problem}`,
         status,
         url,
+        "schema",
       );
     };
 
@@ -3690,7 +3706,10 @@ export class IndexerClient {
   }
 
   /** Fetch `path` and return the parsed body with the status and URL it came from. */
-  private async request<T>(path: string): Promise<{ body: T; status: number; url: string }> {
+  private async request<T>(
+    path: string,
+    options?: IndexerRequestOptions,
+  ): Promise<{ body: T; status: number; url: string }> {
     const url = `${this.baseUrl}${path}`;
     const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
     assertPositiveTimeout(timeoutMs, "timeoutMs");
@@ -3752,14 +3771,41 @@ export class IndexerClient {
         );
       }
 
-    try {
-      return { body: (await response.json()) as T, status: response.status, url };
-    } catch (err: any) {
-      throw new IndexerError(
-        `Failed to parse JSON response from ${url}: ${err?.message ?? "invalid JSON"}`,
-        response.status,
-        url,
-      );
+      if (!response.ok) {
+        let detail = "";
+        try {
+          const errorBody = await bounded(response.json());
+          const message = (errorBody as { error?: unknown } | null)?.error;
+          if (typeof message === "string") detail = `: ${message.slice(0, 300)}`;
+        } catch {
+          if (failure) throw failure;
+        }
+        throw new IndexerError(
+          `Indexer returned HTTP ${response.status}${detail}.`,
+          response.status,
+          url,
+          "http",
+        );
+      }
+
+      try {
+        return {
+          body: (await bounded(response.json())) as T,
+          status: response.status,
+          url,
+        };
+      } catch (err: any) {
+        if (failure) throw failure;
+        throw new IndexerError(
+          `Failed to parse JSON response from ${url}: invalid JSON.`,
+          response.status,
+          url,
+          "json",
+        );
+      }
+    } finally {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
     }
   }
 
@@ -3791,9 +3837,12 @@ export class IndexerClient {
    * @throws {@link IndexerError} on an HTTP/network failure, or when the
    *   response's page envelope is missing or does not match the request.
    */
-  async getCircles(params?: GetCirclesParams): Promise<ApiCirclesListResponse> {
+  async getCircles(
+    params?: GetCirclesParams,
+    options?: IndexerRequestOptions,
+  ): Promise<ApiCirclesListResponse> {
     const { query, page, limit } = buildCirclesQuery("getCircles", params);
-    return this.getPage<ApiCirclesListResponse>(`/circles${query}`, "circles", { page, limit });
+    return this.getPage<ApiCirclesListResponse>(`/circles${query}`, "circles", { page, limit }, options);
   }
 
   /**
