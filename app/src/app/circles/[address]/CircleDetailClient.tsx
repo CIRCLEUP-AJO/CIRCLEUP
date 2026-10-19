@@ -20,6 +20,14 @@ import {
 import { ReputationBadge } from "@/components/ReputationBadge";
 import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
 import clsx from "clsx";
+import { classifyFreshness, formatSourceLabel } from "@/lib/fieldSource";
+import {
+  TX_LOADING,
+  TX_SUCCESS,
+  txDefaultSuccess,
+  invalidCircleAddress,
+  DATA_STATE_MSGS,
+} from "@/lib/messages";
 // ΓöÇΓöÇΓöÇ Shared response contracts (Issue #513) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // All circle API types and runtime parsers now live in lib/circleTypes.ts,
@@ -1203,18 +1211,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       setDataFetchedAtMs(result.fetchedAtMs);
       setManualRefreshError("");
     } else {
-      const messages: Record<typeof result.error, string> = {
-        not_found:
-          "This circle no longer exists on the indexer. The page may be out of date.",
-        network:
-          "Could not reach the indexer. Check your connection and try again.",
-        server:
-          "The indexer returned an error. This is likely temporary ΓÇö try again.",
-        misconfigured:
-          "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL, so the page cannot refresh. " +
-          "Set a valid indexer URL in app/.env.local and restart the server.",
-      };
-      setManualRefreshError(messages[result.error]);
+      setManualRefreshError(
+        DATA_STATE_MSGS.refreshErrors[result.error] ?? DATA_STATE_MSGS.refreshErrors.server,
+      );
     }
 
     setIsManualRefreshing(false);
@@ -1249,24 +1248,10 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // ΓöÇΓöÇ Action handler ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-  const ACTION_SUCCESS_MESSAGES: Record<ActionKey, string> = {
-    join:       "Collateral locked ΓÇö you have joined the circle!",
-    contribute: "Contribution submitted successfully.",
-    payout:     "Payout triggered successfully.",
-    default:    "Member marked as defaulted.",
-    close:      "Collateral released successfully.",
-  };
-
-  // Issue #499: Per-action loading labels surfaced in the spinner and aria-label.
-  // These are distinct from the button labels so the spinner text is always
-  // accurate regardless of which action is in flight.
-  const ACTION_LOADING_LABELS: Record<ActionKey, string> = {
-    join:       "Locking collateralΓÇª",
-    contribute: "Submitting contributionΓÇª",
-    payout:     "Triggering payoutΓÇª",
-    default:    "Marking defaultΓÇª",
-    close:      "Releasing collateralΓÇª",
-  };
+  // Issue #698: Action messages now sourced from the centralized catalog so all
+  // user-facing copy is maintained in one place.
+  const ACTION_SUCCESS_MESSAGES = TX_SUCCESS;
+  const ACTION_LOADING_LABELS   = TX_LOADING;
 
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
     if (!walletAddress) {
@@ -1282,14 +1267,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     if (submittingRef.current) return;
 
     if (!isSorobanContractId(circleAddress)) {
-      setError(
-        `Invalid circle address "${shortAddress(circleAddress)}". ` +
-          "Expected a C-prefixed 56-character Soroban contract ID.",
-      );
+      setError(invalidCircleAddress(shortAddress(circleAddress)));
       return;
     }
 
-    // ΓöÇΓöÇ Data completeness guard ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    // ─── Data completeness guard ──────────────────────────────────────────────
     //
     // Even though the buttons are disabled when dataReadiness !== "ready",
     // re-check here as a defence-in-depth measure in case the UI guard is
@@ -1297,8 +1279,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     if (dataReadiness !== "ready") {
       setError(
         dataReadiness === "stale"
-          ? "Circle data is out of date. Please refresh the page before submitting a transaction."
-          : "Circle data is still loading. Please wait a moment and try again.",
+          ? DATA_STATE_MSGS.staleGuard
+          : DATA_STATE_MSGS.partialGuard,
       );
       return;
     }
@@ -1528,19 +1510,16 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     if (submittingRef.current) return;
 
     if (!isSorobanContractId(circleAddress)) {
-      setError(
-        `Invalid circle address "${shortAddress(circleAddress)}". ` +
-          "Expected a C-prefixed 56-character Soroban contract ID.",
-      );
+      setError(invalidCircleAddress(shortAddress(circleAddress)));
       return;
     }
 
-    // Data completeness guard ΓÇö same defence-in-depth as doAction
+    // Data completeness guard — same defence-in-depth as doAction
     if (dataReadiness !== "ready") {
       setError(
         dataReadiness === "stale"
-          ? "Circle data is out of date. Please refresh before marking a default."
-          : "Circle data is still loading. Wait a moment and try again.",
+          ? DATA_STATE_MSGS.staleDefaultGuard
+          : DATA_STATE_MSGS.partialDefaultGuard,
       );
       return;
     }
@@ -1601,7 +1580,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         }
       } else {
         setSuccess({
-          message: `${shortAddress(memberAddress)} marked as defaulted for round ${currentRound}.`,
+          message: txDefaultSuccess(shortAddress(memberAddress), currentRound),
           txHash: result.txHash,
         });
         const ctrl = new AbortController();
@@ -2138,7 +2117,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
       {/* Rotation view */}
       <div className="bg-white rounded-xl border border-slate-200 p-5">
-        <h2 className="font-semibold text-slate-800 mb-4">≡ƒöä Rotation Order</h2>
+        {/* Issue #697: Show data source and freshness on the member list section.
+            The freshness state is derived from the indexer checkpoint timestamp.
+            "unknown freshness" is shown explicitly when checkpointTime is absent
+            — it is never silently mapped to "current". */}
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="font-semibold text-slate-800">≡ƒöä Rotation Order</h2>
+          <span
+            className="text-xs text-slate-400"
+            title="Where this member data comes from and how current it is. Indexed data may lag the chain by one or more ledgers."
+            aria-label={`Member list data source: Indexed. Freshness: ${classifyFreshness(data.checkpointTime)}.`}
+          >
+            {formatSourceLabel("indexer", classifyFreshness(data.checkpointTime))}
+          </span>
+        </div>
         {data.members.length === 0 ? (
           <MemberListFallback memberCount={data.circle.member_count} />
         ) : (

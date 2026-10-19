@@ -13,6 +13,10 @@
  * GET /circles/:address/rounds         → all rounds grouped by round_index: payouts + contributions + defaults
  * GET /members/:member/contributions   → member contribution history (optional ?circle=)
  * GET /reputation/:member              → member reputation score
+ * GET /circles/:address/export.csv     → CSV of public member, contribution, default and payout
+ *                                        records (bounded, deterministic, formula-safe)
+ * GET /circles/:address/reconciliation → read-only comparison of indexed member order, status,
+ *                                        current round and payouts with the contract's views
  * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
  * GET /indexer/schema                  → schema versioning and migration status diagnostics
  * GET /indexer/failures                → open event-handler failures (skipped events)
@@ -30,8 +34,26 @@
 import express, { NextFunction, Request, Response } from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { query, queryOne, queryExact } from "./db/pool";
+import { query, queryOne, queryExact, withTransaction } from "./db/pool";
 import { rpc, USDC, getIndexerMetrics, isIndexerRunning } from "./indexer";
+import { STELLAR_RPC_URL } from "./config";
+import {
+  CSV_EXPORT_MAX_ROWS,
+  CsvExportTooLargeError,
+  buildCircleActivityCsv,
+  exportFilename,
+  resolveNetworkName,
+  type ExportContributionRow,
+  type ExportDefaultRow,
+  type ExportMemberRow,
+  type ExportPayoutRow,
+} from "./csvExport";
+import {
+  createDbCircleSource,
+  createRpcChainReader,
+  isValidCircleAddress,
+  reconcileCircle,
+} from "./circleReconciliation";
 import { groupCircleRounds } from "./groupRounds";
 import { runAllHealthChecks } from "./health";
 import { isUndefinedTable, listOpenEventFailures } from "./eventFailures";
@@ -1205,6 +1227,145 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     } catch (err) {
       console.error(`[api] Failed to load audit events for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle audit events", getErrorMessage(err));
+    }
+  });
+
+  // ── Circle activity CSV export ──────────────────────────────────────────────
+  //
+  // Offline record of a circle's public indexed activity.  All reads run in
+  // one READ ONLY, REPEATABLE READ transaction so the four record groups come
+  // from the same snapshot even while the indexer is writing.  Exports above
+  // CSV_EXPORT_MAX_ROWS are refused with 413 instead of being truncated.  See
+  // src/csvExport.ts for column, ordering, amount and escaping rules.
+
+  app.get("/circles/:address/export.csv", historyRateLimiter, async (req: Request, res: Response) => {
+    const address = typeof req.params.address === "string" ? req.params.address.trim() : "";
+    if (!isSorobanContractId(address)) {
+      sendError(res, 400, "Circle address must be a valid Soroban contract address (C…, 56 characters)");
+      return;
+    }
+
+    try {
+      const result = await withTransaction(async (client) => {
+        await client.query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
+
+        const circle = await client.query(`SELECT address FROM circles WHERE address = $1`, [address]);
+        if (circle.rowCount === 0) return { kind: "not_found" as const };
+
+        const counts = await client.query(
+          `SELECT ((SELECT COUNT(*) FROM circle_members WHERE circle_address = $1)
+                 + (SELECT COUNT(*) FROM contributions  WHERE circle_address = $1)
+                 + (SELECT COUNT(*) FROM defaults       WHERE circle_address = $1)
+                 + (SELECT COUNT(*) FROM payouts        WHERE circle_address = $1))::text AS total`,
+          [address],
+        );
+        const total = Number(counts.rows[0]?.total ?? 0);
+        if (total > CSV_EXPORT_MAX_ROWS) return { kind: "too_large" as const, total };
+
+        const [members, contributions, defaults, payouts] = [
+          await client.query(
+            `SELECT member_address, payout_order, join_order, defaults, collateral::text AS collateral
+               FROM circle_members WHERE circle_address = $1
+              ORDER BY payout_order ASC, member_address ASC`,
+            [address],
+          ),
+          await client.query(
+            `SELECT member_address, round_index, amount::text AS amount, ledger::text AS ledger, tx_hash
+               FROM contributions WHERE circle_address = $1
+              ORDER BY round_index ASC, ledger ASC, member_address ASC, tx_hash ASC`,
+            [address],
+          ),
+          await client.query(
+            `SELECT member_address, round_index, penalty::text AS penalty, ledger::text AS ledger, tx_hash
+               FROM defaults WHERE circle_address = $1
+              ORDER BY round_index ASC, ledger ASC, member_address ASC, tx_hash ASC`,
+            [address],
+          ),
+          await client.query(
+            `SELECT recipient, round_index, amount::text AS amount, is_exceptional,
+                    ledger::text AS ledger, tx_hash
+               FROM payouts WHERE circle_address = $1
+              ORDER BY round_index ASC, ledger ASC, tx_hash ASC`,
+            [address],
+          ),
+        ];
+
+        return {
+          kind: "ok" as const,
+          csv: buildCircleActivityCsv({
+            network: resolveNetworkName(STELLAR_RPC_URL),
+            circleAddress: address,
+            members: members.rows as ExportMemberRow[],
+            contributions: contributions.rows as ExportContributionRow[],
+            defaults: defaults.rows as ExportDefaultRow[],
+            payouts: payouts.rows as ExportPayoutRow[],
+          }),
+        };
+      });
+
+      if (result.kind === "not_found") {
+        sendError(res, 404, `Circle '${address}' not found`);
+        return;
+      }
+      if (result.kind === "too_large") {
+        sendError(res, 413, `Export exceeds the maximum of ${CSV_EXPORT_MAX_ROWS} rows`, {
+          rows: result.total,
+          maxRows: CSV_EXPORT_MAX_ROWS,
+        });
+        return;
+      }
+
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename="${exportFilename(address)}"`);
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.status(200).send(result.csv);
+    } catch (err) {
+      if (err instanceof CsvExportTooLargeError) {
+        sendError(res, 413, `Export exceeds the maximum of ${err.maxRows} rows`, {
+          rows: err.rowCount,
+          maxRows: err.maxRows,
+        });
+        return;
+      }
+      console.error(`[api] Failed to export activity for circle ${redactAddress(address)}`, err);
+      sendError(res, 500, "Failed to export circle activity", getErrorMessage(err));
+    }
+  });
+
+  // ── Circle reconciliation (diagnostic) ──────────────────────────────────────
+  //
+  // Read-only comparison of one circle's indexed member order, status, current
+  // round and payout records with the contract's own views.  Never writes.
+  // The response distinguishes genuine drift (200, outcome "mismatch") from an
+  // unreachable RPC (503, outcome "rpc_unavailable") and from an address that
+  // is not a CircleUp circle (422, outcome "incompatible_contract").  See
+  // src/circleReconciliation.ts for the field mapping.
+
+  app.get("/circles/:address/reconciliation", historyRateLimiter, async (req: Request, res: Response) => {
+    const address = typeof req.params.address === "string" ? req.params.address.trim() : "";
+    if (!isValidCircleAddress(address)) {
+      sendError(res, 400, "Circle address must be a valid Soroban contract address (C…)");
+      return;
+    }
+
+    try {
+      const report = await reconcileCircle(address, {
+        reader: createRpcChainReader(rpc),
+        source: createDbCircleSource(query),
+      });
+      const status =
+        report.outcome === "not_indexed"
+          ? 404
+          : report.outcome === "rpc_unavailable"
+            ? 503
+            : report.outcome === "incompatible_contract"
+              ? 422
+              : 200;
+      res.status(status).json(report);
+    } catch (err) {
+      console.error(`[api] Failed to reconcile circle ${redactAddress(address)}`, err);
+      sendError(res, 500, "Failed to reconcile circle", getErrorMessage(err));
     }
   });
 

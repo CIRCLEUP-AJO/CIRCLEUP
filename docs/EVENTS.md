@@ -2,8 +2,16 @@
 
 This document is the single source of truth for every event emitted by the
 CircleUp smart contracts. The indexer, SDK, and frontend all rely on these
-shapes; any on-chain change to a topic or data tuple **must** be reflected here
-and in the corresponding `parseXxxEvent` parser in `indexer/src/indexer.ts`.
+shapes; any on-chain change to a topic or data tuple **must** be reflected here,
+in the schema registry `indexer/src/eventSchemas.ts`, in the fixtures
+`indexer/src/fixtures/event-fixtures.ts`, and in the corresponding
+`parseXxxEvent` / handler in `indexer/src/indexer.ts`.
+
+Related documents:
+- [EVENT_COMPATIBILITY.md](EVENT_COMPATIBILITY.md) — versioning rules, unknown-event
+  quarantine, fixture maintenance.
+- [LIFECYCLE_EVENT_MATRIX.md](LIFECYCLE_EVENT_MATRIX.md) — which event (or
+  derivation rule) every user-visible lifecycle transition comes from.
 
 ---
 
@@ -18,13 +26,16 @@ native-decoded types after that call:
 | `Symbol` | `string` |
 | `Address` | `string` (strkey, C- or G-prefix) |
 | `u32` | `number` |
+| `u64` | `bigint` |
 | `i128` | `bigint` |
+| `Vec<Address>` | `string[]` |
 | `bool` | `boolean` |
 | tuple `(A, B, C)` | `[A, B, C]` (`Array`) |
 
-**Filter key:** Every event has exactly two symbol topics:
+**Filter key:** Every event has two symbol topics:
 `topic[0]` = contract family (`"factory"`, `"circle"`, `"reputation"`),
-`topic[1]` = event name. The indexer uses both to route events.
+`topic[1]` = event name. The indexer uses both to route events. (The legacy
+`reputation/increment` shape carries a third `Address` topic.)
 
 ---
 
@@ -84,13 +95,20 @@ ready to accept members.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"initialized"` |
 
-**Data** — tuple `(Address, u32, i128)`
+**Schema version:** 2
 
-| Index | Field | Type | Description |
-|-------|-------|------|-------------|
-| 0 | `circle_address` | `string` | This circle's own contract address |
-| 1 | `member_count` | `number` | Number of configured members (= total rounds) |
-| 2 | `round_amount` | `bigint` | USDC contribution per member per round (stroops) |
+**Data** — tuple `(Address, u32, i128, Vec<Address>)`
+
+| Index | Field | Type | Since | Description |
+|-------|-------|------|-------|-------------|
+| 0 | `circle_address` | `string` | v1 | This circle's own contract address |
+| 1 | `member_count` | `number` | v1 | Number of configured members (= total rounds) |
+| 2 | `round_amount` | `bigint` | v1 | USDC contribution per member per round (stroops) |
+| 3 | `members` | `string[]` | v2 | Payout rotation in order; index = `payout_order` |
+
+`members` is a trailing, backwards-compatible addition. Events from v1
+contract builds stop at index 2; the indexer still projects them but cannot
+create `circle_members` rows for those circles.
 
 **Indexer note:** The indexer uses this event to backfill `member_count`,
 `total_rounds`, and `round_amount` on the `circles` row that was created by
@@ -100,6 +118,9 @@ here.  Because `circle/initialized` fires inside the **same transaction** as
 `factory/circle_created` (the circle's `initialize` is called synchronously by
 the factory's `create_circle`), both events are processed in the same indexer
 ledger batch, guaranteeing the row is complete by the time the batch commits.
+For v2 payloads it also inserts one `circle_members` row per rotation slot
+(`payout_order` = index in `members`), which `circle/joined` and
+`circle/default` then update.
 
 **Parser:** `parseInitializedEvent` (exported for unit testing)
 
@@ -130,7 +151,10 @@ Emitted when a member successfully locks collateral and joins the circle.
 - When `order == member_count` the circle has transitioned to Active and the
   `circle/active` event follows in the same transaction.
 
-**Indexer handler:** `handleCircleJoined` — updates `circle_members.joined_at`
+**Indexer handler:** `handleCircleJoined` — updates `circle_members.joined_at`,
+`join_order` and `collateral`. If the member row does not exist (circle
+initialized by a v1 build) the event fails visibly into `event_failures`
+instead of updating zero rows.
 
 ---
 
@@ -146,11 +170,12 @@ transitioned from Pending to Active and the round-0 deadline clock has started.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"active"` |
 
-**Data** — `Address` (circle address)
+**Data** — tuple `(Address, u64)`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `circle_address` | `string` | This circle's contract address |
+| Index | Field | Type | Description |
+|-------|-------|------|-------------|
+| 0 | `circle_address` | `string` | This circle's contract address |
+| 1 | `deadline_ledger` | `bigint` | Round-0 contribution deadline, started at activation |
 
 **Indexer handler:** `handleCircleActive` — sets `circles.status = 'Active'`
 
@@ -255,11 +280,12 @@ and the circle's ROSCA cycle is complete.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"completed"` |
 
-**Data** — `Address` (circle address)
+**Data** — tuple `(Address, u32)`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `circle_address` | `string` | This circle's contract address |
+| Index | Field | Type | Description |
+|-------|-------|------|-------------|
+| 0 | `circle_address` | `string` | This circle's contract address |
+| 1 | `member_count` | `number` | Number of rounds that were paid out |
 
 **Indexer handler:** `handleCircleCompleted` — sets `circles.status = 'Completed'`
 
@@ -277,7 +303,7 @@ Collateral locked by early joiners is released via a subsequent `close` call.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"cancelled"` |
 
-**Data** — tuple `(Address, Address, u64)`
+**Data** — tuple `(Address, Address, u32)`
 
 | Index | Field | Type | Description |
 |-------|-------|------|-------------|
@@ -285,7 +311,28 @@ Collateral locked by early joiners is released via a subsequent `close` call.
 | 1 | `caller` | `string` | Address that triggered cancellation |
 | 2 | `ledger` | `number` | Ledger sequence at cancellation |
 
-**Indexer handler:** `handleCircleCancelled` — sets `circles.status = 'Cancelled'`
+**Indexer handler:** `handleCircleCancelled` — sets `circles.status = 'Cancelled'`,
+writes a `circle_audit_events` row
+
+---
+
+### `circle` / `collateral_released`
+
+Emitted inside `close` once per member whose remaining collateral is returned.
+
+**Topics** — `("circle", "collateral_released")`
+
+**Data** — tuple `(Address, Address, i128)`
+
+| Index | Field | Type | Description |
+|-------|-------|------|-------------|
+| 0 | `circle_address` | `string` | Circle contract address |
+| 1 | `member` | `string` | Member whose collateral was released |
+| 2 | `collateral` | `bigint` | Stroops returned to the member |
+
+**Indexer note:** not projected (schema handling `ignored`). The aggregate is
+taken from `circle/closed` `total_released`; see the derivation rule in
+[LIFECYCLE_EVENT_MATRIX.md](LIFECYCLE_EVENT_MATRIX.md).
 
 ---
 
@@ -301,7 +348,7 @@ returned to members after a Completed or Cancelled circle is closed.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"closed"` |
 
-**Data** — tuple `(Address, Address, i128, i128, string)`
+**Data** — tuple `(Address, Address, i128, i128, Symbol)`
 
 | Index | Field | Type | Description |
 |-------|-------|------|-------------|
@@ -316,7 +363,8 @@ returned to members after a Completed or Cancelled circle is closed.
   amount released when members defaulted).
 
 **Indexer handler:** `handleCircleClosed` — sets `circles.status = 'Closed'`,
-writes `total_released` and `close_reason`
+writes `total_released` and `close_reason` (columns added by migration 007),
+writes a `circle_audit_events` row
 
 ---
 
@@ -333,7 +381,7 @@ a matching `resumed` event.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"paused"` |
 
-**Data** — tuple `(Address, Address, u64)`
+**Data** — tuple `(Address, Address, u32)`
 
 | Index | Field | Type | Description |
 |-------|-------|------|-------------|
@@ -357,7 +405,7 @@ are re-enabled immediately.
 | 0 | `Symbol` | `"circle"` |
 | 1 | `Symbol` | `"resumed"` |
 
-**Data** — tuple `(Address, Address, u64)`
+**Data** — tuple `(Address, Address, u32)`
 
 | Index | Field | Type | Description |
 |-------|-------|------|-------------|
@@ -375,10 +423,11 @@ Contract: `REPUTATION_ADDRESS` (env var)
 
 All reputation events share `topic[0] = "reputation"`.
 
-### `reputation` / `increment`
+### `reputation` / `increment` (legacy)
 
-Emitted when a circle reports a completed round for a member, incrementing
-their reputation score.
+**Not emitted by the current reputation contract** — it publishes only
+`score_updated` (below). This shape is documented and still handled so that
+ledgers emitted by earlier builds replay correctly.
 
 **Topics**
 
@@ -406,9 +455,8 @@ their reputation score.
 
 ### `reputation` / `score_updated`
 
-Emitted on every successful `increment` call in addition to the `increment`
-event above. Carries both the member address and the full new score for
-consumers that only subscribe to score change events.
+Emitted on every successful `increment` call. Carries both the member address
+and the full new score.
 
 **Topics**
 
@@ -424,9 +472,7 @@ consumers that only subscribe to score change events.
 | 0 | `member` | `string` | Member address |
 | 1 | `new_total_score` | `number` | Member's new cumulative score |
 
-**Indexer note:** The indexer does not currently process this event (the
-`increment` event carries sufficient information). It is present for external
-consumers that need a self-contained score-change notification.
+**Indexer handler:** `handleReputationScoreUpdated` — upserts `reputation` row
 
 ---
 
@@ -448,6 +494,9 @@ caller.
 |-------|------|-------------|
 | `circle` | `string` | Circle contract address that was granted call rights |
 
+**Indexer note:** not projected (schema handling `ignored`); read
+`get_authorized_callers` on-chain.
+
 ---
 
 ### `reputation` / `caller_removed`
@@ -466,6 +515,9 @@ Emitted when the factory de-registers a circle from the authorized caller list.
 | Field | Type | Description |
 |-------|------|-------------|
 | `circle` | `string` | Circle contract address that had its call rights revoked |
+
+**Indexer note:** not projected (schema handling `ignored`); read
+`get_revoked_callers` on-chain.
 
 ---
 
@@ -489,9 +541,17 @@ are considered stable. Adding a new trailing field to a data tuple is a
 backwards-compatible change; reordering or removing fields is a breaking change
 that requires a new event name.
 
-Any breaking change must:
+The full rules — version decisions, how the indexer quarantines unknown and
+incompatible shapes, and how fixtures are maintained — are in
+[EVENT_COMPATIBILITY.md](EVENT_COMPATIBILITY.md).
+
+Any event change must:
 1. Update this document.
-2. Update the corresponding `parseXxxEvent` / `handleXxxEvent` pair in
-   `indexer/src/indexer.ts`.
-3. Add or update tests in `indexer/src/indexer.test.ts` covering the new shape.
-4. Bump the relevant contract version comment in the Rust source.
+2. Update the schema entry in `indexer/src/eventSchemas.ts` (bump `version`
+   and mark new trailing fields with `since`).
+3. Update the fixture in `indexer/src/fixtures/event-fixtures.ts` (keep the
+   previous shape as a historical fixture while old ledgers must replay).
+4. Update the corresponding `parseXxxEvent` / `handleXxxEvent` pair in
+   `indexer/src/indexer.ts` and the projection test in
+   `indexer/src/eventSchemas.test.ts`.
+5. Bump the relevant contract version comment in the Rust source.

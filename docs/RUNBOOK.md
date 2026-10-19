@@ -31,6 +31,7 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Checking Schema Health](#checking-schema-health)
   - [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)
 - [Database Backup and Restore](#database-backup-and-restore)
+- [Indexer Retention and Archival](./INDEXER_RETENTION.md)
   - [Backup](#backup)
   - [Restore drill — isolated target](#restore-drill--isolated-target)
   - [Post-restore verification](#post-restore-verification)
@@ -41,6 +42,8 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
 - [Health Checks and Monitoring](#health-checks-and-monitoring)
   - [Indexer Health Endpoint](#indexer-health-endpoint)
   - [Indexer Audit Endpoint](#indexer-audit-endpoint)
+  - [Per-Circle Reconciliation](#per-circle-reconciliation)
+  - [Circle Activity CSV Export](#circle-activity-csv-export)
   - [Useful Monitoring Queries](#useful-monitoring-queries)
 - [Troubleshooting](#troubleshooting)
   - [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner)
@@ -250,9 +253,10 @@ User navigates to /reputation/[address]
 
 | Tool | Minimum version | Purpose |
 |---|---|---|
-| Node.js | 18 | Frontend, indexer, scripts |
-| npm | 9 | Workspace management |
-| Rust (stable toolchain) | 1.75 | Compile Soroban contracts |
+| Node.js + npm | 18.18+ with npm 9; 22.x with npm 10; 24.x with npm 11 (CI-tested tuples) | Frontend, indexer, scripts |
+| Rust | 1.81.0 (pinned) | Compile Soroban contracts |
+| Soroban SDK | 21.7.7 (locked) | Contract SDK; `contracts/Cargo.lock` is authoritative |
+| Rust WASM target | `wasm32-unknown-unknown` | Compile Soroban contract artifacts |
 | stellar-cli | latest | Deploy contracts to testnet |
 | Docker | any | Postgres via docker compose |
 | Freighter | browser extension | Wallet for the web UI |
@@ -261,6 +265,10 @@ Install stellar-cli:
 ```bash
 cargo install --locked stellar-cli --features opt
 ```
+
+Run `npm run check:node` to validate the Node/npm pair. After Rust and the WASM
+target are installed, run `npm run check:toolchain` to validate the complete
+pinned build tuple before compiling contracts.
 
 ### Step-by-Step
 
@@ -405,6 +413,61 @@ The deploy script (`scripts/src/deploy.ts`) handles:
 3. Deploying the factory with the reputation address and circle WASM hash.
 4. Transferring admin of the reputation contract to the factory address.
 
+### Mainnet Release Readiness
+
+The generic deployment script is testnet-only. A testnet deployment, its
+defaults, or an unrecognized network name must never be used to deploy on
+mainnet. Before authorizing a mainnet release, run the separate read-only gate
+with explicit intent:
+
+```bash
+npm run mainnet:readiness -- --network mainnet --confirm-mainnet
+```
+
+The gate requires the `production` profile, an HTTPS non-testnet RPC whose
+read-only `getNetwork` response and Horizon endpoint's network passphrase both
+match mainnet, all three
+configured contract addresses, the expected Stellar USDC contract identity,
+and an admin public key plus local `stellar-cli` identity matching the
+manifest's deployer. It also requires a valid mainnet deployment manifest
+whose addresses match the profile and all three candidate WASM files matching
+populated hashes in `contracts/expected-hashes.json`. The manifest describes
+the active deployment; candidate artifact hashes are checked separately so a
+contract upgrade need not match the currently deployed WASM. It performs read-only
+RPC/Horizon funding checks and prints named pass/fail results only; it does not
+print environment values, read a secret key, or submit transactions. Missing
+artifact hashes are a failure, not a skipped check. The local identity check
+does not prove that the operator can recover the key or establish on-chain
+signer thresholds; verify custody and signing authority independently using
+the organization's approved key-management procedure.
+
+Mainnet differs from testnet in the following release-critical inputs:
+
+| Context | Mainnet requirement | Testnet distinction |
+|---|---|---|
+| RPC | Explicit HTTPS production RPC; no testnet/futurenet hostname | Testnet RPC may use the public test endpoint |
+| Passphrase | Exact public Stellar network passphrase | Test SDF passphrase |
+| Token | Exact Stellar USDC contract identity; no test-token deployment | Test token may be used only on testnet |
+| Funding | Mainnet XLM must already be funded; Friendbot is unavailable | Testnet accounts may use Friendbot |
+| Admin | Explicit public key and local CLI identity must match the manifest; secrets remain outside profiles | Testnet deployer identity is disposable |
+| Artifacts | All release WASM hashes must match populated expected hashes | Testnet workflows may build artifacts as part of deployment |
+
+After a separately authorized deployment, verify the transaction and contract
+addresses on a mainnet explorer and against the deployment manifest; confirm
+the deployed factory, reputation, and USDC identities through read-only RPC
+checks; update the production profile and service configuration; then verify
+indexer health, indexed events, app connectivity, and alerts before opening
+user access. Record the deployment revision, manifest, transaction IDs, and
+verification evidence in the release record.
+
+Soroban deployments are immutable. There is no rollback that deletes a contract
+or restores prior on-chain state. If a release is incorrect, stop routing new
+traffic, assess any active circles and user funds, deploy corrected contracts
+as a new deployment, and migrate app/indexer configuration only after review.
+Existing contracts remain on-ledger, and recovery of funds or state is not
+guaranteed by redeployment. Do not promise an emergency admin recovery path
+unless the deployed contract explicitly implements and has tested one.
+
 ### Post-Deployment Configuration
 
 After deployment, copy the addresses from `scripts/deployed.json` into both env files:
@@ -503,7 +566,11 @@ Replay is atomic: it wraps the wipe and cursor reset in a single transaction. If
 
 ## Database Backup and Restore
 
-Although the indexer database is a derived read-model that can be fully reconstructed by replaying Soroban events from the deployment ledger, a tested backup and restore path reduces outage time and protects checkpoint correctness.
+See [Indexer Retention and Archival](./INDEXER_RETENTION.md) for online-data
+classes, growth measurements, archive integrity checks, and the no-pruning
+policy.
+
+The indexer database is a derived read-model and can be reconstructed by replaying Soroban events only when the RPC still serves the complete required ledger range or a validated raw-event archive exists. The indexer does not currently store complete event payloads; see [Indexer Retention and Archival](./INDEXER_RETENTION.md). A tested backup and restore path reduces outage time and protects checkpoint correctness.
 
 The procedure below is deliberately structured as an **isolated drill**, not a direct production overwrite. Every step targets a separate restore database (`circleup_restore`) so the production database remains untouched until you have verified the backup is coherent and the schema is clean. Only after passing all verification steps should you decide whether to promote the restore target or fall back to a chain replay.
 
@@ -816,6 +883,49 @@ Reports indexing progress independent of connectivity:
 ```
 
 Alert when `lastLedger` stops advancing ΓÇö this indicates the polling loop has stalled (RPC connection lost, process OOM, etc.).
+
+### Per-Circle Reconciliation
+
+```
+GET /circles/:address/reconciliation
+npm run reconcile:circle --workspace=indexer -- <circle-address> [--json]
+```
+
+This is a read-only check that compares one circle's indexed member order,
+status (including the indexer-only `Closed` derivation), paused flag, current
+round and payout records with the circle contract's views. It never writes.
+Each check uses at most five contract simulations, and member and payout reads
+are capped at 512 rows.
+
+| `outcome` | HTTP | CLI exit | Meaning |
+|---|---|---|---|
+| `match` | 200 | 0 | Every compared field agrees |
+| `mismatch` | 200 | 1 | Chain was read and fields differ. Each mismatch has `source` (contract view), `indexed`/`chain` values and `classification`: `possibly_stale` (indexer cursor behind `ledgerContext.chainLedger`, so wait and re-check) or `drift` (indexer caught up, so investigate or replay) |
+| `rpc_unavailable` | 503 | 2 | RPC unreachable or timed out. This is **not** drift |
+| `incompatible_contract` | 422 | 2 | The address answered but does not expose the circle interface |
+| `not_indexed` | 404 | 2 | The indexer has no row for this circle |
+
+To repair drift, use `npm run reconcile:repair` or a replay. The diagnostic
+never repairs anything itself.
+
+### Circle Activity CSV Export
+
+```
+GET /circles/:address/export.csv
+```
+
+This endpoint returns the circle's public member, contribution, default and
+payout records as CSV. The format:
+
+- has stable columns, with the network name on every row;
+- gives exact amounts both as `amount_stroops` and as 7-decimal `amount_usdc`;
+- is ordered deterministically;
+- starts with a UTF-8 BOM and uses CRLF line endings.
+
+Cells that begin with `=`, `+`, `-`, `@`, TAB or CR (or the full-width forms
+of those characters) get a leading apostrophe, so spreadsheets never evaluate
+them as formulas. Exports over 10,000 rows return **413** rather than being
+truncated. The column contract is in `indexer/src/csvExport.ts`.
 
 ### Useful Monitoring Queries
 

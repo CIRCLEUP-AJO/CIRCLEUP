@@ -45,6 +45,51 @@ Closes #<!-- issue number -->
 - [ ] Ran `npm run lint --workspace=app`
 - [ ] Tested manually on testnet (if contract change)
 
+## Contract security checklist
+
+<!-- Complete this section if "Contract change" is checked above. -->
+<!-- Work through docs/CONTRACT_SECURITY_CHECKLIST.md and paste relevant evidence below. -->
+<!-- Ticking every box does not replace a specialist security audit for novel financial paths. -->
+
+<details>
+<summary>Contract security review (expand if this PR modifies contracts/)</summary>
+
+**1. Authorization** — who is permitted to call each modified entry-point, and is `require_auth()` called before any state write?
+
+<!-- evidence -->
+
+**2. Arithmetic** — are all financial multiplications guarded with `checked_mul`? Is division truncating in the safe direction?
+
+<!-- evidence -->
+
+**3. Token transfers** — are transfers ordered after state writes? Is the recipient address validated?
+
+<!-- evidence -->
+
+**4. Reentrancy** — are all outbound cross-contract calls listed? Is state written before any outbound call?
+
+<!-- evidence -->
+
+**5. Lifecycle** — does each entry-point assert the expected `CircleStatus`? Does it respect the pause flag?
+
+<!-- evidence -->
+
+**6. Events** — does every observable state transition emit the correct event with a stable payload? Is `docs/EVENTS.md` updated?
+
+<!-- evidence -->
+
+**7. Storage cost** — how many new persistent entries does this introduce per call? Are they cleaned up in `close`?
+
+<!-- evidence -->
+
+**8. Rollback** — is the contract left in a consistent state if this entry-point panics? Is the rollback plan documented (gate A9)?
+
+<!-- evidence -->
+
+See [docs/CONTRACT_SECURITY_CHECKLIST.md](../docs/CONTRACT_SECURITY_CHECKLIST.md) for the full prompt and specialist-review assumptions.
+
+</details>
+
 ## Checklist
 
 - [ ] My code follows the project's style guidelines
@@ -54,6 +99,8 @@ Closes #<!-- issue number -->
 - [ ] CI passes on this branch
 - [ ] If this PR removes or renames a public interface, I have followed the [Deprecation Policy](../docs/DEPRECATION_POLICY.md) notice procedure
 - [ ] If this PR redeploys contracts, I have followed the [Deployment Lifecycle](../docs/DEPLOYMENT_LIFECYCLE.md) to archive the superseded manifest
+- [ ] If this PR modifies contracts/, I have worked through [docs/CONTRACT_SECURITY_CHECKLIST.md](../docs/CONTRACT_SECURITY_CHECKLIST.md) and pasted evidence above
+- [ ] If this PR changes a protocol wire format, I have followed the [Protocol and Wire-Format Changes](../CONTRIBUTING.md#protocol-and-wire-format-changes) checklist in CONTRIBUTING.md
 
 ## Screenshots (if applicable)
 

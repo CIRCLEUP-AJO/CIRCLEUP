@@ -11,6 +11,7 @@ Thank you for helping build trustless savings circles for the world. Every contr
 - [How to Contribute](#how-to-contribute)
 - [Commit Style](#commit-style)
 - [Pull Request Process](#pull-request-process)
+- [Protocol and Wire-Format Changes](#protocol-and-wire-format-changes)
 - [Code Style](#code-style)
 - [Governance References](#governance-references)
 - [Definition of Done](#definition-of-done)
@@ -67,6 +68,13 @@ npx tsc --noEmit --project app/tsconfig.json
 
 See the [RUNBOOK](./docs/RUNBOOK.md) for full environment variable setup.
 
+Supported toolchains are Node.js 18.18+ with npm 9, Node.js 22 with npm 10, or
+Node.js 24 with npm 11; Rust 1.81.0; Soroban SDK 21.7.7; and the
+`wasm32-unknown-unknown` target. CI tests each supported tuple. Rust and Soroban are pinned for
+reproducible WASM builds. Run `npm run check:toolchain` after installing Rust
+and the target. Unsupported Node/npm versions fail during `npm install` with
+the supported range and next step.
+
 ---
 
 ## How to Contribute
@@ -112,6 +120,111 @@ If your PR removes or renames a public interface (REST field, SDK export, contra
 
 ---
 
+## Protocol and Wire-Format Changes
+
+A single logical change to a contract event, storage layout, API response field,
+or SDK export can require coordinated updates across multiple packages.  Use
+this checklist whenever your PR touches any of the items below so that no
+downstream consumer is left with a stale fixture, missing migration, or broken
+import.
+
+Work through every row that applies.  If a row does not apply to your change,
+write one line explaining why.
+
+### Contract event payload changed (topics or data tuple)
+
+- [ ] `docs/EVENTS.md` — update the affected event section (payload table,
+  invariants, indexer handler reference).
+- [ ] `indexer/src/eventSchemas.ts` — bump `version`, mark new trailing fields
+  with `since`, update the discriminated-union type.
+- [ ] `indexer/src/fixtures/event-fixtures.ts` — keep the old shape as a
+  historical fixture; add the new shape as the current fixture.
+- [ ] `indexer/src/indexer.ts` — update or add the `parseXxxEvent` /
+  `handleXxxEvent` pair.
+- [ ] `indexer/src/eventSchemas.test.ts` — update the projection test.
+- [ ] `sdk/CONTRACT_FIXTURES.md` — note any argument change if the event is
+  driven by a method-signature change.
+- [ ] `CHANGELOG.md` — add a bullet under `[Unreleased]`.
+
+Verify:
+```bash
+npm run test:incidents --workspace=indexer
+npm test --workspace=indexer
+```
+
+### Contract method added, removed, or signature changed
+
+- [ ] `docs/CONTRACT_REFERENCE.md` — add/update/remove the method entry.
+- [ ] `sdk/CONTRACT_FIXTURES.md` — update the fixtures table; add or replace XDR
+  fixtures in `sdk/src/__tests__/contractFixtures.test.ts`.
+- [ ] `app/src/lib/stellar.ts` — update call helpers and result types.
+- [ ] `app/src/lib/gating.ts` — update eligibility logic if the entry-point
+  affects which actions are available.
+- [ ] `README.md` Contracts Reference section — update if the change is
+  user-visible.
+- [ ] `CHANGELOG.md` — add a bullet.
+
+### Database schema changed (new column, renamed column, new table)
+
+- [ ] Create a new migration file in `indexer/src/migrations/` following the
+  `NNN_short_description.sql` naming convention.  Use `IF NOT EXISTS` / `IF
+  EXISTS` guards for idempotency.
+- [ ] `docs/DATA_DICTIONARY.md` — add or update the column entry (units,
+  nullability, source event, rebuildability).
+- [ ] Update app interfaces in `CircleDetailClient.tsx` or
+  `ReputationClient.tsx` if the API shape changes.
+- [ ] `CHANGELOG.md` — add a bullet.
+
+Verify:
+```bash
+npm run migrate --workspace=indexer
+npm run migrate:check --workspace=indexer   # must show "Health state: clean"
+```
+
+### API response field added, removed, or renamed
+
+- [ ] `indexer/src/api.ts` — update the response interface.
+- [ ] `docs/INDEXER_API_COMPATIBILITY.md` — classify the change (additive /
+  breaking / deprecated) and update the compatibility table.
+- [ ] SDK wire schemas (`sdk/src/indexerSchema.ts`) — update and add a fixture
+  in `sdk/src/__tests__/indexerContract.test.ts`.
+- [ ] App interfaces (`CircleDetailClient.tsx`, `ReputationClient.tsx`) —
+  update TypeScript types.
+- [ ] If removing or renaming: follow the [Deprecation Policy](./docs/DEPRECATION_POLICY.md)
+  notice procedure before merging.
+- [ ] `CHANGELOG.md` — add a bullet.
+
+Verify:
+```bash
+npx tsc --noEmit --project app/tsconfig.json
+```
+
+### SDK export added, removed, or type changed
+
+- [ ] `sdk/package.json` `exports` field — update if the entry-point changes.
+- [ ] Run the API surface check: `npm run check:api --workspace=sdk`.
+- [ ] `sdk/src/__tests__/` — add or update the relevant test.
+- [ ] If removing or renaming a public symbol: follow the [Deprecation Policy](./docs/DEPRECATION_POLICY.md).
+- [ ] `CHANGELOG.md` — add a bullet.
+
+### Contract artifact hash changed (WASM rebuild)
+
+After rebuilding WASM, update the expected hashes and re-run the reproducibility
+check:
+
+```bash
+cd contracts
+cargo build --target wasm32-unknown-unknown --release
+# Update contracts/expected-hashes.json with the new SHA-256 digests
+npm run check:reproducibility   # (or the equivalent CI step)
+```
+
+- [ ] `contracts/expected-hashes.json` — updated with new digests.
+- [ ] `contracts/provenance.json` — updated if the build inputs changed.
+- [ ] CI reproducibility workflow passes.
+
+---
+
 ## Code Style
 
 **Rust** — `cargo fmt` before committing. Follow existing patterns in the contracts.
@@ -133,6 +246,8 @@ one(s) relevant to your change before opening a PR.
 | [docs/DATA_DICTIONARY.md](./docs/DATA_DICTIONARY.md) | When adding or changing indexer schema columns, migrations, or API response fields; or to understand units, nullability, and rebuildability for any table |
 | [docs/DEPLOYMENT_LIFECYCLE.md](./docs/DEPLOYMENT_LIFECYCLE.md) | Before redeploying contracts to any network; defines how to archive superseded manifests and update profiles |
 | [docs/TRACEABILITY_POLICY.md](./docs/TRACEABILITY_POLICY.md) | Defines when issue numbers belong in test names, migration comments, CHANGELOG entries, and PR descriptions |
+| [docs/CONTRACT_REFERENCE.md](./docs/CONTRACT_REFERENCE.md) | Canonical reference for every public contract method, error code, and authorization rule across all three contracts |
+| [docs/CONTRACT_SECURITY_CHECKLIST.md](./docs/CONTRACT_SECURITY_CHECKLIST.md) | Structured review prompt for contract PRs; covers authorization, arithmetic, token transfers, reentrancy, lifecycle, events, storage, and rollback |
 
 ---
 

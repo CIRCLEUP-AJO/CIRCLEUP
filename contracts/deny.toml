@@ -1,0 +1,21 @@
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Apache-2.0",
+  "BlueOak-1.0.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[advisories]
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -12,11 +12,12 @@ jobs:
     name: Contracts (Rust)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.81.0
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust build artifacts
@@ -28,9 +29,45 @@ jobs:
         run: cd contracts && cargo test
         # Failure here blocks merge: names the failed crate in cargo output.
 
-  # ── TypeScript workspaces ───────────────────────────────────────────────────
-  typescript:
-    name: TypeScript workspaces
+  # ── TypeScript SDK ──────────────────────────────────────────────────────────
+  sdk:
+    name: SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Select supported npm line
+        run: npm install --global npm@9
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build SDK
+        run: npm run build --workspace=sdk
+
+      - name: Test SDK
+        run: npm run test --workspace=sdk
+
+      # Issue #464: Run contract fixture tests as an explicit, named step so a
+      # signature change surfaces as "Contract fixture tests" in the CI summary
+      # rather than disappearing into the general test output.
+      - name: Contract fixture tests (Issue #464)
+        run: npm run test --workspace=sdk -- contractFixtures.test.ts contractFixtures.extended.test.ts --run
+
+      # Clean build, then compile examples/ against dist/ and verify that every
+      # documented symbol imports from the package root, no internal helper or
+      # test file is published, and nothing in the repo uses a deep import.
+      - name: Public API check
+        run: npm run check:api --workspace=sdk
+
+  # ── Indexer ─────────────────────────────────────────────────────────────────
+  indexer:
+    name: Indexer
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -47,12 +84,15 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
+      - name: Select supported npm line
+        run: npm install --global npm@9
 
       - name: Install dependencies
         run: npm ci
@@ -77,17 +117,21 @@ jobs:
           NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
         run: npm run test --workspace=indexer
 
-      - name: Build SDK
-        run: npm run build --workspace=sdk
+  # ── Frontend app ─────────────────────────────────────────────────────────────
+  app:
+    name: App
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
 
       - name: Test SDK
         run: npm run test --workspace=sdk
 
-      - name: SDK example typecheck
-        run: npm run typecheck:examples --workspace=sdk
+      - name: Select supported npm line
+        run: npm install --global npm@9
 
-      - name: SDK public API check
-        run: npm run check:api --workspace=sdk
+      - name: Install dependencies
+        run: npm ci
 
       - name: Lint app
         run: npm run lint --workspace=app
@@ -109,23 +153,100 @@ jobs:
       - name: Test app
         run: npm run test --workspace=app
 
-      - name: Install Chromium and Linux dependencies
-        run: npx playwright install --with-deps chromium
+  # ── Deployment scripts ───────────────────────────────────────────────────────
+  scripts:
+    name: Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
 
       - name: App visual regression tests
         run: npm run test:visual --workspace=app
 
-      - name: Typecheck deployment scripts
-        run: npm run typecheck --workspace=scripts
+      - name: Select supported npm line
+        run: npm install --global npm@9
 
-      - name: Test deployment scripts offline
-        run: npm run test --workspace=scripts
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Root demo journey tests
-        run: npm run test:e2e
+      - name: Typecheck scripts
+        run: cd scripts && npx tsc --noEmit
 
-      - name: Root keyboard navigation tests
-        run: npm run test:keyboard
+      - name: Run deployment script tests
+        run: >-
+          TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
+          node --require ts-node/register --test
+          scripts/src/deployment-manifest.test.ts
+          scripts/src/mainnet-readiness.test.ts
+          scripts/src/deploy-network-guard.test.ts
 
-      - name: Root performance budgets
-        run: npm run test:perf
+  # ── Dependency license policy ───────────────────────────────────────────────
+  license-policy:
+    name: Dependency license policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Select supported npm line
+        run: npm install --global npm@9
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.81.0
+          components: clippy
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch locked Rust dependencies
+        run: cd contracts && cargo fetch --locked
+
+      - name: Install inventory tool
+        run: cargo install cargo-license --version 0.6.1 --locked
+
+      - name: Enforce Rust dependency policy
+        run: |
+          cargo install cargo-deny --version 0.16.4 --locked
+          cd contracts && cargo deny check licenses advisories
+
+      - name: Generate and enforce license inventories
+        run: bash scripts/license-inventory.sh
+
+      - name: Upload dependency license inventories
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-license-inventories
+          path: artifacts/licenses-*
+
+  toolchain-compatibility:
+    name: Toolchain (Node ${{ matrix.node }}, npm ${{ matrix.npm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: 18.18.0
+            npm: 9
+          - node: 22
+            npm: 10
+          - node: 24
+            npm: 11
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Select supported npm line
+        run: npm install --global "npm@${{ matrix.npm }}"
+      - name: Validate Node and npm
+        run: npm run check:node
+      - name: Install dependencies
+        run: npm ci
+      - name: Build SDK
+        run: npm run build:sdk

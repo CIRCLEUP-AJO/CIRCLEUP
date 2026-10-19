@@ -11,6 +11,35 @@ All four workspaces (`sdk`, `indexer`, `app`, `scripts`) share a single root `pa
 - Dependency upgrades must be a separate, focused commit. Do not mix dependency bumps with feature changes.
 - Evaluate all audit findings before merging a dependency upgrade. Run `npm audit` after every install.
 
+## Automated update and review policy
+
+Dependabot proposes npm workspace, Cargo, and GitHub Actions updates weekly.
+Minor and patch updates are grouped by ecosystem; major updates remain separate
+proposals so compatibility changes receive focused review. The root npm lockfile
+and `contracts/Cargo.lock` must be committed with dependency changes. CI runs the
+license inventory across all four npm workspaces and Cargo, and enforces the
+SPDX allowlist in this document and `contracts/deny.toml`; missing inventory tooling,
+unknown licenses, and disallowed licenses fail the check. Cargo-deny also checks
+the RustSec advisory database; CI has no blanket advisory ignores.
+
+Every exception must be recorded in [LICENSE_EXCEPTIONS.md](./LICENSE_EXCEPTIONS.md)
+with package, exact license, workspace, reviewer, date, and justification.
+An exception must be approved by a second contributor and reflected explicitly
+in the relevant CI allowlist before merge. An empty exception table grants no
+exceptions.
+
+Run `npm audit --workspaces` and review advisories in each update PR. Do not
+silence an advisory only to make CI green: assess reachability, affected
+versions, available fixes, and production versus development exposure, then
+record any deferral with its owner and planned review date. Major-version
+updates require a dedicated review of upstream breaking changes, supported
+toolchains, API compatibility, and the affected workspace test/build gates.
+
+For Rust, reproduce the locked license and advisory checks with
+`cd contracts && cargo deny check licenses advisories`. Do not add a blanket
+ignore for a RustSec advisory; record any narrowly justified exception with the
+affected crate/version, exposure assessment, reviewer, and review date.
+
 ## Audit status (as of 2026-08-28)
 
 Run `npm audit --workspaces` to reproduce. Non-breaking fixes were applied with `npm audit fix`.

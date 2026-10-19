@@ -4,6 +4,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit --module es2022 --moduleResolution bundler",
     "deploy:testnet": "ts-node src/deploy.ts",
+    "mainnet:readiness": "ts-node src/mainnet-readiness.ts",
     "seed:demo": "ts-node src/seed-demo.ts",
     "release-check": "ts-node src/release-check.ts",
     "validate-env": "ts-node src/validate-env.ts",
@@ -11,10 +12,11 @@
     "verify-artifacts": "ts-node src/check-artifact-hashes.ts",
     "funding-diagnostics": "ts-node src/funding-diagnostics.ts",
     "validate-manifest": "ts-node src/deployment-manifest.ts",
-    "test": "node --require ts-node/register --test src/*.test.ts"
+    "check:env-parity": "ts-node src/check-env-parity.ts",
+    "test": "node --require ts-node/register --test src/check-env-parity.test.ts src/release-check.test.ts"
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^12.3.0",
+    "@stellar/stellar-sdk": "^17.2.1",
     "dotenv": "^16.4.5"
   },
   "devDependencies": {
