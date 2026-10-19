@@ -7,18 +7,16 @@
  *   After round 1: member A's reputation score increments
  *
  * Usage:
- *   npx ts-node src/seed-demo.ts
+ *   npm run seed:demo --workspace=scripts -- --always-create
  *
  * Prerequisites:
- *   - deployed.json exists (run deploy.ts first)
- *   - stellar-cli funded testnet accounts: alice, bob, carol, dave
- *     stellar keys generate alice --network testnet
- *     curl "https://friendbot.stellar.org?addr=$(stellar keys address alice)"
+ *   - deployed-manifest.json exists (run deploy.ts first)
+ *   - testnet Soroban RPC and Friendbot are reachable
+ *   - pass --always-create to acknowledge that each run creates new state
  */
 
 import * as dotenv from "dotenv";
 import * as path from "path";
-import * as fs from "fs";
 import {
   Keypair,
   SorobanRpc,
@@ -30,12 +28,20 @@ import {
   scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
+import { validateManifest } from "./deployment-manifest";
 import {
   runFundingDiagnostics,
   printFundingDiagnostics,
   checkRpcReachability,
 } from "./funding-diagnostics";
-import { redactSecrets } from "./redact";
+import {
+  assertAlwaysCreate,
+  assertSeedNetwork,
+  recordSeedTransaction,
+  redactSeedError,
+  SeedJournal,
+  writeSeedJournal,
+} from "./seed-demo-policy";
 
 // Load from scripts/.env if present, otherwise fall back to root .env
 dotenv.config({ path: path.join(__dirname, "../.env") });
@@ -43,8 +49,9 @@ dotenv.config({ path: path.join(__dirname, "../../.env") });
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
-const RPC_URL = "https://soroban-testnet.stellar.org";
+const NETWORK = process.env.NETWORK ?? "testnet";
+const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
+const RPC_URL = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const FRIENDBOT = "https://friendbot.stellar.org";
 
 // $100 USDC = 1_000_000_000 stroops (7 decimals)
@@ -53,6 +60,12 @@ const ROUND_AMOUNT = 1_000_000_000n; // $100
 const ROUND_DEADLINE_LEDGERS = 120_960;
 
 const rpc = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
+const seedOutPath = path.join(__dirname, "../seeded.json");
+let activeJournal!: SeedJournal;
+
+function persistJournal() {
+  if (activeJournal) writeSeedJournal(seedOutPath, activeJournal);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -72,6 +85,7 @@ async function buildAndSend(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
+  step: string,
 ): Promise<string> {
   const account = await rpc.getAccount(keypair.publicKey());
   const contract = new Contract(contractId);
@@ -87,28 +101,42 @@ async function buildAndSend(
   const simResult = await rpc.simulateTransaction(tx);
 
   if (SorobanRpc.Api.isSimulationError(simResult)) {
-    throw new Error(`Simulation error: ${redactSecrets(String(simResult.error))}`);
+    throw new Error(`Simulation error: ${redactSeedError(String(simResult.error))}`);
   }
 
   const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
   preparedTx.sign(keypair);
+  const transactionHash = preparedTx.hash().toString("hex");
+  recordSeedTransaction(activeJournal!, step, transactionHash, "pending");
+  persistJournal();
 
   const sendResult = await rpc.sendTransaction(preparedTx);
   if (sendResult.status === "ERROR") {
-    throw new Error(`Send error: ${redactSecrets(JSON.stringify(sendResult.errorResult))}`);
+    recordSeedTransaction(activeJournal!, step, transactionHash, "failed");
+    persistJournal();
+    throw new Error(`Send error: ${transactionHash} ${redactSeedError(JSON.stringify(sendResult.errorResult))}`);
   }
 
-  const hash = sendResult.hash;
+  const hash = sendResult.hash || transactionHash;
+  recordSeedTransaction(activeJournal!, step, hash, "submitted");
+  persistJournal();
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 3000));
     const status = await rpc.getTransaction(hash);
     if (status.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
+      recordSeedTransaction(activeJournal!, step, hash, "confirmed");
+      activeJournal!.currentStep = undefined;
+      persistJournal();
       return hash;
     }
     if (status.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+      recordSeedTransaction(activeJournal!, step, hash, "failed");
+      persistJournal();
       throw new Error(`Transaction failed: ${hash}`);
     }
   }
+  recordSeedTransaction(activeJournal!, step, hash, "timeout");
+  persistJournal();
   throw new Error(`Timeout waiting for transaction ${hash}`);
 }
 
@@ -145,18 +173,24 @@ async function readContract<T>(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Load deployed addresses
-  const deployedPath = path.join(__dirname, "../deployed.json");
-  if (!fs.existsSync(deployedPath)) {
-    throw new Error("deployed.json not found. Run deploy.ts first.");
+  assertAlwaysCreate(process.argv.slice(2));
+
+  const manifestPath = path.join(__dirname, "../deployed-manifest.json");
+  const validation = validateManifest(manifestPath, NETWORK);
+  if (!validation.ok || !validation.manifest) {
+    throw new Error(
+      `[seed] Refusing to seed with an invalid deployment manifest:\n${validation.errors.join("\n")}`,
+    );
   }
-  const deployed = JSON.parse(fs.readFileSync(deployedPath, "utf-8"));
+  const deployed = validation.manifest;
+  const rpcNetwork = await rpc.getNetwork();
+  assertSeedNetwork(NETWORK, NETWORK_PASSPHRASE, rpcNetwork.passphrase, deployed);
 
   console.log("🔄 CircleUp Demo Seed Script");
   console.log("===========================");
-  console.log(`Factory: ${deployed.circleFactory}`);
-  console.log(`Reputation: ${deployed.reputation}`);
-  console.log(`USDC: ${deployed.usdc}`);
+  console.log(`Factory: ${deployed.contracts.circleFactory.contractId}`);
+  console.log(`Reputation: ${deployed.contracts.reputation.contractId}`);
+  console.log(`USDC: ${deployed.contracts.usdc}`);
   console.log("");
 
   // ── Funding diagnostics (#399) — fail early before any write ─────────────
@@ -164,10 +198,7 @@ async function main() {
   console.log("[seed] Checking RPC reachability and account funding...");
   const rpcOk = await checkRpcReachability(RPC_URL);
   if (!rpcOk) {
-    throw new Error(
-      `[seed] RPC endpoint is unreachable: ${RPC_URL}\n` +
-      "  Check your internet connection or set RPC_URL to an available testnet endpoint.",
-    );
+    throw new Error("[seed] RPC endpoint is unreachable. Check the configured testnet endpoint and network connectivity.");
   }
 
   // Generate 4 member keypairs
@@ -177,6 +208,17 @@ async function main() {
   const dave = Keypair.random();
   const members = [alice, bob, carol, dave];
   const names = ["Alice", "Bob", "Carol", "Dave"];
+  activeJournal = {
+    runId: `${new Date().toISOString()}-${process.pid}`,
+    status: "in_progress",
+    network: NETWORK,
+    members: members.map((member) => member.publicKey()),
+    completedSteps: [],
+    transactions: [],
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  persistJournal();
 
   console.log("👥 Members:");
   for (const [i, kp] of members.entries()) {
@@ -187,7 +229,12 @@ async function main() {
   // Fund all members
   console.log("💧 Funding accounts via Friendbot...");
   for (const kp of members) {
+    activeJournal.currentStep = `fund:${kp.publicKey()}`;
+    persistJournal();
     await fund(kp.publicKey());
+    activeJournal.completedSteps.push(`fund:${kp.publicKey()}`);
+    activeJournal.currentStep = undefined;
+    persistJournal();
     await new Promise((r) => setTimeout(r, 1000));
   }
 
@@ -197,7 +244,7 @@ async function main() {
     rpcUrl:            RPC_URL,
     deployerPublicKey: alice.publicKey(), // alice acts as circle creator
     memberPublicKeys:  members.map((kp) => kp.publicKey()),
-    usdcContractId:    deployed.usdc,
+    usdcContractId:    deployed.contracts.usdc,
     networkPassphrase: NETWORK_PASSPHRASE,
   });
 
@@ -221,29 +268,35 @@ async function main() {
     members.map((kp) => new Address(kp.publicKey()).toScVal()),
   );
 
-  const createHash = await buildAndSend(alice, deployed.circleFactory, "create_circle", [
+  activeJournal.currentStep = "create_circle";
+  persistJournal();
+  const createHash = await buildAndSend(alice, deployed.contracts.circleFactory.contractId, "create_circle", [
     new Address(alice.publicKey()).toScVal(),
     membersVec,
     nativeToScVal(ROUND_AMOUNT, { type: "i128" }),
     nativeToScVal(ROUND_DEADLINE_LEDGERS, { type: "u32" }),
-  ]);
+  ], "create_circle");
   console.log(`  ✅ Circle created. Tx: ${createHash}`);
 
   // Get circle address from factory
   const circleAddresses = await readContract<string[]>(
-    deployed.circleFactory,
+    deployed.contracts.circleFactory.contractId,
     "get_circles",
     [],
   );
   const circleAddress = circleAddresses[circleAddresses.length - 1];
+  activeJournal.circleAddress = circleAddress;
+  persistJournal();
   console.log(`  Circle address: ${circleAddress}`);
 
   // All members join (lock collateral)
   console.log("\n🔒 All members join (lock $100 collateral)...");
   for (const [i, kp] of members.entries()) {
+    activeJournal.currentStep = `join:${names[i]}`;
+    persistJournal();
     const hash = await buildAndSend(kp, circleAddress, "join", [
       new Address(kp.publicKey()).toScVal(),
-    ]);
+    ], `join:${names[i]}`);
     console.log(`  ✅ ${names[i]} joined. Tx: ${hash.slice(0, 16)}…`);
   }
 
@@ -251,18 +304,22 @@ async function main() {
   console.log("\n--- ROUND 1: All contribute → Alice receives $400 ---");
 
   for (const [i, kp] of members.entries()) {
+    activeJournal.currentStep = `contribute-round-1:${names[i]}`;
+    persistJournal();
     const hash = await buildAndSend(kp, circleAddress, "contribute", [
       new Address(kp.publicKey()).toScVal(),
-    ]);
+    ], `contribute-round-1:${names[i]}`);
     console.log(`  ✅ ${names[i]} contributed $100. Tx: ${hash.slice(0, 16)}…`);
   }
 
   // Payout round 1
-  const payoutHash1 = await buildAndSend(alice, circleAddress, "payout", []);
+  activeJournal.currentStep = "payout:round-1";
+  persistJournal();
+  const payoutHash1 = await buildAndSend(alice, circleAddress, "payout", [], "payout:round-1");
   console.log(`  ✅ Payout triggered. Alice receives $400. Tx: ${payoutHash1.slice(0, 16)}…`);
 
   // Check Alice's reputation
-  const aliceScore = await readContract<number>(deployed.reputation, "score", [
+  const aliceScore = await readContract<number>(deployed.contracts.reputation.contractId, "score", [
     new Address(alice.publicKey()).toScVal(),
   ]);
   console.log(`\n  🏆 Alice's reputation score: ${aliceScore}`);
@@ -277,9 +334,11 @@ async function main() {
   // Alice, Bob, Carol contribute; Dave does NOT
   for (const [i, kp] of [alice, bob, carol].entries()) {
     const name = names[i];
+    activeJournal.currentStep = `contribute-round-2:${name}`;
+    persistJournal();
     const hash = await buildAndSend(kp, circleAddress, "contribute", [
       new Address(kp.publicKey()).toScVal(),
-    ]);
+    ], `contribute-round-2:${name}`);
     console.log(`  ✅ ${name} contributed $100. Tx: ${hash.slice(0, 16)}…`);
   }
   console.log(`  ❌ Dave did NOT contribute.`);
@@ -314,26 +373,23 @@ async function main() {
   console.log(`\nExplore on testnet:`);
   console.log(`  https://stellar.expert/explorer/testnet/contract/${circleAddress}`);
 
-  // Save seed output
-  const seedOut = {
-    circleAddress,
-    members: {
-      alice: alice.publicKey(),
-      bob: bob.publicKey(),
-      carol: carol.publicKey(),
-      dave: dave.publicKey(),
-    },
-    roundAmount: "$100 USDC",
-    seededAt: new Date().toISOString(),
-  };
-  fs.writeFileSync(
-    path.join(__dirname, "../seeded.json"),
-    JSON.stringify(seedOut, null, 2),
-  );
+  activeJournal.status = "completed";
+  activeJournal.currentStep = undefined;
+  activeJournal.completedAt = new Date().toISOString();
+  persistJournal();
   console.log(`\nSaved to scripts/seeded.json`);
 }
 
 main().catch((err) => {
-  console.error("[seed] Fatal:", redactSecrets(String(err.message)));
+  if (activeJournal) {
+    activeJournal.status = "failed";
+    activeJournal.failure = redactSeedError(String(err.message));
+    try {
+      persistJournal();
+    } catch (journalError) {
+      console.error("[seed] Could not update progress journal:", redactSeedError(String(journalError)));
+    }
+  }
+  console.error("[seed] Fatal:", redactSeedError(String(err.message)));
   process.exit(1);
 });

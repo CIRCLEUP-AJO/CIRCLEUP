@@ -83,6 +83,18 @@ Versions follow [Semantic Versioning](https://semver.org/).
   license inventories with fail-closed SPDX policy.
 - **Issue #708**: Declared supported Node.js/npm and pinned Rust/Soroban/WASM
   toolchains, added early Node/npm validation, and aligned CI and setup docs.
+- **Issue 712**: Added a role-specific compromised/unavailable admin credential
+  response procedure to `docs/RUNBOOK.md`, including the lack of admin rotation
+  and the limits of pause, communication, and evidence preservation.
+- **Issue 711**: Made the demo seeder testnet-only, manifest-validated, and
+  explicit about always-create behavior. Added a public-only progress/history
+  journal with transaction references and redacted failures.
+- **Issue 714**: Added `docs/PROTOCOL_INVARIANTS.md`, linking protocol guarantees
+  to enforcing contract entry points and executable tests while identifying
+  unsupported behavior and maintenance requirements.
+- **Issue 713**: Documented Soroban storage TTL and retention assumptions and
+  added a test for reputation score renewal on increment; circle-key renewal
+  remains unsupported.
 - **Issue 32**: Bounded timeouts and categorised failures for SDK indexer
   requests (`sdk/src/client.ts`) — every `IndexerClient` request (connect,
   headers and body) is bounded by `DEFAULT_INDEXER_TIMEOUT_MS` (10 s,

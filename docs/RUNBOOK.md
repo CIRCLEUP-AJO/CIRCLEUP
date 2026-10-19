@@ -63,6 +63,10 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Round Lifecycle](#round-lifecycle)
   - [Reputation Authorization Flow](#reputation-authorization-flow)
 - [Security Notes](#security-notes)
+- [Admin Credential Incident Procedure](#admin-credential-incident-procedure)
+- [Demo Seed State and Repeat Runs](#demo-seed-state-and-repeat-runs)
+- [Storage TTL and Retention](#storage-ttl-and-retention)
+- [Protocol Invariant Reference](#protocol-invariant-reference)
 - [Incident Fixtures and Offline Reproduction](#incident-fixtures-and-offline-reproduction)
   - [Fixture Overview](#fixture-overview)
   - [Running the Incident Tests](#running-the-incident-tests)
@@ -330,8 +334,8 @@ npm run dev:app
 **8. (Optional) Seed the demo circle**
 
 ```bash
-npm run seed:demo
-# Creates a 4-member $100/round testnet circle
+npm run seed:demo --workspace=scripts -- --always-create
+# Creates a new 4-member $100/round testnet circle; explicit confirmation required.
 # Runs through Round 1 (all contribute ΓåÆ Alice receives $400)
 # Simulates Round 2 default for Dave
 ```
@@ -1276,6 +1280,64 @@ The deploy script validates that `NETWORK`, `NETWORK_PASSPHRASE`, and `RPC_URL` 
 - **Reputation is manipulation-resistant**: `increment` requires a signature from the calling circle contract (auto-granted by Soroban's Contract Invoker rule for cross-contract calls). A wallet cannot directly call `increment` for itself without producing a signature for a circle contract's private key, which is impossible.
 - **CORS in production**: The indexer allows all origins by default (`ALLOWED_ORIGINS` unset). In production always set `ALLOWED_ORIGINS` to the app's exact origin. The API logs a warning on startup when this is unset.
 - **Rate limiting**: The API applies a per-IP rate limit (default 100 requests/60 seconds). Adjust `RATE_LIMIT_MAX` and `RATE_LIMIT_WINDOW_MS` in `indexer/.env` for production traffic.
+
+### Admin Credential Incident Procedure
+
+Use this procedure for suspected compromise, loss, or unavailability of an administrative signer. Start an incident record in the organization's configured on-call/security channel. The repository does not define named incident contacts; operators must maintain that contact route outside this repository. Existing operational alerts include indexer `/health` and `/indexer/state` checks and a stalled-ledger alert (see [Health Checks and Monitoring](#health-checks-and-monitoring)); these detect service/indexing failures, not credential compromise, so notify the designated security/on-call contact directly. Do not put private keys, recovery phrases, RPC credentials, signed envelopes, or unredacted environment dumps in logs, tickets, chat, or public issues.
+
+#### 1. Identify the affected deployment and authority
+
+Use the deployment manifest for the affected network and verify its network/passphrase and contract IDs against the live RPC before acting. Record the network, factory, reputation, USDC, affected circle IDs, current ledger, and relevant transaction hashes. Read `get_admin` and circle `get_status`/`is_paused` views where available; corroborate the manifest with chain state and deployment records.
+
+| Contract / role | Authority and limit |
+|---|---|
+| `circle_factory` admin | Set during one-time initialization. It does not have a general pause, admin-transfer, or recovery entry point; `create_circle` is permissionless. |
+| Standard circle admin | The factory contract address, passed by `create_circle` to `circle.initialize`. The circle exposes `pause`/`resume`, but the factory has no forwarding entry point for either call. Operators therefore cannot invoke those methods on standard factory-created circles through this deployment. |
+| Manually initialized circle admin | The address supplied to `circle.initialize` can pause/resume that circle if it can still authorize Soroban transactions. A pause blocks `join`, `contribute`, `payout`, `mark_default`, `settle_round`, and `close`; views remain available. It does not refund funds, and it can block default settlement and close. |
+| `reputation` admin | In the standard deployment this is the factory contract, not the deployer wallet. The reputation contract permits caller add/remove only to this admin; no public factory forwarding method exists for those actions. |
+| Deployer wallet | It signs deployment and may initially administer reputation before the deployment script transfers that role to the factory. It is not a general administrator of existing circles. |
+
+#### 2. Contain access
+
+For a compromised signer, revoke its access to the wallet, signing device/session, CI secret store, and any automation that can submit with it. Rotate credentials that are independently rotatable, starting with RPC/provider and deployment automation credentials; do not assume that changing an environment variable changes an on-chain admin. Preserve a trusted, uncompromised signer for any response action that the contract actually permits. For a lost signer, do not repeatedly retry from copied backups or publish recovery material while investigating.
+
+Attempt `pause` only for circles whose stored admin is an operator-controlled address and whose signer remains available; confirm success from the transaction result and `is_paused`. For standard factory-created circles, record that the factory forwarding path is absent rather than implying a pause succeeded. There is no factory-wide or reputation-wide emergency pause in these contracts. Do not submit `close` or `cancel` as an improvised containment action: `cancel` is only for Pending circles and `close` only works after Completed or Cancelled, and both can move collateral.
+
+#### 3. Assess and communicate impact
+
+Compare current on-chain state with indexer state and identify each affected circle's status, round, contribution/deadline state, collateral, and recent transactions. Treat the chain as authoritative if the indexer lags. Notify members through established channels with the affected network and circles, known/unknown impact, confirmed transaction references, actions taken, and the next update time. Do not promise reversal, refunds, or recovery until a permitted on-chain path has been verified. If frontend writes need to stop, disable them operationally and announce the resulting read-only/availability impact; this does not stop direct contract calls.
+
+#### 4. Preserve evidence and assess recovery
+
+Keep a UTC timeline, deployment manifest, public contract/account addresses, ledger numbers, transaction hashes/results, sanitized service logs, alerts, and the exact code/deployment version. Restrict access to the incident record and preserve original evidence. Redact secrets before sharing excerpts; transaction hashes and public addresses are not credentials but may still be sensitive operational data.
+
+Admin addresses are immutable after initialization in these contracts. There is no admin rotation, upgrade, or lost-key recovery entry point. A lost key cannot be replaced by an operator. A compromised authorized signer may submit anything allowed by that role until access is contained; on-chain transactions cannot be rolled back. Funds can only move through contract-defined payout/settlement paths, and a pause is not a clawback. If a contract instance or persistent entry has expired, use only a network-supported restoration procedure while the archived entry remains recoverable; expired state is not reconstructed by this application, and restoration must not be assumed possible after archival data is purged.
+
+### Demo Seed State and Repeat Runs
+
+`npm run seed:demo --workspace=scripts -- --always-create` is a testnet-only, always-create workflow. It does not discover or reuse a prior demo circle: every confirmed invocation creates a new circle, and it generates new member accounts. The script refuses to proceed without the explicit `--always-create` acknowledgement, a valid `scripts/deployed-manifest.json`, a testnet manifest, and an RPC whose reported passphrase matches testnet. These checks happen before Friendbot funding or contract writes. Never point this demo seeder at mainnet.
+
+The script updates `scripts/seeded.json` as an atomic, mode-0600 history journal containing each run's public member addresses, completed funding steps, current step, circle address when known, transaction hashes and confirmation status, timestamps, and a redacted failure summary. It never writes generated secret keys, so the journal cannot restore or operate the generated wallets after the process exits. On failure or timeout, inspect that journal and query each transaction hash on the same network before deciding what to do; a timeout means outcome may be unknown, not that the transaction failed. Rerunning with `--always-create` starts another circle rather than resuming or cleaning up the partial one, while preserving prior run records. Accounts funded by Friendbot and every successful contract transaction remain on-chain even though the ephemeral member signing keys are discarded.
+
+Friendbot funding and successful on-chain transactions persist. The script does not delete accounts, circles, contributions, payouts, or reputation, and there is no general on-chain cleanup operation. Record the seeded circle and transaction references for testnet cleanup/monitoring; do not treat deleting the local journal as cleanup of chain state.
+
+### Storage TTL and Retention
+
+Soroban TTL is measured in ledgers, not wall-clock days. The network's current minimum/maximum TTL and archival/restoration policy are protocol configuration and can differ by network or change over time. Before a production launch, inspect the current network configuration and observed entry expiration ledgers; do not convert to seconds using a permanent 5-second-ledger assumption.
+
+| Contract storage | Keys and code behavior | Retention / recovery assumption |
+|---|---|---|
+| `circle` instance | `Config`, `Status`, `CurrentRound`, `RoundsCompleted`, `UsdcToken`, `Admin`, `Paused`, `Closed`, and initialization guard. No application-level `extend_ttl` call exists. No temporary storage is used. | Core configuration and lifecycle state share the contract instance lifetime. The contract has no migration or state reconstruction path. Check live instance TTL and network restoration options. |
+| `circle` persistent | `Collateral(member)`, `Contributed(member, round)`, `Defaulted(member, round)`, and `Defaults(member)`. Writes do not call `extend_ttl`; completed/closed circles do not prune every historical key. | Long-lived circles and retained history depend on network TTL/archival behavior. The maximum supported round deadline alone does not guarantee that all keys live for a whole multi-round circle. No keeper renewal workflow is implemented; operators must treat approaching expiration as a protocol risk, not assume reads renew these entries. |
+| `circle_factory` instance | Admin, WASM hash, reputation/token addresses, circle registry, and count. No application-level `extend_ttl` call exists. | Registry availability depends on the factory instance remaining available. No registry rebuild or admin recovery method exists in the contract. |
+| `reputation` instance | Admin, authorized callers, and revoked callers. No application-level explicit renewal call exists. | These authorization lists are coupled to the reputation instance lifetime; expiration could affect authorization and score increments. Verify instance TTL under the target network rules. |
+| `reputation` persistent | `Score(member)` is extended on every successful `increment` with threshold 100,000 ledgers and target 200,000 ledgers. The `score` read does not renew it; a missing score reads as zero. | Renewal protects active scores when they are incremented, not indefinitely inactive scores. The targeted renewal test is `test_increment_renews_persistent_score_ttl` in `contracts/reputation/src/lib.rs`. |
+
+Before expected circle lifetime exceeds the remaining TTL, a supported protocol change must provide and test renewal for the relevant keys or an authorized keeper workflow; do not silently rely on default TTL. Once an entry is archived, restore it before its network retention window ends. After purging, this application cannot recreate exact contract state from the indexer or event history. Completed-circle retention is therefore not indefinite by contract guarantee.
+
+### Protocol Invariant Reference
+
+See [Protocol Invariant Evidence](PROTOCOL_INVARIANTS.md) for the scoped list of protocol guarantees with direct implementation and executable-test links. Unsupported behavior and operational assumptions are called out separately.
 
 ---
 
