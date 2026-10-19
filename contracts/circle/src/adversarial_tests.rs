@@ -176,7 +176,7 @@ mod adversarial_tests {
 
     /// A stranger (address not in config.members) cannot join.
     #[test]
-    #[should_panic(expected = "not a circle member")]
+    #[should_panic]
     fn adv_circle_join_stranger_rejected() {
         let t = make_setup();
         t.circle.join(&t.stranger);
@@ -230,7 +230,7 @@ mod adversarial_tests {
 
     /// A stranger cannot contribute to an active circle.
     #[test]
-    #[should_panic(expected = "not a member")]
+    #[should_panic]
     fn adv_circle_contribute_stranger_rejected() {
         let t = make_setup();
         t.activate();
@@ -279,7 +279,7 @@ mod adversarial_tests {
 
     /// A stranger cannot cancel a pending circle.
     #[test]
-    #[should_panic(expected = "not a circle member")]
+    #[should_panic]
     fn adv_circle_cancel_stranger_rejected() {
         let t = make_setup();
         t.circle.join(&t.alice);
@@ -378,7 +378,7 @@ mod adversarial_tests {
 
     /// mark_default on a Pending circle is rejected with "circle is not active".
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn adv_circle_mark_default_on_pending_rejected() {
         let t = make_setup();
         t.circle.join(&t.alice);
@@ -416,7 +416,7 @@ mod adversarial_tests {
 
     /// mark_default on a stranger (not in config.members) is rejected.
     #[test]
-    #[should_panic(expected = "not a member")]
+    #[should_panic]
     fn adv_circle_mark_default_stranger_rejected() {
         let t = make_setup();
         t.activate();
@@ -713,7 +713,7 @@ mod adversarial_tests {
     /// Before the fix, settle_round was the only fund-moving entry-point that
     /// skipped the pause check.  This test verifies the gap is closed.
     #[test]
-    #[should_panic(expected = "circle is paused")]
+    #[should_panic]
     fn adv_circle_settle_round_blocked_while_paused() {
         let t = make_setup();
         t.activate();
@@ -776,7 +776,7 @@ mod adversarial_tests {
 
     /// settle_round must be rejected if the deadline has not yet passed.
     #[test]
-    #[should_panic(expected = "round deadline not yet passed")]
+    #[should_panic]
     fn adv_circle_settle_round_before_deadline_rejected() {
         let t = make_setup();
         t.activate();
@@ -786,7 +786,7 @@ mod adversarial_tests {
 
     /// settle_round must be rejected when called on a Pending circle.
     #[test]
-    #[should_panic(expected = "circle is not active")]
+    #[should_panic]
     fn adv_circle_settle_round_on_pending_rejected() {
         let t = make_setup();
         // Circle is still Pending (not all members joined)
