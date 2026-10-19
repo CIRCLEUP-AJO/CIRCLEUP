@@ -67,6 +67,13 @@ npx tsc --noEmit --project app/tsconfig.json
 
 See the [RUNBOOK](./docs/RUNBOOK.md) for full environment variable setup.
 
+Supported toolchains are Node.js 18.18+ with npm 9, Node.js 22 with npm 10, or
+Node.js 24 with npm 11; Rust 1.81.0; Soroban SDK 21.7.7; and the
+`wasm32-unknown-unknown` target. CI tests each supported tuple. Rust and Soroban are pinned for
+reproducible WASM builds. Run `npm run check:toolchain` after installing Rust
+and the target. Unsupported Node/npm versions fail during `npm install` with
+the supported range and next step.
+
 ---
 
 ## How to Contribute

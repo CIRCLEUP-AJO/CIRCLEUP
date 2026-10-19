@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "scripts": {
     "deploy:testnet": "ts-node src/deploy.ts",
+    "mainnet:readiness": "ts-node src/mainnet-readiness.ts",
     "seed:demo": "ts-node src/seed-demo.ts",
     "release-check": "ts-node src/release-check.ts",
     "validate-env": "ts-node src/validate-env.ts",

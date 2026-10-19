@@ -17,6 +17,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.81.0
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust build artifacts
@@ -39,6 +40,9 @@ jobs:
         with:
           node-version: 18
           cache: npm
+
+      - name: Select supported npm line
+        run: npm install --global npm@9
 
       - name: Install dependencies
         run: npm ci
@@ -87,6 +91,9 @@ jobs:
           node-version: 18
           cache: npm
 
+      - name: Select supported npm line
+        run: npm install --global npm@9
+
       - name: Install dependencies
         run: npm ci
 
@@ -115,6 +122,9 @@ jobs:
         with:
           node-version: 18
           cache: npm
+
+      - name: Select supported npm line
+        run: npm install --global npm@9
 
       - name: Install dependencies
         run: npm ci
@@ -148,8 +158,90 @@ jobs:
           node-version: 18
           cache: npm
 
+      - name: Select supported npm line
+        run: npm install --global npm@9
+
       - name: Install dependencies
         run: npm ci
 
       - name: Typecheck scripts
         run: cd scripts && npx tsc --noEmit
+
+      - name: Run deployment script tests
+        run: >-
+          TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
+          node --require ts-node/register --test
+          scripts/src/deployment-manifest.test.ts
+          scripts/src/mainnet-readiness.test.ts
+          scripts/src/deploy-network-guard.test.ts
+
+  # ── Dependency license policy ───────────────────────────────────────────────
+  license-policy:
+    name: Dependency license policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Select supported npm line
+        run: npm install --global npm@9
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.81.0
+          components: clippy
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch locked Rust dependencies
+        run: cd contracts && cargo fetch --locked
+
+      - name: Install inventory tool
+        run: cargo install cargo-license --version 0.6.1 --locked
+
+      - name: Enforce Rust dependency policy
+        run: |
+          cargo install cargo-deny --version 0.16.4 --locked
+          cd contracts && cargo deny check licenses advisories
+
+      - name: Generate and enforce license inventories
+        run: bash scripts/license-inventory.sh
+
+      - name: Upload dependency license inventories
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-license-inventories
+          path: artifacts/licenses-*
+
+  toolchain-compatibility:
+    name: Toolchain (Node ${{ matrix.node }}, npm ${{ matrix.npm }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: 18.18.0
+            npm: 9
+          - node: 22
+            npm: 10
+          - node: 24
+            npm: 11
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Select supported npm line
+        run: npm install --global "npm@${{ matrix.npm }}"
+      - name: Validate Node and npm
+        run: npm run check:node
+      - name: Install dependencies
+        run: npm ci
+      - name: Build SDK
+        run: npm run build:sdk

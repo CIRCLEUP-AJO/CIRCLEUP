@@ -4,8 +4,7 @@
 # Produces machine-readable license inventories for every package manager in
 # the repository:
 #
-#   artifacts/licenses-app.csv      — production JS deps for app/
-#   artifacts/licenses-indexer.csv  — production JS deps for indexer/
+#   artifacts/licenses-*.csv       — JS deps, including devDependencies, per workspace
 #   artifacts/licenses-rust.json    — Rust crate licenses (cargo-license)
 #
 # Requirements
@@ -17,8 +16,8 @@
 # ─────
 #   bash scripts/license-inventory.sh
 #
-# In CI add this as a step after npm ci and cargo fetch so that no network
-# access is required during the inventory run:
+# In CI install cargo-license and run cargo fetch before this check so no
+# network access is required during inventory generation.
 #
 #   - name: Generate license inventory
 #     run: bash scripts/license-inventory.sh
@@ -30,19 +29,15 @@
 #
 # Policy
 # ──────
-# Permitted SPDX identifiers (non-exhaustive; covers current deps):
+# Permitted SPDX identifiers (enforced exactly by license-checker and cargo-deny):
 #   MIT, ISC, BSD-2-Clause, BSD-3-Clause, Apache-2.0, BlueOak-1.0.0
-#
-# Prohibited:
-#   GPL-2.0, GPL-3.0, LGPL-2.0, LGPL-2.1, LGPL-3.0, AGPL-3.0
-#   CC-BY-NC-*, BUSL-1.1, proprietary / UNLICENSED (unless reviewed)
 #
 # Unknown or unlisted licenses must receive an explicit exception documented
 # in docs/LICENSE_EXCEPTIONS.md before the artifact is released.
 #
 # Exit codes
 # ──────────
-#   0   All inventories produced; no prohibited licenses detected.
+#   0   All inventories produced; all licenses are allowed.
 #   1   A prohibited license was found; see output for details.
 #   2   A required tool is missing.
 
@@ -52,46 +47,31 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACTS="${REPO_ROOT}/artifacts"
 mkdir -p "${ARTIFACTS}"
 
-# ── Prohibited license patterns (grep-compatible) ────────────────────────────
-PROHIBITED_PATTERN="GPL-[23]\.0\|LGPL-[23]\.[01]\|AGPL-3\.0\|CC-BY-NC\|BUSL-1\.1\|UNLICENSED\|proprietary"
+# ── Allowed SPDX identifiers ─────────────────────────────────────────────────
+ALLOWED_LICENSES="MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0;BlueOak-1.0.0"
 
 violations=0
 
-# ── JS: app workspace ─────────────────────────────────────────────────────────
-echo "[license-inventory] Scanning app/ JS dependencies..."
-(
-  cd "${REPO_ROOT}/app"
-  npx license-checker --production --excludePrivatePackages \
-    --out "${ARTIFACTS}/licenses-app.csv" --csv
-)
-echo "[license-inventory] Written: artifacts/licenses-app.csv"
-
-if grep -i "${PROHIBITED_PATTERN}" "${ARTIFACTS}/licenses-app.csv" > /dev/null 2>&1; then
-  echo "[license-inventory] ERROR: Prohibited license(s) found in app/ deps:" >&2
-  grep -i "${PROHIBITED_PATTERN}" "${ARTIFACTS}/licenses-app.csv" >&2
-  violations=$((violations + 1))
-fi
-
-# ── JS: indexer workspace ─────────────────────────────────────────────────────
-echo "[license-inventory] Scanning indexer/ JS dependencies..."
-(
-  cd "${REPO_ROOT}/indexer"
-  npx license-checker --production --excludePrivatePackages \
-    --out "${ARTIFACTS}/licenses-indexer.csv" --csv
-)
-echo "[license-inventory] Written: artifacts/licenses-indexer.csv"
-
-if grep -i "${PROHIBITED_PATTERN}" "${ARTIFACTS}/licenses-indexer.csv" > /dev/null 2>&1; then
-  echo "[license-inventory] ERROR: Prohibited license(s) found in indexer/ deps:" >&2
-  grep -i "${PROHIBITED_PATTERN}" "${ARTIFACTS}/licenses-indexer.csv" >&2
-  violations=$((violations + 1))
-fi
+# ── JS: every npm workspace ───────────────────────────────────────────────────
+for workspace in app indexer sdk scripts; do
+  echo "[license-inventory] Scanning ${workspace}/ dependencies..."
+  (
+    cd "${REPO_ROOT}/${workspace}"
+    project_package="$(node -e 'const p=require("./package.json"); process.stdout.write(`${p.name}@${p.version}`)')"
+    npx license-checker --unknown --excludePrivatePackages \
+      --onlyAllow "${ALLOWED_LICENSES}" --excludePackages "${project_package}" \
+      --out "${ARTIFACTS}/licenses-${workspace}.csv" --csv
+  ) || violations=$((violations + 1))
+  if [[ -f "${ARTIFACTS}/licenses-${workspace}.csv" ]]; then
+    echo "[license-inventory] Written: artifacts/licenses-${workspace}.csv"
+  fi
+done
 
 # ── Rust: contracts workspace ─────────────────────────────────────────────────
 if ! command -v cargo-license > /dev/null 2>&1; then
-  echo "[license-inventory] WARNING: cargo-license not found. Install with:" >&2
+  echo "[license-inventory] ERROR: cargo-license not found. Install with:" >&2
   echo "  cargo install cargo-license" >&2
-  echo "[license-inventory] Skipping Rust inventory." >&2
+  exit 2
 else
   echo "[license-inventory] Scanning contracts/ Rust dependencies..."
   (
@@ -99,12 +79,6 @@ else
     cargo license --json > "${ARTIFACTS}/licenses-rust.json"
   )
   echo "[license-inventory] Written: artifacts/licenses-rust.json"
-
-  if grep -i "${PROHIBITED_PATTERN}" "${ARTIFACTS}/licenses-rust.json" > /dev/null 2>&1; then
-    echo "[license-inventory] ERROR: Prohibited license(s) found in Rust deps:" >&2
-    grep -i "${PROHIBITED_PATTERN}" "${ARTIFACTS}/licenses-rust.json" >&2
-    violations=$((violations + 1))
-  fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

@@ -1,10 +1,10 @@
 /**
- * deploy.ts — Deploy CircleUp contracts to Stellar Testnet.
+ * deploy.ts — Deploy CircleUp contracts to Stellar Testnet only.
  *
  * Enhancements:
  *   #397 — Preflight checks: validates network, account funding, tool
  *           availability, and WASM artifacts before any write transaction.
- *   #398 — Deployment manifest: writes an atomic, integrity-protected
+ *   #398 — Deployment manifest: writes an atomic, checksummed
  *           manifest after all contracts are successfully deployed.
  *   #399 — Funding diagnostics: reports which balance is insufficient and
  *           why, with actionable remediation steps.
@@ -20,7 +20,7 @@
  *
  * Flags:
  *   --skip-preflight   Bypass read-only preflight checks (not recommended)
- *   --network          testnet | mainnet  (default: testnet)
+ *   --network          testnet only (default: testnet)
  *
  * Exit codes:
  *   0 — All contracts deployed; manifest written to scripts/deployed-manifest.json
@@ -62,19 +62,23 @@ const NETWORK_ARG    = (() => {
 const NETWORK  = NETWORK_ARG ?? process.env.NETWORK ?? "testnet";
 const DEPLOYER = process.env.DEPLOYER_IDENTITY ?? "deployer";
 
+if (NETWORK !== "testnet") {
+  console.error(
+    `[deploy] Unsupported deployment network: ${NETWORK}. This command is testnet-only. ` +
+    "Use the dedicated mainnet readiness gate before any separately approved mainnet procedure.",
+  );
+  process.exit(1);
+}
+
 const NETWORK_PASSPHRASE_MAP: Record<string, string> = {
   testnet:   "Test SDF Network ; September 2015",
-  mainnet:   "Public Global Stellar Network ; September 2015",
-  futurenet: "Test SDF Future Network ; October 2022",
 };
-const NETWORK_PASSPHRASE =
-  process.env.NETWORK_PASSPHRASE ?? NETWORK_PASSPHRASE_MAP[NETWORK] ?? "";
+const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE ?? NETWORK_PASSPHRASE_MAP.testnet;
 
 const RPC_URL_MAP: Record<string, string> = {
   testnet: "https://soroban-testnet.stellar.org",
-  mainnet: "https://soroban.stellar.org",
 };
-const RPC_URL = process.env.STELLAR_RPC_URL ?? RPC_URL_MAP[NETWORK] ?? "";
+const RPC_URL = process.env.STELLAR_RPC_URL ?? RPC_URL_MAP.testnet;
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 

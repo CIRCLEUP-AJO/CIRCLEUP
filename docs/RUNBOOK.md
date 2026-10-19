@@ -250,9 +250,10 @@ User navigates to /reputation/[address]
 
 | Tool | Minimum version | Purpose |
 |---|---|---|
-| Node.js | 18 | Frontend, indexer, scripts |
-| npm | 9 | Workspace management |
-| Rust (stable toolchain) | 1.75 | Compile Soroban contracts |
+| Node.js + npm | 18.18+ with npm 9; 22.x with npm 10; 24.x with npm 11 (CI-tested tuples) | Frontend, indexer, scripts |
+| Rust | 1.81.0 (pinned) | Compile Soroban contracts |
+| Soroban SDK | 21.7.7 (locked) | Contract SDK; `contracts/Cargo.lock` is authoritative |
+| Rust WASM target | `wasm32-unknown-unknown` | Compile Soroban contract artifacts |
 | stellar-cli | latest | Deploy contracts to testnet |
 | Docker | any | Postgres via docker compose |
 | Freighter | browser extension | Wallet for the web UI |
@@ -261,6 +262,10 @@ Install stellar-cli:
 ```bash
 cargo install --locked stellar-cli --features opt
 ```
+
+Run `npm run check:node` to validate the Node/npm pair. After Rust and the WASM
+target are installed, run `npm run check:toolchain` to validate the complete
+pinned build tuple before compiling contracts.
 
 ### Step-by-Step
 
@@ -404,6 +409,61 @@ The deploy script (`scripts/src/deploy.ts`) handles:
 2. Deploying the reputation contract with the deployer as temporary admin.
 3. Deploying the factory with the reputation address and circle WASM hash.
 4. Transferring admin of the reputation contract to the factory address.
+
+### Mainnet Release Readiness
+
+The generic deployment script is testnet-only. A testnet deployment, its
+defaults, or an unrecognized network name must never be used to deploy on
+mainnet. Before authorizing a mainnet release, run the separate read-only gate
+with explicit intent:
+
+```bash
+npm run mainnet:readiness -- --network mainnet --confirm-mainnet
+```
+
+The gate requires the `production` profile, an HTTPS non-testnet RPC whose
+read-only `getNetwork` response and Horizon endpoint's network passphrase both
+match mainnet, all three
+configured contract addresses, the expected Stellar USDC contract identity,
+and an admin public key plus local `stellar-cli` identity matching the
+manifest's deployer. It also requires a valid mainnet deployment manifest
+whose addresses match the profile and all three candidate WASM files matching
+populated hashes in `contracts/expected-hashes.json`. The manifest describes
+the active deployment; candidate artifact hashes are checked separately so a
+contract upgrade need not match the currently deployed WASM. It performs read-only
+RPC/Horizon funding checks and prints named pass/fail results only; it does not
+print environment values, read a secret key, or submit transactions. Missing
+artifact hashes are a failure, not a skipped check. The local identity check
+does not prove that the operator can recover the key or establish on-chain
+signer thresholds; verify custody and signing authority independently using
+the organization's approved key-management procedure.
+
+Mainnet differs from testnet in the following release-critical inputs:
+
+| Context | Mainnet requirement | Testnet distinction |
+|---|---|---|
+| RPC | Explicit HTTPS production RPC; no testnet/futurenet hostname | Testnet RPC may use the public test endpoint |
+| Passphrase | Exact public Stellar network passphrase | Test SDF passphrase |
+| Token | Exact Stellar USDC contract identity; no test-token deployment | Test token may be used only on testnet |
+| Funding | Mainnet XLM must already be funded; Friendbot is unavailable | Testnet accounts may use Friendbot |
+| Admin | Explicit public key and local CLI identity must match the manifest; secrets remain outside profiles | Testnet deployer identity is disposable |
+| Artifacts | All release WASM hashes must match populated expected hashes | Testnet workflows may build artifacts as part of deployment |
+
+After a separately authorized deployment, verify the transaction and contract
+addresses on a mainnet explorer and against the deployment manifest; confirm
+the deployed factory, reputation, and USDC identities through read-only RPC
+checks; update the production profile and service configuration; then verify
+indexer health, indexed events, app connectivity, and alerts before opening
+user access. Record the deployment revision, manifest, transaction IDs, and
+verification evidence in the release record.
+
+Soroban deployments are immutable. There is no rollback that deletes a contract
+or restores prior on-chain state. If a release is incorrect, stop routing new
+traffic, assess any active circles and user funds, deploy corrected contracts
+as a new deployment, and migrate app/indexer configuration only after review.
+Existing contracts remain on-ledger, and recovery of funds or state is not
+guaranteed by redeployment. Do not promise an emergency admin recovery path
+unless the deployed contract explicitly implements and has tested one.
 
 ### Post-Deployment Configuration
 
