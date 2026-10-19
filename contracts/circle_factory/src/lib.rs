@@ -55,7 +55,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
+    contract, contracterror, contractimpl, contracttype,
     xdr::ToXdr,
     Address, Bytes, BytesN, Env, Symbol, Vec,
 };
@@ -88,6 +88,21 @@ pub enum DataKey {
     Initializing,
 }
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum FactoryError {
+    TooFewMembers = 100,
+    TooManyMembers = 101,
+    DuplicateMembers = 102,
+    InvalidRoundAmount = 103,
+    PotOverflow = 104,
+    PenaltyOverflow = 105,
+    DeadlineBelowMinimum = 106,
+    DeadlineAboveMaximum = 107,
+    AlreadyInitialized = 108,
+    InitializeInProgress = 109,
+}
+
 // ─── Events ───────────────────────────────────────────────────────────────────
 
 /// Topic-0 namespace shared by every event this contract publishes.
@@ -101,7 +116,7 @@ pub const EVENT_NAMESPACE: &str = "factory";
 ///
 /// Duplicate members break payout ordering and let one wallet occupy multiple
 /// rotation slots. We fail before paying deploy gas.
-fn assert_unique_members(members: &Vec<Address>) {
+fn assert_unique_members(members: &Vec<Address>) -> Result<(), FactoryError> {
     let len = members.len();
     let mut i: u32 = 0;
     while i < len {
@@ -114,12 +129,13 @@ fn assert_unique_members(members: &Vec<Address>) {
                 .get(j)
                 .unwrap_or_else(|| panic!("factory: member index {} out of bounds", j));
             if a == b {
-                panic!("duplicate members");
+                return Err(FactoryError::DuplicateMembers);
             }
             j += 1;
         }
         i += 1;
     }
+    Ok(())
 }
 
 /// Validate all `create_circle` inputs before touching any state.
@@ -130,23 +146,23 @@ fn validate_create_inputs(
     members: &Vec<Address>,
     round_amount: i128,
     round_deadline_ledgers: u32,
-) {
+) -> Result<(), FactoryError> {
     // Member count bounds — mirrors circle contract limits exactly.
     let member_count = members.len();
     if member_count < 2 {
-        panic!("need at least 2 members");
+        return Err(FactoryError::TooFewMembers);
     }
     if member_count > MAX_MEMBERS {
-        panic!("too many members");
+        return Err(FactoryError::TooManyMembers);
     }
 
     // Duplicate-member check.
-    assert_unique_members(members);
+    assert_unique_members(members)?;
 
     // round_amount: must be strictly positive. Zero or negative would make
     // collateral and pot calculations meaningless.
     if round_amount <= 0 {
-        panic!("round_amount must be positive");
+        return Err(FactoryError::InvalidRoundAmount);
     }
 
     // Overflow pre-check: the circle contract multiplies round_amount by
@@ -161,11 +177,12 @@ fn validate_create_inputs(
 
     // Deadline bounds — must match circle contract's accepted range exactly.
     if round_deadline_ledgers < MIN_ROUND_DEADLINE_LEDGERS {
-        panic!("round_deadline_ledgers below minimum");
+        return Err(FactoryError::DeadlineBelowMinimum);
     }
     if round_deadline_ledgers > MAX_ROUND_DEADLINE_LEDGERS {
-        panic!("round_deadline_ledgers above maximum");
+        return Err(FactoryError::DeadlineAboveMaximum);
     }
+    Ok(())
 }
 
 /// Build a deploy salt unique per successful `create_circle` call.
@@ -218,10 +235,10 @@ impl CircleFactory {
     /// initialized state.  Consistent with the same guard pattern used in the
     /// circle and reputation contracts.
     ///
-    /// # Panics
+    /// # Contract errors
     ///
-    /// - `"already initialized"` if called more than once
-    /// - `"initialize already in progress"` if a reentrant call is detected
+    /// - `108` — factory was already initialized.
+    /// - `109` — initialization is already in progress.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -230,14 +247,14 @@ impl CircleFactory {
         usdc_token: Address,
     ) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            env.panic_with_error(FactoryError::AlreadyInitialized);
         }
 
         // Reentrancy guard: set Initializing as the very first write so that
         // any reentrant call (e.g. from a future cross-contract call added here)
-        // sees the flag and panics before it can observe or commit partial state.
+        // sees the flag and returns a typed error before observing or committing partial state.
         if env.storage().instance().has(&DataKey::Initializing) {
-            panic!("initialize already in progress");
+            env.panic_with_error(FactoryError::InitializeInProgress);
         }
         env.storage().instance().set(&DataKey::Initializing, &true);
 
@@ -268,16 +285,15 @@ impl CircleFactory {
     /// `add_authorized_caller` all succeed.  A failure at any step rolls back
     /// the entire transaction and leaves factory state unchanged.
     ///
-    /// # Panics
+    /// # Contract errors
     ///
-    /// - `"factory: create_circle called before initialize"` — factory not set up
-    /// - `"need at least 2 members"` — fewer than 2 members supplied
-    /// - `"too many members"` — more than `MAX_MEMBERS` supplied
-    /// - `"duplicate members"` — same address appears more than once
-    /// - `"round_amount must be positive"` — zero or negative amount
-    /// - `"round_amount too large: overflows pot calculation"` — would overflow i128
-    /// - `"round_deadline_ledgers below minimum"` — below `MIN_ROUND_DEADLINE_LEDGERS`
-    /// - `"round_deadline_ledgers above maximum"` — above `MAX_ROUND_DEADLINE_LEDGERS`
+    /// - `100` — fewer than 2 members; `101` — more than `MAX_MEMBERS`.
+    /// - `102` — duplicate members.
+    /// - `103` — non-positive round amount; `104` / `105` — pot / penalty overflow.
+    /// - `106` / `107` — deadline below minimum / above maximum.
+    ///
+    /// Authorization, deployment, nested-contract, and storage failures remain
+    /// host diagnostics and are not converted into `FactoryError` values.
     ///
     /// # Events
     ///
@@ -293,7 +309,9 @@ impl CircleFactory {
 
         // ── 1. Pure precondition validation (no state reads) ────────────────
         // All panics here leave the factory completely unchanged.
-        validate_create_inputs(&members, round_amount, round_deadline_ledgers);
+        if let Err(error) = validate_create_inputs(&members, round_amount, round_deadline_ledgers) {
+            env.panic_with_error(error);
+        }
 
         // ── 2. Load factory config ───────────────────────────────────────────
         // Fail early if the factory was not initialized, before spending gas on
@@ -626,24 +644,25 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already initialized")]
     fn test_double_initialize_panics() {
         let env = Env::default();
         let s = setup_factory(&env);
         let admin2 = Address::generate(&env);
-        s.client.initialize(&admin2, &s.wasm_hash, &Address::generate(&env), &Address::generate(&env));
+        assert_eq!(
+            s.client.try_initialize(&admin2, &s.wasm_hash, &Address::generate(&env), &Address::generate(&env)),
+            Err(Ok(FactoryError::AlreadyInitialized))
+        );
     }
 
     /// The reentrancy guard (DataKey::Initializing) is set before any other
     /// storage write in `initialize`.  A second call that arrives while the
-    /// first is still in progress must panic with "initialize already in
-    /// progress" rather than proceeding and observing partial state.
+    /// first is still in progress must return a typed error rather than
+    /// proceeding and observing partial state.
     ///
     /// In the test environment we simulate this by manually setting the
     /// Initializing flag via `as_contract` before calling initialize on a
     /// fresh (un-initialized) factory instance.
     #[test]
-    #[should_panic(expected = "initialize already in progress")]
     fn test_initialize_reentrancy_guard_fires() {
         let env = Env::default();
         env.mock_all_auths();
@@ -734,32 +753,37 @@ mod tests {
     // ── validate_create_inputs ────────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "need at least 2 members")]
     fn test_validate_rejects_single_member() {
         let env = Env::default();
         let mut m = Vec::new(&env);
         m.push_back(Address::generate(&env));
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::TooFewMembers)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "need at least 2 members")]
     fn test_validate_rejects_empty_members() {
         let env = Env::default();
         let m = Vec::new(&env);
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::TooFewMembers)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "too many members")]
     fn test_validate_rejects_too_many_members() {
         let env = Env::default();
         let m = make_members(&env, MAX_MEMBERS + 1);
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::TooManyMembers)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "duplicate members")]
     fn test_validate_rejects_duplicate_members() {
         let env = Env::default();
         let a = Address::generate(&env);
@@ -767,63 +791,86 @@ mod tests {
         m.push_back(a.clone());
         m.push_back(Address::generate(&env));
         m.push_back(a);
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::DuplicateMembers)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "round_amount must be positive")]
     fn test_validate_rejects_zero_round_amount() {
         let env = Env::default();
         let m = make_members(&env, 2);
-        validate_create_inputs(&m, 0, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, 0, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::InvalidRoundAmount)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "round_amount must be positive")]
     fn test_validate_rejects_negative_round_amount() {
         let env = Env::default();
         let m = make_members(&env, 2);
-        validate_create_inputs(&m, -1, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, -1, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::InvalidRoundAmount)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers below minimum")]
     fn test_validate_rejects_deadline_below_minimum() {
         let env = Env::default();
         let m = make_members(&env, 2);
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS - 1);
+        assert_eq!(
+            validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS - 1),
+            Err(FactoryError::DeadlineBelowMinimum)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers above maximum")]
     fn test_validate_rejects_deadline_above_maximum() {
         let env = Env::default();
         let m = make_members(&env, 2);
-        validate_create_inputs(&m, 1_000_000, MAX_ROUND_DEADLINE_LEDGERS + 1);
+        assert_eq!(
+            validate_create_inputs(&m, 1_000_000, MAX_ROUND_DEADLINE_LEDGERS + 1),
+            Err(FactoryError::DeadlineAboveMaximum)
+        );
     }
 
     #[test]
     fn test_validate_accepts_boundary_deadlines() {
         let env = Env::default();
         let m = make_members(&env, 2);
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS);
-        validate_create_inputs(&m, 1_000_000, MAX_ROUND_DEADLINE_LEDGERS);
+        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS).unwrap();
+        validate_create_inputs(&m, 1_000_000, MAX_ROUND_DEADLINE_LEDGERS).unwrap();
     }
 
     #[test]
     fn test_validate_accepts_max_members_at_boundary() {
         let env = Env::default();
         let m = make_members(&env, MAX_MEMBERS);
-        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS);
+        validate_create_inputs(&m, 1_000_000, MIN_ROUND_DEADLINE_LEDGERS).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "round_amount too large: overflows pot calculation")]
     fn test_validate_rejects_round_amount_overflow() {
         let env = Env::default();
         let m = make_members(&env, 2);
         // i128::MAX / 1 = i128::MAX — multiplied by member_count(2) overflows
-        validate_create_inputs(&m, i128::MAX, MIN_ROUND_DEADLINE_LEDGERS);
+        assert_eq!(
+            validate_create_inputs(&m, i128::MAX, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::PotOverflow)
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_penalty_overflow() {
+        let env = Env::default();
+        let m = make_members(&env, 2);
+        assert_eq!(
+            validate_create_inputs(&m, i128::MAX / 1_000, MIN_ROUND_DEADLINE_LEDGERS),
+            Err(FactoryError::PenaltyOverflow)
+        );
     }
 
     // ── assert_unique_members (unit) ──────────────────────────────────────────
@@ -832,11 +879,10 @@ mod tests {
     fn test_assert_unique_members_accepts_distinct() {
         let env = Env::default();
         let m = make_members(&env, 3);
-        assert_unique_members(&m);
+        assert_eq!(assert_unique_members(&m), Ok(()));
     }
 
     #[test]
-    #[should_panic(expected = "duplicate members")]
     fn test_assert_unique_members_rejects_duplicates() {
         let env = Env::default();
         let a = Address::generate(&env);
@@ -844,7 +890,7 @@ mod tests {
         m.push_back(a.clone());
         m.push_back(Address::generate(&env));
         m.push_back(a);
-        assert_unique_members(&m);
+        assert_eq!(assert_unique_members(&m), Err(FactoryError::DuplicateMembers));
     }
 
     // ── derive_circle_salt (unit) ─────────────────────────────────────────────
@@ -1063,7 +1109,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "duplicate members")]
     fn test_create_circle_rejects_duplicate_members() {
         let env = Env::default();
         let s = setup_factory(&env);
@@ -1077,7 +1122,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "round_amount must be positive")]
     fn test_create_circle_rejects_zero_round_amount() {
         let env = Env::default();
         let s = setup_factory(&env);
@@ -1086,7 +1130,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers below minimum")]
     fn test_create_circle_rejects_deadline_below_min() {
         let env = Env::default();
         let s = setup_factory(&env);
@@ -1097,7 +1140,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "round_deadline_ledgers above maximum")]
     fn test_create_circle_rejects_deadline_above_max() {
         let env = Env::default();
         let s = setup_factory(&env);
@@ -1149,11 +1191,11 @@ mod tests {
         // salt-differ test above. The registry itself never deduplicates by
         // member set; uniqueness is enforced at the salt level.
         // Here we just confirm unique_members still works after batch rejects.
-        assert_unique_members(&m);
+        assert_unique_members(&m).unwrap();
 
         // Confirm idempotency: a second call on the same members doesn't panic
         // in assert_unique_members (no false-positive after first call).
-        assert_unique_members(&m);
+        assert_unique_members(&m).unwrap();
     }
 
     // ── Failed create leaves factory state unchanged ──────────────────────────
@@ -1169,7 +1211,13 @@ mod tests {
         let result = s.client.try_create_circle(
             &Address::generate(&env), &m, &0i128, &MIN_ROUND_DEADLINE_LEDGERS,
         );
-        assert!(result.is_err(), "expected error for zero round_amount");
+        let Err(Ok(sdk_error)) = result else {
+            panic!("expected a typed FactoryError for zero round_amount");
+        };
+        assert_eq!(
+            FactoryError::try_from(sdk_error).expect("must be a typed FactoryError"),
+            FactoryError::InvalidRoundAmount
+        );
         assert_eq!(s.client.get_circle_count(), 0);
         assert!(s.client.get_circles().is_empty());
     }

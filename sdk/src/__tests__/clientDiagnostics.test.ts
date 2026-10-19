@@ -326,8 +326,8 @@ describe("validateCircleUpConfig — indexerUrl", () => {
 describe("extractSimulationError — host-error patterns (via buildAndSend)", () => {
   // A thin subclass that exposes buildAndSend for direct testing
   class TestClient extends CircleUpClient {
-    call(method = "join") {
-      return this.buildAndSend(MEMBER_A, CIRCLE_ADDR, method, []);
+    call(method = "join", contractId = CIRCLE_ADDR) {
+      return this.buildAndSend(MEMBER_A, contractId, method, []);
     }
   }
 
@@ -415,12 +415,90 @@ describe("extractSimulationError — host-error patterns (via buildAndSend)", ()
 
   it("falls back to the contract error code when no pattern matches", async () => {
     vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
-      simulationError("HostError: SomeUnknownVariant\nError(Contract, #7)"),
+      simulationError("HostError: SomeUnknownVariant\nError(Contract, #99)"),
     );
     const result = await new TestClient(SDK_CONFIG, FAST_POLL).call();
     expect(isTxFailure(result)).toBe(true);
     if (isTxFailure(result)) {
-      expect(result.errorMessage).toContain("Contract error code 7");
+      expect(result.errorMessage).toContain("Contract error code 99");
+      expect(result.contractError).toMatchObject({
+        contract: "circle",
+        method: "join",
+        code: 99,
+        category: "unknown",
+      });
+    }
+  });
+
+  it("maps typed circle initialization codes to stable diagnostics", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationError("HostError: SomeUnknownVariant\nError(Contract, #8)"),
+    );
+    const result = await new TestClient(SDK_CONFIG, FAST_POLL).call("initialize");
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorMessage).toContain("round deadline is below the minimum");
+      expect(result.errorMessage).not.toContain("Contract error code 8");
+      expect(result.contractError).toMatchObject({
+        contract: "circle",
+        method: "initialize",
+        code: 8,
+        category: "initialization",
+      });
+    }
+  });
+
+  it("maps typed factory validation codes to stable diagnostics", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationError("HostError: SomeUnknownVariant\nError(Contract, #106)"),
+    );
+    const result = await new TestClient(SDK_CONFIG, FAST_POLL).call("create_circle", FACTORY_ADDR);
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorMessage).toContain("Circle creation failed: round deadline is below the minimum");
+      expect(result.errorMessage).not.toContain("Contract error code 106");
+      expect(result.contractError).toMatchObject({
+        contract: "factory",
+        method: "create_circle",
+        code: 106,
+        category: "validation",
+      });
+    }
+  });
+
+  it("maps typed mutation deadline codes to stable diagnostics", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationError("HostError: SomeUnknownVariant\nError(Contract, #9)"),
+    );
+    const result = await new TestClient(SDK_CONFIG, FAST_POLL).call("mark_default");
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorMessage).toContain("deadline has not passed yet");
+      expect(result.errorMessage).not.toContain("Contract error code 9");
+      expect(result.contractError).toMatchObject({
+        contract: "circle",
+        method: "mark_default",
+        code: 9,
+        category: "deadline",
+      });
+    }
+  });
+
+  it("uses the target contract to disambiguate initialization error codes", async () => {
+    vi.spyOn(SorobanRpc.Server.prototype, "simulateTransaction").mockResolvedValue(
+      simulationError("HostError: SomeUnknownVariant\nError(Contract, #7)"),
+    );
+    const result = await new TestClient(SDK_CONFIG, FAST_POLL).call("initialize", REPUTATION_ADDR);
+    expect(isTxFailure(result)).toBe(true);
+    if (isTxFailure(result)) {
+      expect(result.errorMessage).toContain("Reputation initialization failed");
+      expect(result.errorMessage).toContain("already been initialized");
+      expect(result.contractError).toMatchObject({
+        contract: "reputation",
+        method: "initialize",
+        code: 7,
+        category: "initialization",
+      });
     }
   });
 

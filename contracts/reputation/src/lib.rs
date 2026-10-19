@@ -135,6 +135,12 @@ pub enum ReputationError {
     /// `add_authorized_caller` was asked to re-register an address that has
     /// already been revoked.  Revocation cannot be undone.
     CallerRevoked = 5,
+    /// `increment` would overflow the stored `u32` score.
+    ScoreOverflow = 6,
+    /// `initialize` was called after a previous successful call.
+    AlreadyInitialized = 7,
+    /// `initialize` was re-entered while initialization was in progress.
+    InitializeInProgress = 8,
 }
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -199,7 +205,7 @@ impl ReputationContract {
     /// guard because a reentrant call would also see `Admin` absent.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            env.panic_with_error(ReputationError::AlreadyInitialized);
         }
 
         // Reentrancy guard: set the Initializing flag before any other write.
@@ -207,7 +213,7 @@ impl ReputationContract {
         // introduces a cross-contract call here) sees this flag and panics
         // immediately, preventing partial state from being observed or committed.
         if env.storage().instance().has(&DataKey::Initializing) {
-            panic!("initialize already in progress");
+            env.panic_with_error(ReputationError::InitializeInProgress);
         }
         env.storage().instance().set(&DataKey::Initializing, &true);
 
@@ -385,9 +391,9 @@ impl ReputationContract {
             .get(&DataKey::Score(member.clone()))
             .unwrap_or(0);
 
-        // `overflow-checks` is on for the release profile, so an overflow traps
-        // and aborts the transaction rather than wrapping the score back to 0.
-        let new_score = current + 1;
+        let Some(new_score) = current.checked_add(1) else {
+            return Err(ReputationError::ScoreOverflow);
+        };
 
         env.storage()
             .persistent()
@@ -559,10 +565,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already initialized")]
     fn test_double_initialize_panics() {
         let s = setup();
-        s.client.initialize(&s.admin);
+        assert_eq!(
+            s.client.try_initialize(&s.admin),
+            Err(Ok(ReputationError::AlreadyInitialized))
+        );
     }
 
     #[test]
@@ -582,10 +590,8 @@ mod tests {
 
     /// The reentrancy guard (DataKey::Initializing) is set before any other
     /// storage write in `initialize`.  Simulating a reentrant call by
-    /// pre-setting the flag must cause initialize to panic with
-    /// "initialize already in progress" rather than proceeding.
+    /// pre-setting the flag must return its stable typed error.
     #[test]
-    #[should_panic(expected = "initialize already in progress")]
     fn test_initialize_reentrancy_guard_fires() {
         let env = Env::default();
         env.mock_all_auths();
@@ -600,8 +606,10 @@ mod tests {
                 .set(&DataKey::Initializing, &true);
         });
 
-        // Must panic: Initializing flag already set.
-        client.initialize(&Address::generate(&env));
+        assert_eq!(
+            client.try_initialize(&Address::generate(&env)),
+            Err(Ok(ReputationError::InitializeInProgress))
+        );
     }
 
     /// After a reentrancy-guard failure the Admin key must remain absent,
@@ -1062,9 +1070,7 @@ mod tests {
         );
     }
 
-    /// Incrementing from u32::MAX must trap rather than silently wrap back to 0.
-    /// The release profile sets overflow-checks = true; in the test environment
-    /// Rust's debug overflow checks also fire, so this panic is deterministic.
+    /// Incrementing from u32::MAX returns a typed error rather than wrapping.
     #[test]
     fn test_score_overflow_at_u32_max_traps() {
         let s = setup();
@@ -1073,10 +1079,7 @@ mod tests {
         force_score(&s, &member, u32::MAX);
         // The increment must fail (overflow trap) rather than wrap to 0.
         let result = s.client.try_increment(&s.contract_id, &member);
-        assert!(
-            result.is_err(),
-            "score must not silently wrap past u32::MAX — the operation must trap"
-        );
+        assert_eq!(result, Err(Ok(ReputationError::ScoreOverflow)));
         // The failed call must leave the score unchanged at u32::MAX.
         assert_eq!(
             s.client.score(&member),

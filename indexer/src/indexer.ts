@@ -5,10 +5,12 @@
  * and reputation contracts and writes them into Postgres.
  *
  * Events consumed:
- *   factory/circle_created        → inserts circles + circle_members rows
+ *   factory/circle_created        → inserts circles row
  *   circle/initialized            → updates circles.member_count, round_amount,
- *                                   total_rounds, round_deadline_ledgers
- *   circle/joined                 → updates circle_members.joined_at
+ *                                   total_rounds; v2 payloads also insert one
+ *                                   circle_members row per rotation slot
+ *   circle/joined                 → updates circle_members.joined_at, join_order,
+ *                                   collateral
  *   circle/active                 → updates circles.status = 'Active'
  *   circle/contributed            → inserts contributions row
  *   circle/payout                 → inserts payouts row, updates circles.current_round
@@ -23,7 +25,14 @@
  *                                   writes circle_audit_events row
  *   circle/paused                 → updates circles.paused = TRUE
  *   circle/resumed                → updates circles.paused = FALSE
- *   reputation/increment          → upserts reputation row
+ *   reputation/score_updated      → upserts reputation row
+ *   reputation/increment          → upserts reputation row (legacy shape)
+ *
+ * Every event is checked against the schema registry in ./eventSchemas before
+ * a handler is chosen.  Unknown topics and payloads that match no supported
+ * version are quarantined (recorded in event_failures, never projected) —
+ * see docs/EVENT_COMPATIBILITY.md.  The lifecycle-to-event mapping is in
+ * docs/LIFECYCLE_EVENT_MATRIX.md.
  *
  * Ordering model
  * ──────────────
@@ -61,6 +70,12 @@ import {
   POLL_BACKOFF_MULTIPLIER,
 } from "./config";
 import { redactAddress, formatAmount } from "./redact";
+import {
+  classifyEvent,
+  quarantineMessage,
+  UnsupportedEventError,
+  type EventClassification,
+} from "./eventSchemas";
 import {
   buildFailureEvidence,
   eventFailureId,
@@ -520,7 +535,13 @@ export async function processLedger(
  * Parse the data payload of a `circle/initialized` event.
  *
  * Contract data tuple (contracts/circle/src/lib.rs — `initialize` entry-point):
- *   (circle_address: Address, member_count: u32, round_amount: i128)
+ *   v1: (circle_address: Address, member_count: u32, round_amount: i128)
+ *   v2: (circle_address: Address, member_count: u32, round_amount: i128,
+ *        members: Vec<Address>)
+ *
+ * `members` is a trailing (backwards-compatible) addition: v1 events omit it
+ * and `members` is returned as null.  When present it is the payout rotation
+ * in order (index = payout_order) and its length must equal `member_count`.
  *
  * This event is emitted by every newly deployed circle immediately after
  * `initialize` completes, inside the same transaction as the factory's
@@ -544,6 +565,7 @@ export function parseInitializedEvent(value: unknown): {
   circleAddress: string;
   memberCount: number;
   roundAmount: bigint;
+  members: string[] | null;
 } {
   if (!Array.isArray(value) || value.length < 3) {
     throw new Error(
@@ -589,7 +611,29 @@ export function parseInitializedEvent(value: unknown): {
     );
   }
 
-  return { circleAddress, memberCount, roundAmount: roundAmountBig };
+  let members: string[] | null = null;
+  if (value.length > 3) {
+    const rawMembers = value[3];
+    if (
+      !Array.isArray(rawMembers) ||
+      !rawMembers.every((m) => typeof m === "string" && m.length > 0)
+    ) {
+      throw new Error(
+        `circle/initialized: members must be an array of addresses, got ${JSON.stringify(rawMembers)}`,
+      );
+    }
+    if (rawMembers.length !== memberCount) {
+      throw new Error(
+        `circle/initialized: members length ${rawMembers.length} does not match member_count ${memberCount}`,
+      );
+    }
+    if (new Set(rawMembers).size !== rawMembers.length) {
+      throw new Error("circle/initialized: members must not contain duplicates");
+    }
+    members = rawMembers as string[];
+  }
+
+  return { circleAddress, memberCount, roundAmount: roundAmountBig, members };
 }
 
 /**
@@ -717,6 +761,10 @@ async function setLastLedger(ledger: number) {
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
 async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
+  // circle/initialized is emitted *before* this event in the same transaction
+  // (the factory calls initialize, then publishes circle_created), so the row
+  // usually already exists with a '' creator placeholder.  Fill the creator in
+  // without touching the values initialized wrote.
   const { circleAddress, creator, circleIndex } = parseCircleCreatedEvent(
     getValueNative(event),
   );
@@ -726,7 +774,9 @@ async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
        (address, creator, round_amount, member_count, total_rounds, status,
         current_round, created_ledger)
      VALUES ($1, $2, 0, 0, 0, 'Pending', 0, $3)
-     ON CONFLICT (address) DO NOTHING`,
+     ON CONFLICT (address) DO UPDATE
+       SET creator = EXCLUDED.creator, updated_at = NOW()
+       WHERE circles.creator = ''`,
     [circleAddress, creator, event.ledger],
   );
   log("info", "event_ingested", {
@@ -743,7 +793,7 @@ async function handleCircleJoined(client: PoolClient, circleAddr: string, event:
   // immediately instead of silently writing wrong data.
   const { member, joinOrder, collateral } = parseJoinedEvent(getValueNative(event));
 
-  await client.query(
+  const result = await client.query(
     `UPDATE circle_members
         SET joined_at   = NOW(),
             join_order  = $3,
@@ -751,6 +801,18 @@ async function handleCircleJoined(client: PoolClient, circleAddr: string, event:
       WHERE circle_address = $1 AND member_address = $2`,
     [circleAddr, member, joinOrder, collateral.toString()],
   );
+
+  // The member row is created from the v2 circle/initialized payload.  If it
+  // is missing (a circle initialized by a v1 contract build, or a skipped
+  // initialized event) silently updating zero rows would lose the join, so
+  // fail the event instead: it lands in event_failures and can be retried
+  // with `npm run replay -- --retry-failed` once the row exists.
+  if (result.rowCount === 0) {
+    throw new Error(
+      `circle/joined: no circle_members row for ${redactAddress(member)} in ` +
+        `${redactAddress(circleAddr)} (circle/initialized v2 rotation not indexed)`,
+    );
+  }
   console.log(
     `[indexer] Member joined: ${redactAddress(member)} → ${redactAddress(circleAddr)} ` +
       `(order=${joinOrder}, collateral=${collateral})`,
@@ -973,13 +1035,14 @@ async function handleCircleInitialized(
   circleAddr: string,
   event: SdkEvent,
 ) {
-  // Event data: (circle_address, member_count, round_amount)
+  // Event data: (circle_address, member_count, round_amount[, members])
   //   value[0] = circle_address  (same as circleAddr — replay identity)
   //   value[1] = member_count    — u32 number of configured members (= total rounds)
   //   value[2] = round_amount    — i128 USDC stroops per member per round
-  const value = getValueNative(event) as unknown[];
-  const memberCount = value[1] !== undefined ? Number(value[1]) : 0;
-  const roundAmount = value[2] !== undefined ? String(value[2]) : "0";
+  //   value[3] = members         — v2: Vec<Address> payout rotation in order
+  const parsed = parseInitializedEvent(getValueNative(event));
+  const memberCount = parsed.memberCount;
+  const roundAmount = parsed.roundAmount.toString();
 
   await client.query(
     `INSERT INTO circles
@@ -993,9 +1056,24 @@ async function handleCircleInitialized(
            updated_at    = NOW()`,
     [circleAddr, roundAmount, memberCount, event.ledger],
   );
+
+  // v2 payloads carry the payout rotation: create one circle_members row per
+  // slot (payout_order = index in the rotation).  Joined/default events then
+  // update these rows.  ON CONFLICT keeps re-index replays idempotent.
+  if (parsed.members) {
+    await client.query(
+      `INSERT INTO circle_members (circle_address, member_address, payout_order)
+       SELECT $1, m.member_address, (m.ord - 1)::int
+         FROM unnest($2::text[]) WITH ORDINALITY AS m(member_address, ord)
+       ON CONFLICT (circle_address, member_address) DO NOTHING`,
+      [circleAddr, parsed.members],
+    );
+  }
+
   console.log(
     `[indexer] Circle initialized: ${redactAddress(circleAddr)} ` +
-    `members=${memberCount} round_amount=${roundAmount}`,
+    `members=${memberCount} round_amount=${roundAmount}` +
+    (parsed.members ? "" : " (v1 payload — no rotation, member rows not created)"),
   );
 }
 
@@ -1108,6 +1186,35 @@ async function handleCircleExceptionalSettlement(
   );
 }
 
+/**
+ * Handle `reputation/score_updated` — the event current reputation contracts
+ * emit on every successful `increment`.
+ *
+ * Contract event data: (member: Address, new_total_score: u32)
+ */
+async function handleReputationScoreUpdated(client: PoolClient, event: SdkEvent) {
+  const value = getValueNative(event) as unknown[];
+  const memberAddr = String(value[0]);
+  const score = Number(value[1]);
+
+  await client.query(
+    `INSERT INTO reputation (member_address, score, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (member_address) DO UPDATE SET score = $2, updated_at = NOW()`,
+    [memberAddr, score],
+  );
+  log("info", "event_ingested", {
+    ledger: event.ledger,
+    eventType: "reputation/score_updated",
+    contractId: memberAddr,
+    txHash: event.txHash,
+  }, `Reputation: ${redactAddress(memberAddr)} → score ${score}`);
+}
+
+/**
+ * Handle the legacy `reputation/increment` shape (member as topic[2], data is
+ * the bare score).  Kept so historical ledgers still replay.
+ */
 async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
   const score = getValueNative(event) as number;
   const memberAddr = getTopicStr(event, 1);
@@ -1128,6 +1235,89 @@ async function handleReputationIncrement(client: PoolClient, event: SdkEvent) {
     contractId: memberAddr,
     txHash: event.txHash,
   }, `Reputation: ${redactAddress(memberAddr)} → score ${score}`);
+}
+
+// ─── Event routing ────────────────────────────────────────────────────────────
+
+/** Decode an SDK event's topics/data and classify it against the registry. */
+export function classifySdkEvent(event: SdkEvent): EventClassification {
+  const topics = Array.isArray(event.topic)
+    ? event.topic.map((_, idx) => getTopicValue(event, idx))
+    : [];
+  return classifyEvent({
+    topics,
+    data: getValueNative(event),
+    contractId: getContractIdStr(event),
+  });
+}
+
+/**
+ * Choose the handler for one event.
+ *
+ * Returns null for events the indexer deliberately does not project
+ * (`ignored` schemas, e.g. circle/collateral_released).  Unknown or
+ * incompatible events are routed to a quarantine handler that throws
+ * UnsupportedEventError: processLedger rolls back its savepoint (so the event
+ * is not marked ingested) and records it in event_failures, where it stays
+ * visible until a replay with an upgraded indexer ingests it.
+ *
+ * Exported for the fixture and projection tests.
+ */
+export function routeEvent(event: SdkEvent): EventHandler | null {
+  const classification = classifySdkEvent(event);
+
+  if (classification.status === "ignored") return null;
+  if (classification.status === "unknown" || classification.status === "incompatible") {
+    const message = quarantineMessage(classification);
+    return {
+      event,
+      handler: async () => {
+        throw new UnsupportedEventError(message);
+      },
+    };
+  }
+
+  const { family, name } = classification.schema;
+  const contractId = getContractIdStr(event) ?? "";
+  let handler: ((client: PoolClient) => Promise<void>) | null = null;
+
+  if (family === "factory" && name === "circle_created") {
+    handler = (c) => handleFactoryCircleCreated(c, event);
+  } else if (family === "reputation") {
+    switch (name) {
+      case "score_updated": handler = (c) => handleReputationScoreUpdated(c, event); break;
+      case "increment":     handler = (c) => handleReputationIncrement(c, event); break;
+    }
+  } else if (family === "circle") {
+    switch (name) {
+      case "initialized":            handler = (c) => handleCircleInitialized(c, contractId, event); break;
+      case "joined":                 handler = (c) => handleCircleJoined(c, contractId, event); break;
+      case "active":                 handler = (c) => handleCircleActive(c, contractId); break;
+      case "contributed":            handler = (c) => handleCircleContributed(c, contractId, event); break;
+      case "payout":                 handler = (c) => handleCirclePayout(c, contractId, event); break;
+      case "default":                handler = (c) => handleCircleDefault(c, contractId, event); break;
+      case "round_started":          handler = (c) => handleCircleRoundStarted(c, contractId, event); break;
+      case "exceptional_settlement": handler = (c) => handleCircleExceptionalSettlement(c, contractId, event); break;
+      case "completed":              handler = (c) => handleCircleCompleted(c, contractId); break;
+      case "cancelled":              handler = (c) => handleCircleCancelled(c, contractId, event); break;
+      case "closed":                 handler = (c) => handleCircleClosed(c, contractId, event); break;
+      case "paused":                 handler = (c) => handleCirclePaused(c, contractId); break;
+      case "resumed":                handler = (c) => handleCircleResumed(c, contractId); break;
+    }
+  }
+
+  if (!handler) {
+    // A "projected" schema without a handler is a registry/indexer mismatch;
+    // quarantine rather than silently drop.
+    const message = `Quarantined ${family}/${name}: schema is marked projected but has no handler`;
+    return {
+      event,
+      handler: async () => {
+        throw new UnsupportedEventError(message);
+      },
+    };
+  }
+  return { event, handler };
 }
 
 // ─── Metrics ─────────────────────────────────────────────────────────────────
@@ -1244,47 +1434,12 @@ async function processEvents(fromLedger: number, toLedger: number) {
   }
 
   // ── 5. Build (event, handler) pairs ──────────────────────────────────────
+  // routeEvent checks every event against the schema registry; unknown or
+  // incompatible shapes get a quarantine handler instead of being dropped.
   const items: EventHandler[] = [];
-
-  for (const event of factoryResponse.events) {
-    if (!event.topic || event.topic.length < 2) continue;
-    const t0 = getTopicStr(event, 0);
-    const t1 = getTopicStr(event, 1);
-    if (t0 === "factory" && t1 === "circle_created") {
-      items.push({ event, handler: (c) => handleFactoryCircleCreated(c, event) });
-    } else if (t0 === "reputation" && t1 === "increment") {
-      items.push({ event, handler: (c) => handleReputationIncrement(c, event) });
-    }
-  }
-
-  for (const event of circleEvents) {
-    if (!event.topic || event.topic.length < 2) continue;
-    const t0 = getTopicStr(event, 0);
-    const t1 = getTopicStr(event, 1);
-    if (t0 !== "circle") continue;
-    const contractId = getContractIdStr(event);
-    if (!contractId) continue;
-
-    let handler: ((client: PoolClient) => Promise<void>) | null = null;
-    switch (t1) {
-      case "initialized":            handler = (c) => handleCircleInitialized(c, contractId, event); break;
-      case "joined":                 handler = (c) => handleCircleJoined(c, contractId, event); break;
-      case "active":                 handler = (c) => handleCircleActive(c, contractId); break;
-      case "contributed":            handler = (c) => handleCircleContributed(c, contractId, event); break;
-      case "payout":                 handler = (c) => handleCirclePayout(c, contractId, event); break;
-      case "default":                handler = (c) => handleCircleDefault(c, contractId, event); break;
-      case "round_started":          handler = (c) => handleCircleRoundStarted(c, contractId, event); break;
-      case "exceptional_settlement": handler = (c) => handleCircleExceptionalSettlement(c, contractId, event); break;
-      case "completed":              handler = (c) => handleCircleCompleted(c, contractId); break;
-      case "cancelled":              handler = (c) => handleCircleCancelled(c, contractId, event); break;
-      case "closed":                 handler = (c) => handleCircleClosed(c, contractId, event); break;
-      case "paused":                 handler = (c) => handleCirclePaused(c, contractId); break;
-      case "resumed":                handler = (c) => handleCircleResumed(c, contractId); break;
-      // collateral_released is per-member and emitted inside close(); the
-      // aggregate total is captured by the circle/closed event handler above,
-      // so individual collateral_released events need no separate DB write.
-    }
-    if (handler) items.push({ event, handler });
+  for (const event of [...factoryResponse.events, ...circleEvents]) {
+    const item = routeEvent(event);
+    if (item) items.push(item);
   }
 
   // ── 6. Sort by (ledger ASC, event id ASC) — canonical on-chain order ────

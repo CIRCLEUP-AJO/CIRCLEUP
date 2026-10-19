@@ -105,6 +105,7 @@ These govern USDC token flows into and out of the circle contract.
 | R5 | `mark_default` can only be called after the round deadline (`sequence > deadline_ledger`) | Strict `>` comparison (not `>=`) |
 | R6 | `settle_round` requires `mark_default` for all non-contributors before running | Internal guard; settle panics if any member hasn't contributed and isn't defaulted |
 | R7 | `round_amount × member_count` never overflows `i128` | `checked_mul` in `initialize` |
+| R8 | A contribution at `sequence == deadline_ledger` is on time; defaulting becomes eligible only at `sequence > deadline_ledger` | Shared `deadline_passed` predicate and exact before/equal/after contract tests |
 
 ---
 
@@ -159,6 +160,7 @@ These govern USDC token flows into and out of the circle contract.
 | S6 | `sanitizeTxMetadata` strips secrets and payloads before they appear in logs | `SECRET_KEY_RE` + value-length + stellar-seed pattern checks |
 | S7 | `TxResult` is a discriminated union — callers must check `success` before accessing `txHash` / `ledger` | TypeScript narrowing; `success: true` branch has non-optional `txHash` |
 | S8 | `ReadResult<T>` is a discriminated union — callers must check `ok` before accessing `value` | TypeScript narrowing; `isReadSuccess` / `isReadFailure` type guards |
+| S9 | Wall-clock deadline countdowns are advisory and never authorize a write | Contract ledger checks are authoritative; app gating fails closed on unknown/stale ledger data |
 
 ---
 
@@ -166,12 +168,13 @@ These govern USDC token flows into and out of the circle contract.
 
 | # | Invariant | Enforced by |
 |---|-----------|-------------|
-| E1 | All mutating entry-points (`join`, `contribute`, `payout`, …) use `panic!` — the whole invocation rolls back | Soroban host: any panic reverts the transaction |
+| E1 | Deterministic validation guards use typed contract errors where supported; host, authorization, token, and storage failures remain explicit diagnostics | Contract error enums in the factory, circle, and reputation contracts; Soroban host diagnostics otherwise |
 | E2 | All read-only views (`get_config`, `get_status`, …) use `contracterror` — callers receive a typed code | `ContractError` enum + `Result<T, ContractError>` return type |
 | E3 | A panic message is always descriptive and includes the operation name | Every `panic!` / `unwrap_or_else` uses a context string |
 | E4 | The reentrancy guard (`DataKey::Initializing`) is always cleared on success | Removed as last step before `circle/initialized` event in `initialize` |
 | E5 | `RoundsCompleted` missing is a storage inconsistency, not a recoverable default | `unwrap_or_else(|| panic!("RoundsCompleted missing"))` |
 | E6 | Indexer event parse errors surface at ingest time with the full context (contract, ledger, tx) | `ingestEventInTx` logs contract + ledger + txHash before re-throwing |
+| E7 | Existing numeric contract error discriminants are never renumbered or reused; consumers scope codes by contract and method | SDK `TxFailure.contractError`; `docs/CONTRACT_ERRORS.md`; compatibility snapshot test |
 
 ---
 

@@ -737,6 +737,17 @@ describe("MutationGuard: deadline_not_passed for default", () => {
     assertAllowed("contribute", atDeadline);
     assertBlocked("default", atDeadline, "deadline_not_passed");
   });
+
+  test("one ledger before the deadline, contribution remains open and default is blocked", () => {
+    const beforeDeadline = makeSnap({
+      status: "Active",
+      deadlineLedger: 4000,
+      latestLedger: 3999,
+      hasContributedCurrentRound: false,
+    });
+    assertAllowed("contribute", beforeDeadline);
+    assertBlocked("default", beforeDeadline, "deadline_not_passed");
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

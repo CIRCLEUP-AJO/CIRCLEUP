@@ -8,6 +8,8 @@ import { isCanonicalStellarAddress } from "@/lib/address";
 // parseReputationResponse validates the raw JSON at the network boundary
 // instead of the previous bare `as ReputationResponse` cast.
 import { type ReputationResponse, parseReputationResponse } from "@/lib/circleTypes";
+import { classifyFreshness, formatSourceLabel } from "@/lib/fieldSource";
+import { REPUTATION_MSGS } from "@/lib/messages";
 
 // ─── Reputation event naming & total score semantics ──────────────────────────
 //
@@ -187,7 +189,7 @@ export default function ReputationClient({ member }: { member: string }) {
           className="inline-block w-8 h-8 border-4 border-slate-200 border-t-brand-600 rounded-full animate-spin mb-4"
           aria-hidden="true"
         />
-        <p className="text-sm">Loading reputation…</p>
+        <p className="text-sm">{REPUTATION_MSGS.loading}</p>
       </div>
     );
   }
@@ -202,9 +204,9 @@ export default function ReputationClient({ member }: { member: string }) {
       return (
         <div className="text-center py-16 text-slate-500">
           <div className="text-4xl mb-3" aria-hidden="true">🔍</div>
-          <p className="font-medium text-slate-800">No reputation record found.</p>
+          <p className="font-medium text-slate-800">{REPUTATION_MSGS.noRecord}</p>
           <p className="text-sm mt-1 text-slate-500">
-            This address has no on-chain activity in CircleUp yet.
+            {REPUTATION_MSGS.noRecordDetail}
           </p>
           <p className="font-mono text-xs text-slate-400 mt-2 break-all max-w-xs mx-auto">
             {member}
@@ -213,17 +215,6 @@ export default function ReputationClient({ member }: { member: string }) {
       );
     }
 
-    const errorMessages: Record<string, string> = {
-      network: "The reputation service is unreachable. Check your connection and try again.",
-      unknown: "An unexpected error occurred loading reputation data.",
-      indexer_outage:
-        "The indexer is running but currently degraded. Reputation data may be temporarily unavailable. Try again in a few minutes.",
-      misconfigured:
-        "NEXT_PUBLIC_INDEXER_URL is not set or is not a valid URL. " +
-        "Set a valid indexer URL in app/.env.local and restart the server.",
-      malformed:
-        "Malformed reputation data received from server. The response payload structure is invalid.",
-    };
     // Retrying cannot fix a configuration error, so don't offer it.
     const canRetry = result.reason !== "misconfigured";
 
@@ -232,7 +223,7 @@ export default function ReputationClient({ member }: { member: string }) {
         <div className="text-4xl mb-3" aria-hidden="true">⚠️</div>
         <p className="font-medium text-slate-800">Could not load reputation</p>
         <p className="text-sm mt-1 text-slate-500">
-          {errorMessages[result.reason] ?? errorMessages.unknown}
+          {REPUTATION_MSGS.fetchErrors[result.reason] ?? REPUTATION_MSGS.fetchErrors.unknown}
         </p>
         {canRetry && (
           <button
@@ -240,7 +231,7 @@ export default function ReputationClient({ member }: { member: string }) {
             disabled={refreshing}
             className="mt-4 text-sm text-brand-600 hover:underline disabled:opacity-50"
           >
-            {refreshing ? "Retrying…" : "Try again"}
+            {refreshing ? REPUTATION_MSGS.refreshing : REPUTATION_MSGS.retryLabel}
           </button>
         )}
       </div>
@@ -254,6 +245,13 @@ export default function ReputationClient({ member }: { member: string }) {
   const events = data.events ?? [];
   const total = events.length > 0 ? computeTotal(events) : data.score;
   const isNoRecord = !data.found || (data.score === null && events.length === 0);
+
+  // Issue #697: Classify data freshness from the indexer's updatedAt timestamp.
+  // updatedAt is the closest freshness signal available in the reputation response.
+  // When absent, freshness is "unknown" — never shown as "current".
+  const dataAgeMs = lastRefreshed ? Date.now() - lastRefreshed.getTime() : undefined;
+  const freshness = classifyFreshness(data.updatedAt, dataAgeMs, 120_000);
+  const sourceLabel = formatSourceLabel("indexer", freshness);
 
   return (
     <div className="max-w-xl mx-auto space-y-6">
@@ -286,7 +284,7 @@ export default function ReputationClient({ member }: { member: string }) {
           </p>
         </div>
 
-        {/* Refresh button */}
+        {/* Refresh button + source/freshness label */}
         <div className="shrink-0 text-right">
           <button
             onClick={() => load(true)}
@@ -294,13 +292,23 @@ export default function ReputationClient({ member }: { member: string }) {
             aria-label="Refresh reputation data"
             className="inline-flex items-center gap-1.5 text-sm text-brand-600 hover:underline disabled:opacity-50"
           >
-            {refreshing ? "Refreshing…" : "Refresh"}
+            {refreshing ? REPUTATION_MSGS.refreshing : REPUTATION_MSGS.refreshLabel}
           </button>
           {lastRefreshed && (
             <p className="text-xs text-slate-400 mt-1">
               Updated {lastRefreshed.toLocaleTimeString()}
             </p>
           )}
+          {/* Issue #697: Show data source and freshness so users know this data
+              may lag the chain. Missing freshness is shown as "unknown freshness",
+              never as "current". */}
+          <p
+            className="text-xs text-slate-400 mt-0.5"
+            title="Where this data comes from and how current it is"
+            aria-label={`Data source: Indexed. Freshness: ${freshness}.`}
+          >
+            {sourceLabel}
+          </p>
         </div>
       </div>
 
@@ -319,7 +327,7 @@ export default function ReputationClient({ member }: { member: string }) {
         </div>
       ) : (
         <div className="rounded-lg border border-slate-200 bg-white p-6 text-center">
-          <p className="text-sm text-slate-500">Total reputation score</p>
+          <p className="text-sm text-slate-500">{REPUTATION_MSGS.scoreDescription}</p>
           <p
             className="text-4xl font-bold text-slate-900 mt-1"
             aria-label={`Total reputation score: ${total}`}
@@ -328,8 +336,16 @@ export default function ReputationClient({ member }: { member: string }) {
           </p>
           <p className="text-xs text-slate-400 mt-1">
             {events.length > 0
-              ? "Signed sum of all reputation events."
-              : "On-chain reputation score recorded by contract."}
+              ? REPUTATION_MSGS.scoreByEvents
+              : REPUTATION_MSGS.scoreByContract}
+          </p>
+          {/* Issue #697: source label on the score so users can see this may
+              lag chain state. "unknown freshness" is shown when updatedAt is absent. */}
+          <p
+            className="text-xs text-slate-300 mt-1"
+            title="Where this score comes from. Indexed data may lag the chain by one or more ledgers."
+          >
+            {sourceLabel}
           </p>
         </div>
       )}
@@ -337,10 +353,10 @@ export default function ReputationClient({ member }: { member: string }) {
       {/* Event list */}
       <div>
         <h2 className="text-sm font-semibold text-slate-700 mb-2">
-          Reputation events
+          {REPUTATION_MSGS.eventsHeading}
         </h2>
         {events.length === 0 ? (
-          <p className="text-sm text-slate-500">No reputation events recorded.</p>
+          <p className="text-sm text-slate-500">{REPUTATION_MSGS.noEvents}</p>
         ) : (
           <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
             {events.map((event, i) => (

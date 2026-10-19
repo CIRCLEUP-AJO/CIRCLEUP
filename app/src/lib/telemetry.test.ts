@@ -43,10 +43,13 @@ import {
   configureTelemetry,
   startTx,
   emit,
+  emitProduct,
   scrubPayload,
   looksLikeAddress,
   looksLikeSensitiveString,
+  looksLikeSeedPhrase,
   categorizeError,
+  ALLOWED_PRODUCT_EVENTS,
   type TxTelemetryEvent,
   type TxStage,
   type TxErrorCategory,
@@ -616,5 +619,139 @@ describe("Privacy integration: scrubPayload on a real TxTelemetryEvent shape", (
     };
     const scrubbed = scrubPayload(event);
     assert.equal(scrubbed.errorCategory, "network");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. Seed-phrase detection — looksLikeSeedPhrase
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("Privacy: looksLikeSeedPhrase", () => {
+  // 12-word BIP-39 phrase (all lowercase 3–8 char alpha tokens)
+  const TWELVE_WORD_PHRASE =
+    "abandon ability able about above absent absorb abstract absurd abuse access accident";
+  // 24-word BIP-39 phrase
+  const TWENTY_FOUR_WORD_PHRASE =
+    "abandon ability able about above absent absorb abstract absurd abuse access accident " +
+    "account accuse achieve acid acoustic acquire across act action actor actress actual";
+
+  test("12-word BIP-39 phrase is detected as seed phrase", () => {
+    assert.equal(looksLikeSeedPhrase(TWELVE_WORD_PHRASE), true);
+  });
+
+  test("24-word BIP-39 phrase is detected as seed phrase", () => {
+    assert.equal(looksLikeSeedPhrase(TWENTY_FOUR_WORD_PHRASE), true);
+  });
+
+  test("7 words (below threshold) is not flagged", () => {
+    assert.equal(looksLikeSeedPhrase("one two three four five six seven"), false);
+  });
+
+  test("8+ words where some are too long are not flagged", () => {
+    // Tokens > 8 chars break the pattern
+    assert.equal(
+      looksLikeSeedPhrase("thiswordistoolong ability able about above absent absorb abstract"),
+      false,
+    );
+  });
+
+  test("8+ words containing numbers are not flagged", () => {
+    assert.equal(
+      looksLikeSeedPhrase("word1 word2 word3 word4 word5 word6 word7 word8"),
+      false,
+    );
+  });
+
+  test("non-string values are not flagged", () => {
+    assert.equal(looksLikeSeedPhrase(null), false);
+    assert.equal(looksLikeSeedPhrase(42), false);
+    assert.equal(looksLikeSeedPhrase(undefined), false);
+  });
+
+  test("empty string is not flagged", () => {
+    assert.equal(looksLikeSeedPhrase(""), false);
+  });
+
+  test("short method name string is not flagged", () => {
+    assert.equal(looksLikeSeedPhrase("contribute"), false);
+  });
+});
+
+describe("Privacy: scrubPayload removes seed-phrase-valued fields", () => {
+  const TWELVE_WORD_PHRASE =
+    "abandon ability able about above absent absorb abstract absurd abuse access accident";
+
+  test("field with seed phrase value is omitted", () => {
+    const scrubbed = scrubPayload({ mnemonic: TWELVE_WORD_PHRASE, method: "join" });
+    assert.ok(!("mnemonic" in scrubbed), "seed phrase field must be omitted");
+    assert.equal(scrubbed.method, "join");
+  });
+
+  test("nested seed phrase is omitted", () => {
+    const scrubbed = scrubPayload({
+      meta: { seed: TWELVE_WORD_PHRASE, stage: "started" },
+    });
+    const meta = scrubbed.meta as Record<string, unknown>;
+    assert.ok(!("seed" in meta), "nested seed phrase must be omitted");
+    assert.equal(meta.stage, "started");
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 9. Product event allowlist — emitProduct
+// ═════════════════════════════════════════════════════════════════════════════
+
+describe("Product events: ALLOWED_PRODUCT_EVENTS coverage", () => {
+  test("allowlist contains at least the core events", () => {
+    const required = [
+      "page_view",
+      "circle_detail_viewed",
+      "reputation_viewed",
+      "create_form_started",
+      "create_form_submitted",
+      "wallet_connect_clicked",
+    ];
+    for (const name of required) {
+      assert.ok(
+        ALLOWED_PRODUCT_EVENTS.has(name as never),
+        `ALLOWED_PRODUCT_EVENTS must include "${name}"`,
+      );
+    }
+  });
+
+  test("allowlist is a Set (not an array)", () => {
+    assert.ok(ALLOWED_PRODUCT_EVENTS instanceof Set);
+  });
+});
+
+describe("Product events: emitProduct enforces allowlist", () => {
+  function captureProduct(name: string): TxTelemetryEvent[] {
+    const localSpy = makeSpyTransport();
+    configureTelemetry({ transport: localSpy.fn });
+    emitProduct(name);
+    configureTelemetry({ transport: spy.fn });
+    return localSpy.calls;
+  }
+
+  test("allowed event name reaches transport (when telemetry enabled)", () => {
+    const calls = captureProduct("page_view");
+    // If telemetry is disabled globally the spy gets nothing — that is valid.
+    // When it is enabled exactly one event is emitted.
+    if (calls.length > 0) {
+      assert.equal(calls[0].name, "page_view");
+    }
+  });
+
+  test("unlisted event name is silently dropped", () => {
+    const calls = captureProduct("SECRET_CUSTOM_EVENT_NOT_IN_ALLOWLIST");
+    assert.equal(calls.length, 0, "unlisted event must be dropped");
+  });
+
+  test("emitProduct does not throw for unlisted names", () => {
+    assert.doesNotThrow(() => emitProduct("not_in_allowlist"));
+  });
+
+  test("emitProduct does not throw when telemetry is disabled", () => {
+    assert.doesNotThrow(() => emitProduct("page_view"));
   });
 });

@@ -31,6 +31,7 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Checking Schema Health](#checking-schema-health)
   - [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)
 - [Database Backup and Restore](#database-backup-and-restore)
+- [Indexer Retention and Archival](./INDEXER_RETENTION.md)
   - [Backup](#backup)
   - [Restore drill — isolated target](#restore-drill--isolated-target)
   - [Post-restore verification](#post-restore-verification)
@@ -41,6 +42,8 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
 - [Health Checks and Monitoring](#health-checks-and-monitoring)
   - [Indexer Health Endpoint](#indexer-health-endpoint)
   - [Indexer Audit Endpoint](#indexer-audit-endpoint)
+  - [Per-Circle Reconciliation](#per-circle-reconciliation)
+  - [Circle Activity CSV Export](#circle-activity-csv-export)
   - [Useful Monitoring Queries](#useful-monitoring-queries)
 - [Troubleshooting](#troubleshooting)
   - [App shows "indexer unreachable" banner](#app-shows-indexer-unreachable-banner)
@@ -563,7 +566,11 @@ Replay is atomic: it wraps the wipe and cursor reset in a single transaction. If
 
 ## Database Backup and Restore
 
-Although the indexer database is a derived read-model that can be fully reconstructed by replaying Soroban events from the deployment ledger, a tested backup and restore path reduces outage time and protects checkpoint correctness.
+See [Indexer Retention and Archival](./INDEXER_RETENTION.md) for online-data
+classes, growth measurements, archive integrity checks, and the no-pruning
+policy.
+
+The indexer database is a derived read-model and can be reconstructed by replaying Soroban events only when the RPC still serves the complete required ledger range or a validated raw-event archive exists. The indexer does not currently store complete event payloads; see [Indexer Retention and Archival](./INDEXER_RETENTION.md). A tested backup and restore path reduces outage time and protects checkpoint correctness.
 
 The procedure below is deliberately structured as an **isolated drill**, not a direct production overwrite. Every step targets a separate restore database (`circleup_restore`) so the production database remains untouched until you have verified the backup is coherent and the schema is clean. Only after passing all verification steps should you decide whether to promote the restore target or fall back to a chain replay.
 
@@ -876,6 +883,49 @@ Reports indexing progress independent of connectivity:
 ```
 
 Alert when `lastLedger` stops advancing ΓÇö this indicates the polling loop has stalled (RPC connection lost, process OOM, etc.).
+
+### Per-Circle Reconciliation
+
+```
+GET /circles/:address/reconciliation
+npm run reconcile:circle --workspace=indexer -- <circle-address> [--json]
+```
+
+This is a read-only check that compares one circle's indexed member order,
+status (including the indexer-only `Closed` derivation), paused flag, current
+round and payout records with the circle contract's views. It never writes.
+Each check uses at most five contract simulations, and member and payout reads
+are capped at 512 rows.
+
+| `outcome` | HTTP | CLI exit | Meaning |
+|---|---|---|---|
+| `match` | 200 | 0 | Every compared field agrees |
+| `mismatch` | 200 | 1 | Chain was read and fields differ. Each mismatch has `source` (contract view), `indexed`/`chain` values and `classification`: `possibly_stale` (indexer cursor behind `ledgerContext.chainLedger`, so wait and re-check) or `drift` (indexer caught up, so investigate or replay) |
+| `rpc_unavailable` | 503 | 2 | RPC unreachable or timed out. This is **not** drift |
+| `incompatible_contract` | 422 | 2 | The address answered but does not expose the circle interface |
+| `not_indexed` | 404 | 2 | The indexer has no row for this circle |
+
+To repair drift, use `npm run reconcile:repair` or a replay. The diagnostic
+never repairs anything itself.
+
+### Circle Activity CSV Export
+
+```
+GET /circles/:address/export.csv
+```
+
+This endpoint returns the circle's public member, contribution, default and
+payout records as CSV. The format:
+
+- has stable columns, with the network name on every row;
+- gives exact amounts both as `amount_stroops` and as 7-decimal `amount_usdc`;
+- is ordered deterministically;
+- starts with a UTF-8 BOM and uses CRLF line endings.
+
+Cells that begin with `=`, `+`, `-`, `@`, TAB or CR (or the full-width forms
+of those characters) get a leading apostrophe, so spreadsheets never evaluate
+them as formulas. Exports over 10,000 rows return **413** rather than being
+truncated. The column contract is in `indexer/src/csvExport.ts`.
 
 ### Useful Monitoring Queries
 

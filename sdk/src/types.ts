@@ -1281,6 +1281,24 @@ export interface StateMismatch {
   readonly actual: string | number | boolean;
 }
 
+/** Stable classification for a Soroban contract error returned by simulation. */
+export interface ContractErrorDiagnostic {
+  readonly contract: "circle" | "factory" | "reputation";
+  readonly method: string;
+  /** Numeric Soroban contract error discriminant, preserved without renumbering. */
+  readonly code: number;
+  readonly category:
+    | "initialization"
+    | "validation"
+    | "authorization"
+    | "state"
+    | "deadline"
+    | "token"
+    | "unknown";
+  /** Stable SDK diagnostic; raw host details remain in `TxFailure.errorMessage`. */
+  readonly message: string;
+}
+
 /** A transaction that failed to submit, was rejected, or timed out. */
 export interface TxFailure {
   readonly success: false;
@@ -1299,6 +1317,8 @@ export interface TxFailure {
    * @see {@link TxErrorCode} for the full list of codes and their meanings.
    */
   readonly errorCode: TxErrorCode;
+  /** Present when simulation reports a numeric Soroban contract error. */
+  readonly contractError?: ContractErrorDiagnostic;
   /**
    * Correlation metadata supplied by the caller on the originating write, echoed
    * back verbatim (after {@link sanitizeTxMetadata}).  Present on failures too,

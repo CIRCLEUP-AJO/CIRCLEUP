@@ -25,8 +25,8 @@
 //   Low-level      scAddress, scU32, scI128, scBool, scAddressVec — ScVal
 //                  encoders for advanced callers building raw contract args.
 //   Diagnostics    summarizeSimulation, SimulationEstimate — log-safe
-//                  resource/fee estimates (also attached to every TxResult
-//                  and TxLogEvent once a write has been simulated).
+//                  resource/fee estimates, plus ContractErrorDiagnostic on
+//                  TxFailure for stable contract/method/code classification.
 //
 // Internal modules (test files, and any module not re-exported below) are
 // private: they are excluded from the published build and carry no stability
