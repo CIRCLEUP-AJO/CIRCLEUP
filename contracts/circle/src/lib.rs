@@ -75,6 +75,8 @@ mod issue_fixes_tests; // targeted fixes: #552 #553 #554 #555
 mod lifecycle_invariant_tests; // settle_round, deadline boundary, close arithmetic, reputation rollback (issue #631)
 #[cfg(test)]
 mod cancellation_invariants_tests; // cancellation and collateral recovery invariants (issue #689)
+#[cfg(test)]
+mod payout_integration_tests; // payout cross-contract boundary: token + reputation atomicity
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
