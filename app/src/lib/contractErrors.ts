@@ -342,7 +342,7 @@ const USER_MESSAGES: Record<ContractErrorCode, string> = {
   NETWORK_ERROR:
     "A network error occurred. Check your internet connection and try again.",
   NETWORK_TIMEOUT:
-    "The transaction timed out waiting for confirmation. If you don't see the transaction on Stellar Expert, please try again.",
+    "Confirmation observation timed out. The transaction may still confirm. Open Recent transactions to check its hash before considering another write.",
   NETWORK_RPC_UNAVAILABLE:
     "The Stellar RPC is temporarily unavailable. Please try again in a moment. If the problem persists, contact support.",
 
@@ -643,4 +643,10 @@ export function isExecutionError(e: ContractAppError): e is ExecutionError {
 }
 export function isUnknownError(e: ContractAppError): e is UnknownError {
   return e.kind === "unknown";
+}
+
+/** Runtime validation: TypeScript types alone do not make provider objects safe. */
+export function safeContractError(error: ContractAppError): ContractAppError {
+  if (!Object.prototype.hasOwnProperty.call(USER_MESSAGES, error.code)) return parseContractError('');
+  return { kind: ['validation','authorization','state','deadline','token','wallet','network','execution','unknown'].includes(error.kind) ? error.kind : 'unknown', code: error.code, message: USER_MESSAGES[error.code] } as ContractAppError;
 }
