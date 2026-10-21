@@ -190,15 +190,11 @@ describe("fetchAllEventsWithPagination", () => {
       },
     };
 
-    const results = await fetchAllEventsWithPagination(mockRpc, {
-      fromLedger: 100,
-      toLedger: 105,
-      filters: [],
-      limit: 2,
-    });
+    await assert.rejects(fetchAllEventsWithPagination(mockRpc, {
+      fromLedger: 100, toLedger: 105, filters: [], limit: 2,
+    }), /cursor did not advance/);
 
-    // Loop detection stops after detecting that next cursor equals current cursor
     assert.strictEqual(calls, 2);
-    assert.ok(results.length > 0);
+
   });
 });

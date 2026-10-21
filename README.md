@@ -821,3 +821,6 @@ Step 4: Explorer
 MIT © CircleUp Contributors
 r3tkl
 <!-- Verified for issue #624: feat(indexer): add explicit health, outage, and diagnostic states to indexer API -->
+
+
+HTTP API: [versioned reference](docs/api/README.md). See [bounded backfill](docs/BOUNDED_BACKFILL.md) for recovery limits and durable progress.

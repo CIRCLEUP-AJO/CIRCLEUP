@@ -1,4 +1,5 @@
 ﻿import type { Metadata } from "next";
+import { indexerFetch } from "@/lib/indexerFetch";
 import { notFound } from "next/navigation";
 import {
   indexerEndpoint,
@@ -140,8 +141,8 @@ async function getCircleDetail(address: string): Promise<FetchResult> {
       signal: AbortSignal.timeout(INDEXER_TIMEOUT_MS),
     };
     [circleRes, roundsRes] = await Promise.all([
-      fetch(circleUrl, init),
-      fetch(roundsUrl, init),
+      indexerFetch(circleUrl, init),
+      indexerFetch(roundsUrl, init),
     ]);
   } catch {
     return { ok: false, error: "network" };
