@@ -1,3 +1,4 @@
+import { indexerFetch } from "@/lib/indexerFetch";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { INDEXER_URL, shortAddress } from "@/lib/config";
@@ -78,7 +79,7 @@ export async function generateMetadata({
 /**
  * Returns true when `url` is a syntactically valid absolute HTTP/HTTPS URL.
  * A misconfigured INDEXER_URL (empty string, relative path, placeholder text,
- * etc.) would otherwise cause fetch() to throw an opaque TypeError that looks
+ * etc.) would otherwise cause indexerFetch() to throw an opaque TypeError that looks
  * identical to a real network failure and gives no actionable guidance.
  */
 function isValidUrl(url: string): boolean {
@@ -119,7 +120,7 @@ async function lookupReputationMember(member: string): Promise<MemberLookup> {
 
   let res: Response;
   try {
-    res = await fetch(`${INDEXER_URL}/reputation/${member}`, {
+    res = await indexerFetch(`${INDEXER_URL}/reputation/${member}`, {
       cache: "no-store",
     });
   } catch {

@@ -3501,6 +3501,10 @@ export interface IndexerClientOptions {
 
 /** Per-call options accepted by every {@link IndexerClient} read method. */
 export interface IndexerRequestOptions {
+  /** Random UUIDv4 for correlating this read; never authentication. */
+  requestId?: string;
+  /** Receives the sanitized server correlation identifier, including on HTTP errors. */
+  onRequestId?: (requestId: string) => void;
   /**
    * Caller cancellation. When it fires the request is abandoned and the
    * method rejects with an {@link IndexerError} of kind `"aborted"`.
@@ -3686,7 +3690,7 @@ function buildContributionsQuery(
       `circle must be a Stellar address (G… or C…, 56 characters), got ${describeOption(o.circle)}.`,
     );
   }
-  check.integer("page", o.page, 1, Number.MAX_SAFE_INTEGER);
+  check.integer("page", o.page, 1, Math.floor(Number.MAX_SAFE_INTEGER / INDEXER_MAX_PAGE_SIZE));
   check.integer("limit", o.limit, 1, INDEXER_MAX_PAGE_SIZE);
   check.throwIfAny();
 
@@ -3895,6 +3899,9 @@ export class IndexerClient {
     options?: IndexerRequestOptions,
   ): Promise<{ body: T; status: number; url: string }> {
     const url = `${this.baseUrl}${path}`;
+    const idPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    if (options?.requestId !== undefined && !idPattern.test(options.requestId)) throw new RangeError("requestId must be a random UUIDv4");
+    const requestId = options?.requestId ?? globalThis.crypto?.randomUUID?.();
     const timeoutMs = options?.timeoutMs ?? this.timeoutMs;
     assertPositiveTimeout(timeoutMs, "timeoutMs");
 
@@ -3943,7 +3950,7 @@ export class IndexerClient {
     try {
       let response: Response;
       try {
-        response = await bounded(fetch(url, { signal: controller.signal }));
+        response = await bounded(fetch(url, { signal: controller.signal, headers: requestId ? { "X-Request-ID": requestId } : undefined }));
       } catch (err: any) {
         if (failure) throw failure;
         throw new IndexerError(
@@ -3955,6 +3962,10 @@ export class IndexerClient {
         );
       }
 
+      const returnedId = response.headers?.get("x-request-id");
+      if (returnedId && idPattern.test(returnedId)) {
+        try { options?.onRequestId?.(returnedId.toLowerCase()); } catch { /* Diagnostics must not fail reads. */ }
+      }
       let body: T;
       try {
         body = (await bounded(response.json())) as T;
@@ -3979,7 +3990,9 @@ export class IndexerClient {
         const detail =
           body && typeof body === "object" && "error" in body && typeof body.error === "string"
             ? body.error.slice(0, MAX_ERROR_DETAIL_LENGTH)
-            : `HTTP ${response.status}`;
+            : body && typeof body === "object" && "error" in body && body.error !== null && typeof body.error === "object" && "message" in body.error && typeof body.error.message === "string"
+              ? body.error.message.slice(0, MAX_ERROR_DETAIL_LENGTH)
+              : `HTTP ${response.status}`;
         throw new IndexerError(
           `Indexer returned HTTP ${response.status}: ${detail}`,
           response.status,
@@ -4118,7 +4131,9 @@ export class IndexerClient {
   }
 
   /**
-   * Fetch all rounds for a circle — completed payouts, the in-progress round,
+   * Fetch a bounded complete grouped view (100 source records per kind).
+   * Oversized histories return HTTP 413; use getCircleHistory to page all records.
+   * Includes completed payouts, the in-progress round,
    * open rounds, and pending defaults.
    *
    * Every round row includes a `status` field (`"completed"`, `"current"`,
@@ -4154,10 +4169,10 @@ export class IndexerClient {
    */
   async getReputation(
     member: string,
-    options?: IndexerRequestOptions,
+    options?: IndexerRequestOptions & GetMemberContributionsParams,
   ): Promise<ApiReputationResponse> {
     return this.get<ApiReputationResponse>(
-      `/reputation/${encodeURIComponent(member)}`,
+      `/reputation/${encodeURIComponent(member)}${buildContributionsQuery("getReputation", options ? { page: options.page, limit: options.limit, circle: options.circle } : undefined).query}`,
       { contributions: "array", defaults: "array" },
       options,
     );
@@ -4224,6 +4239,18 @@ export class IndexerClient {
     );
   }
 
+  /** Fetch one bounded page of complete flat circle history. */
+  async getCircleHistory(
+    address: string,
+    params?: Pick<GetMemberContributionsParams, "page" | "limit">,
+    options?: IndexerRequestOptions,
+  ): Promise<import("./types").ApiCircleHistoryResponse> {
+    const { query, page, limit } = buildContributionsQuery("getCircleHistory", params);
+    return this.getPage<import("./types").ApiCircleHistoryResponse>(
+      `/circles/${encodeURIComponent(address)}/history${query}`, "events", { page, limit }, options,
+    );
+  }
+
   /**
    * Fetch structured audit records for a circle's terminal lifecycle transitions
    * (`cancelled` and `closed`).
@@ -4251,10 +4278,10 @@ export class IndexerClient {
    */
   async getCircleAuditEvents(
     address: string,
-    options?: IndexerRequestOptions,
+    options?: IndexerRequestOptions & Pick<GetMemberContributionsParams, "page" | "limit">,
   ): Promise<ApiAuditEventsResponse> {
     return this.get<ApiAuditEventsResponse>(
-      `/circles/${encodeURIComponent(address)}/audit`,
+      `/circles/${encodeURIComponent(address)}/audit${buildContributionsQuery("getCircleAuditEvents", options ? { page: options.page, limit: options.limit } : undefined).query}`,
       { events: "array" },
       options,
     );

@@ -82,3 +82,5 @@ export type {
   PreflightFresh,
   PreflightStale,
 } from "./client";
+
+export type { IndexerRequestOptions, IndexerClientOptions } from "./client";

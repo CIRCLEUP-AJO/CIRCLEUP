@@ -1,0 +1,5278 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "CircleUp indexer HTTP API",
+    "version": "1.0.0",
+    "description": "Read-only, unauthenticated HTTP API. Amounts are decimal stroop strings; PostgreSQL BIGINT ledgers can be strings while computed ledger fields are numbers. Unknown response properties are compatible additions. Errors preserve both legacy string and structured {message,details} envelopes. Retained DB records are not pruned. Public histories default page=1, limit=20, maximum=100; invalid repeated, non-integer, or oversized paging parameters return 400."
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "health0",
+        "description": "HTTP 200 when serviceStatus is healthy or legacy status is ok; otherwise HTTP 503. Component status is ok, degraded, or error. This checks DB, RPC, lag, schema, contract drift, and skipped events.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/health"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or degraded",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles": {
+      "get": {
+        "operationId": "circlesList1",
+        "description": "Paged circles. Default created_ledger descending; address ascending breaks ties.",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 90071992547409,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "Pending",
+                "Active",
+                "Completed",
+                "Cancelled",
+                "Closed"
+              ]
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "created_ledger",
+                "updated_at",
+                "round_amount",
+                "member_count",
+                "status"
+              ],
+              "default": "created_ledger"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/circlesList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/summary": {
+      "get": {
+        "operationId": "Summary2",
+        "description": "Counts for all five projected statuses.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Summary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}": {
+      "get": {
+        "operationId": "circleDetail3",
+        "description": "Circle and roster. deadline_ledger is an approximation; null unless Active with deadline configuration.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/circleDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}/members": {
+      "get": {
+        "operationId": "members4",
+        "description": "Roster in payout order; nullable reputation and join metadata.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/members"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}/rounds": {
+      "get": {
+        "operationId": "rounds5",
+        "description": "Grouped history: at most 100 source records of each kind; HTTP 413 above that bound, never partial success. Use /circles/{address}/history to retrieve all activity in pages. Round order ascending; deadlineLedger is approximate.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/rounds"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response exceeds documented bound",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}/history": {
+      "get": {
+        "operationId": "History6",
+        "description": "All retained contribution/default/payout records. Ordered ledger ASC, kind ASC, id ASC. No records are deleted by retention. Offset pages reflect live data; restart paging if ingestion changes earlier history.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 90071992547409,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/History"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}/audit": {
+      "get": {
+        "operationId": "auditEvents7",
+        "description": "Terminal lifecycle records, created_at ASC then id ASC; empty and final pages report hasMore=false.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 90071992547409,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/auditEvents"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/members/{member}/contributions": {
+      "get": {
+        "operationId": "memberContributions8",
+        "description": "Newest first: ledger DESC, round_index DESC, created_at DESC, id DESC. totalAmount covers all pages. Missing member yields empty page; unknown circle filter is 404.",
+        "parameters": [
+          {
+            "name": "member",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 90071992547409,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "circle",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/memberContributions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/reputation/{member}": {
+      "get": {
+        "operationId": "reputation9",
+        "description": "Score plus paged per-circle summaries. Page unit is distinct circle_address across contributions and defaults, ascending. Each array can be shorter than limit. Missing member: found=false, score=0, updatedAt=null.",
+        "parameters": [
+          {
+            "name": "member",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 90071992547409,
+              "default": 1
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "circle",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Address"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/reputation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}/reconciliation": {
+      "get": {
+        "operationId": "Reconciliation10",
+        "description": "Read-only diagnostics: match/mismatch=200, not_indexed=404, incompatible_contract=422, rpc_unavailable=503.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ContractAddress"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Reconciliation"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Reconciliation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Reconciliation"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or degraded",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Reconciliation"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/circles/{address}/export.csv": {
+      "get": {
+        "operationId": "Error11",
+        "description": "CSV export of public records, bounded by CSV_EXPORT_MAX_ROWS (default 10000); oversized exports return 413 and are never truncated.",
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/ContractAddress"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "text/csv": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Response exceeds documented bound",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/indexer/state": {
+      "get": {
+        "operationId": "indexerState12",
+        "description": "Durable ledger cursor, event and entity counts.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/indexerState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/indexer/health": {
+      "get": {
+        "operationId": "IndexerHealth13",
+        "description": "Operational counters and bounded backfill estimates. 503 if consecutive poll failures > 0. Durable progress comes from checkpoints; head and estimates are snapshots.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexerHealth"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or degraded",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IndexerHealth"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/indexer/schema": {
+      "get": {
+        "operationId": "Schema14",
+        "description": "Migration diagnostics.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Schema"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/indexer/failures": {
+      "get": {
+        "operationId": "Failures15",
+        "description": "Open failure evidence, newest failures first. Bounded diagnostic sample, not complete history; count is returned row count.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "ledger",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "eventId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9A-Za-z:_-]{1,200}$"
+            }
+          },
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Failures"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Unavailable or degraded",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi/v1.json": {
+      "get": {
+        "operationId": "OpenAPI16",
+        "description": "Version 1 HTTP API reference.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAPI"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "circlesList": {
+        "type": "object",
+        "properties": {
+          "circles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "address": {
+                  "type": "string"
+                },
+                "creator": {
+                  "type": "string"
+                },
+                "round_amount": {
+                  "type": "string",
+                  "pattern": "^-?[0-9]+$"
+                },
+                "member_count": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "Pending",
+                    "Active",
+                    "Completed",
+                    "Cancelled",
+                    "Closed"
+                  ]
+                },
+                "current_round": {
+                  "type": "integer"
+                },
+                "total_rounds": {
+                  "type": "integer"
+                },
+                "created_ledger": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    }
+                  ]
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "deadline_ledger": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "round_deadline_ledgers": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "address",
+                "creator",
+                "round_amount",
+                "member_count",
+                "status",
+                "current_round",
+                "total_rounds",
+                "created_ledger",
+                "updated_at"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "pagination": {
+            "type": "object",
+            "properties": {
+              "page": {
+                "type": "integer"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "total": {
+                "type": "integer"
+              },
+              "totalPages": {
+                "type": "integer"
+              },
+              "hasMore": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "page",
+              "limit",
+              "total",
+              "totalPages"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "circles",
+          "pagination"
+        ],
+        "additionalProperties": true
+      },
+      "circleDetail": {
+        "type": "object",
+        "properties": {
+          "circle": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "type": "string"
+              },
+              "creator": {
+                "type": "string"
+              },
+              "round_amount": {
+                "type": "string",
+                "pattern": "^-?[0-9]+$"
+              },
+              "member_count": {
+                "type": "integer"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "Pending",
+                  "Active",
+                  "Completed",
+                  "Cancelled",
+                  "Closed"
+                ]
+              },
+              "current_round": {
+                "type": "integer"
+              },
+              "total_rounds": {
+                "type": "integer"
+              },
+              "created_ledger": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9]+$"
+                  }
+                ]
+              },
+              "updated_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "id": {
+                "type": "integer"
+              },
+              "deadline_ledger": {
+                "anyOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^[0-9]+$"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "round_deadline_ledgers": {
+                "anyOf": [
+                  {
+                    "oneOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "string",
+                        "pattern": "^[0-9]+$"
+                      }
+                    ]
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "address",
+              "creator",
+              "round_amount",
+              "member_count",
+              "status",
+              "current_round",
+              "total_rounds",
+              "created_ledger",
+              "updated_at"
+            ],
+            "additionalProperties": true
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "member_address": {
+                  "type": "string"
+                },
+                "payout_order": {
+                  "type": "integer"
+                },
+                "join_order": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "collateral": {
+                  "type": "string",
+                  "pattern": "^-?[0-9]+$"
+                },
+                "defaults": {
+                  "type": "integer"
+                },
+                "joined_at": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "reputation_score": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "total_contributions": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "circle_address": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "member_address",
+                "payout_order",
+                "join_order",
+                "collateral",
+                "defaults",
+                "joined_at",
+                "reputation_score"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "latestLedger": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9]+$"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "circle",
+          "members",
+          "latestLedger"
+        ],
+        "additionalProperties": true
+      },
+      "members": {
+        "type": "object",
+        "properties": {
+          "members": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "member_address": {
+                  "type": "string"
+                },
+                "payout_order": {
+                  "type": "integer"
+                },
+                "join_order": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "collateral": {
+                  "type": "string",
+                  "pattern": "^-?[0-9]+$"
+                },
+                "defaults": {
+                  "type": "integer"
+                },
+                "joined_at": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "reputation_score": {
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "total_contributions": {
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "circle_address": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "member_address",
+                "payout_order",
+                "join_order",
+                "collateral",
+                "defaults",
+                "joined_at",
+                "reputation_score"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "totals": {
+            "type": "object",
+            "properties": {
+              "memberCount": {
+                "type": "integer"
+              },
+              "totalCollateral": {
+                "type": "string",
+                "pattern": "^-?[0-9]+$"
+              },
+              "totalContributions": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "memberCount",
+              "totalCollateral",
+              "totalContributions"
+            ],
+            "additionalProperties": true
+          },
+          "roundDeadlineLedgers": {
+            "anyOf": [
+              {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "string",
+                    "pattern": "^[0-9]+$"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "members"
+        ],
+        "additionalProperties": true
+      },
+      "rounds": {
+        "type": "object",
+        "properties": {
+          "rounds": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "roundIndex": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "completed",
+                    "current",
+                    "cancelled",
+                    "open"
+                  ]
+                },
+                "recipient": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "amount": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^-?[0-9]+$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "txHash": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ledger": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "deadlineLedger": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "contributions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "member_address": {
+                        "type": "string"
+                      },
+                      "amount": {
+                        "type": "string",
+                        "pattern": "^-?[0-9]+$"
+                      },
+                      "tx_hash": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "integer"
+                      },
+                      "circle_address": {
+                        "type": "string"
+                      },
+                      "round_index": {
+                        "type": "integer"
+                      },
+                      "ledger": {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9]+$"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    },
+                    "required": [
+                      "member_address",
+                      "amount",
+                      "tx_hash"
+                    ],
+                    "additionalProperties": true
+                  }
+                },
+                "defaults": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "member_address": {
+                        "type": "string"
+                      },
+                      "penalty": {
+                        "type": "string",
+                        "pattern": "^-?[0-9]+$"
+                      },
+                      "id": {
+                        "type": "integer"
+                      },
+                      "circle_address": {
+                        "type": "string"
+                      },
+                      "round_index": {
+                        "type": "integer"
+                      },
+                      "tx_hash": {
+                        "type": "string"
+                      },
+                      "ledger": {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9]+$"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    },
+                    "required": [
+                      "member_address",
+                      "penalty"
+                    ],
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "required": [
+                "roundIndex",
+                "status",
+                "recipient",
+                "amount",
+                "txHash",
+                "contributions",
+                "defaults"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "openRounds": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "roundIndex": {
+                  "type": "integer"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "completed",
+                    "current",
+                    "cancelled",
+                    "open"
+                  ]
+                },
+                "recipient": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "amount": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^-?[0-9]+$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "txHash": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ledger": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "deadlineLedger": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "contributions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "member_address": {
+                        "type": "string"
+                      },
+                      "amount": {
+                        "type": "string",
+                        "pattern": "^-?[0-9]+$"
+                      },
+                      "tx_hash": {
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "integer"
+                      },
+                      "circle_address": {
+                        "type": "string"
+                      },
+                      "round_index": {
+                        "type": "integer"
+                      },
+                      "ledger": {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9]+$"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    },
+                    "required": [
+                      "member_address",
+                      "amount",
+                      "tx_hash"
+                    ],
+                    "additionalProperties": true
+                  }
+                },
+                "defaults": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "member_address": {
+                        "type": "string"
+                      },
+                      "penalty": {
+                        "type": "string",
+                        "pattern": "^-?[0-9]+$"
+                      },
+                      "id": {
+                        "type": "integer"
+                      },
+                      "circle_address": {
+                        "type": "string"
+                      },
+                      "round_index": {
+                        "type": "integer"
+                      },
+                      "tx_hash": {
+                        "type": "string"
+                      },
+                      "ledger": {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9]+$"
+                          }
+                        ]
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    },
+                    "required": [
+                      "member_address",
+                      "penalty"
+                    ],
+                    "additionalProperties": true
+                  }
+                }
+              },
+              "required": [
+                "roundIndex",
+                "status",
+                "recipient",
+                "amount",
+                "txHash",
+                "contributions",
+                "defaults"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "pendingDefaults": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "member_address": {
+                  "type": "string"
+                },
+                "penalty": {
+                  "type": "string",
+                  "pattern": "^-?[0-9]+$"
+                },
+                "id": {
+                  "type": "integer"
+                },
+                "circle_address": {
+                  "type": "string"
+                },
+                "round_index": {
+                  "type": "integer"
+                },
+                "tx_hash": {
+                  "type": "string"
+                },
+                "ledger": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    }
+                  ]
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "member_address",
+                "penalty"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "currentRound": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "roundIndex": {
+                    "type": "integer"
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": [
+                      "completed",
+                      "current",
+                      "cancelled",
+                      "open"
+                    ]
+                  },
+                  "recipient": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "amount": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^-?[0-9]+$"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "txHash": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "ledger": {
+                    "anyOf": [
+                      {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9]+$"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "deadlineLedger": {
+                    "anyOf": [
+                      {
+                        "oneOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "string",
+                            "pattern": "^[0-9]+$"
+                          }
+                        ]
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "contributions": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "member_address": {
+                          "type": "string"
+                        },
+                        "amount": {
+                          "type": "string",
+                          "pattern": "^-?[0-9]+$"
+                        },
+                        "tx_hash": {
+                          "type": "string"
+                        },
+                        "id": {
+                          "type": "integer"
+                        },
+                        "circle_address": {
+                          "type": "string"
+                        },
+                        "round_index": {
+                          "type": "integer"
+                        },
+                        "ledger": {
+                          "oneOf": [
+                            {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            {
+                              "type": "string",
+                              "pattern": "^[0-9]+$"
+                            }
+                          ]
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "member_address",
+                        "amount",
+                        "tx_hash"
+                      ],
+                      "additionalProperties": true
+                    }
+                  },
+                  "defaults": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "member_address": {
+                          "type": "string"
+                        },
+                        "penalty": {
+                          "type": "string",
+                          "pattern": "^-?[0-9]+$"
+                        },
+                        "id": {
+                          "type": "integer"
+                        },
+                        "circle_address": {
+                          "type": "string"
+                        },
+                        "round_index": {
+                          "type": "integer"
+                        },
+                        "tx_hash": {
+                          "type": "string"
+                        },
+                        "ledger": {
+                          "oneOf": [
+                            {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            {
+                              "type": "string",
+                              "pattern": "^[0-9]+$"
+                            }
+                          ]
+                        },
+                        "created_at": {
+                          "type": "string",
+                          "format": "date-time"
+                        }
+                      },
+                      "required": [
+                        "member_address",
+                        "penalty"
+                      ],
+                      "additionalProperties": true
+                    }
+                  }
+                },
+                "required": [
+                  "roundIndex",
+                  "status",
+                  "recipient",
+                  "amount",
+                  "txHash",
+                  "contributions",
+                  "defaults"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "rounds",
+          "openRounds",
+          "pendingDefaults",
+          "currentRound"
+        ],
+        "additionalProperties": true
+      },
+      "memberContributions": {
+        "type": "object",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "circle": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "contributions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "circle_address": {
+                  "type": "string"
+                },
+                "member_address": {
+                  "type": "string"
+                },
+                "round_index": {
+                  "type": "integer"
+                },
+                "amount": {
+                  "type": "string",
+                  "pattern": "^-?[0-9]+$"
+                },
+                "tx_hash": {
+                  "type": "string"
+                },
+                "ledger": {
+                  "oneOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "string",
+                      "pattern": "^[0-9]+$"
+                    }
+                  ]
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "circle_address",
+                "member_address",
+                "round_index",
+                "amount",
+                "tx_hash",
+                "ledger",
+                "created_at"
+              ],
+              "additionalProperties": true
+            },
+            "maxItems": 100
+          },
+          "totalAmount": {
+            "type": "string",
+            "pattern": "^-?[0-9]+$"
+          },
+          "pagination": {
+            "type": "object",
+            "properties": {
+              "page": {
+                "type": "integer"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "total": {
+                "type": "integer"
+              },
+              "totalPages": {
+                "type": "integer"
+              },
+              "hasMore": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "page",
+              "limit",
+              "total",
+              "totalPages"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "member",
+          "circle",
+          "contributions",
+          "pagination"
+        ],
+        "additionalProperties": true
+      },
+      "reputation": {
+        "type": "object",
+        "properties": {
+          "member": {
+            "type": "string"
+          },
+          "found": {
+            "type": "boolean"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "contributions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "circle_address": {
+                  "type": "string"
+                },
+                "contributions": {
+                  "type": "integer"
+                },
+                "total_rounds": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "circle_address",
+                "contributions",
+                "total_rounds"
+              ],
+              "additionalProperties": true
+            },
+            "maxItems": 100
+          },
+          "defaults": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "circle_address": {
+                  "type": "string"
+                },
+                "count": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "circle_address",
+                "count"
+              ],
+              "additionalProperties": true
+            },
+            "maxItems": 100
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string"
+                },
+                "delta": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "type",
+                "delta"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "member",
+          "found",
+          "score",
+          "contributions",
+          "defaults",
+          "updatedAt"
+        ],
+        "additionalProperties": true
+      },
+      "auditEvents": {
+        "type": "object",
+        "properties": {
+          "circle_address": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "integer"
+                },
+                "circle_address": {
+                  "type": "string"
+                },
+                "event_type": {
+                  "type": "string",
+                  "enum": [
+                    "cancelled",
+                    "closed"
+                  ]
+                },
+                "triggered_by": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "ledger": {
+                  "anyOf": [
+                    {
+                      "oneOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "string",
+                          "pattern": "^[0-9]+$"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "tx_hash": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "total_released": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^-?[0-9]+$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "total_expected_collateral": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^-?[0-9]+$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "close_reason": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "created_at": {
+                  "type": "string",
+                  "format": "date-time"
+                }
+              },
+              "required": [
+                "id",
+                "circle_address",
+                "event_type",
+                "triggered_by",
+                "ledger",
+                "tx_hash",
+                "total_released",
+                "total_expected_collateral",
+                "close_reason",
+                "created_at"
+              ],
+              "additionalProperties": true
+            },
+            "maxItems": 100
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "circle_address",
+          "events"
+        ],
+        "additionalProperties": true
+      },
+      "health": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "serviceStatus": {
+            "type": "string",
+            "enum": [
+              "healthy",
+              "degraded",
+              "unavailable"
+            ]
+          },
+          "db": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded",
+                  "error"
+                ]
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": true
+          },
+          "rpc": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded",
+                  "error"
+                ]
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": true
+          },
+          "indexerLag": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded",
+                  "error"
+                ]
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": true
+          },
+          "schema": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded",
+                  "error"
+                ]
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": true
+          },
+          "contractDrift": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded",
+                  "error"
+                ]
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": true
+          },
+          "eventFailures": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "enum": [
+                  "ok",
+                  "degraded",
+                  "error"
+                ]
+              },
+              "latencyMs": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              },
+              "details": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": true
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "usdcAddress": {
+                "type": "string"
+              },
+              "lagAlertLedgers": {
+                "type": "integer"
+              },
+              "driftRoundThreshold": {
+                "type": "integer"
+              },
+              "eventFailureAlertCount": {
+                "type": "integer"
+              },
+              "eventFailureRecurringAttempts": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "usdcAddress",
+              "lagAlertLedgers",
+              "driftRoundThreshold",
+              "eventFailureAlertCount",
+              "eventFailureRecurringAttempts"
+            ],
+            "additionalProperties": true
+          },
+          "diagnostics": {
+            "type": "object",
+            "properties": {
+              "lastIndexedLedger": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "rpcLatestLedger": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "lagLedgers": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "dbAvailable": {
+                "type": "boolean"
+              },
+              "rpcAvailable": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "lastIndexedLedger",
+              "rpcLatestLedger",
+              "lagLedgers",
+              "dbAvailable",
+              "rpcAvailable"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "status",
+          "timestamp"
+        ],
+        "additionalProperties": true
+      },
+      "indexerState": {
+        "type": "object",
+        "properties": {
+          "lastLedger": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "string",
+                "pattern": "^[0-9]+$"
+              }
+            ]
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "totalEvents": {
+            "type": "integer"
+          },
+          "eventCounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          },
+          "entityCounts": {
+            "type": "object",
+            "properties": {
+              "circles": {
+                "type": "integer"
+              },
+              "members": {
+                "type": "integer"
+              },
+              "contributions": {
+                "type": "integer"
+              },
+              "payouts": {
+                "type": "integer"
+              },
+              "defaults": {
+                "type": "integer"
+              },
+              "circlesByStatus": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer"
+                }
+              }
+            },
+            "required": [
+              "circles",
+              "members",
+              "contributions",
+              "payouts",
+              "defaults",
+              "circlesByStatus"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "lastLedger",
+          "updatedAt",
+          "totalEvents",
+          "eventCounts",
+          "entityCounts"
+        ],
+        "additionalProperties": true
+      },
+      "Address": {
+        "type": "string",
+        "pattern": "^[GC][A-Z2-7]{55}$"
+      },
+      "ContractAddress": {
+        "type": "string",
+        "pattern": "^C[A-Z2-7]{55}$"
+      },
+      "Amount": {
+        "type": "string",
+        "pattern": "^-?[0-9]+$"
+      },
+      "Ledger": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        ]
+      },
+      "Pagination": {
+        "type": "object",
+        "properties": {
+          "page": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "totalPages": {
+            "type": "integer"
+          },
+          "hasMore": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "page",
+          "limit",
+          "total",
+          "totalPages"
+        ],
+        "additionalProperties": true
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  },
+                  "details": {}
+                },
+                "required": [
+                  "message",
+                  "details"
+                ],
+                "additionalProperties": true
+              }
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "address": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": true
+      },
+      "Summary": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer"
+          },
+          "byStatus": {
+            "type": "object",
+            "properties": {
+              "Pending": {
+                "type": "integer"
+              },
+              "Active": {
+                "type": "integer"
+              },
+              "Completed": {
+                "type": "integer"
+              },
+              "Cancelled": {
+                "type": "integer"
+              },
+              "Closed": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "Pending",
+              "Active",
+              "Completed",
+              "Cancelled",
+              "Closed"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "total",
+          "byStatus"
+        ],
+        "additionalProperties": true
+      },
+      "Backfill": {
+        "type": "object",
+        "properties": {
+          "durableLedger": {
+            "type": "integer"
+          },
+          "headLedger": {
+            "type": "integer"
+          },
+          "fromLedger": {
+            "type": "integer"
+          },
+          "toLedger": {
+            "type": "integer"
+          },
+          "remainingLedgers": {
+            "type": "integer"
+          },
+          "estimatedBatches": {
+            "type": "integer"
+          },
+          "maxLedgers": {
+            "type": "integer"
+          },
+          "maxEvents": {
+            "type": "integer"
+          },
+          "concurrency": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "durableLedger",
+          "headLedger",
+          "fromLedger",
+          "toLedger",
+          "remainingLedgers",
+          "estimatedBatches",
+          "maxLedgers",
+          "maxEvents",
+          "concurrency"
+        ],
+        "additionalProperties": true
+      },
+      "IndexerHealth": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "enum": [
+              "ok",
+              "degraded"
+            ]
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "backfill": {
+            "$ref": "#/components/schemas/Backfill"
+          },
+          "events": {
+            "type": "object",
+            "properties": {
+              "processed": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "integer"
+              },
+              "skipped": {
+                "type": "integer"
+              },
+              "retried": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "processed",
+              "failed",
+              "skipped",
+              "retried"
+            ],
+            "additionalProperties": true
+          },
+          "pollCycles": {
+            "type": "object",
+            "properties": {
+              "completed": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "completed",
+              "failed"
+            ],
+            "additionalProperties": true
+          },
+          "lastPoll": {
+            "type": "object",
+            "properties": {
+              "durationMs": {
+                "type": "integer"
+              },
+              "ledgerRange": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "durationMs",
+              "ledgerRange"
+            ],
+            "additionalProperties": true
+          },
+          "backoff": {
+            "type": "object",
+            "properties": {
+              "consecutiveFailures": {
+                "type": "integer"
+              },
+              "currentIntervalMs": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "consecutiveFailures",
+              "currentIntervalMs"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "status",
+          "running",
+          "backfill",
+          "events",
+          "pollCycles",
+          "lastPoll",
+          "backoff"
+        ],
+        "additionalProperties": true
+      },
+      "HistoryRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "circle_address": {
+            "type": "string"
+          },
+          "round_index": {
+            "type": "integer"
+          },
+          "ledger": {
+            "$ref": "#/components/schemas/Ledger"
+          },
+          "tx_hash": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "member_address": {
+            "type": "string"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "penalty": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "is_exceptional": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "defaulted_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "circle_address",
+          "round_index",
+          "ledger",
+          "tx_hash",
+          "created_at"
+        ],
+        "additionalProperties": true
+      },
+      "History": {
+        "type": "object",
+        "properties": {
+          "circle_address": {
+            "$ref": "#/components/schemas/Address"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "contribution"
+                    },
+                    "record": {
+                      "$ref": "#/components/schemas/ContributionHistoryRecord"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "record"
+                  ],
+                  "additionalProperties": true
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "default"
+                    },
+                    "record": {
+                      "$ref": "#/components/schemas/DefaultHistoryRecord"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "record"
+                  ],
+                  "additionalProperties": true
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "payout"
+                    },
+                    "record": {
+                      "$ref": "#/components/schemas/PayoutHistoryRecord"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "record"
+                  ],
+                  "additionalProperties": true
+                }
+              ]
+            },
+            "maxItems": 100
+          },
+          "pagination": {
+            "$ref": "#/components/schemas/Pagination"
+          }
+        },
+        "required": [
+          "circle_address",
+          "events",
+          "pagination"
+        ],
+        "additionalProperties": true
+      },
+      "Reconciliation": {
+        "type": "object",
+        "properties": {
+          "circleAddress": {
+            "$ref": "#/components/schemas/ContractAddress"
+          },
+          "generatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "outcome": {
+            "enum": [
+              "match",
+              "mismatch",
+              "rpc_unavailable",
+              "incompatible_contract",
+              "not_indexed"
+            ]
+          },
+          "ledgerContext": {
+            "type": "object",
+            "properties": {
+              "indexedLedger": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "chainLedger": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "lagLedgers": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "indexedLedger",
+              "chainLedger",
+              "lagLedgers"
+            ],
+            "additionalProperties": true
+          },
+          "checked": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mismatches": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "indexed": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "chain": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "source": {
+                  "type": "string"
+                },
+                "indexedRowLedger": {
+                  "type": "integer"
+                },
+                "classification": {
+                  "enum": [
+                    "possibly_stale",
+                    "drift"
+                  ]
+                }
+              },
+              "required": [
+                "field",
+                "indexed",
+                "chain",
+                "source",
+                "classification"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "unavailable": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "source": {
+                  "type": "string"
+                },
+                "failure": {
+                  "enum": [
+                    "rpc_unavailable",
+                    "contract_error"
+                  ]
+                },
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "source",
+                "failure",
+                "error"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "circleAddress",
+          "generatedAt",
+          "outcome",
+          "ledgerContext",
+          "checked",
+          "mismatches",
+          "unavailable"
+        ],
+        "additionalProperties": true
+      },
+      "Failures": {
+        "type": "object",
+        "properties": {
+          "failures": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "eventId": {
+                  "type": "string"
+                },
+                "ledger": {
+                  "type": "integer"
+                },
+                "txHash": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "contractId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "eventType": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "errorClass": {
+                  "type": "string"
+                },
+                "errorName": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "errorMessage": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "attempts": {
+                  "type": "integer"
+                },
+                "firstFailedAt": {
+                  "type": "string"
+                },
+                "lastFailedAt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "eventId",
+                "ledger",
+                "txHash",
+                "contractId",
+                "eventType",
+                "errorClass",
+                "errorName",
+                "errorMessage",
+                "attempts",
+                "firstFailedAt",
+                "lastFailedAt"
+              ],
+              "additionalProperties": true
+            },
+            "maxItems": 100
+          },
+          "count": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "failures",
+          "count",
+          "limit"
+        ],
+        "additionalProperties": true
+      },
+      "Schema": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "enum": [
+              "clean",
+              "pending",
+              "drifted",
+              "modified",
+              "partial",
+              "uninitialized"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "canStartSafely": {
+            "type": "boolean"
+          },
+          "currentVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "applied": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "missingOnDisk": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "modified": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "state",
+          "summary",
+          "canStartSafely",
+          "currentVersion",
+          "applied",
+          "pending",
+          "missingOnDisk",
+          "modified"
+        ],
+        "additionalProperties": true
+      },
+      "OpenAPI": {
+        "type": "object",
+        "properties": {
+          "openapi": {
+            "const": "3.1.0"
+          },
+          "info": {
+            "type": "object"
+          },
+          "paths": {
+            "type": "object"
+          },
+          "components": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "openapi",
+          "info",
+          "paths",
+          "components"
+        ],
+        "additionalProperties": true
+      },
+      "ContributionHistoryRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "circle_address": {
+            "type": "string"
+          },
+          "round_index": {
+            "type": "integer"
+          },
+          "ledger": {
+            "$ref": "#/components/schemas/Ledger"
+          },
+          "tx_hash": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "member_address": {
+            "type": "string"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "penalty": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "is_exceptional": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "defaulted_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "circle_address",
+          "round_index",
+          "ledger",
+          "tx_hash",
+          "created_at",
+          "member_address",
+          "amount"
+        ],
+        "additionalProperties": true
+      },
+      "DefaultHistoryRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "circle_address": {
+            "type": "string"
+          },
+          "round_index": {
+            "type": "integer"
+          },
+          "ledger": {
+            "$ref": "#/components/schemas/Ledger"
+          },
+          "tx_hash": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "member_address": {
+            "type": "string"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "penalty": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "is_exceptional": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "defaulted_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "circle_address",
+          "round_index",
+          "ledger",
+          "tx_hash",
+          "created_at",
+          "member_address",
+          "penalty"
+        ],
+        "additionalProperties": true
+      },
+      "PayoutHistoryRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "circle_address": {
+            "type": "string"
+          },
+          "round_index": {
+            "type": "integer"
+          },
+          "ledger": {
+            "$ref": "#/components/schemas/Ledger"
+          },
+          "tx_hash": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "member_address": {
+            "type": "string"
+          },
+          "recipient": {
+            "type": "string"
+          },
+          "amount": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "penalty": {
+            "$ref": "#/components/schemas/Amount"
+          },
+          "is_exceptional": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "defaulted_count": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "circle_address",
+          "round_index",
+          "ledger",
+          "tx_hash",
+          "created_at",
+          "recipient",
+          "amount"
+        ],
+        "additionalProperties": true
+      }
+    }
+  },
+  "x-source-sha256": {
+    "indexer/src/api.ts": "3c3fcb8cfa8cbc72e6bd3301cf8c444a836be92f613e5a809c349b07c423669e",
+    "indexer/src/config.ts": "ed5370adbedbf5e764e3b9476ea1b766102b8fbe16e106e461cd6440b7b0e520",
+    "indexer/src/indexer.ts": "f5ce62d183ca67b0454aae20d3e933e8380019b315471eeeb0481958637c34d5",
+    "indexer/src/groupRounds.ts": "5f99e3f6863b3ef6055e6c55e5e2c43bfa8124a5bda2e58bc800d601b857d9dd",
+    "indexer/src/health.ts": "7bbe1d45c65a26ba05002e6275b7efa1be67192accea774f0f0ab93c9b0668f7",
+    "indexer/src/eventFailures.ts": "a52687befc2da9d42991112e7dc3248cb74413237139f172e653247c98dd339d",
+    "indexer/src/circleReconciliation.ts": "77991096eeb818e7398486dd50450909dfd14a63f86ee4f515cb5a5f32b95c5e",
+    "indexer/src/csvExport.ts": "abb7911ec696cfb0b12cea8d35e3152514bf39629abbf1eca50ed1242e7f01c2",
+    "indexer/src/requestTracing.ts": "07608e5cf4077dd335bfa2a44c5b96b12d44e0ce9e63549abfaf58842e6dca0e",
+    "sdk/src/types.ts": "a3493b62d3d7a201b343d955709c2c06bb051d875ce76a124f76321d36efa444",
+    "sdk/src/indexerSchema.ts": "b011cf93e8d7b2353829c566c8307dbad7c86f6fc951969421a0360d9933be51",
+    "sdk/src/client.ts": "f3a31d631503402e590d5a80c5b161b268d11955190cd0204eac91c159da8afa",
+    "app/src/lib/indexerFetch.ts": "0b0227e571cdd83bb24c71641788193ae08a68d0643dedb807ccecda01c00ba9"
+  }
+}
