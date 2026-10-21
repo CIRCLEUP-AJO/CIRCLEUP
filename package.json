@@ -18,7 +18,7 @@
     "build:app": "npm run build --workspace=app",
     "dev:app": "npm run dev --workspace=app",
     "dev:indexer": "npm run dev --workspace=indexer",
-    "dev": "npm run dev:indexer & npm run dev:app",
+    "dev": "node api.js && npm run dev:indexer & npm run dev:app",
     "deploy:testnet": "npm run deploy:testnet --workspace=scripts",
     "mainnet:readiness": "npm run --workspace=scripts mainnet:readiness --",
     "seed:demo": "npm run seed:demo --workspace=scripts",
