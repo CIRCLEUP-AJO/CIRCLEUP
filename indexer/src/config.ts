@@ -287,7 +287,80 @@ export const DB_CONNECT_BASE_DELAY_MS = parseDbConnectBaseDelayMs(
   process.env.DB_CONNECT_BASE_DELAY_MS,
 );
 
-// ── Soroban RPC retry ─────────────────────────────────────────────────────────
+// ── DB pool sizing and backpressure ──────────────────────────────────────────
+// These three parameters define the backpressure policy for the Postgres
+// connection pool.  Together they ensure that:
+//   - DB demand is bounded (DB_POOL_MAX caps active connections).
+//   - Overload is explicit: a caller that cannot acquire a connection within
+//     DB_ACQUIRE_TIMEOUT_MS receives a PoolSaturationError instead of
+//     queuing indefinitely.
+//   - Individual queries cannot stall the pool forever: DB_STATEMENT_TIMEOUT_MS
+//     causes Postgres to cancel a query that exceeds its budget, releasing the
+//     connection for the next waiter.
+
+/**
+ * Parse DB_POOL_MAX — maximum Postgres connections the pool may hold open.
+ * Range: [1, 100].  Default: 10.
+ * Exported for unit testing.
+ */
+export function parseDbPoolMax(raw: string | undefined): number {
+  const n = parsePositiveIntEnv("DB_POOL_MAX", raw, 10);
+  if (n > 100) {
+    throw new Error(
+      `[circleup-indexer] DB_POOL_MAX must be at most 100, got: "${raw}"`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Parse DB_ACQUIRE_TIMEOUT_MS — maximum milliseconds a caller will wait for a
+ * free connection before receiving a PoolSaturationError.
+ * Range: [50, 30_000].  Default: 5_000 ms.
+ * Exported for unit testing.
+ */
+export function parseDbAcquireTimeoutMs(raw: string | undefined): number {
+  const n = parsePositiveIntEnv("DB_ACQUIRE_TIMEOUT_MS", raw, 5_000);
+  if (n < 50) {
+    throw new Error(
+      `[circleup-indexer] DB_ACQUIRE_TIMEOUT_MS must be at least 50ms, got: "${raw}"`,
+    );
+  }
+  if (n > 30_000) {
+    throw new Error(
+      `[circleup-indexer] DB_ACQUIRE_TIMEOUT_MS must be at most 30000ms, got: "${raw}"`,
+    );
+  }
+  return n;
+}
+
+/**
+ * Parse DB_STATEMENT_TIMEOUT_MS — milliseconds before Postgres cancels a
+ * running query.  Applied as SET statement_timeout on every connection
+ * checkout so a hung query releases its connection within a bounded time.
+ * Range: [0, 300_000].  0 disables the per-statement timeout.
+ * Default: 30_000 ms.
+ * Exported for unit testing.
+ */
+export function parseDbStatementTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 30_000;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(
+      `[circleup-indexer] DB_STATEMENT_TIMEOUT_MS must be a non-negative integer, got: "${raw}"`,
+    );
+  }
+  if (n > 300_000) {
+    throw new Error(
+      `[circleup-indexer] DB_STATEMENT_TIMEOUT_MS must be at most 300000ms, got: "${raw}"`,
+    );
+  }
+  return n;
+}
+
+export const DB_POOL_MAX = parseDbPoolMax(process.env.DB_POOL_MAX);
+export const DB_ACQUIRE_TIMEOUT_MS = parseDbAcquireTimeoutMs(process.env.DB_ACQUIRE_TIMEOUT_MS);
+export const DB_STATEMENT_TIMEOUT_MS = parseDbStatementTimeoutMs(process.env.DB_STATEMENT_TIMEOUT_MS);
 // Maximum retry attempts for a single RPC call (getLatestLedger, getEvents).
 // Default: 4 attempts. Upper bound: 20.
 export const RPC_RETRY_MAX_ATTEMPTS = parseRpcRetryMaxAttempts(
