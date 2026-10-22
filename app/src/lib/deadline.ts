@@ -50,7 +50,11 @@ export interface DeadlineDisplay {
 }
 
 export function ledgersToHuman(ledgers: number): string {
-  if (ledgers <= 0) return "overdue";
+  // Ledger boundary: the deadline passes only when latestLedger EXCEEDS
+  // deadlineLedger (see lib/gating.ts). At exact equality the round is due
+  // now, not overdue — wall-clock time alone never declares it passed.
+  if (ledgers < 0) return "overdue";
+  if (ledgers === 0) return "due now";
   const totalSeconds = ledgers * SECONDS_PER_LEDGER;
   const days = Math.floor(totalSeconds / 86_400);
   const hours = Math.floor((totalSeconds % 86_400) / 3600);
@@ -107,7 +111,10 @@ export function computeDeadlineDisplay({
   const isStale = dataAgeMs >= maxDataAgeMs;
 
   const ledgersRemaining = deadlineLedger - latestLedger;
-  const isOverdue = ledgersRemaining <= 0;
+  // Authoritative ledger state: passed only when the network has moved PAST
+  // the deadline ledger (latestLedger > deadlineLedger), matching gating.ts.
+  // Equality is "due now", still actionable — never overdue via wall-clock.
+  const isOverdue = ledgersRemaining < 0;
   const secondsRemaining = ledgersRemaining * SECONDS_PER_LEDGER;
   const human = ledgersToHuman(ledgersRemaining);
 
