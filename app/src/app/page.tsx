@@ -33,8 +33,15 @@ import {
   isValidStatusFilter,
   isValidUrl,
   getBrowseState,
+  parseBrowseParams,
+  browseQueryString,
+  BROWSE_SORTS,
+  BROWSE_SORT_LABELS,
+  isValidBrowseSort,
+  isValidBrowseOrder,
   type CircleStatusFilter as StatusFilterType,
   type BrowseState,
+  type BrowseParams,
   type FetchResult,
 } from "@/lib/homeHero";
 
@@ -52,21 +59,27 @@ import {
  * `total` comes from the indexer's pagination envelope so the heading can
  * show the accurate filtered count without a second request.
  */
-function makeGetCircles(status: StatusFilterType | undefined) {
-  const cacheKey = status ? `circles-homepage-${status}` : "circles-homepage";
+function makeGetCircles(params: BrowseParams) {
+  const { status, sort, order, page } = params;
+  const cacheKey = `circles-homepage-${status ?? "all"}-${sort}-${order}-p${page}`;
 
   return unstable_cache(
     async function fetchCircles(): Promise<FetchResult> {
-      // Build the URL: encode the status param when present so a crafted value
-      // can never inject additional query-string segments.
+      // Build the URL with server-side query params so the indexer — not the
+      // client — filters, sorts, and paginates (never fetch-all-then-filter).
       const segments: string[] = ["circles"];
       const base = indexerEndpoint(segments);
       if (base === null) {
         return { ok: false, error: "misconfigured" };
       }
-      const url = status
-        ? `${base}?${new URLSearchParams({ status }).toString()}`
-        : base;
+      const qs = new URLSearchParams({
+        sort,
+        order,
+        page: String(page),
+        limit: "20",
+      });
+      if (status) qs.set("status", status);
+      const url = `${base}?${qs.toString()}`;
 
       let res: Response;
       try {
@@ -206,11 +219,11 @@ function CircleListSkeleton() {
 // ─── Circles list (async server component) ────────────────────────────────────
 
 async function CirclesList({
-  status,
+  browse,
 }: {
-  status: StatusFilterType | undefined;
+  browse: BrowseParams;
 }) {
-  const getCircles = makeGetCircles(status);
+  const getCircles = makeGetCircles(browse);
   const result = await getCircles();
 
   if (!result.ok) {
@@ -231,17 +244,21 @@ async function CirclesList({
       <div className="text-center py-16 text-slate-500">
         <div className="text-4xl mb-3">NEW</div>
         <p className="font-medium">
-          {status
-            ? `No ${status.toLowerCase()} circles found.`
+          {browse.status
+            ? `No ${browse.status.toLowerCase()} circles found.`
             : "No circles yet."}
         </p>
-        {!status && (
-          <p className="text-sm mt-1">
+        <p className="text-sm mt-1">
+          {browse.status || browse.page > 1 ? (
+            <a href="/#circles" className="text-brand-600 underline">
+              Clear filters
+            </a>
+          ) : (
             <Link href="/create" className="text-brand-600 underline">
               Create the first one
             </Link>
-          </p>
-        )}
+          )}
+        </p>
       </div>
     );
   }
@@ -258,18 +275,18 @@ async function CirclesList({
 // ─── Error-aware list wrapper (server component) ──────────────────────────────
 
 async function CirclesListWithRetry({
-  status,
+  browse,
 }: {
-  status: StatusFilterType | undefined;
+  browse: BrowseParams;
 }) {
-  const getCircles = makeGetCircles(status);
+  const getCircles = makeGetCircles(browse);
   const result = await getCircles().catch(() => null);
   const initialError =
     !result || !result.ok ? (result?.error ?? "network") : null;
 
   return (
     <RetryableCirclesList initialError={initialError}>
-      <CirclesList status={status} />
+      <CirclesList browse={browse} />
     </RetryableCirclesList>
   );
 }
@@ -280,17 +297,19 @@ async function CirclesListWithRetry({
 // fetch failed — a stale or missing number is never presented as fact.
 
 async function CircleCount({
-  status,
+  browse,
 }: {
-  status: StatusFilterType | undefined;
+  browse: BrowseParams;
 }) {
-  const getCircles = makeGetCircles(status);
+  const getCircles = makeGetCircles(browse);
   const result = await getCircles().catch(() => null);
   if (!result || !result.ok) return null;
 
+  const totalPages = Math.max(1, Math.ceil(result.total / 20));
   return (
     <span className="ml-2 text-sm font-normal text-slate-400">
-      ({result.total})
+      ({result.total}
+      {totalPages > 1 ? ` · page ${Math.min(browse.page, totalPages)} of ${totalPages}` : ""})
     </span>
   );
 }
@@ -386,13 +405,13 @@ interface HomePageProps {
 export default async function HomePage({ searchParams }: HomePageProps) {
   // Resolve the async searchParams (Next.js 15 dynamic API)
   const params = await searchParams;
-  const rawStatus = Array.isArray(params.status) ? params.status[0] : params.status;
-  // Guard the raw query-string value: only pass it through when it matches a
-  // known status so a crafted URL can never inject an arbitrary string into the
-  // fetch URL or the heading label.
-  const activeStatus: StatusFilterType | undefined = isValidStatusFilter(rawStatus)
-    ? rawStatus
-    : undefined;
+  // Central browse parsing: invalid status/sort/order/page values fall back
+  // to explicit defaults (status→All, sort→created_ledger, order→desc,
+  // page→1) so shared/edited URLs never break the list.
+  const browse = parseBrowseParams(
+    params as Record<string, string | string[] | undefined>,
+  );
+  const activeStatus = browse.status;
 
   // Label for the list section heading.
   const sectionLabel = activeStatus ? `${activeStatus} Circles` : "All Circles";
@@ -498,26 +517,60 @@ export default async function HomePage({ searchParams }: HomePageProps) {
           <h2 className="text-xl font-bold text-slate-800">
             {sectionLabel}
             <Suspense fallback={null}>
-              <CircleCount status={activeStatus} />
+              <CircleCount browse={browse} />
             </Suspense>
           </h2>
-          <Link
-            href="/create"
-            className="text-brand-600 text-sm font-medium hover:underline"
-          >
-            + New circle
-          </Link>
+          <div className="flex items-center gap-3">
+            <label className="text-sm text-slate-500">
+              Sort{" "}
+              <select
+                aria-label="Sort circles"
+                className="text-sm border border-slate-200 rounded-lg px-2 py-1 bg-white"
+                defaultValue={`${browse.sort}:${browse.order}`}
+                onChange={(e) => {
+                  // Plain navigation keeps SSR + history working without JS
+                  // router state; the select is progressively enhanced below.
+                  const [sort, order] = e.target.value.split(":");
+                  const q = new URLSearchParams(window.location.search);
+                  q.set("sort", sort);
+                  q.set("order", order);
+                  q.delete("page");
+                  window.location.href = `${window.location.pathname}?${q.toString()}#circles`;
+                }}
+              >
+                {(
+                  [
+                    ["created_ledger", "desc", "Recently created"],
+                    ["updated_at", "desc", "Recently active"],
+                    ["round_amount", "desc", "Amount: high to low"],
+                    ["round_amount", "asc", "Amount: low to high"],
+                    ["member_count", "desc", "Most members"],
+                  ] as const
+                ).map(([s, o, label]) => (
+                  <option key={`${s}:${o}`} value={`${s}:${o}`}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Link
+              href="/create"
+              className="text-brand-600 text-sm font-medium hover:underline"
+            >
+              + New circle
+            </Link>
+          </div>
         </div>
 
         {/* Status filter tabs — client component so selection updates the URL
             without a full page reload. The active value is read back from
             searchParams on the server so the correct circles are streamed
             immediately, even on a direct URL visit or a hard refresh.        */}
-        <CircleStatusFilterNav activeStatus={activeStatus} />
+        <CircleStatusFilterNav activeStatus={activeStatus} sort={browse.sort} order={browse.order} />
       </div>
 
       <Suspense fallback={<CircleListSkeleton />}>
-        <CirclesListWithRetry status={activeStatus} />
+        <CirclesListWithRetry browse={browse} />
       </Suspense>
     </div>
   );
