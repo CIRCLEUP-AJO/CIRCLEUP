@@ -164,3 +164,31 @@ describe("deadline — shared constants", () => {
     expect(SECONDS_PER_LEDGER).toBe(5);
   });
 });
+
+describe("deadline — ledger boundary (authoritative state)", () => {
+  it("exact equality is due now, not overdue (latest == deadline)", () => {
+    const d = displayFor({ deadlineLedger: 5000, latestLedger: 5000 });
+    expect(d.ledgersRemaining).toBe(0);
+    expect(d.isOverdue).toBe(false);
+    expect(d.human).toBe("due now");
+  });
+
+  it("one ledger past the deadline is overdue (latest > deadline)", () => {
+    const d = displayFor({ deadlineLedger: 5000, latestLedger: 5001 });
+    expect(d.isOverdue).toBe(true);
+    expect(d.human).toBe("overdue");
+    expect(d.urgency).toBe("red");
+  });
+
+  it("one ledger before the deadline is still open", () => {
+    const d = displayFor({ deadlineLedger: 5000, latestLedger: 4999 });
+    expect(d.isOverdue).toBe(false);
+    expect(d.ledgersRemaining).toBe(1);
+  });
+
+  it("estimate flag is always set and label signals approximation", () => {
+    const d = displayFor({});
+    expect(d.isEstimate).toBe(true);
+    expect(d.label).toMatch(/estimate/i);
+  });
+});
