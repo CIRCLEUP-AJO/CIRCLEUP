@@ -18,6 +18,16 @@ export interface ReputationLevel {
   description: string;
 }
 
+// ─── Score Semantics ──────────────────────────────────────────────────────────
+//
+// **What the score means:** Count of completed ROSCA circle rounds.
+// **What it does NOT mean:** Credit rating, trustworthiness guarantee, or
+// predictor of future behavior.
+//
+// One point = one circle completed and payout received. Points are monotonically
+// increasing (never decrease). Scores can be stale or incomplete if the indexer
+// has not caught up. See docs/REPUTATION_SCORE_SEMANTICS.md for full details.
+
 // ─── Threshold constants ──────────────────────────────────────────────────────
 //
 // Centralised so tests and callers can import these rather than hard-coding
@@ -187,6 +197,17 @@ export function ReputationBadge({ score, size = "md" }: ReputationBadgeProps) {
 
 /**
  * ReputationLegend — renders a full tier table explaining each badge level.
+ *
+ * **Important:** This legend explains the badge tier bands, not the meaning of
+ * the score itself. Users should understand that:
+ *
+ * - The score counts completed ROSCA circle rounds, not general trustworthiness.
+ * - A higher score means "you have completed more circles" — nothing more.
+ * - The score does not indicate credit rating, future reliability, or character.
+ * - Scores are permanent (never decrease) and may reflect historical participation.
+ * - The indexer may have incomplete history; the on-chain score is the source of truth.
+ *
+ * See docs/REPUTATION_SCORE_SEMANTICS.md for complete limitations and guarantees.
  *
  * Intended for the reputation profile page to help users understand the scoring
  * system.  Each row shows the badge (colour + shape marker + label) alongside

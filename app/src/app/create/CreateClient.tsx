@@ -1,4 +1,8 @@
 "use client";
+import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
+import { parseContractError, userMessageForError, type ContractAppError } from "@/lib/contractErrors";
+import { observeWalletChanges } from "@/lib/walletIdentity";
+import { useDeploymentVerified, deploymentVerified } from "@/lib/deploymentState";
 import { useState, useId, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -382,6 +386,11 @@ function FieldError({ id, message }: { id: string; message: string | undefined }
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function CreateClient() {
+  const actionAbortRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const stop = observeWalletChanges(() => { actionAbortRef.current?.abort(); });
+    return () => { stop(); actionAbortRef.current?.abort(); };
+  }, []);
   const router = useRouter();
 
   // ── Form state ─────────────────────────────────────────────────────────────
@@ -393,8 +402,10 @@ export default function CreateClient() {
   // ── Submission state ───────────────────────────────────────────────────────
   const [loading, setLoading] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [supportError, setSupportError] = useState<ContractAppError | null>(null);
   const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
   const [txHash, setTxHash] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
   const [copied, setCopied] = useState(false);
 
   // Whether validation has been attempted — controls when inline errors appear.
@@ -508,6 +519,7 @@ export default function CreateClient() {
   // ── Submit ──────────────────────────────────────────────────────────────────
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    if (!deploymentVerified()) { setSubmitError("Verify deployment before submitting."); return; }
 
     // Prevent concurrent submissions (rapid double-click guard). Armed before
     // the first await so a second click during the wallet prompt is dropped,
@@ -515,10 +527,14 @@ export default function CreateClient() {
     // through it).
     if (submittingRef.current) return;
     submittingRef.current = true;
+    const actionCtrl = new AbortController();
+    actionAbortRef.current = actionCtrl;
 
     try {
       setSubmitError("");
+      setSupportError(null);
       setTxHash("");
+      setConfirmed(false);
       setCopied(false);
       setValidated(true);
 
@@ -543,7 +559,7 @@ export default function CreateClient() {
             "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
           );
         } else {
-          setSubmitError(err instanceof Error ? err.message : "Failed to access wallet.");
+          setSubmitError("Unable to access your wallet. Unlock Freighter and reconnect.");
         }
         return;
       }
@@ -586,17 +602,25 @@ export default function CreateClient() {
           nativeToScVal(daysToLedgers(days), { type: "u32" }),
         ],
         walletAddress,
+        actionCtrl.signal,
       );
+      if (actionCtrl.signal.aborted) return;
 
       if (!result.success) {
-        setSubmitError(result.typedError?.message || result.error || "Transaction failed.");
+        setSupportError(result.typedError ?? parseContractError(result.error));
+        if (result.txHash) setTxHash(result.txHash);
+        setSubmitError(userMessageForError(result.typedError ?? parseContractError(result.error)));
         return;
       }
 
+      setConfirmed(true);
       setTxHash(result.txHash ?? "");
       setTimeout(() => router.push("/"), 5000);
     } catch (err: unknown) {
-      setSubmitError(err instanceof Error ? err.message : "Unknown error.");
+      if (actionCtrl.signal.aborted) return;
+      const safeError = parseContractError(err instanceof Error ? err.message : "");
+      setSupportError(safeError);
+      setSubmitError(userMessageForError(safeError));
     } finally {
       setLoading(false);
       submittingRef.current = false;
@@ -607,7 +631,8 @@ export default function CreateClient() {
     ? getExplorerLink(ACTIVE_NETWORK, "tx", txHash)
     : null;
 
-  const submitBlocked = loading || !!txHash;
+  const deploymentReady = useDeploymentVerified();
+  const submitBlocked = !deploymentReady || loading || !!txHash;
 
   const submitDescribedBy = [
     submitError ? submitErrId : null,
@@ -926,8 +951,9 @@ export default function CreateClient() {
             className="bg-brand-50 border border-brand-200 rounded-lg p-4 text-sm text-brand-700 space-y-3 focus:outline-none"
           >
             <p className="font-semibold text-brand-800 flex items-center gap-1.5">
-              <span aria-hidden="true">✅</span> Circle created successfully!
+              <span aria-hidden="true">{confirmed ? "✅" : "ℹ"}</span> {confirmed ? "Circle created successfully!" : "Transaction receipt — check status before another write"}
             </p>
+            <a href="/transactions" className="underline">Reopen transaction status</a>
             <div>
               <p
                 className="text-xs text-brand-600 mb-1 font-medium"
@@ -964,10 +990,12 @@ export default function CreateClient() {
               </a>
             )}
             <p className="text-xs text-slate-500" aria-live="polite" aria-atomic="true">
-              Redirecting to circles list in a few seconds…
+              {confirmed ? "Redirecting to circles list in a few seconds…" : "Confirmation was not established. Open Recent transactions to check this hash."}
             </p>
           </div>
         )}
+
+        {submitError && <DiagnosticsPanel operation="create_circle" typedError={supportError ?? parseContractError(submitError)} txHash={txHash} />}
 
         {/* Pending state announcement */}
         <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">

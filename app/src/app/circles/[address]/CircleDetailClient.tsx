@@ -22,6 +22,8 @@ import {
 } from "@/lib/walletCapabilities";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
+import { observeWalletChanges } from '@/lib/walletIdentity';
+import { useDeploymentVerified, deploymentVerified } from '@/lib/deploymentState';
 import clsx from "clsx";
 import { classifyFreshness, formatSourceLabel } from "@/lib/fieldSource";
 import {
@@ -57,6 +59,13 @@ export type { CircleMember, ContributionRecord, DefaultRecord, CircleRound, Circ
 // under PendingDefault in circleTypes.ts. The alias keeps downstream imports
 // building without changes.
 export type { PendingDefault as CirclePendingDefault } from "@/lib/circleTypes";
+
+// ─── Feature panels (Issues: join intro, timeline, member round summary) ──────
+import { buildJoinIntroContent } from "@/lib/joinIntro";
+import { JoinIntroBanner } from "@/components/JoinIntroBanner";
+import { CircleTimeline } from "@/components/CircleTimeline";
+import { computeMemberRoundSummary } from "@/lib/memberRoundSummary";
+import { MemberRoundSummary } from "@/components/MemberRoundSummary";
 
 interface Props {
   circleAddress: string;
@@ -752,6 +761,67 @@ export type RefreshResult =
   | { ok: true; data: CircleDetailData; fetchedAtMs: number }
   | { ok: false; error: RefreshError };
 
+// ─── Timeline event builder ───────────────────────────────────────────────────
+//
+// Synthesises raw-event-shaped objects from the already-loaded rounds data so
+// CircleTimeline can render a chronological view without an additional fetch.
+// Each round produces events for join actions, contributions, defaults, and
+// payout — all derived from what the indexer already returned.
+
+function buildTimelineEvents(data: CircleDetailData): unknown[] {
+  const events: unknown[] = [];
+
+  const allRounds = [
+    ...data.rounds,
+    ...data.openRounds,
+    ...(data.currentRound ? [data.currentRound] : []),
+  ];
+
+  for (const round of allRounds) {
+    // Contributions
+    for (const contrib of round.contributions) {
+      events.push({
+        type: "circle_contribute",
+        actor: contrib.member_address,
+        round: round.roundIndex,
+        amount: contrib.amount,
+        tx_hash: contrib.tx_hash,
+        ledger: null,
+        event_position: null,
+        timestamp: null,
+      });
+    }
+    // Defaults
+    for (const def of round.defaults) {
+      events.push({
+        type: "circle_default",
+        actor: def.member_address,
+        round: round.roundIndex,
+        penalty: def.penalty,
+        tx_hash: null,
+        ledger: null,
+        event_position: null,
+        timestamp: null,
+      });
+    }
+    // Payout
+    if (round.status === "completed" && round.recipient) {
+      events.push({
+        type: "circle_payout",
+        actor: round.recipient,
+        round: round.roundIndex,
+        amount: round.amount,
+        tx_hash: round.txHash,
+        ledger: null,
+        event_position: null,
+        timestamp: null,
+      });
+    }
+  }
+
+  return events;
+}
+
 export async function fetchCircleData(
   circleAddress: string,
   signal?: AbortSignal,
@@ -875,6 +945,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // ΓöÇΓöÇ Action state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
+  const [errorOperation, setErrorOperation] = useState<string | undefined>(undefined);
   const [error,        setError]        = useState<string>("");
   // Hash of the transaction that produced the current error (set when the
   // failure happened on-chain after submission) so the banner can link to
@@ -990,25 +1061,34 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // ΓöÇΓöÇ Wallet resolution ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   useEffect(() => {
-    let cancelled = false;
-    getWalletAddress()
-      .then((address) => {
-        if (cancelled) return;
-        if (address) {
-          setWalletAddress(address);
-          setWalletLoadState("connected");
-        } else {
-          setWalletLoadState("disconnected");
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        // WalletError with reason "not_installed" lands here
-        setWalletLoadState("not_installed");
-      });
-    return () => { cancelled = true; };
+    let generation = 0;
+    let disposed = false;
+    const resolve = async () => {
+      const current = ++generation;
+      txAbortRef.current?.abort();
+      refreshAbortRef.current?.abort();
+      setWalletAddress(null);
+      setWalletLoadState('loading');
+      setNetworkMismatch(null);
+      setDefaultConfirm(null);
+      setRetryAction(null);
+      setContributionReceipt(null);
+      setSuccess(null);
+      setError(''); setErrorTypedError(null); setErrorTxHash(null); setErrorOperation(undefined);
+      setIsManualRefreshing(false); setRefreshState('idle');
+      try {
+        const address = await getWalletAddress();
+        if (disposed || current !== generation) return;
+        setWalletAddress(address);
+        setWalletLoadState(address ? 'connected' : 'disconnected');
+      } catch {
+        if (!disposed && current === generation) setWalletLoadState('not_installed');
+      }
+    };
+    const stop = observeWalletChanges(() => { void resolve(); });
+    void resolve();
+    return () => { disposed = true; generation++; stop(); };
   }, []);
-
   // Build the invite URL client-side only.  useEffect never runs on the server,
   // so window.location is guaranteed to exist here ΓÇö no typeof guard needed.
   // Keeping this in an effect (rather than useMemo) also means the URL is only
@@ -1086,7 +1166,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // Actions are only allowed when data is fully ready.
   // This is the single authoritative gate for data completeness.
-  const actionsEnabled = dataReadiness === "ready" && walletLoadState !== "loading";
+  const deploymentReady = useDeploymentVerified();
+  const actionsEnabled = deploymentReady && dataReadiness === "ready" && walletLoadState === "connected";
   const networkCheck: NetworkCheckState =
     networkMismatch?.kind === "mismatch"
       ? "mismatch"
@@ -1296,6 +1377,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const ACTION_LOADING_LABELS   = TX_LOADING;
 
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
+    setErrorOperation(action);
+    if (!deploymentVerified() || walletLoadState !== 'connected') { setError('Verify deployment and reconnect your wallet before reviewing this action.'); return; }
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
@@ -1400,11 +1483,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         txCtrl.signal,
       );
 
+      if (txCtrl.signal.aborted) return;
       if (!result.success) {
-        const errMsg = result.typedError?.message || result.error || "Transaction failed";
+        const errMsg = result.typedError ? userMessageForError(result.typedError) : userMessageForError(parseContractError(result.error));
         setError(errMsg);
         setErrorTypedError(result.typedError ?? null);
-        if (isRetryableError(errMsg)) {
+        setErrorTxHash(result.txHash || null);
+        if (!result.txHash && isRetryableError(errMsg)) {
           setRetryAction(() => () => doAction(action, args));
         }
       } else {
@@ -1427,6 +1512,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
+      if (txCtrl.signal.aborted) return;
       // Issue #654: handle LocalCancelResult throws from invokeContract.
       // These are not transaction failures ΓÇö they mean the caller stopped
       // waiting.  Silently swallow them when the component is unmounting
@@ -1452,7 +1538,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         return;
       }
       const message = err instanceof Error ? err.message : "Unknown error";
-      setError(message);
+      setError(userMessageForError(parseContractError(message)));
       setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doAction(action, args));
@@ -1559,6 +1645,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   }, [defaultConfirm, dismissDefaultConfirm]);
 
   async function doDefault(memberAddress: string) {
+    setErrorOperation("mark_default");
+    if (!deploymentVerified() || walletLoadState !== 'connected') { setError('Verify deployment and reconnect your wallet before reviewing this action.'); return; }
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
@@ -1622,18 +1710,23 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     submittingRef.current = true;
     setLoading("default");
 
+    const txCtrl = new AbortController();
+    txAbortRef.current = txCtrl;
     try {
       const result = await invokeContract(
         circleAddress,
         "mark_default",
         [new Address(memberAddress).toScVal()],
         walletAddress,
+        txCtrl.signal,
       );
+      if (txCtrl.signal.aborted) return;
       if (!result.success) {
-        const errMsg = result.typedError?.message || result.error || "Transaction failed";
+        const errMsg = result.typedError ? userMessageForError(result.typedError) : userMessageForError(parseContractError(result.error));
         setError(errMsg);
         setErrorTypedError(result.typedError ?? null);
-        if (isRetryableError(errMsg)) {
+        setErrorTxHash(result.txHash || null);
+        if (!result.txHash && isRetryableError(errMsg)) {
           setRetryAction(() => () => doDefault(memberAddress));
         }
       } else {
@@ -1645,8 +1738,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
+      if (txCtrl.signal.aborted) return;
       const message = err instanceof Error ? err.message : "Unknown error";
-      setError(message);
+      setError(userMessageForError(parseContractError(message)));
       setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doDefault(memberAddress));
@@ -1681,6 +1775,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   return (
     <div className="space-y-8">
+      <a href="/transactions" className="text-sm underline">Reopen recent transaction status</a>
 
       {/*
         Live announcement of status / round changes.
@@ -1785,6 +1880,24 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         totalRounds={data.circle.total_rounds}
       />
 
+      {/* Join introduction panel — advisory only, shown to non-members */}
+      {!isMember && walletLoadState !== "loading" && (
+        <JoinIntroBanner
+          content={buildJoinIntroContent({
+            status: data.circle.status,
+            joinedCount: data.members.filter(
+              (m) => BigInt(m.collateral || "0") > 0n,
+            ).length,
+            memberCount: data.circle.member_count,
+            roundAmountStroops: data.circle.round_amount,
+            isMember: false,
+            walletState: walletLoadState as "not_installed" | "disconnected" | "connected",
+            networkName: ACTIVE_NETWORK,
+            networkMismatch: networkMismatch?.kind === "mismatch",
+          })}
+        />
+      )}
+
       {/* Action panel */}
       <div className="bg-white rounded-xl border border-slate-200 p-5">
         <h2 className="font-semibold text-slate-800 mb-4">Actions</h2>
@@ -1814,6 +1927,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         {error && (
           <div className="mb-3">
             <DiagnosticsPanel
+              operation={errorOperation}
               typedError={errorTypedError}
               txHash={errorTxHash}
             />
@@ -2285,7 +2399,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                         actionsEnabled && (
                           <button
                             onClick={() => handleMarkDefault(member.member_address)}
-                            disabled={loading !== null}
+                            disabled={loading !== null || !actionsEnabled}
                             className="text-xs text-red-600 hover:text-red-800 underline disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             Mark Default
@@ -2360,9 +2474,31 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         </div>
       )}
 
+      {/* Activity timeline — only shown when there are any rounds of data */}
+      {(data.rounds.length > 0 || data.openRounds.length > 0) && (
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <CircleTimeline
+            rawEvents={buildTimelineEvents(data)}
+            fetchedAt={data.checkpointTime ?? null}
+          />
+        </div>
+      )}
+
+      {/* Per-member round summary — shown for the connected wallet member */}
+      {isMember && myMember && (data.rounds.length > 0 || data.openRounds.length > 0) && (
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <MemberRoundSummary
+            summary={computeMemberRoundSummary(
+              myMember.member_address,
+              [...data.rounds, ...data.openRounds, ...(data.currentRound ? [data.currentRound] : [])],
+              data.circle.status as import("@/lib/circleTypes").CircleApiStatus,
+            )}
+          />
+        </div>
+      )}
+
       {/* Invite link */}
-      <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
-        <h2 className="font-semibold text-slate-700 mb-2">≡ƒöù Invite link</h2>
+      <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">        <h2 className="font-semibold text-slate-700 mb-2">≡ƒöù Invite link</h2>
         <p className="text-xs text-slate-500 mb-2">
           Share this link so members can find and join this circle:
         </p>
