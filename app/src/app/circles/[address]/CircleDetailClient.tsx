@@ -4,6 +4,8 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/stellar";
 import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK, NETWORK_PASSPHRASE } from "@/lib/config";
+import { leaseKey, tryAcquireLease, releaseLease } from "@/lib/actionLease";
+import { subscribeIndexerUpdates } from "@/lib/indexerUpdates";
 import { parseMemberRows } from "@/lib/members";
 import { isSorobanContractId } from "@/lib/address";
 import { parseContractError, userMessageForError, type ContractAppError } from "@/lib/contractErrors";
@@ -929,6 +931,11 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   // Refresh error message when a manual refresh fails
   const [manualRefreshError, setManualRefreshError] = useState<string>("");
 
+  // Issue #797: tracks whether a confirmed tx is still waiting for the
+  // indexer to ingest it. Informational only — never implies confirmation.
+  // Cleared on the next successful refresh (manual, post-action, or push).
+  const [awaitingIndex, setAwaitingIndex] = useState(false);
+
   // ΓöÇΓöÇ Staleness tracking ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
   // Re-evaluated every second so the stale banner appears automatically once
@@ -1218,7 +1225,38 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     }
 
     setIsManualRefreshing(false);
+    setAwaitingIndex(false);
   }, [circleAddress, isManualRefreshing]);
+
+  // Issue #797: bounded push-style discovery of indexed changes. Prefers SSE
+  // when NEXT_PUBLIC_INDEXER_EVENTS_URL is set, else bounded polling; both
+  // are cancelled on route change/unmount and fall back to manual refresh.
+  useEffect(() => {
+    if (!awaitingIndex) return;
+    const ctrl = new AbortController();
+    const streamUrl =
+      typeof process.env.NEXT_PUBLIC_INDEXER_EVENTS_URL === "string" &&
+      process.env.NEXT_PUBLIC_INDEXER_EVENTS_URL !== ""
+        ? `${process.env.NEXT_PUBLIC_INDEXER_EVENTS_URL}?circle=${encodeURIComponent(circleAddress)}`
+        : null;
+    const sub = subscribeIndexerUpdates({
+      circleAddress,
+      streamUrl,
+      fetchLedger: async () => {
+        const r = await fetchCircleData(circleAddress, ctrl.signal);
+        return r.ok ? r.data.latestLedger : null;
+      },
+      onUpdate: () => {
+        setAwaitingIndex(false);
+        void handleManualRefresh();
+      },
+      signal: ctrl.signal,
+    });
+    return () => {
+      ctrl.abort();
+      sub.stop();
+    };
+  }, [awaitingIndex, circleAddress, handleManualRefresh]);
 
   // ΓöÇΓöÇ Post-action refresh ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   //
@@ -1238,6 +1276,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
       setData(result.data);
       setDataFetchedAtMs(result.fetchedAtMs);
       setRefreshState("idle");
+      // The immediate re-fetch may predate indexer ingestion; keep watching
+      // (bounded) so the page discovers the indexed change without a manual refresh.
+      setAwaitingIndex(true);
     } else if (result.error === "network") {
       // Genuine network failure after action ΓÇö show warning
       setRefreshState("error");
@@ -1266,6 +1307,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     // conditions where a second invocation begins before the first has
     // flushed the loading state.
     if (submittingRef.current) return;
+
+    // Issue #800: cross-tab UX guard — same network/circle/member/action in
+    // another tab shows a notice instead of a second wallet prompt. Contract
+    // validation remains authoritative; this never blocks on-chain truth.
+    const actionLease = walletAddress
+      ? leaseKey({ network: NETWORK_PASSPHRASE, circle: circleAddress, member: walletAddress, action })
+      : null;
+    if (actionLease && !tryAcquireLease(actionLease)) {
+      setError(
+        "The same action appears to be in progress in another tab. " +
+          "Finish or cancel it there first — this guard expires automatically.",
+      );
+      return;
+    }
 
     if (!isSorobanContractId(circleAddress)) {
       setError(invalidCircleAddress(shortAddress(circleAddress)));
@@ -1405,6 +1460,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     } finally {
       setLoading(null);
       submittingRef.current = false;
+      // Issue #800: always release the cross-tab lease so stale locks recover.
+      if (actionLease) releaseLease(actionLease);
       // Clear the ref so a stale controller doesn't block future actions.
       if (txAbortRef.current === txCtrl) txAbortRef.current = null;
     }
@@ -1802,6 +1859,20 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                   aria-hidden="true"
                 />
                 Refreshing circle dataΓÇª
+              </p>
+            )}
+            {awaitingIndex && refreshState !== "refreshing" && (
+              <p className="text-xs text-slate-500" role="status">
+                Transaction confirmed on-chain. Waiting for the indexer to
+                show it — this page will update automatically, or{" "}
+                <button
+                  onClick={handleManualRefresh}
+                  disabled={isManualRefreshing}
+                  className="underline font-medium hover:text-slate-700 disabled:opacity-50"
+                >
+                  refresh manually
+                </button>
+                .
               </p>
             )}
             {refreshState === "error" && (
