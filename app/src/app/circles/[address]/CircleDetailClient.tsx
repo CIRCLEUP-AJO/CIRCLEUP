@@ -59,6 +59,13 @@ export type { CircleMember, ContributionRecord, DefaultRecord, CircleRound, Circ
 // building without changes.
 export type { PendingDefault as CirclePendingDefault } from "@/lib/circleTypes";
 
+// ─── Feature panels (Issues: join intro, timeline, member round summary) ──────
+import { buildJoinIntroContent } from "@/lib/joinIntro";
+import { JoinIntroBanner } from "@/components/JoinIntroBanner";
+import { CircleTimeline } from "@/components/CircleTimeline";
+import { computeMemberRoundSummary } from "@/lib/memberRoundSummary";
+import { MemberRoundSummary } from "@/components/MemberRoundSummary";
+
 interface Props {
   circleAddress: string;
   circleData: CircleDetailData;
@@ -752,6 +759,67 @@ export type RefreshError = "not_found" | "network" | "server" | "misconfigured";
 export type RefreshResult =
   | { ok: true; data: CircleDetailData; fetchedAtMs: number }
   | { ok: false; error: RefreshError };
+
+// ─── Timeline event builder ───────────────────────────────────────────────────
+//
+// Synthesises raw-event-shaped objects from the already-loaded rounds data so
+// CircleTimeline can render a chronological view without an additional fetch.
+// Each round produces events for join actions, contributions, defaults, and
+// payout — all derived from what the indexer already returned.
+
+function buildTimelineEvents(data: CircleDetailData): unknown[] {
+  const events: unknown[] = [];
+
+  const allRounds = [
+    ...data.rounds,
+    ...data.openRounds,
+    ...(data.currentRound ? [data.currentRound] : []),
+  ];
+
+  for (const round of allRounds) {
+    // Contributions
+    for (const contrib of round.contributions) {
+      events.push({
+        type: "circle_contribute",
+        actor: contrib.member_address,
+        round: round.roundIndex,
+        amount: contrib.amount,
+        tx_hash: contrib.tx_hash,
+        ledger: null,
+        event_position: null,
+        timestamp: null,
+      });
+    }
+    // Defaults
+    for (const def of round.defaults) {
+      events.push({
+        type: "circle_default",
+        actor: def.member_address,
+        round: round.roundIndex,
+        penalty: def.penalty,
+        tx_hash: null,
+        ledger: null,
+        event_position: null,
+        timestamp: null,
+      });
+    }
+    // Payout
+    if (round.status === "completed" && round.recipient) {
+      events.push({
+        type: "circle_payout",
+        actor: round.recipient,
+        round: round.roundIndex,
+        amount: round.amount,
+        tx_hash: round.txHash,
+        ledger: null,
+        event_position: null,
+        timestamp: null,
+      });
+    }
+  }
+
+  return events;
+}
 
 export async function fetchCircleData(
   circleAddress: string,
@@ -1811,6 +1879,24 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         totalRounds={data.circle.total_rounds}
       />
 
+      {/* Join introduction panel — advisory only, shown to non-members */}
+      {!isMember && walletLoadState !== "loading" && (
+        <JoinIntroBanner
+          content={buildJoinIntroContent({
+            status: data.circle.status,
+            joinedCount: data.members.filter(
+              (m) => BigInt(m.collateral || "0") > 0n,
+            ).length,
+            memberCount: data.circle.member_count,
+            roundAmountStroops: data.circle.round_amount,
+            isMember: false,
+            walletState: walletLoadState as "not_installed" | "disconnected" | "connected",
+            networkName: ACTIVE_NETWORK,
+            networkMismatch: networkMismatch?.kind === "mismatch",
+          })}
+        />
+      )}
+
       {/* Action panel */}
       <div className="bg-white rounded-xl border border-slate-200 p-5">
         <h2 className="font-semibold text-slate-800 mb-4">Actions</h2>
@@ -2387,9 +2473,31 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         </div>
       )}
 
+      {/* Activity timeline — only shown when there are any rounds of data */}
+      {(data.rounds.length > 0 || data.openRounds.length > 0) && (
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <CircleTimeline
+            rawEvents={buildTimelineEvents(data)}
+            fetchedAt={data.checkpointTime ?? null}
+          />
+        </div>
+      )}
+
+      {/* Per-member round summary — shown for the connected wallet member */}
+      {isMember && myMember && (data.rounds.length > 0 || data.openRounds.length > 0) && (
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <MemberRoundSummary
+            summary={computeMemberRoundSummary(
+              myMember.member_address,
+              [...data.rounds, ...data.openRounds, ...(data.currentRound ? [data.currentRound] : [])],
+              data.circle.status as import("@/lib/circleTypes").CircleApiStatus,
+            )}
+          />
+        </div>
+      )}
+
       {/* Invite link */}
-      <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
-        <h2 className="font-semibold text-slate-700 mb-2">≡ƒöù Invite link</h2>
+      <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">        <h2 className="font-semibold text-slate-700 mb-2">≡ƒöù Invite link</h2>
         <p className="text-xs text-slate-500 mb-2">
           Share this link so members can find and join this circle:
         </p>
