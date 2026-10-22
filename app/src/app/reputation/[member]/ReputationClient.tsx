@@ -1,5 +1,6 @@
 "use client";
 
+import { indexerFetch } from "@/lib/indexerFetch";
 import { useState, useEffect, useCallback } from "react";
 import { indexerEndpoint, shortAddress } from "@/lib/config";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
@@ -113,13 +114,13 @@ async function fetchReputation(member: string, signal?: AbortSignal): Promise<Fe
   if (!isCanonicalStellarAddress(member)) {
     return { ok: false, reason: "not_found" };
   }
-  // A misconfigured NEXT_PUBLIC_INDEXER_URL must not fall through to fetch():
+  // A misconfigured NEXT_PUBLIC_INDEXER_URL must not fall through to indexerFetch():
   // a scheme-less value is a relative URL here, so the request would hit this
   // Next app, 404, and render "No reputation record found" for a real member.
   const url = indexerEndpoint(["reputation", member]);
   if (url === null) return { ok: false, reason: "misconfigured" };
   try {
-    const res = await fetch(url, {
+    const res = await indexerFetch(url, {
       cache: "no-store",
       signal,
     });

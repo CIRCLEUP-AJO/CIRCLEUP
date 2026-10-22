@@ -1,3 +1,5 @@
+import * as path from "node:path";
+import { requestTracing } from "./requestTracing";
 /**
  * CircleUp REST API
  *
@@ -303,7 +305,7 @@ function isParseError<T>(result: ParseResult<T>): result is { error: string } {
 function parsePage(value: unknown): ParseResult<number> {
   if (value === undefined) return DEFAULT_PAGE;
   const n = Number(value);
-  if (!Number.isInteger(n) || n < 1) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(n) || n < 1 || n > Math.floor(Number.MAX_SAFE_INTEGER / MAX_LIMIT)) {
     return { error: "page must be a positive integer" };
   }
   return n;
@@ -312,7 +314,7 @@ function parsePage(value: unknown): ParseResult<number> {
 function parseLimit(value: unknown): ParseResult<number> {
   if (value === undefined) return DEFAULT_LIMIT;
   const n = Number(value);
-  if (!Number.isInteger(n) || n < 1 || n > MAX_LIMIT) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(n) || n < 1 || n > MAX_LIMIT) {
     return { error: `limit must be an integer between 1 and ${MAX_LIMIT}` };
   }
   return n;
@@ -519,23 +521,9 @@ interface CircleStatusCountRow {
 export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
-  app.use(cors(buildCorsOptions()));
+  app.use(requestTracing);
+  app.use(cors({ ...buildCorsOptions(), exposedHeaders: ["X-Request-ID"] }));
   app.use(express.json());
-
-  app.use((req: Request, _res: Response, next: NextFunction) => {
-    const startedAt = Date.now();
-
-    _res.on("finish", () => {
-      logApiRequest({
-        method: req.method,
-        path: req.originalUrl || req.url,
-        statusCode: _res.statusCode,
-        durationMs: Date.now() - startedAt,
-      });
-    });
-
-    next();
-  });
 
   // cors() calls next(err) for rejected origins instead of sending a response
   // itself — without this handler, Express's default error page would leak a
@@ -545,8 +533,9 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       if (err.message.startsWith("Origin ")) {
         logApiCorsRejected({
           method: req.method,
-          path: req.originalUrl || req.url,
-          origin: req.headers.origin ?? undefined,
+          path: typeof req.route?.path === "string" ? req.route.path : "unmatched",
+          requestId: res.locals.requestId,
+          origin: undefined,
         });
         res.status(403).json({ error: err.message });
         return;
@@ -554,6 +543,10 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       next(err);
     },
   );
+
+  app.get("/openapi/v1.json", detailRateLimiter, (_req: Request, res: Response) => {
+    res.sendFile(path.resolve(__dirname, "../../docs/api/v1/openapi.json"));
+  });
 
   // ── Health ───────────────────────────────────────────────────────────────────
   //
@@ -629,7 +622,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
                   c.updated_at
            FROM circles c
            ${whereClause}
-           ORDER BY c.${sort} ${order.toUpperCase()}
+           ORDER BY c.${sort} ${order.toUpperCase()}, c.address ASC
            LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
           [...whereParams, limit, offset],
         ),
@@ -903,19 +896,23 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
       const [payouts, contributions, defaults] = await Promise.all([
         query<PayoutRow>(
-          `SELECT * FROM payouts WHERE circle_address = $1 ORDER BY round_index`,
+          `SELECT * FROM payouts WHERE circle_address = $1 ORDER BY round_index, id LIMIT 101`,
           [address],
         ),
         query<ContributionRow>(
-          `SELECT * FROM contributions WHERE circle_address = $1 ORDER BY round_index, created_at`,
+          `SELECT * FROM contributions WHERE circle_address = $1 ORDER BY round_index, created_at, id LIMIT 101`,
           [address],
         ),
         query<DefaultRow>(
-          `SELECT * FROM defaults WHERE circle_address = $1 ORDER BY round_index`,
+          `SELECT * FROM defaults WHERE circle_address = $1 ORDER BY round_index, id LIMIT 101`,
           [address],
         ),
       ]);
 
+      if ([payouts, contributions, defaults].some(rows => rows.length > MAX_LIMIT)) {
+        sendError(res, 413, "Grouped history exceeds 100 records per kind; use /circles/:address/history with page and limit");
+        return;
+      }
       // Single-pass grouping by round_index so contributions/defaults for
       // unpaid rounds are never silently dropped, and we avoid O(n×m)
       // filter scans per payout.
@@ -966,6 +963,24 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       console.error(`[api] Failed to load rounds for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle rounds", getErrorMessage(err));
     }
+  });
+
+  // Flat history preserves access to records too large for grouped responses.
+  app.get("/circles/:address/history", historyRateLimiter, async (req: Request, res: Response) => {
+    const address = parseAddress(req.params.address, "Circle address");
+    if (isParseError(address)) { res.status(400).json({ error: address.error }); return; }
+    const paging = parseHistoryPage(req, res);
+    if (!paging) return;
+    try {
+      const circle = await queryOne("SELECT address FROM circles WHERE address = $1", [address]);
+      if (!circle) { sendError(res, 404, "Circle not found"); return; }
+      const source = `SELECT 'contribution'::text AS kind, id, ledger, (to_jsonb(c) || jsonb_build_object('amount', c.amount::text, 'ledger', c.ledger::text)) AS record FROM contributions c WHERE circle_address = $1
+        UNION ALL SELECT 'default', id, ledger, (to_jsonb(d) || jsonb_build_object('penalty', d.penalty::text, 'ledger', d.ledger::text)) FROM defaults d WHERE circle_address = $1
+        UNION ALL SELECT 'payout', id, ledger, (to_jsonb(p) || jsonb_build_object('amount', p.amount::text, 'ledger', p.ledger::text)) FROM payouts p WHERE circle_address = $1`;
+      const events = await query(`SELECT kind, record FROM (${source}) h ORDER BY ledger ASC, kind ASC, id ASC LIMIT $2 OFFSET $3`, [address, paging.limit, paging.offset]);
+      const count = await queryExact<{ count: string }>(`SELECT COUNT(*)::text AS count FROM (${source}) h`, [address]);
+      res.json({ circle_address: address, events, pagination: historyMetadata(paging, Number(count.count)) });
+    } catch (err) { sendError(res, 500, "Failed to load circle history"); }
   });
 
   // ── Member contribution history endpoint (#541) ───────────────────────────────
@@ -1045,7 +1060,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
                   c.tx_hash, c.ledger, c.created_at
            FROM contributions c
            ${whereSql}
-           ORDER BY c.ledger DESC, c.round_index DESC, c.created_at DESC
+           ORDER BY c.ledger DESC, c.round_index DESC, c.created_at DESC, c.id DESC
            LIMIT $${whereParams.length + 1} OFFSET $${whereParams.length + 2}`,
           [...whereParams, limit, offset],
         ),
@@ -1096,6 +1111,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       return;
     }
     const member = memberResult;
+    const paging = parseHistoryPage(req, res);
+    if (!paging) return;
 
     // Optional ?circle=<address> narrows the contributions/defaults
     // breakdown to a single circle, e.g. for a member-in-circle detail view
@@ -1112,22 +1129,29 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         `SELECT * FROM reputation WHERE member_address = $1`,
         [member],
       );
+      const scope = `SELECT circle_address FROM contributions WHERE member_address = $1
+        UNION SELECT circle_address FROM defaults WHERE member_address = $1`;
+      const scopeSql = `SELECT circle_address FROM (${scope}) scope ${circleFilter ? "WHERE circle_address = $2" : ""}`;
+      const scopeParams = circleFilter ? [member, circleFilter] : [member];
+      const selected = await query<{ circle_address: string }>(`${scopeSql} ORDER BY circle_address ASC LIMIT $${scopeParams.length + 1} OFFSET $${scopeParams.length + 2}`, [...scopeParams, paging.limit, paging.offset]);
+      const selectedAddresses = selected.map(row => row.circle_address);
+      const count = await queryExact<{ count: string }>(`SELECT COUNT(*)::text AS count FROM (${scopeSql}) s`, scopeParams);
       const contributions = await query<ReputationContributionSummaryRow>(
         `SELECT c.circle_address, COUNT(*) as contributions,
                 ci.total_rounds
          FROM contributions c
          JOIN circles ci ON ci.address = c.circle_address
          WHERE c.member_address = $1
-         ${circleFilter ? "AND c.circle_address = $2" : ""}
-         GROUP BY c.circle_address, ci.total_rounds`,
-        circleFilter ? [member, circleFilter] : [member],
+         AND c.circle_address = ANY($2::text[])
+         GROUP BY c.circle_address, ci.total_rounds ORDER BY c.circle_address ASC`,
+        [member, selectedAddresses],
       );
       const defaults = await query<ReputationDefaultSummaryRow>(
         `SELECT circle_address, COUNT(*) as count
          FROM defaults WHERE member_address = $1
-         ${circleFilter ? "AND circle_address = $2" : ""}
-         GROUP BY circle_address`,
-        circleFilter ? [member, circleFilter] : [member],
+         AND circle_address = ANY($2::text[])
+         GROUP BY circle_address ORDER BY circle_address ASC`,
+        [member, selectedAddresses],
       );
 
       // A missing reputation row is not an error — it just means this member
@@ -1141,6 +1165,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       res.json({
         member,
         found: row != null,
+        pagination: historyMetadata(paging, Number(count.count)),
         // When `found` is false, the member has no recorded reputation activity
         // yet. This means either no reputation/increment event has been emitted
         // for this wallet address, or the indexer has not yet processed it.
@@ -1192,6 +1217,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       return;
     }
     const address = addressResult;
+    const paging = parseHistoryPage(req, res);
+    if (!paging) return;
 
     try {
       const [circle] = await query<Pick<CircleRow, "address">>(
@@ -1219,11 +1246,11 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
                 total_released, total_expected_collateral, close_reason, created_at
          FROM circle_audit_events
          WHERE circle_address = $1
-         ORDER BY created_at ASC`,
-        [address],
+         ORDER BY created_at ASC, id ASC LIMIT $2 OFFSET $3`,
+        [address, paging.limit, paging.offset],
       );
-
-      res.json({ circle_address: address, events });
+      const count = await queryExact<{ count: string }>("SELECT COUNT(*)::text AS count FROM circle_audit_events WHERE circle_address = $1", [address]);
+      res.json({ circle_address: address, events, pagination: historyMetadata(paging, Number(count.count)) });
     } catch (err) {
       console.error(`[api] Failed to load audit events for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle audit events", getErrorMessage(err));
@@ -1448,6 +1475,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       res.status(status === "ok" ? 200 : 503).json({
         status,
         running,
+        backfill: metrics.backfill,
         events: {
           processed: metrics.totalEventsProcessed,
           failed: metrics.totalEventsFailed,
@@ -1488,7 +1516,7 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     let ledger: number | undefined;
     if (req.query.ledger !== undefined) {
       const n = Number(req.query.ledger);
-      if (!Number.isInteger(n) || n < 0) {
+      if (typeof req.query.ledger !== "string" || !/^[0-9]+$/.test(req.query.ledger) || !Number.isSafeInteger(n) || n < 0) {
         sendError(res, 400, "ledger must be a non-negative integer");
         return;
       }
@@ -1543,13 +1571,28 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
     const message = getErrorMessage(err);
     logApiRequestError({
       method: req.method,
-      path: req.originalUrl || req.url,
+      path: typeof req.route?.path === "string" ? req.route.path : "unmatched",
+          requestId: res.locals.requestId,
       statusCode: 500,
-      error: message,
+      error: "Request failed",
     });
     console.error("[api] Unhandled error", err);
     sendError(res, 500, "Internal server error", message);
   });
 
   return app;
+}
+
+function parseHistoryPage(req: Request, res: Response): { page: number; limit: number; offset: number } | null {
+  const page = parsePage(req.query.page);
+  const limit = parseLimit(req.query.limit);
+  if (isParseError(page) || isParseError(limit)) {
+    res.status(400).json({ error: [page, limit].filter(isParseError).map(e => e.error).join("; ") });
+    return null;
+  }
+  return { page, limit, offset: (page - 1) * limit };
+}
+function historyMetadata(p: { page: number; limit: number }, total: number) {
+  const totalPages = Math.ceil(total / p.limit);
+  return { page: p.page, limit: p.limit, total, totalPages, hasMore: p.page < totalPages };
 }

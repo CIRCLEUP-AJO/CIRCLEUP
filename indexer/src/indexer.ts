@@ -1,3 +1,5 @@
+import { BatchLimitError, batchEnd } from "./backfill";
+import { BACKFILL_MAX_LEDGERS, BACKFILL_MAX_EVENTS, BACKFILL_MAX_PAGES } from "./config";
 /**
  * CircleUp Event Indexer
  *
@@ -757,13 +759,6 @@ async function getLastLedger(): Promise<number> {
   return rows.length > 0 ? Number(rows[0].last_ledger) : 0;
 }
 
-async function setLastLedger(ledger: number) {
-  await query(
-    "UPDATE indexer_state SET last_ledger = $1, updated_at = NOW() WHERE id = 1",
-    [ledger],
-  );
-}
-
 // ─── Event handlers ───────────────────────────────────────────────────────────
 
 async function handleFactoryCircleCreated(client: PoolClient, event: SdkEvent) {
@@ -1381,6 +1376,8 @@ export interface FetchAllEventsOptions {
   limit?: number;
   label?: string;
   maxPages?: number;
+  maxEvents?: number;
+  shouldStop?: () => boolean;
 }
 
 /**
@@ -1394,7 +1391,7 @@ export interface FetchAllEventsOptions {
  *     1. An empty events array is returned.
  *     2. Fewer than `limit` events are returned.
  *     3. All events on the current page have `ledger > toLedger`.
- *     4. Cursor does not progress (loop guard).
+ *     4. A stalled cursor or exhausted page/event budget throws (never partial success).
  * - If ANY page fetch fails, the entire function throws without returning partial events.
  *   This ensures that the poll cycle aborts and the cursor in indexer_state is NOT advanced,
  *   preserving un-ingested events for safe replay.
@@ -1411,7 +1408,9 @@ export async function fetchAllEventsWithPagination(
     filters,
     limit = EVENTS_LIMIT,
     label = "getEvents(paginated)",
-    maxPages = 1000,
+    maxPages = BACKFILL_MAX_PAGES,
+    maxEvents = BACKFILL_MAX_EVENTS,
+    shouldStop = () => false,
   } = options;
 
   const allEvents: SdkEvent[] = [];
@@ -1420,6 +1419,7 @@ export async function fetchAllEventsWithPagination(
   let previousCursor: string | undefined = undefined;
 
   while (pageCount < maxPages) {
+    if (shouldStop()) throw new Error("Backfill interrupted before checkpoint");
     pageCount++;
     const currentCursor = cursor;
     const isFirstPage = currentCursor === undefined;
@@ -1435,14 +1435,19 @@ export async function fetchAllEventsWithPagination(
       rpcClient.getEvents(queryParams),
     );
 
+    if (Number.isSafeInteger(response.latestLedger) && response.latestLedger < toLedger) throw new Error("RPC has not retained the complete requested range");
     const events = response.events || [];
+    for (let i = 0; i < events.length; i++) {
+      if (!Number.isSafeInteger(events[i].ledger) || events[i].ledger < fromLedger || (i > 0 && events[i].ledger < events[i - 1].ledger)) throw new Error("RPC returned an invalid or unordered ledger range");
+    }
     if (events.length === 0) {
-      break;
+      return allEvents;
     }
 
     let reachedBeyondWindow = false;
     for (const ev of events) {
       if (ev.ledger <= toLedger) {
+        if (allEvents.length >= maxEvents) throw new BatchLimitError("Event budget exceeded; reduce ledger batch size");
         allEvents.push(ev);
       } else {
         reachedBeyondWindow = true;
@@ -1450,25 +1455,25 @@ export async function fetchAllEventsWithPagination(
     }
 
     if (reachedBeyondWindow) {
-      break;
+      return allEvents;
     }
 
     if (events.length < limit) {
-      break;
+      return allEvents;
     }
 
     const lastEvent = events[events.length - 1];
     const nextCursor = (response as any).cursor || (lastEvent as any).pagingToken || lastEvent.id;
 
     if (!nextCursor || nextCursor === previousCursor) {
-      break;
+      throw new Error("RPC pagination cursor did not advance");
     }
 
     previousCursor = nextCursor;
     cursor = nextCursor;
   }
 
-  return allEvents;
+  throw new BatchLimitError("Page budget exhausted before range completion");
 }
 
 /**
@@ -1481,10 +1486,10 @@ export async function fetchAllEventsWithPagination(
  * ledger as circle_created are not missed.
  *
  * The cursor in indexer_state is advanced per ledger inside processLedger.
- * After all event-carrying ledgers are done, setLastLedger advances the
+ * After all event-carrying ledgers are done, an empty processLedger transaction advances the
  * cursor to toLedger to cover any trailing empty ledgers.
  */
-export async function processEvents(fromLedger: number, toLedger: number) {
+export async function processEvents(fromLedger: number, toLedger: number, shouldStop: () => boolean = () => false) {
   const startedAt = Date.now();
 
   // ── 1. Fetch factory + reputation events (with full pagination) ──────────
@@ -1499,6 +1504,7 @@ export async function processEvents(fromLedger: number, toLedger: number) {
     ],
     limit: EVENTS_LIMIT,
     label: "getEvents(factory+reputation)",
+    shouldStop,
   });
 
   // Verify range consistency (Issue 98)
@@ -1532,28 +1538,24 @@ export async function processEvents(fromLedger: number, toLedger: number) {
 
   // ── 4. Fetch circle contract events (with full pagination) ───────────────
   let circleEvents: SdkEvent[] = [];
-  if (allCircleAddrs.length > 0) {
-    circleEvents = await fetchAllEventsWithPagination(rpc, {
-      fromLedger,
-      toLedger,
-      filters: [{ type: "contract", contractIds: allCircleAddrs }],
-      limit: EVENTS_LIMIT,
-      label: "getEvents(circles)",
+  // Provider filters are bounded to five contract IDs; requests stay serial.
+  for (let offset = 0; offset < allCircleAddrs.length; offset += 5) {
+    const events = await fetchAllEventsWithPagination(rpc, {
+      fromLedger, toLedger, shouldStop,
+      filters: [{ type: "contract", contractIds: allCircleAddrs.slice(offset, offset + 5) }],
+      maxEvents: Math.max(1, BACKFILL_MAX_EVENTS - factoryEvents.length - circleEvents.length),
     });
-
-    // Verify range consistency (Issue 98)
-    const circleContradiction = detectEventRangeContradiction(circleEvents, fromLedger, toLedger);
-    if (circleContradiction) {
-      logLedgerContradiction(circleContradiction);
-      throw new LedgerContradictionError(circleContradiction);
-    }
+    circleEvents.push(...events);
+    if (factoryEvents.length + circleEvents.length > BACKFILL_MAX_EVENTS) throw new BatchLimitError("Combined event budget exceeded");
+    const contradiction = detectEventRangeContradiction(events, fromLedger, toLedger);
+    if (contradiction) throw new LedgerContradictionError(contradiction);
   }
 
   // ── 5. Build (event, handler) pairs ──────────────────────────────────────
   // routeEvent checks every event against the schema registry; unknown or
   // incompatible shapes get a quarantine handler instead of being dropped.
   const items: EventHandler[] = [];
-  for (const event of [...factoryResponse.events, ...circleEvents]) {
+  for (const event of [...factoryEvents, ...circleEvents]) {
     const item = routeEvent(event);
     if (item) items.push(item);
   }
@@ -1581,7 +1583,10 @@ export async function processEvents(fromLedger: number, toLedger: number) {
   let totalFailed = 0;
 
   for (const ledger of sortedLedgers) {
+    if (shouldStop()) throw new Error("Backfill interrupted at durable ledger boundary");
     const { processed, failed } = await processLedger(ledger, byLedger.get(ledger)!);
+    backfillProgress.durableLedger = ledger;
+    backfillProgress.remainingLedgers = Math.max(0, backfillProgress.headLedger - ledger);
     totalSeen += processed;
     totalFailed += failed;
   }
@@ -1593,8 +1598,10 @@ export async function processEvents(fromLedger: number, toLedger: number) {
   const lastEventLedger = sortedLedgers.length > 0
     ? sortedLedgers[sortedLedgers.length - 1]
     : 0;
+  if (shouldStop()) throw new Error("Backfill interrupted before trailing checkpoint");
   if (lastEventLedger < toLedger) {
-    await setLastLedger(toLedger);
+    await processLedger(toLedger, []);
+    backfillProgress.durableLedger = toLedger;
   }
 
   const durationMs = Date.now() - startedAt;
@@ -1688,7 +1695,9 @@ export async function runPollCycle(): Promise<void> {
   if (lastLedger === 0) lastLedger = START_LEDGER;
 
   const latestLedger = await withRpcRetry("getLatestLedger", () => rpc.getLatestLedger());
-  const toLedger = latestLedger.sequence;
+  const headLedger = latestLedger.sequence;
+  const toLedger = batchEnd(lastLedger + 1, headLedger, BACKFILL_MAX_LEDGERS);
+  backfillProgress = { durableLedger: lastLedger, headLedger, fromLedger: lastLedger + 1, toLedger, remainingLedgers: Math.max(0, headLedger - lastLedger), estimatedBatches: Math.ceil(Math.max(0, headLedger - lastLedger) / BACKFILL_MAX_LEDGERS) };
 
   // Issue 98: Detect contradictory ledger sequence regression
   const contradiction = detectLedgerSequenceRegression(lastLedger, toLedger, latestLedger.id);
@@ -1698,7 +1707,19 @@ export async function runPollCycle(): Promise<void> {
   }
 
   if (toLedger > lastLedger) {
-    await processEvents(lastLedger + 1, toLedger);
+    // Shrink a dense range without committing any partially fetched pages.
+    let end = toLedger;
+    while (true) {
+      backfillProgress.toLedger = end;
+      try { await processEvents(lastLedger + 1, end, () => shuttingDown); break; }
+      catch (err) {
+        if (!(err instanceof BatchLimitError) || end <= lastLedger + 1) throw err;
+        end = lastLedger + Math.max(1, Math.floor((end - lastLedger) / 2));
+      }
+    }
+    backfillProgress = { ...backfillProgress, toLedger: end, durableLedger: await getLastLedger() };
+    backfillProgress.remainingLedgers = Math.max(0, headLedger - backfillProgress.durableLedger);
+    backfillProgress.estimatedBatches = Math.ceil(backfillProgress.remainingLedgers / BACKFILL_MAX_LEDGERS);
   }
   
   // Success — reset backoff so the next failure starts from the initial interval
@@ -1706,7 +1727,7 @@ export async function runPollCycle(): Promise<void> {
   
   pollCyclesCompleted++;
   lastPollDurationMs = Date.now() - cycleStartedAt;
-  lastPollLedgerRange = `${lastLedger + 1}-${toLedger}`;
+  lastPollLedgerRange = `${lastLedger + 1}-${backfillProgress.durableLedger}`;
 }
 
 // ─── Poller lifecycle (graceful shutdown) ─────────────────────────────────────
@@ -1857,8 +1878,11 @@ export function isIndexerRunning(): boolean {
   return indexerStarted && !shuttingDown;
 }
 
+let backfillProgress = { durableLedger: 0, headLedger: 0, fromLedger: 0, toLedger: 0, remainingLedgers: 0, estimatedBatches: 0 };
+
 export function getIndexerMetrics() {
   return {
+    backfill: { ...backfillProgress, maxLedgers: BACKFILL_MAX_LEDGERS, maxEvents: BACKFILL_MAX_EVENTS, concurrency: 1 },
     totalEventsProcessed,
     totalEventsFailed,
     totalEventsSkipped,

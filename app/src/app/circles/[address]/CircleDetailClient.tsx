@@ -1,4 +1,5 @@
 "use client";
+import { indexerFetch } from "@/lib/indexerFetch";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/stellar";
@@ -836,8 +837,8 @@ export async function fetchCircleData(
 
   try {
     [circleRes, roundsRes] = await Promise.all([
-      fetch(circleUrl, { cache: "no-store", signal }),
-      fetch(roundsUrl, { cache: "no-store", signal }),
+      indexerFetch(circleUrl, { cache: "no-store", signal }),
+      indexerFetch(roundsUrl, { cache: "no-store", signal }),
     ]);
   } catch (err) {
     // AbortError is not a real failure ΓÇö the component unmounted during refresh

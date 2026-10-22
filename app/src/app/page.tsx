@@ -1,3 +1,4 @@
+import { indexerFetch } from "@/lib/indexerFetch";
 import { Suspense } from "react";
 import Link from "next/link";
 import type { Metadata } from "next";
@@ -75,7 +76,7 @@ function makeGetCircles(params: BrowseParams) {
 
       let res: Response;
       try {
-        res = await fetch(url, {
+        res = await indexerFetch(url, {
           cache: "no-store",
           signal: AbortSignal.timeout(INDEXER_TIMEOUT_MS),
         });
