@@ -34,7 +34,7 @@
 
 import { SorobanRpc, xdr, scValToNative, Contract } from "@stellar/stellar-sdk";
 import type { MigrationHealth } from "./db/migrate";
-import { query } from "./db/pool";
+import { query, getPoolStats, PoolSaturationError } from "./db/pool";
 import { isUndefinedTable, summarizeOpenEventFailures } from "./eventFailures";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -143,12 +143,39 @@ export async function checkDbConnectivity(): Promise<ComponentHealth> {
   const start = Date.now();
   try {
     await withTimeout(query("SELECT 1"), HEALTH_TIMEOUT_MS);
-    return { status: "ok", latencyMs: Date.now() - start };
-  } catch (err) {
+    const stats = getPoolStats();
+    // Report saturation as degraded even when the SELECT 1 succeeds, so a
+    // health-poller sees the pressure before the next request fails.
+    const saturated = stats.waitingCount > 0;
     return {
-      status: "error",
+      status: saturated ? "degraded" : "ok",
+      latencyMs: Date.now() - start,
+      ...(saturated
+        ? {
+            error: `Pool pressure detected: ${stats.waitingCount} caller(s) waiting for a connection (${stats.totalCount}/${stats.max} checked out)`,
+          }
+        : {}),
+      details: {
+        poolMax: stats.max,
+        totalConnections: stats.totalCount,
+        idleConnections: stats.idleCount,
+        waitingCallers: stats.waitingCount,
+      },
+    };
+  } catch (err) {
+    const stats = getPoolStats();
+    const isSaturation = err instanceof PoolSaturationError;
+    return {
+      status: isSaturation ? "degraded" : "error",
       latencyMs: Date.now() - start,
       error: err instanceof Error ? err.message : String(err),
+      details: {
+        poolMax: stats.max,
+        totalConnections: stats.totalCount,
+        idleConnections: stats.idleCount,
+        waitingCallers: stats.waitingCount,
+        saturated: isSaturation,
+      },
     };
   }
 }

@@ -246,6 +246,115 @@ export function formatPot(
   return formatUsdc(n * BigInt(memberCount));
 }
 
+// ─── Amount unit labels ───────────────────────────────────────────────────────
+
+/**
+ * Unit label constants for monetary amounts.
+ *
+ * Every user-visible or exported amount must carry an unambiguous unit so that
+ * a decimal string cannot be mistaken for a raw token integer, or vice versa.
+ *
+ * Usage guide:
+ *
+ *   UNIT_STROOPS      Append to raw on-chain / wire amounts:
+ *                     `"${amount} ${UNIT_STROOPS}"` → "15000000 stroops"
+ *                     Use for: API wire fields, DB values, CSV amount_stroops.
+ *
+ *   UNIT_USDC         Append to human-readable USDC display strings produced
+ *                     by stroopsToUsdc() or formatUsdc():
+ *                     `"${formatUsdc(n)} ${UNIT_USDC}"` → "1.50 USDC"
+ *                     Use for: UI card stats, round-detail amounts, receipts.
+ *
+ *   UNIT_USDC_EXACT   Append to full-precision (7 dp) USDC strings that must
+ *                     round-trip exactly (CSV export, audit logs, SDK responses
+ *                     where the caller needs to re-convert to stroops):
+ *                     `"${csvFormatUsdc(n)} ${UNIT_USDC_EXACT}"` → "1.5000000 USDC (exact)"
+ *
+ * These are intentionally short constants rather than a formatting wrapper so
+ * existing call-sites can adopt them incrementally without changing the type
+ * of existing fields.
+ */
+
+/** Unit suffix for raw stroop integers: the smallest on-chain unit. */
+export const UNIT_STROOPS = "stroops" as const;
+
+/** Unit suffix for 2-decimal-place USDC display strings (display-only, truncated). */
+export const UNIT_USDC = "USDC" as const;
+
+/**
+ * Unit suffix for exact 7-decimal-place USDC strings (full precision, no
+ * rounding).  Distinguishes archival/round-trip values from 2-dp display.
+ */
+export const UNIT_USDC_EXACT = "USDC (exact)" as const;
+
+export type AmountUnit = typeof UNIT_STROOPS | typeof UNIT_USDC | typeof UNIT_USDC_EXACT;
+
+/**
+ * A monetary value paired with its unit label.
+ *
+ * Used in contexts where the value and unit must travel together — e.g. SDK
+ * response objects, structured log entries, and receipt objects — so the
+ * receiver cannot accidentally treat a stroop integer as a USDC display string
+ * or vice versa.
+ *
+ *   { amount: "15000000", unit: "stroops" }     raw wire value
+ *   { amount: "1.50",     unit: "USDC" }        display (2 dp, truncated)
+ *   { amount: "1.5000000", unit: "USDC (exact)" } archival (7 dp, exact)
+ */
+export interface TaggedAmount {
+  amount: string;
+  unit: AmountUnit;
+}
+
+/**
+ * Tag a raw stroop string (as returned by the indexer API) with the stroops
+ * unit label.  The value is validated to be a decimal integer string; any
+ * other input throws TypeError so a mis-labelled float is caught at the point
+ * of tagging rather than at an unexpected downstream failure.
+ *
+ * @throws TypeError when `stroops` is not a decimal integer string.
+ */
+export function tagStroops(stroops: string): TaggedAmount {
+  if (!/^-?\d+$/.test(stroops.trim())) {
+    throw new TypeError(
+      `tagStroops: expected a decimal integer string, got ${JSON.stringify(stroops)}. ` +
+        `Did you pass a USDC display string by mistake?`,
+    );
+  }
+  return { amount: stroops.trim(), unit: UNIT_STROOPS };
+}
+
+/**
+ * Convert a stroop integer (bigint | string | number) to a tagged 2-dp USDC
+ * display value.  Uses {@link formatUsdc} internally (truncates, never rounds
+ * up).  Returns `{ amount: "0.00", unit: "USDC" }` for invalid inputs.
+ */
+export function toDisplayUsdc(stroops: bigint | string | number): TaggedAmount {
+  return { amount: formatUsdc(stroops), unit: UNIT_USDC };
+}
+
+/**
+ * Convert a stroop integer (bigint | string | number) to a tagged exact
+ * 7-dp USDC string suitable for archival, CSV export, or round-trip conversion.
+ * Uses {@link stroopsToUsdc} then pads to 7 decimal places.
+ * Returns `{ amount: "0.0000000", unit: "USDC (exact)" }` for invalid inputs.
+ */
+export function toExactUsdc(stroops: bigint | string | number): TaggedAmount {
+  let n: bigint;
+  try {
+    n = BigInt(stroops.toString());
+  } catch {
+    return { amount: "0.0000000", unit: UNIT_USDC_EXACT };
+  }
+  if (n < 0n) return { amount: "0.0000000", unit: UNIT_USDC_EXACT };
+
+  // Build exact 7-dp string using pure BigInt arithmetic (no float).
+  const scale = 10n ** BigInt(USDC_DECIMALS);
+  const whole = n / scale;
+  const fraction = (n % scale).toString().padStart(USDC_DECIMALS, "0");
+  return { amount: `${whole}.${fraction}`, unit: UNIT_USDC_EXACT };
+}
+
 // ─── Ledger / time helpers ────────────────────────────────────────────────────
 //
 // UTC / rounding policy (single source of truth for schedule → ledger math):
