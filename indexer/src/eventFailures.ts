@@ -147,6 +147,12 @@ export function classifyHandlerError(err: unknown): HandlerErrorClass {
   if (/Connection terminated|connection is closed|Client has encountered a connection error/i.test(message)) {
     return "transient";
   }
+  // Pool saturation is a transient infrastructure condition: the DB is
+  // reachable but all connections are checked out.  The event must be retried
+  // after the pool recovers, not skipped and recorded as a permanent failure.
+  if (err != null && (err as { name?: unknown }).name === "PoolSaturationError") {
+    return "transient";
+  }
   return "permanent";
 }
 

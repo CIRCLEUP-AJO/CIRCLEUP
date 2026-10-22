@@ -1,14 +1,67 @@
 import { Pool, PoolClient, QueryResultRow } from "pg";
 import * as dotenv from "dotenv";
-import { DB_CONNECT_MAX_RETRIES, DB_CONNECT_BASE_DELAY_MS } from "../config";
+import {
+  DB_CONNECT_MAX_RETRIES,
+  DB_CONNECT_BASE_DELAY_MS,
+  DB_POOL_MAX,
+  DB_ACQUIRE_TIMEOUT_MS,
+  DB_STATEMENT_TIMEOUT_MS,
+} from "../config";
 
 dotenv.config();
 
+// ── Pool backpressure policy ──────────────────────────────────────────────────
+//
+// Three parameters govern how the pool handles concurrency pressure:
+//
+//   DB_POOL_MAX             — maximum active connections (default 10).
+//   DB_ACQUIRE_TIMEOUT_MS   — maximum wait before a caller receives a
+//                             PoolSaturationError instead of queuing forever
+//                             (default 5 000 ms, matches pg's default
+//                             connectionTimeoutMillis so existing behaviour is
+//                             preserved unless the operator overrides it).
+//   DB_STATEMENT_TIMEOUT_MS — Postgres-level per-query time-box: Postgres
+//                             cancels the query and returns an error to the
+//                             client, releasing the connection within a
+//                             bounded time (default 30 000 ms; 0 = disabled).
+//
+// These three together bound database demand, make overload explicit and
+// observable (PoolSaturationError vs silent queue), and ensure the poller
+// cannot advance a ledger checkpoint if a DB write times out.
+
+/**
+ * Thrown when all pool connections are checked out and a new `connect()` call
+ * cannot acquire one within `DB_ACQUIRE_TIMEOUT_MS`.
+ *
+ * Callers must NOT retry silently on this error — surfacing it lets operators
+ * see saturation via logs and the /health endpoint before it becomes an
+ * outage.  The HTTP layer maps this to 503 Service Unavailable.
+ */
+export class PoolSaturationError extends Error {
+  /** Total connections the pool is configured to hold. */
+  readonly poolMax: number;
+  /** Milliseconds the caller waited before giving up. */
+  readonly acquireTimeoutMs: number;
+
+  constructor(poolMax: number, acquireTimeoutMs: number) {
+    super(
+      `[db] Pool saturated: all ${poolMax} connection(s) are in use. ` +
+        `Acquisition timed out after ${acquireTimeoutMs}ms. ` +
+        `Increase DB_POOL_MAX or reduce concurrent DB consumers.`,
+    );
+    this.name = "PoolSaturationError";
+    this.poolMax = poolMax;
+    this.acquireTimeoutMs = acquireTimeoutMs;
+  }
+}
+
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 10,
+  max: DB_POOL_MAX,
   idleTimeoutMillis: 30_000,
-  connectionTimeoutMillis: 5_000,
+  // pg's own connection-timeout is kept in sync with our acquisition timeout
+  // so the two mechanisms agree on the wait budget.
+  connectionTimeoutMillis: DB_ACQUIRE_TIMEOUT_MS,
 });
 
 pool.on("error", (err) => {
@@ -35,6 +88,76 @@ function describeConnectionError(err: unknown): string {
     if (code) return code;
   }
   return String(err);
+}
+
+// ── Pool stats ────────────────────────────────────────────────────────────────
+
+/**
+ * A snapshot of the pool's current connection state.
+ *
+ * Exposed so the health check can include pool saturation in its /health
+ * response without importing the internal pg Pool fields directly.
+ */
+export interface PoolStats {
+  /** Maximum configured connections. */
+  max: number;
+  /** Connections currently checked out to callers. */
+  totalCount: number;
+  /** Connections idle in the pool (checked in). */
+  idleCount: number;
+  /** Callers waiting for a connection to become available. */
+  waitingCount: number;
+}
+
+/** Return a snapshot of the current pool connection counts. */
+export function getPoolStats(): PoolStats {
+  return {
+    max: DB_POOL_MAX,
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount,
+  };
+}
+
+// ── Connection acquisition with saturation detection ─────────────────────────
+
+/**
+ * Acquire a PoolClient, converting pg's generic connection-timeout error into
+ * a typed PoolSaturationError so callers and the health check can distinguish
+ * "pool is full" from other database errors.
+ *
+ * pg throws a plain Error("timeout exceeded") when
+ * connectionTimeoutMillis elapses before a free slot appears.  We detect this
+ * by the timeout message rather than by a specific error class because pg does
+ * not export a typed error for it.
+ */
+async function acquireClient(): Promise<PoolClient> {
+  try {
+    const client = await pool.connect();
+    return client;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // pg's internal connection-timeout message (stable across pg@8.x):
+    if (/timeout exceeded|connection timeout/i.test(msg)) {
+      throw new PoolSaturationError(DB_POOL_MAX, DB_ACQUIRE_TIMEOUT_MS);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Apply the statement_timeout to a newly acquired client so every query it
+ * runs is subject to the global budget.  A timeout of 0 leaves Postgres's
+ * default in place (usually no limit).
+ *
+ * This is called inside every public helper and withTransaction before the
+ * client is handed to the caller.  It adds one round-trip per checkout, which
+ * is negligible compared to typical query latencies.
+ */
+async function applyStatementTimeout(client: PoolClient): Promise<void> {
+  if (DB_STATEMENT_TIMEOUT_MS > 0) {
+    await client.query(`SET statement_timeout = ${DB_STATEMENT_TIMEOUT_MS}`);
+  }
 }
 
 /**
@@ -100,13 +223,16 @@ export async function connectWithRetry({
  *               `$2`, … (never interpolated directly).
  * @param params Query parameter values, in `$N` order.
  * @returns      Typed array of result rows; empty when no rows match.
+ * @throws       PoolSaturationError when the pool is full and DB_ACQUIRE_TIMEOUT_MS
+ *               elapses without a free connection becoming available.
  */
 export async function query<T extends QueryResultRow = QueryResultRow>(
   text: string,
   params?: unknown[],
 ): Promise<T[]> {
-  const client = await pool.connect();
+  const client = await acquireClient();
   try {
+    await applyStatementTimeout(client);
     const res = await client.query<T>(text, params);
     return res.rows;
   } finally {
@@ -129,6 +255,8 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
  * @param text   Parameterised SQL string.
  * @param params Query parameter values, in `$N` order.
  * @returns      First row typed as `T`, or `null` if the result set is empty.
+ * @throws       PoolSaturationError when the pool is full and DB_ACQUIRE_TIMEOUT_MS
+ *               elapses without a free connection becoming available.
  */
 export async function queryOne<T extends QueryResultRow = QueryResultRow>(
   text: string,
@@ -153,6 +281,8 @@ export async function queryOne<T extends QueryResultRow = QueryResultRow>(
  *                    `"Expected exactly one row but got none"`.
  * @returns           First row typed as `T`.
  * @throws            `Error` when the query returns zero rows.
+ * @throws            PoolSaturationError when the pool is full and
+ *                    DB_ACQUIRE_TIMEOUT_MS elapses.
  */
 export async function queryExact<T extends QueryResultRow = QueryResultRow>(
   text: string,
@@ -166,11 +296,28 @@ export async function queryExact<T extends QueryResultRow = QueryResultRow>(
   return row;
 }
 
+/**
+ * Run `fn` inside a single Postgres transaction, committing on success and
+ * rolling back on any error.
+ *
+ * Each event handler in the ingestion path wraps its writes in a SAVEPOINT
+ * (see processLedger) rather than calling withTransaction directly for inner
+ * retries — this outer transaction is the ledger-level atomicity boundary.
+ *
+ * The connection is always released in `finally` so a crash inside `fn`
+ * cannot leak a connection.
+ *
+ * @throws PoolSaturationError when the pool is full and DB_ACQUIRE_TIMEOUT_MS
+ *         elapses without a free connection.  The poller treats this as a
+ *         transient error (classifyHandlerError returns "transient") so the
+ *         ledger is retried after backoff without advancing the checkpoint.
+ */
 export async function withTransaction<T>(
   fn: (client: PoolClient) => Promise<T>,
 ): Promise<T> {
-  const client = await pool.connect();
+  const client = await acquireClient();
   try {
+    await applyStatementTimeout(client);
     await client.query("BEGIN");
     const result = await fn(client);
     await client.query("COMMIT");

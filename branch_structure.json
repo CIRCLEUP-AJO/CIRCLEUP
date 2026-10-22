@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/801-804-transaction-status-wallet-safety-diagnostics",
+    "fix/circle-state-indexer-reliability",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "feat/801-804-transaction-status-wallet-safety-diagnostics": "main",
+    "fix/circle-state-indexer-reliability": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "feat/801-804-transaction-status-wallet-safety-diagnostics",
+    "fix/circle-state-indexer-reliability",
+    "origin"
+  ]
+}
