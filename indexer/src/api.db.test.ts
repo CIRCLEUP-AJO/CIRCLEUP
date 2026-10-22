@@ -718,4 +718,32 @@ if (hasDb) {
       "004_query_plan_indexes migration must appear in the applied list",
     );
   });
+
+  test("bounded histories preserve maximum, final, empty pages and exact wire amounts", async () => {
+    const address = fixtureContractAddress("bounded-history");
+    const member = fixtureMemberAddress("bounded-history");
+    await seedCircle(address);
+    try {
+      await pool.query(`INSERT INTO contributions (circle_address, member_address, round_index, amount, tx_hash, ledger)
+        SELECT $1, $2, n, 9007199254740993, 'bounded-history-' || n, 2000
+        FROM generate_series(0, 100) AS n`, [address, member]);
+      const first = await request(app).get(`/circles/${address}/history?limit=100`);
+      assert.equal(first.status, 200);
+      assert.equal(first.body.events.length, 100);
+      assert.equal(first.body.events[0].record.amount, "9007199254740993");
+      assert.equal(typeof first.body.events[0].record.ledger, "string");
+      assert.equal(first.body.pagination.hasMore, true);
+      const final = await request(app).get(`/circles/${address}/history?limit=100&page=2`);
+      assert.equal(final.body.events.length, 1);
+      assert.equal(final.body.pagination.hasMore, false);
+      const ids = [...first.body.events, ...final.body.events].map((e: any) => e.record.id);
+      assert.equal(new Set(ids).size, 101);
+      const empty = await request(app).get(`/circles/${address}/history?limit=100&page=3`);
+      assert.deepEqual(empty.body.events, []);
+      assert.equal(empty.body.pagination.hasMore, false);
+      assert.equal((await request(app).get(`/circles/${address}/history?limit=101`)).status, 400);
+      assert.equal((await request(app).get(`/circles/${address}/rounds`)).status, 413);
+      assert.equal((await pool.query("SELECT COUNT(*)::int AS count FROM contributions WHERE circle_address = $1", [address])).rows[0].count, 101);
+    } finally { await cleanCircle(address); }
+  });
 }

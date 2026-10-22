@@ -1,3 +1,4 @@
+import { boundedInteger } from "./backfill";
 /**
  * Environment variable validation and typed config for the indexer.
  *
@@ -391,3 +392,8 @@ export const POLL_BACKOFF_MAX_MS = parsePollBackoffMaxMs(
 export const POLL_BACKOFF_MULTIPLIER = parsePollBackoffMultiplier(
   process.env.POLL_BACKOFF_MULTIPLIER,
 );
+
+// Polls remain serial; no additional database workers are created.
+export const BACKFILL_MAX_LEDGERS = boundedInteger("BACKFILL_MAX_LEDGERS", process.env.BACKFILL_MAX_LEDGERS, 100, 10000);
+export const BACKFILL_MAX_EVENTS = boundedInteger("BACKFILL_MAX_EVENTS", process.env.BACKFILL_MAX_EVENTS, 10000, 100000);
+export const BACKFILL_MAX_PAGES = boundedInteger("BACKFILL_MAX_PAGES", process.env.BACKFILL_MAX_PAGES, 100, 1000);

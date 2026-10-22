@@ -241,6 +241,7 @@ export interface MigrationCtx {
 }
 
 export interface ApiRequestCtx {
+  requestId?: string;
   method: string;
   path: string;
   statusCode: number;
@@ -248,6 +249,7 @@ export interface ApiRequestCtx {
 }
 
 export interface ApiRequestErrorCtx {
+  requestId?: string;
   method: string;
   path: string;
   statusCode?: number;
@@ -255,6 +257,7 @@ export interface ApiRequestErrorCtx {
 }
 
 export interface ApiCorsRejectedCtx {
+  requestId?: string;
   method: string;
   path: string;
   origin?: string;

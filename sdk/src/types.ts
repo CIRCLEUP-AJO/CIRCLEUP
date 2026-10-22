@@ -1451,7 +1451,7 @@ export interface ApiCircleRow {
   status: ApiCircleStatus;
   current_round: number;
   total_rounds: number;
-  created_ledger: number;
+  created_ledger: number | string;
   updated_at: string;
   /**
    * Only present in the single-circle detail response
@@ -1461,7 +1461,7 @@ export interface ApiCircleRow {
    */
   deadline_ledger?: number | null;
   /** Round deadline window, in ledgers (sourced from the contract config). */
-  round_deadline_ledgers?: number | null;
+  round_deadline_ledgers?: number | string | null;
 }
 
 /**
@@ -1494,13 +1494,13 @@ export interface ApiMemberRow {
   defaults: number;
   joined_at: string | null;
   /** Reputation score aggregated by the reputation contract (0–100). */
-  reputation_score: number;
+  reputation_score: number | null;
   /**
    * Total number of contributions this member has made across all rounds of
    * this circle. Used to derive whether they have contributed to the current
    * active round.
    */
-  total_contributions: number;
+  total_contributions?: number;
 }
 
 /**
@@ -1574,7 +1574,7 @@ export interface ApiRoundRow {
   /** Payout transaction hash; `null` until the round is paid out. */
   txHash: string | null;
   /** Ledger sequence of the payout; `null` until the round is paid out. */
-  ledger?: number | null;
+  ledger?: number | string | null;
   contributions: ApiContributionRecord[];
   defaults: ApiDefaultRecord[];
 }
@@ -1685,6 +1685,8 @@ export interface ApiCircleDetailResponse {
 
 /** Response body for GET /circles/:address/members */
 export interface ApiMembersResponse {
+  totals?: { memberCount: number; totalCollateral: string; totalContributions: number };
+  roundDeadlineLedgers?: number | string | null;
   members: ApiMemberRow[];
 }
 
@@ -1749,6 +1751,7 @@ export interface ApiCircleDetailWithRoundsResponse {
 
 /** Response body for GET /reputation/:member */
 export interface ApiReputationResponse {
+  pagination?: IndexerPagination;
   member: string;
   /**
    * `true` when a reputation row exists for this member in the database.
@@ -1807,7 +1810,8 @@ export interface ApiMemberContributionsResponse {
 
 /** Response body for GET /health */
 export interface ApiHealthResponse {
-  status: "ok";
+  status: "ok" | "degraded";
+  serviceStatus?: "healthy" | "degraded" | "unavailable";
   timestamp: string;
 }
 
@@ -2055,6 +2059,7 @@ export interface AuditEvent {
 
 /** Response body for `GET /circles/:address/audit`. */
 export interface ApiAuditEventsResponse {
+  pagination?: IndexerPagination;
   /** Circle contract address the audit records belong to (C…). */
   circle_address: string;
   /**
@@ -2063,4 +2068,15 @@ export interface ApiAuditEventsResponse {
    * have been indexed yet for this circle.
    */
   events: AuditEvent[];
+}
+
+/** Flat, complete circle history; page 1/limit 20 by default, maximum 100. */
+export interface ApiCircleHistoryResponse {
+  circle_address: string;
+  events: Array<{ kind: "contribution" | "default" | "payout"; record: {
+    id: number; circle_address: string; round_index: number; ledger: string;
+    tx_hash: string; created_at: string; member_address?: string; recipient?: string;
+    amount?: string; penalty?: string; is_exceptional?: boolean; defaulted_count?: number;
+  } }>;
+  pagination: IndexerPagination;
 }

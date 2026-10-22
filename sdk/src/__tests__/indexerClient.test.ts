@@ -628,3 +628,29 @@ describe("IndexerClient transport", () => {
     expect(new IndexerError("x", 500, "u").kind).toBe("http");
   });
 });
+
+describe("read correlation and bounded history", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("propagates a safe ID and exposes the server ID on an HTTP error", async () => {
+    const id = "12345678-1234-4123-8123-123456789abc";
+    const callback = vi.fn();
+    const transport = vi.fn().mockResolvedValue({ ok: false, status: 503, headers: new Headers({ "X-Request-ID": id }), json: async () => ({ error: "Unavailable" }) });
+    vi.stubGlobal("fetch", transport);
+    await expect(new IndexerClient(BASE_CONFIG).health({ requestId: id, onRequestId: callback })).rejects.toBeInstanceOf(IndexerError);
+    expect(transport.mock.calls[0][1].headers["X-Request-ID"]).toBe(id);
+    expect(callback).toHaveBeenCalledWith(id);
+  });
+  it("rejects wallet-shaped IDs before issuing a request", async () => {
+    const transport = vi.fn(); vi.stubGlobal("fetch", transport);
+    await expect(new IndexerClient(BASE_CONFIG).health({ requestId: "G" + "A".repeat(55) })).rejects.toBeInstanceOf(RangeError);
+    expect(transport).not.toHaveBeenCalled();
+  });
+  it("keeps the flat history page envelope and rejects oversized limits", async () => {
+    const body = { circle_address: CIRCLE_ADDR, events: [], pagination: { page: 2, limit: 100, total: 0, totalPages: 0, hasMore: false } };
+    const transport = mockOk(body); vi.stubGlobal("fetch", transport);
+    const client = new IndexerClient(BASE_CONFIG);
+    expect(await client.getCircleHistory(CIRCLE_ADDR, { page: 2, limit: 100 })).toEqual(body);
+    await expect(client.getCircleHistory(CIRCLE_ADDR, { limit: 101 })).rejects.toBeInstanceOf(RangeError);
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+});
