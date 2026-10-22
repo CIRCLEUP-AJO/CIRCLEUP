@@ -21,6 +21,8 @@ import {
 } from "@/lib/walletCapabilities";
 import { ReputationBadge } from "@/components/ReputationBadge";
 import { DiagnosticsPanel } from "@/components/DiagnosticsPanel";
+import { observeWalletChanges } from '@/lib/walletIdentity';
+import { useDeploymentVerified, deploymentVerified } from '@/lib/deploymentState';
 import clsx from "clsx";
 import { classifyFreshness, formatSourceLabel } from "@/lib/fieldSource";
 import {
@@ -874,6 +876,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // ΓöÇΓöÇ Action state ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   const [loading,      setLoading]      = useState<ActionKey | null>(null);
+  const [errorOperation, setErrorOperation] = useState<string | undefined>(undefined);
   const [error,        setError]        = useState<string>("");
   // Hash of the transaction that produced the current error (set when the
   // failure happened on-chain after submission) so the banner can link to
@@ -989,25 +992,34 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // ΓöÇΓöÇ Wallet resolution ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
   useEffect(() => {
-    let cancelled = false;
-    getWalletAddress()
-      .then((address) => {
-        if (cancelled) return;
-        if (address) {
-          setWalletAddress(address);
-          setWalletLoadState("connected");
-        } else {
-          setWalletLoadState("disconnected");
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        // WalletError with reason "not_installed" lands here
-        setWalletLoadState("not_installed");
-      });
-    return () => { cancelled = true; };
+    let generation = 0;
+    let disposed = false;
+    const resolve = async () => {
+      const current = ++generation;
+      txAbortRef.current?.abort();
+      refreshAbortRef.current?.abort();
+      setWalletAddress(null);
+      setWalletLoadState('loading');
+      setNetworkMismatch(null);
+      setDefaultConfirm(null);
+      setRetryAction(null);
+      setContributionReceipt(null);
+      setSuccess(null);
+      setError(''); setErrorTypedError(null); setErrorTxHash(null); setErrorOperation(undefined);
+      setIsManualRefreshing(false); setRefreshState('idle');
+      try {
+        const address = await getWalletAddress();
+        if (disposed || current !== generation) return;
+        setWalletAddress(address);
+        setWalletLoadState(address ? 'connected' : 'disconnected');
+      } catch {
+        if (!disposed && current === generation) setWalletLoadState('not_installed');
+      }
+    };
+    const stop = observeWalletChanges(() => { void resolve(); });
+    void resolve();
+    return () => { disposed = true; generation++; stop(); };
   }, []);
-
   // Build the invite URL client-side only.  useEffect never runs on the server,
   // so window.location is guaranteed to exist here ΓÇö no typeof guard needed.
   // Keeping this in an effect (rather than useMemo) also means the URL is only
@@ -1085,7 +1097,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   // Actions are only allowed when data is fully ready.
   // This is the single authoritative gate for data completeness.
-  const actionsEnabled = dataReadiness === "ready" && walletLoadState !== "loading";
+  const deploymentReady = useDeploymentVerified();
+  const actionsEnabled = deploymentReady && dataReadiness === "ready" && walletLoadState === "connected";
   const networkCheck: NetworkCheckState =
     networkMismatch?.kind === "mismatch"
       ? "mismatch"
@@ -1295,6 +1308,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const ACTION_LOADING_LABELS   = TX_LOADING;
 
   async function doAction(action: ActionKey, args: xdr.ScVal[] = []) {
+    setErrorOperation(action);
+    if (!deploymentVerified() || walletLoadState !== 'connected') { setError('Verify deployment and reconnect your wallet before reviewing this action.'); return; }
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
@@ -1399,11 +1414,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         txCtrl.signal,
       );
 
+      if (txCtrl.signal.aborted) return;
       if (!result.success) {
-        const errMsg = result.typedError?.message || result.error || "Transaction failed";
+        const errMsg = result.typedError ? userMessageForError(result.typedError) : userMessageForError(parseContractError(result.error));
         setError(errMsg);
         setErrorTypedError(result.typedError ?? null);
-        if (isRetryableError(errMsg)) {
+        setErrorTxHash(result.txHash || null);
+        if (!result.txHash && isRetryableError(errMsg)) {
           setRetryAction(() => () => doAction(action, args));
         }
       } else {
@@ -1426,6 +1443,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
+      if (txCtrl.signal.aborted) return;
       // Issue #654: handle LocalCancelResult throws from invokeContract.
       // These are not transaction failures ΓÇö they mean the caller stopped
       // waiting.  Silently swallow them when the component is unmounting
@@ -1451,7 +1469,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         return;
       }
       const message = err instanceof Error ? err.message : "Unknown error";
-      setError(message);
+      setError(userMessageForError(parseContractError(message)));
       setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doAction(action, args));
@@ -1558,6 +1576,8 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   }, [defaultConfirm, dismissDefaultConfirm]);
 
   async function doDefault(memberAddress: string) {
+    setErrorOperation("mark_default");
+    if (!deploymentVerified() || walletLoadState !== 'connected') { setError('Verify deployment and reconnect your wallet before reviewing this action.'); return; }
     if (!walletAddress) {
       setError("Connect your wallet first.");
       return;
@@ -1621,18 +1641,23 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     submittingRef.current = true;
     setLoading("default");
 
+    const txCtrl = new AbortController();
+    txAbortRef.current = txCtrl;
     try {
       const result = await invokeContract(
         circleAddress,
         "mark_default",
         [new Address(memberAddress).toScVal()],
         walletAddress,
+        txCtrl.signal,
       );
+      if (txCtrl.signal.aborted) return;
       if (!result.success) {
-        const errMsg = result.typedError?.message || result.error || "Transaction failed";
+        const errMsg = result.typedError ? userMessageForError(result.typedError) : userMessageForError(parseContractError(result.error));
         setError(errMsg);
         setErrorTypedError(result.typedError ?? null);
-        if (isRetryableError(errMsg)) {
+        setErrorTxHash(result.txHash || null);
+        if (!result.txHash && isRetryableError(errMsg)) {
           setRetryAction(() => () => doDefault(memberAddress));
         }
       } else {
@@ -1644,8 +1669,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         await postActionRefresh(ctrl);
       }
     } catch (err: unknown) {
+      if (txCtrl.signal.aborted) return;
       const message = err instanceof Error ? err.message : "Unknown error";
-      setError(message);
+      setError(userMessageForError(parseContractError(message)));
       setErrorTypedError(parseContractError(message));
       if (isRetryableError(message)) {
         setRetryAction(() => () => doDefault(memberAddress));
@@ -1680,6 +1706,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
 
   return (
     <div className="space-y-8">
+      <a href="/transactions" className="text-sm underline">Reopen recent transaction status</a>
 
       {/*
         Live announcement of status / round changes.
@@ -1813,6 +1840,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
         {error && (
           <div className="mb-3">
             <DiagnosticsPanel
+              operation={errorOperation}
               typedError={errorTypedError}
               txHash={errorTxHash}
             />
@@ -2284,7 +2312,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                         actionsEnabled && (
                           <button
                             onClick={() => handleMarkDefault(member.member_address)}
-                            disabled={loading !== null}
+                            disabled={loading !== null || !actionsEnabled}
                             className="text-xs text-red-600 hover:text-red-800 underline disabled:opacity-50 disabled:cursor-not-allowed"
                           >
                             Mark Default
