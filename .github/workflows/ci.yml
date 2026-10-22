@@ -180,6 +180,21 @@ jobs:
           scripts/src/mainnet-readiness.test.ts
           scripts/src/deploy-network-guard.test.ts
 
+      - name: Validate contributor templates (links + safety notices)
+        # Checks every relative link in .github templates and asserts that
+        # bug_report.md carries required safety-notice content.  Fails with
+        # actionable file:line references so the broken entry is easy to fix.
+        run: >-
+          TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
+          node --require ts-node/register
+          scripts/src/validate-templates.ts
+
+      - name: Template integrity tests
+        run: >-
+          TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
+          node --require ts-node/register --test
+          scripts/src/validate-templates.test.ts
+
   # ── Dependency license policy ───────────────────────────────────────────────
   license-policy:
     name: Dependency license policy
