@@ -31,7 +31,64 @@ export function isValidUrl(url: string): boolean {
   }
 }
 
-export interface ProtocolGuarantee {
+export type BrowseSort = "created_ledger" | "updated_at" | "round_amount" | "member_count" | "status";
+export type BrowseOrder = "asc" | "desc";
+
+export const BROWSE_SORTS: readonly BrowseSort[] = [
+  "created_ledger",
+  "updated_at",
+  "round_amount",
+  "member_count",
+  "status",
+] as const;
+
+export const BROWSE_SORT_LABELS: Record<BrowseSort, string> = {
+  created_ledger: "Recently created",
+  updated_at: "Recently active",
+  round_amount: "Contribution amount",
+  member_count: "Member count",
+  status: "Status",
+};
+
+export function isValidBrowseSort(v: unknown): v is BrowseSort {
+  return typeof v === "string" && (BROWSE_SORTS as readonly string[]).includes(v);
+}
+
+export function isValidBrowseOrder(v: unknown): v is BrowseOrder {
+  return v === "asc" || v === "desc";
+}
+
+export interface BrowseParams {
+  status: CircleStatusFilter | undefined;
+  sort: BrowseSort;
+  order: BrowseOrder;
+  page: number;
+}
+
+export function parseBrowseParams(
+  params: Record<string, string | string[] | undefined>,
+): BrowseParams {
+  const first = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v);
+  const rawStatus = first(params.status);
+  const rawSort = first(params.sort);
+  const rawOrder = first(params.order);
+  const rawPage = first(params.page);
+  const status = isValidStatusFilter(rawStatus) ? rawStatus : undefined;
+  const sort: BrowseSort = isValidBrowseSort(rawSort) ? rawSort : "created_ledger";
+  const order: BrowseOrder = isValidBrowseOrder(rawOrder) ? rawOrder : "desc";
+  const pageNum = typeof rawPage === "string" ? Number.parseInt(rawPage, 10) : NaN;
+  const page = Number.isInteger(pageNum) && pageNum >= 1 ? Math.min(pageNum, 1000) : 1;
+  return { status, sort, order, page };
+}
+
+export function browseQueryString(p: BrowseParams): string {
+  const q = new URLSearchParams();
+  if (p.status) q.set("status", p.status);
+  q.set("sort", p.sort);
+  q.set("order", p.order);
+  if (p.page > 1) q.set("page", String(p.page));
+  return q.toString();
+}
   emoji: string;
   title: string;
   desc: string;
