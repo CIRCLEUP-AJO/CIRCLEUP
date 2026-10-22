@@ -49,7 +49,6 @@ import type { TxStage, TxErrorCategory } from "@/lib/telemetry";
 
 export interface DiagnosticsPanelProps {
   /** Typed error from the failed transaction. */
-  operation?: string;
   typedError?: ContractAppError | null;
   /** On-chain tx hash when available (always redacted in the bundle). */
   txHash?: string | null;
@@ -71,13 +70,13 @@ type ActionState = "idle" | "success" | "error";
 
 const INCLUDED_FIELDS: readonly string[] = [
   "App version and active network (testnet / mainnet)",
-  "Stellar RPC and indexer origins (no credentials, path or query)",
+  "Stellar RPC and indexer URLs",
   "Whether the Freighter wallet extension is detected",
   "Allowed public environment variable names and values (redacted for safety)",
-  "Browser online status",
-  "Allowlisted operation, error kind, code, and canonical user guidance",
+  "Browser user-agent string, language, and online status",
+  "Error kind, code, and user-facing message",
   "Transaction lifecycle stage and error category (when available)",
-  "Validated public transaction hash (when available)",
+  "Whether a transaction hash was produced (hash itself is always redacted)",
   "Bundle generation timestamp",
 ];
 
@@ -85,6 +84,7 @@ const EXCLUDED_FIELDS: readonly string[] = [
   "Wallet addresses or private keys",
   "Secret keys, seed phrases, or mnemonics",
   "Signed or unsigned XDR",
+  "Transaction hash values",
   "ScVal arguments (which may encode amounts or addresses)",
   "Raw provider error messages",
   "Any environment variable not on the explicit allowlist",
@@ -93,7 +93,6 @@ const EXCLUDED_FIELDS: readonly string[] = [
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function DiagnosticsPanel({
-  operation,
   typedError,
   txHash,
   stage,
@@ -115,12 +114,11 @@ export function DiagnosticsPanel({
   // ── Bundle builder ─────────────────────────────────────────────────────────
 
   const buildInput = useCallback((): DiagnosticsBundleInput => ({
-    operation,
     typedError:    typedError ?? undefined,
     txHash:        txHash     ?? undefined,
     stage,
     errorCategory,
-  }), [operation, typedError, txHash, stage, errorCategory]);
+  }), [typedError, txHash, stage, errorCategory]);
 
   // ── Toggle ─────────────────────────────────────────────────────────────────
 
@@ -392,7 +390,7 @@ export function DiagnosticsPanel({
           <p className="text-xs text-slate-400 leading-relaxed border-t border-slate-100 pt-3">
             This bundle is generated locally and is never submitted to a server.
             Share it only with people you trust to help diagnose the issue.
-            Wallet keys, addresses, and raw provider error bodies are excluded
+            Wallet keys, addresses, and transaction hashes are always redacted
             before the bundle is created.
           </p>
         </div>

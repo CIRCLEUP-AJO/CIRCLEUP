@@ -82,7 +82,3 @@ export type {
   PreflightFresh,
   PreflightStale,
 } from "./client";
-
-export { transactionSupport } from "./support";
-export type { SupportSummary } from "./support";
-export type { DeploymentCheck, DeploymentCheckName, DeploymentCheckStatus, DeploymentVerification, VerifyDeploymentOptions } from "./client";

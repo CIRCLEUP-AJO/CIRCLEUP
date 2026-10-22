@@ -10,7 +10,6 @@
  */
 
 "use client";
-import { observeWalletChanges, invalidateWalletIdentity, walletRevision } from "./walletIdentity";
 import { useState, useEffect, useCallback } from "react";
 import {
   getWalletAddress,
@@ -53,14 +52,11 @@ export function useWallet(): WalletState {
   // On mount: silently check whether wallet is already connected
   useEffect(() => {
     let cancelled = false;
-    let generation = 0;
 
     async function checkConnection() {
-      const current = ++generation;
-      setAddress(null); setCapabilities(null); setCapabilityWarning(null);
       try {
         const walletAddress = await getWalletAddress();
-        if (cancelled || current !== generation) return;
+        if (cancelled) return;
 
         if (walletAddress) {
           setAddress(walletAddress);
@@ -73,19 +69,17 @@ export function useWallet(): WalletState {
           setIsInstalled(isFreighterInstalled());
         }
       } catch {
-        if (!cancelled && current === generation) {
+        if (!cancelled) {
           setIsInstalled(isFreighterInstalled());
         }
       }
     }
 
-    const stop = observeWalletChanges(() => { void checkConnection(); });
-    void checkConnection();
-    return () => { cancelled = true; generation++; stop(); };
+    checkConnection();
+    return () => { cancelled = true; };
   }, []);
 
   const connect = useCallback(async (): Promise<string | null> => {
-    const identity = walletRevision();
     setIsConnecting(true);
     setError(null);
 
@@ -98,8 +92,6 @@ export function useWallet(): WalletState {
       }
 
       const pk = await connectWallet();
-      if (identity !== walletRevision()) throw new WalletError("unknown", "Wallet changed. Reconnect and review your account.");
-      invalidateWalletIdentity();
       setAddress(pk);
       setIsInstalled(true);
 
@@ -121,7 +113,7 @@ export function useWallet(): WalletState {
       } else {
         setError({
           reason: "unknown",
-          message: "Unable to connect your wallet. Unlock Freighter and try again.",
+          message: (err as Error)?.message || "Failed to connect wallet.",
         });
       }
       return null;

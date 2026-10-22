@@ -1,10 +1,73 @@
-/** Local, user-initiated support summary.
- * Fields are selected explicitly, error copy is regenerated from known codes,
- * and only validated public transaction hashes are retained. Provider bodies,
- * messages, XDR, wallet keys and browser-controlled text are never copied.
- * Endpoints contain origins only, without credentials, paths or queries.
+/**
+ * Opt-in local diagnostics bundle for CircleUp.
+ *
+ * # Purpose
+ *
+ * Transaction failures are hard to debug without context: the browser
+ * version, wallet state, network configuration, and error category are
+ * all relevant but users cannot reliably copy them by hand.  This module
+ * builds a structured, redacted summary that a user can generate on demand
+ * and share with support.
+ *
+ * # Privacy model
+ *
+ * The bundle is NEVER submitted to a server automatically.  It is only
+ * produced when the user explicitly requests it via the UI, and only
+ * copied/downloaded locally.
+ *
+ * Fields are selected from a strict allowlist — not from raw objects.
+ * Every string value is passed through {@link redactSecrets} before
+ * inclusion.  The redaction rules mirror (and extend) those in
+ * telemetry.ts:
+ *
+ *   - G… / C… strkeys (56-char, matching Stellar address format) → "[redacted:address]"
+ *   - 64-char hex strings (tx-hash pattern) → "[redacted:hash]"
+ *   - Strings > 100 chars (likely XDR or base64 blobs) → "[redacted:blob]"
+ *   - Known secret-shaped environment variable names (SEED, MNEMONIC,
+ *     PRIVATE_KEY, SECRET, etc.) → "[redacted:secret]"
+ *   - Any value that passes isSecretShaped() → "[redacted:secret]"
+ *
+ * # What IS included
+ *
+ *   - app.version      — package version string
+ *   - app.activeNetwork — "testnet" / "mainnet" / "custom"
+ *   - app.rpcUrl       — RPC endpoint (may include domain, never credentials)
+ *   - app.indexerUrl   — indexer URL (same policy)
+ *   - app.walletInstalled — boolean (Freighter present?)
+ *   - browser.userAgent — navigator.userAgent
+ *   - browser.language  — navigator.language
+ *   - browser.online    — navigator.onLine
+ *   - error.kind        — ContractAppError.kind ("wallet", "network", etc.)
+ *   - error.code        — ContractAppError.code (stable enum string)
+ *   - error.message     — ContractAppError.message (user-facing, safe string)
+ *   - error.txHash      — present only when an on-chain hash exists; passed
+ *                         through redactSecrets so it is replaced with
+ *                         "[redacted:hash]" — the hash is in the UI already
+ *                         and is never the sensitive part of the failure
+ *   - error.stage       — TxStage if available (e.g. "simulate_failed")
+ *   - error.category    — TxErrorCategory if available
+ *   - timestamp         — ISO-8601 string of bundle generation time
+ *
+ * # What is NEVER included
+ *
+ *   - Wallet private keys, seeds, or mnemonics
+ *   - Unsigned or signed XDR
+ *   - ScVal arguments (which may encode amounts, addresses, etc.)
+ *   - Full Stellar address of the connected wallet
+ *   - Raw provider error messages that may echo user input
+ *   - Any NEXT_PUBLIC_* env var whose name contains a secret-shaped keyword
+ *
+ * # Usage
+ *
+ * ```ts
+ * import { buildDiagnosticsBundle, serialiseDiagnosticsBundle } from "@/lib/diagnostics";
+ *
+ * const bundle = buildDiagnosticsBundle({ typedError: err, txHash: result.txHash });
+ * const json   = serialiseDiagnosticsBundle(bundle);
+ * navigator.clipboard.writeText(json);
+ * ```
  */
-import { safeContractError } from "./contractErrors";
+
 import type { ContractAppError } from "./contractErrors";
 import type { TxStage, TxErrorCategory } from "./telemetry";
 
@@ -252,7 +315,6 @@ export interface DiagnosticsBundle {
    */
   readonly error?: {
     /** ContractAppError.kind — "wallet" | "network" | "validation" | etc. */
-    readonly operation?: string;
     readonly kind: string;
     /** ContractAppError.code — stable enum string, safe to include. */
     readonly code: string;
@@ -272,7 +334,7 @@ export interface DiagnosticsBundle {
      */
     readonly category?: string;
     /**
-     * Transaction hash for on-chain failures — included only when it is a validated public hash; previously replaced with
+     * Transaction hash for on-chain failures — always replaced with
      * "[redacted:hash]" so the raw hash never leaves the browser automatically.
      * (The user can copy it separately from the explorer link in the UI.)
      */
@@ -287,7 +349,6 @@ export interface DiagnosticsBundleInput {
    * The typed error from the failed transaction.
    * When absent the `error` section is omitted from the bundle.
    */
-  readonly operation?: string;
   readonly typedError?: ContractAppError | null;
 
   /**
@@ -345,7 +406,7 @@ export function collectEnv(
     const raw = env[key];
     if (raw === undefined || raw === "") continue;
 
-    const redacted = key.endsWith('_URL') ? safeEndpoint(raw) : key === 'NEXT_PUBLIC_NETWORK_PASSPHRASE' ? networkLabel(raw) : ['mainnet','testnet','custom'].includes(raw) ? raw : 'unknown';
+    const redacted = redactSecrets(raw);
     out[key] = redacted;
   }
 
@@ -400,6 +461,8 @@ export function buildDiagnosticsBundle(
   const win = _win ?? (isBrowser ? (window as unknown as typeof _win) : undefined);
   const nav = _win?.navigator ?? (isBrowser ? navigator : undefined);
 
+  const userAgent = nav?.userAgent ?? "";
+  const language  = nav?.language  ?? "";
   const online    = nav?.onLine    ?? true;
 
   const walletInstalled = isFreighterPresent(win);
@@ -409,10 +472,10 @@ export function buildDiagnosticsBundle(
   // this module free of Next.js server-side initialisation side-effects).
   const rawRpcUrl    = (process.env.NEXT_PUBLIC_STELLAR_RPC_URL ?? "").trim();
   const rawIndexerUrl = (process.env.NEXT_PUBLIC_INDEXER_URL    ?? "").trim();
-  const activeNetwork = networkLabel(process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? '');
+  const activeNetwork = (process.env.NEXT_PUBLIC_ACTIVE_NETWORK ?? "unknown").trim();
 
-  const rpcUrl     = safeEndpoint(rawRpcUrl);
-  const indexerUrl = safeEndpoint(rawIndexerUrl);
+  const rpcUrl     = redactSecrets(rawRpcUrl);
+  const indexerUrl = redactSecrets(rawIndexerUrl);
   const envRecord = collectEnv();
 
   // ── Error context ─────────────────────────────────────────────────────────
@@ -423,20 +486,18 @@ export function buildDiagnosticsBundle(
   let errorSection: DiagnosticsBundle["error"];
 
   if (typedError) {
-    const safeError = safeContractError(typedError);
-    const safeMessage = safeError.message;
+    const safeMessage = redactSecrets(typedError.message);
 
     errorSection = {
-      kind:     safeError.kind,
-      code:     safeError.code,
+      kind:     typedError.kind,
+      code:     typedError.code,
       message:  safeMessage,
-      ...(['create_circle','join','contribute','payout','close','mark_default','transaction_status'].includes(input.operation ?? '') ? { operation: input.operation } : {}),
-      ...(['started','simulated','simulate_failed','wallet_rejected','submitted','submission_failed','confirmed','timed_out','failed'].includes(stage ?? '') ? { stage } : {}),
-      ...(['network','simulation_error','wallet_denied','on_chain_failed','timeout','unknown'].includes(errorCategory ?? '') ? { category: errorCategory } : {}),
-      // txHash is validated public hash — the value is in the UI; we only need to
+      ...(stage         !== undefined ? { stage }               : {}),
+      ...(errorCategory !== undefined ? { category: errorCategory } : {}),
+      // txHash is always redacted — the value is in the UI; we only need to
       // know whether a hash was produced at all, and even that is conveyed by
       // the "kind" / "code" (on-chain failure vs. pre-submission failure).
-      ...(typeof txHash === 'string' && /^[a-fA-F0-9]{64}$/.test(txHash) ? { txHash: txHash.toLowerCase() } : {}),
+      ...(txHash ? { txHash: "[redacted:hash]" as const } : {}),
     };
   }
 
@@ -452,8 +513,8 @@ export function buildDiagnosticsBundle(
       env:             envRecord,
     },
     browser: {
-      userAgent: "",
-      language:  "",
+      userAgent: redactSecrets(userAgent),
+      language:  redactSecrets(language),
       online,
     },
     ...(errorSection !== undefined ? { error: errorSection } : {}),
@@ -479,11 +540,4 @@ export function serialiseDiagnosticsBundle(bundle: DiagnosticsBundle): string {
  */
 export function buildAndSerialise(input: DiagnosticsBundleInput = {}): string {
   return serialiseDiagnosticsBundle(buildDiagnosticsBundle(input));
-}
-
-function safeEndpoint(raw: string): string {
-  try { const url = new URL(raw); return ['https:','http:'].includes(url.protocol) ? url.origin : ''; } catch { return ''; }
-}
-function networkLabel(passphrase: string): string {
-  return passphrase === 'Public Global Stellar Network ; September 2015' ? 'mainnet' : passphrase === 'Test SDF Network ; September 2015' ? 'testnet' : 'custom';
 }
