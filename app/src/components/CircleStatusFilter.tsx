@@ -52,6 +52,8 @@ const STATUS_UI: Record<
 interface CircleStatusFilterProps {
   /** The currently active status filter, or `undefined` for "All". */
   activeStatus: StatusFilter | undefined;
+  sort?: string;
+  order?: string;
 }
 
 /**
@@ -66,15 +68,23 @@ interface CircleStatusFilterProps {
  * the corresponding status value.  The selected pill is announced to screen
  * readers via `aria-pressed` on each button.
  */
-export function CircleStatusFilter({ activeStatus }: CircleStatusFilterProps) {
+export function CircleStatusFilter({ activeStatus, sort, order }: CircleStatusFilterProps) {
   const router = useRouter();
   const pathname = usePathname();
   const [isPending, startTransition] = useTransition();
 
   function handleSelect(status: StatusFilter | undefined) {
     startTransition(() => {
-      const params = new URLSearchParams();
+      // Preserve sort/order in the URL; reset page/cursor on filter change.
+      const params = new URLSearchParams(
+        typeof window !== "undefined" ? window.location.search : "",
+      );
       if (status) params.set("status", status);
+      else params.delete("status");
+      if (sort) params.set("sort", sort);
+      if (order) params.set("order", order);
+      params.delete("page");
+      params.delete("cursor");
       // Preserve the circles anchor so the list stays in view after filtering.
       const qs = params.toString();
       router.replace(`${pathname}${qs ? `?${qs}` : ""}#circles`, { scroll: false });
