@@ -1,5 +1,4 @@
 "use client";
-import { invalidateWalletIdentity } from "@/lib/walletIdentity";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { getWalletAddress, connectWallet, isFreighterInstalled, WalletError, type WalletErrorReason } from "@/lib/stellar";
 import { shortAddress, NETWORK_PASSPHRASE } from "@/lib/config";
@@ -69,7 +68,6 @@ async function runNetworkCheck(): Promise<NetworkMismatchResult | null> {
 export function WalletButton() {
   const [state, setState] = useState<ConnectionState>({ status: "checking" });
   const mountedRef = useRef(true);
-  const resolutionRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -83,12 +81,11 @@ export function WalletButton() {
   // state once the wallet address and capabilities are known.
 
   const resolveAccount = useCallback(async () => {
-    const resolution = ++resolutionRef.current;
     let address: string | null;
     try {
       address = await getWalletAddress();
     } catch (err) {
-      if (!mountedRef.current || resolution !== resolutionRef.current) return;
+      if (!mountedRef.current) return;
       // getWalletAddress only throws WalletError("not_installed") — but handle
       // all reasons explicitly so a permission_denied or unknown error during
       // the silent probe surfaces as an error state rather than the install link.
@@ -102,14 +99,14 @@ export function WalletButton() {
         // Non-WalletError (e.g. network failure talking to the extension).
         setState({
           status: "error",
-          message: "Unable to check your wallet. Unlock Freighter and reconnect.",
+          message: (err as Error)?.message || "An unexpected error occurred checking your wallet.",
           reason: "unknown",
         });
       }
       return;
     }
 
-    if (!mountedRef.current || resolution !== resolutionRef.current) return;
+    if (!mountedRef.current) return;
 
     if (!address) {
       setState(isFreighterInstalled() ? { status: "idle" } : { status: "not_installed" });
@@ -123,12 +120,12 @@ export function WalletButton() {
     try { signWarning = caps ? explainUnsupportedAction("sign", caps) : null; } catch { signWarning = null; }
 
     if (signWarning) {
-      if (mountedRef.current && resolution === resolutionRef.current) setState({ status: "limited", message: signWarning, address });
+      if (mountedRef.current) setState({ status: "limited", message: signWarning, address });
       return;
     }
 
     const networkMismatch = await runNetworkCheck();
-    if (!mountedRef.current || resolution !== resolutionRef.current) return;
+    if (!mountedRef.current) return;
 
     setState({
       status: "connected",
@@ -152,7 +149,6 @@ export function WalletButton() {
 
     const handleChange = () => {
       if (!mountedRef.current) return;
-      invalidateWalletIdentity();
       setState({ status: "changing" });
       void resolveAccount();
     };
@@ -170,12 +166,10 @@ export function WalletButton() {
 
   // ── Connect handler ─────────────────────────────────────────────────────
   async function connect() {
-    const resolution = ++resolutionRef.current;
     setState({ status: "connecting" });
     try {
       const address = await connectWallet();
-      invalidateWalletIdentity();
-      if (!mountedRef.current || resolution !== resolutionRef.current) return;
+      if (!mountedRef.current) return;
 
       let caps;
       try { caps = detectWalletCapabilities(); } catch { caps = null; }
@@ -190,7 +184,7 @@ export function WalletButton() {
       }
 
       const networkMismatch = await runNetworkCheck();
-      if (!mountedRef.current || resolution !== resolutionRef.current) return;
+      if (!mountedRef.current) return;
 
       setState({
         status: "connected",
@@ -201,13 +195,13 @@ export function WalletButton() {
           : undefined,
       });
     } catch (err) {
-      if (!mountedRef.current || resolution !== resolutionRef.current) return;
+      if (!mountedRef.current) return;
       if (err instanceof WalletError) {
         setState(err.reason === "not_installed"
           ? { status: "not_installed" }
           : { status: "error", message: err.message, reason: err.reason });
       } else {
-        setState({ status: "error", message: "Unable to connect your wallet. Unlock Freighter and try again.", reason: "unknown" });
+        setState({ status: "error", message: (err as Error)?.message || "Failed to connect wallet.", reason: "unknown" });
       }
     }
   }

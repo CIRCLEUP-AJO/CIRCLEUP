@@ -26,7 +26,7 @@ import {
   Address,
   scValToNative,
   xdr,
-  Account,
+  type Account,
 } from "@stellar/stellar-sdk";
 import {
   isConnected,
@@ -35,10 +35,6 @@ import {
   requestAccess,
 } from "@stellar/freighter-api";
 import { STELLAR_RPC_URL, NETWORK_PASSPHRASE, REPUTATION_ADDRESS } from "./config";
-import { rememberTransaction, boundedRead, type TransactionStatus } from './transactionStatus';
-import { walletRevision } from './walletIdentity';
-import { deploymentVerified, setDeploymentFacts, type DeploymentFact } from './deploymentState';
-import { CIRCLE_FACTORY_ADDRESS, USDC_ADDRESS } from './config';
 import { startTx, emit, categorizeError } from "./telemetry";
 import {
   assertStellarPublicKey,
@@ -156,7 +152,7 @@ export async function connectWallet(): Promise<string> {
       );
     }
 
-    throw new WalletError("unknown", "Unable to connect your wallet. Unlock Freighter and try again.");
+    throw new WalletError("unknown", err?.message || "Failed to connect wallet.");
   }
 }
 
@@ -436,7 +432,7 @@ export function formatContractError(raw: string | undefined): string {
   }
 
   // Return the raw error, capitalised, for developer visibility
-  return userMessageForError(parseContractError(raw));
+  return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
 /**
@@ -728,15 +724,6 @@ export async function submitContractTx(
   txCtx: ReturnType<typeof startTx>,
   signal?: AbortSignal,
 ): Promise<InvokeResult> {
-  signal?.throwIfAborted();
-  const identityRevision = walletRevision();
-  const assertIdentity = async () => {
-    const address = await getWalletAddress();
-    if (identityRevision !== walletRevision() || address !== accountToSign) throw new Error('Wallet account changed. Review the action again.');
-    if (!deploymentVerified()) throw new Error('Verify the configured deployment before submitting.');
-    signal?.throwIfAborted();
-  };
-  await assertIdentity();
   const rpc = getRpc();
 
   // ── Abort gate: pre-flight ────────────────────────────────────────────────
@@ -811,28 +798,32 @@ export async function submitContractTx(
   // still "clean" — no on-chain state has changed.
   signal?.throwIfAborted();
 
-  await assertIdentity();
-
   // ── Submission ───────────────────────────────────────────────────────────
-  // One broadcast attempt. A lost response is an unknown outcome resolved
-  // through the locally computed public hash, never an automatic write retry.
-  const envelope = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
-  const prepared = TransactionBuilder.fromXDR(preparedXdr, NETWORK_PASSPHRASE);
-  if (!('source' in envelope) || envelope.source !== accountToSign || !('source' in prepared) || prepared.source !== accountToSign || envelope.hash().toString('hex') !== prepared.hash().toString('hex')) {
-    throw new Error('Wallet returned a different transaction. Review the action again.');
-  }
-  const submittedHash = envelope.hash().toString('hex');
-  rememberTransaction(submittedHash, false);
+  // withRpcRetry covers transient network blips at the submission layer.
+  // Note: we only retry on transient errors (connection reset, rate-limit).
+  // An "ERROR" status from the RPC means the transaction itself was rejected
+  // by the network and must NOT be retried — doing so would submit it again.
+  // The signal is forwarded so an abort during a retry backoff exits promptly.
   let sendResult: Awaited<ReturnType<typeof rpc.sendTransaction>>;
   try {
-    sendResult = await boundedRead(rpc.sendTransaction(envelope as any), 15000);
+    sendResult = await withRpcRetry(
+      "sendTransaction",
+      () =>
+        rpc.sendTransaction(
+          TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE) as any,
+        ),
+      RPC_RETRY_MAX_ATTEMPTS,
+      RPC_RETRY_BASE_DELAY_MS,
+      sleepWithAbort,
+      signal,
+    );
   } catch (err: any) {
     // Re-throw abort reasons directly.  At this point the tx may or may not
     // have reached the network depending on which retry attempt was in flight,
     // so we attach a LocalCancelResult as the cause so callers can decide how
     // to message this to the user.
     if (signal?.aborted) {
-      const cancelInfo: LocalCancelResult = { kind: "local_cancel", submittedBeforeAbort: true };
+      const cancelInfo: LocalCancelResult = { kind: "local_cancel", submittedBeforeAbort: false };
       const abortErr = new Error("Transaction submission cancelled by caller.", {
         cause: cancelInfo,
       });
@@ -841,9 +832,9 @@ export async function submitContractTx(
     const typedError = parseContractError(err?.message ?? "network error");
     emit(txCtx, "failed", categorizeError(err?.message ?? "network error"));
     return {
-      txHash: submittedHash,
+      txHash: "",
       success: false,
-      error: "Submission outcome is unknown. Check Recent transactions before attempting another write.",
+      error: userMessageForError(typedError),
       typedError,
     };
   }
@@ -870,7 +861,6 @@ export async function submitContractTx(
   emit(txCtx, "submitted");
 
   const hash = sendResult.hash;
-  rememberTransaction(hash, sendResult.status === "PENDING" || sendResult.status === "DUPLICATE");
 
   // ── Polling loop ─────────────────────────────────────────────────────────
   //
@@ -912,7 +902,7 @@ export async function submitContractTx(
 
     let status: Awaited<ReturnType<typeof rpc.getTransaction>>;
     try {
-      status = await boundedRead(rpc.getTransaction(hash), 8000, signal);
+      status = await rpc.getTransaction(hash);
     } catch {
       // Transient polling error — keep trying
       continue;
@@ -980,7 +970,6 @@ export async function invokeContract(
   signal?: AbortSignal,
 ): Promise<InvokeResult> {
   const txCtx = startTx(method);
-  const initialIdentityRevision = walletRevision();
 
   // Every failure path — including unexpected synchronous exceptions such as
   // address assertions or SDK client throws — is converted to a typed
@@ -992,7 +981,6 @@ export async function invokeContract(
   // caller can distinguish "user stopped waiting" from "transaction failed".
   // It is never recorded as a telemetry failure event.
   try {
-    if (!deploymentVerified()) throw new Error('Verify deployment before preparing this action.');
     const simOutcome = await simulateContractTx(
       contractId,
       method,
@@ -1010,7 +998,6 @@ export async function invokeContract(
       };
     }
 
-    if (initialIdentityRevision !== walletRevision()) throw new Error('Wallet changed. Review the action again.');
     return await submitContractTx(simOutcome.preparedXdr, walletAddress, txCtx, signal);
   } catch (err: unknown) {
     // Re-throw LocalCancelResult causes so UI layers can distinguish
@@ -1034,7 +1021,9 @@ export async function invokeContract(
       txHash: "",
       success: false,
       error:
-        userMessageForError(typedError),
+        typedError.kind === "unknown" && raw
+          ? raw
+          : userMessageForError(typedError),
       typedError,
     };
   }
@@ -1060,10 +1049,11 @@ export async function readContract<T>(
 
   const rpc = getRpc();
   const contract = new Contract(contractId);
-  const fakeAccount = new Account(
-    'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
-    '0',
-  );
+  const fakeAccount = {
+    id: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN",
+    sequence: "0",
+    incrementSequenceNumber() {},
+  } as unknown as Account;
 
   const tx = new TransactionBuilder(fakeAccount, {
     fee: BASE_FEE,
@@ -1131,47 +1121,4 @@ export async function getCurrentRound(circleAddress: string): Promise<unknown> {
 export async function getCircleConfig(circleAddress: string): Promise<unknown> {
   assertSorobanContractId(circleAddress, "circleAddress");
   return readContract<unknown>(circleAddress, "get_config", []);
-}
-
-/** Read-only lookup. NOT_FOUND does not prove cancellation or failure. */
-export async function lookupTransactionStatus(hash: string, accepted = false, signal?: AbortSignal): Promise<TransactionStatus> {
-  if (!/^[a-fA-F0-9]{64}$/.test(hash)) return 'not_found';
-  try {
-    const result = await boundedRead(getRpc().getTransaction(hash), 8000, signal);
-    if (result.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) return 'success';
-    if (result.status === SorobanRpc.Api.GetTransactionStatus.FAILED) return 'failed';
-    if (result.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) return accepted ? 'pending' : 'not_found';
-    return 'unavailable';
-  } catch { return 'unavailable'; }
-}
-
-/** Explicit app preflight: independent network and getter evidence, never a write. */
-export async function verifyConfiguredDeployment(): Promise<DeploymentFact[]> {
-  const identity = walletRevision();
-  setDeploymentFacts([]);
-  const checks: DeploymentFact[] = [];
-  try {
-    const network = await boundedRead(getRpc().getNetwork());
-    checks.push({ name: 'RPC network', status: typeof network.passphrase !== 'string' ? 'unverifiable' : network.passphrase === NETWORK_PASSPHRASE ? 'verified' : 'mismatch' });
-  } catch { checks.push({ name: 'RPC network', status: 'unverifiable' }); }
-  const specs = [
-    { name: 'Factory token link', id: CIRCLE_FACTORY_ADDRESS, method: 'get_usdc_token', valid: (v: unknown) => typeof v === 'string' && /^C[A-Z2-7]{55}$/.test(v), matches: (v: unknown) => v === USDC_ADDRESS },
-    { name: 'Factory reputation link', id: CIRCLE_FACTORY_ADDRESS, method: 'get_reputation_contract', valid: (v: unknown) => typeof v === 'string' && /^C[A-Z2-7]{55}$/.test(v), matches: (v: unknown) => v === REPUTATION_ADDRESS },
-    { name: 'Reputation interface', id: REPUTATION_ADDRESS, method: 'get_admin', valid: (v: unknown) => typeof v === 'string' && /^[GC][A-Z2-7]{55}$/.test(v), matches: () => true },
-    { name: 'Token decimals', id: USDC_ADDRESS, method: 'decimals', valid: (v: unknown) => typeof v === 'number' && Number.isInteger(v), matches: (v: unknown) => v === 7 },
-  ];
-  if (checks[0].status === 'verified') {
-    checks.push(...await Promise.all(specs.map(async spec => {
-      let status: DeploymentFact['status'] = 'unverifiable';
-      try { const value = await boundedRead(readContract<unknown>(spec.id, spec.method, [])); status = !spec.valid(value) ? 'unverifiable' : spec.matches(value) ? 'verified' : 'mismatch'; } catch { /* Missing code, incompatible getter or RPC outage: no identity evidence. */ }
-      return { name: spec.name, status };
-    })));
-  } else checks.push(...specs.map(spec => ({ name: spec.name, status: 'unverifiable' as const })));
-  if (identity !== walletRevision()) {
-    const invalidated = checks.map(check => ({ name: check.name, status: 'unverifiable' as const }));
-    setDeploymentFacts(invalidated);
-    return invalidated;
-  }
-  setDeploymentFacts(checks);
-  return checks;
 }
