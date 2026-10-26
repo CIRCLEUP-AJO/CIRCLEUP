@@ -26,7 +26,7 @@
     "prepublishOnly": "npm run check:api"
   },
   "dependencies": {
-    "@stellar/stellar-sdk": "^17.2.1"
+    "@stellar/stellar-sdk": "^17.3.0"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
