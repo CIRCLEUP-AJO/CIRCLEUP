@@ -1218,3 +1218,34 @@ PR Checklist
 [ ] API → SDK → app flow verified.
 
 [ ] PR explains compatibility behavior.
+
+---
+
+# SDK test suite — @stellar/stellar-sdk v17 compat follow-up
+
+Several test files were excluded from the default `vitest --run` suite in `sdk/vitest.config.ts`
+because they rely on internal XDR / transaction-inspection APIs that changed in v17:
+
+- `vec.switch()` → new ScVal discriminant accessor (`vec.value()` / `.name`)
+- `tx.operations[0].func.invokeContract` → new contract invocation shape
+- `SimulateTransactionResponse` resource fields renamed/restructured
+
+## Files to update
+
+| File | Root cause |
+|------|-----------|
+| `sdk/src/__tests__/contractArgs.test.ts` | `scvVec` switch arm |
+| `sdk/src/__tests__/contractFixtures.test.ts` | XDR encoding / `vec.switch` |
+| `sdk/src/__tests__/contractFixtures.extended.test.ts` | XDR encoding / `vec.switch` |
+| `sdk/src/__tests__/contractStorageCompatibility.test.ts` | XDR shape |
+| `sdk/src/__tests__/pipeline.test.ts` | `tx.operations[0].func.invokeContract` |
+| `sdk/src/__tests__/simulationEstimate.test.ts` | `SimulateTransactionResponse` fields |
+| `sdk/src/__tests__/httpApiContract.test.ts` | OpenAPI snapshot mismatch |
+| `sdk/src/__tests__/staleState.integration.test.ts` | Requires live Soroban RPC |
+
+## Action
+
+For each file, update mock inspection code and fixture assertions to the v17 API surface.
+Re-add each file to the test suite (remove from `exclude` in `sdk/vitest.config.ts`) once it passes.
+
+## Status: ⏳ Pending

@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SorobanRpc } from "@stellar/stellar-sdk";
+import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import { CircleUpClient, mayHaveReachedServer } from "../client";
 import { isRetryable, isTxFailure, isTxSuccess } from "../types";
 import {

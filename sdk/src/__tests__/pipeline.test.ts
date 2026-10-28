@@ -22,7 +22,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   Address,
-  SorobanRpc,
+  rpc as SorobanRpc,
   nativeToScVal,
   scValToNative,
   xdr,

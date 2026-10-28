@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SorobanRpc, xdr } from "@stellar/stellar-sdk";
+import { rpc as SorobanRpc, xdr } from "@stellar/stellar-sdk";
 import {
   CircleUpClient,
   CircleClient,

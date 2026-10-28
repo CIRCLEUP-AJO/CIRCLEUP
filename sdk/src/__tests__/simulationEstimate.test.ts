@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { SorobanDataBuilder, SorobanRpc } from "@stellar/stellar-sdk";
+import { SorobanDataBuilder, rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import { CircleUpClient, summarizeSimulation, type TxLogEvent } from "../client";
 import { isTxFailure, isTxSuccess } from "../types";
 import {

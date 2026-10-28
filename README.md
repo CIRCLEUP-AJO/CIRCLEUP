@@ -209,7 +209,7 @@ cargo install --locked stellar-cli --features opt
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/your-org/circleup
+git clone https://github.com/CIRCLEUP-AJO/CIRCLEUP
 cd circleup
 npm install
 ```

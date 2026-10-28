@@ -9,7 +9,18 @@ const nodeSupported =
 
 let npmVersion = "unavailable";
 try {
-  npmVersion = execFileSync("npm", ["--version"], { encoding: "utf8" }).trim();
+  // On Windows `npm` is npm.cmd (a batch script) and cannot be launched
+  // directly via execFileSync; routing the version check through a shell
+  // resolves it. The command string is a fixed literal (no user input), so
+  // passing it as a single string — not an args array — avoids both the
+  // .cmd resolution problem and Node's DEP0190 shell-args deprecation.
+  // Without this, a valid Node.js 24 / npm 11 pair is rejected as
+  // "npm unavailable" on Windows, breaking install from a fresh clone.
+  npmVersion = execFileSync("npm --version", {
+    encoding: "utf8",
+    shell: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
 } catch {
   // The actionable version message below covers a missing npm executable.
 }

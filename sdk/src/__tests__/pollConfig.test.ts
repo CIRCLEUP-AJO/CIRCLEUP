@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { SorobanRpc } from "@stellar/stellar-sdk";
+import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import {
   CircleUpClient,
   DEFAULT_POLL_CONFIG,

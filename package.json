@@ -30,6 +30,7 @@
     "smoke-test": "npm run smoke-test --workspace=scripts",
     "smoke-test:mainnet": "npm run smoke-test:mainnet --workspace=scripts",
     "lint": "npm run lint --workspace=app",
+    "typecheck": "npm run typecheck --workspace=sdk && npm run typecheck --workspace=indexer && npm run typecheck --workspace=app",
     "test": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
     "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
     "test:keyboard": "node --experimental-strip-types --test tests/keyboard-navigation.test.ts",
@@ -44,7 +45,25 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-org/circleup"
+    "url": "https://github.com/CIRCLEUP-AJO/CIRCLEUP"
   },
+  "homepage": "https://github.com/CIRCLEUP-AJO/CIRCLEUP#readme",
+  "bugs": {
+    "url": "https://github.com/CIRCLEUP-AJO/CIRCLEUP/issues"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "rosca",
+    "defi",
+    "savings",
+    "ajo",
+    "esusu",
+    "tanda",
+    "chama",
+    "financial-inclusion",
+    "smart-contract"
+  ],
+  "author": "CircleUp Contributors",
   "license": "MIT"
 }

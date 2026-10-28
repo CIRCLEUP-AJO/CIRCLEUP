@@ -1,0 +1,22 @@
+# Build output & dependencies
+node_modules
+dist
+build
+.next
+out
+coverage
+.nyc_output
+
+# Rust / Soroban build artifacts
+contracts/target
+**/*.wasm
+
+# Generated / vendored
+package-lock.json
+**/Cargo.lock
+docs/api/**/openapi.json
+artifacts
+profiles
+
+# Lockfiles & machine-generated files
+*.log

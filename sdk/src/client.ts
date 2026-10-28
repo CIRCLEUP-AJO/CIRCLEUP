@@ -8,7 +8,7 @@ import {
   nativeToScVal,
   scValToNative,
   Contract,
-  SorobanRpc,
+  rpc as SorobanRpc,
 } from "@stellar/stellar-sdk";
 import type {
   CircleUpConfig,
@@ -1749,7 +1749,7 @@ export class CircleUpClient {
     // The hash is a pure function of the signed envelope, so it is known before
     // the RPC answers — which is what lets an ambiguous submission be looked up
     // instead of rebuilt.
-    const localHash = preparedTx.hash().toString("hex");
+    const localHash = Buffer.from(preparedTx.hash()).toString("hex");
     const validUntil = readValidUntil(preparedTx);
 
     const sent = await this.submitEnvelope(preparedTx);
