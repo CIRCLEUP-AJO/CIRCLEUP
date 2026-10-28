@@ -29,6 +29,12 @@ jobs:
         run: cd contracts && cargo test
         # Failure here blocks merge: names the failed crate in cargo output.
 
+      - name: cargo audit (high-severity advisories)
+        run: |
+          cargo install cargo-audit --locked --quiet
+          cd contracts && cargo audit
+        continue-on-error: true
+
   # ── TypeScript SDK ──────────────────────────────────────────────────────────
   sdk:
     name: SDK
@@ -67,6 +73,14 @@ jobs:
       # test file is published, and nothing in the repo uses a deep import.
       - name: Public API check
         run: npm run check:api --workspace=sdk
+
+      - name: npm audit (high-severity advisories)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+      - name: SDK coverage (≥70% threshold)
+        run: npm run test:coverage --workspace=sdk
+        continue-on-error: true
 
   # ── Indexer ─────────────────────────────────────────────────────────────────
   indexer:
@@ -138,6 +152,10 @@ jobs:
 
       - name: Lint app
         run: npm run lint --workspace=app
+
+      - name: Format check
+        run: npm run format:check
+        continue-on-error: true
 
       - name: Typecheck app
         run: npm run typecheck --workspace=app
