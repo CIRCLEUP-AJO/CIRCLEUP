@@ -47,15 +47,8 @@ export * from "./utils";     // usdcToStroops, stroopsToUsdc, formatUsdc, shortA
 export * from "./gating";    // StateSnapshot, GateResult, computeActionEligibility, buildSnapshot, …
 
 export {
-  // Clients
+  // Base client (from circleUpClient.ts)
   CircleUpClient,
-  FactoryClient,
-  CircleClient,
-  ReputationClient,
-  IndexerClient,
-  // Errors
-  GateError,
-  IndexerError,
   // Read-error classifiers
   isConfigAbsent,
   isCircleNotActive,
@@ -68,7 +61,7 @@ export {
   scI128,
   scBool,
   scAddressVec,
-} from "./client";
+} from "./circleUpClient";
 
 export type {
   PollConfig,
@@ -77,6 +70,25 @@ export type {
   TxLogEvent,
   TxLogger,
   CircleFullState,
+  DeploymentCheck,
+  DeploymentCheckName,
+  DeploymentCheckStatus,
+  DeploymentVerification,
+  VerifyDeploymentOptions,
+} from "./circleUpClient";
+
+export {
+  // Sub-clients (from client.ts)
+  FactoryClient,
+  CircleClient,
+  ReputationClient,
+  IndexerClient,
+  // Errors
+  GateError,
+  IndexerError,
+} from "./client";
+
+export type {
   PreflightOptions,
   PreflightResult,
   PreflightFresh,
@@ -85,4 +97,3 @@ export type {
 
 export { transactionSupport } from "./support";
 export type { SupportSummary } from "./support";
-export type { DeploymentCheck, DeploymentCheckName, DeploymentCheckStatus, DeploymentVerification, VerifyDeploymentOptions } from "./client";
