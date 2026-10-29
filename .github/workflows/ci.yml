@@ -30,6 +30,7 @@ jobs:
         # Failure here blocks merge: names the failed crate in cargo output.
 
       - name: cargo audit (high-severity advisories)
+        # Advisory-only: does not block merge (see dependency-advisory job).
         run: |
           cargo install cargo-audit --locked --quiet
           cd contracts && cargo audit
@@ -75,12 +76,16 @@ jobs:
         run: npm run check:api --workspace=sdk
 
       - name: npm audit (high-severity advisories)
+        # Auditing is advisory-only: upstream packages may carry known CVEs that
+        # have no fix yet (e.g. ip-address via express-rate-limit). Failures are
+        # visible in the job log but do not block merges — see the separate
+        # 'dependency-advisory' job for a full audit report.
         run: npm audit --omit=dev --audit-level=high
         continue-on-error: true
 
       - name: SDK coverage (≥70% threshold)
+        # Enforced gate: a drop below 70% fails the SDK job and blocks merge.
         run: npm run test:coverage --workspace=sdk
-        continue-on-error: true
 
   # ── Indexer ─────────────────────────────────────────────────────────────────
   indexer:
@@ -154,8 +159,8 @@ jobs:
         run: npm run lint --workspace=app
 
       - name: Format check
+        # Enforced gate: unformatted code fails the App job and blocks merge.
         run: npm run format:check
-        continue-on-error: true
 
       - name: Typecheck app
         run: npm run typecheck --workspace=app

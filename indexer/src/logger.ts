@@ -278,22 +278,42 @@ export interface LogEntry {
   [key: string]: unknown;
 }
 
+// ─── Pino-backed default transport ──────────────────────────────────────────────
+//
+// The indexer uses pino as its structured logging library.  The existing
+// `log()` / `logIndexerStarted()` / etc. call sites are unchanged — they emit
+// the same LogEntry shape; only the transport swaps from raw console.* to
+// pino's JSON serializer, which adds proper level mapping, child loggers,
+// and transport pipeline support for production log aggregation.
+
+import pino from "pino";
+
+const pinoLogger = pino({
+  name: "circleup-indexer",
+  level: (process.env.LOG_LEVEL as string | undefined) ?? "info",
+  // Redact sensitive fields globally — belt-and-suspenders alongside the
+  // per-field redaction done in log() before the entry reaches the transport.
+  redact: {
+    paths: ["*.secret", "*.privateKey", "*.secretKey", "*.seed", "req.headers.authorization"],
+    censor: "[REDACTED]",
+  },
+  // Serialise bigint as string (same as the old JSON.stringify replacer).
+  serializers: {
+    value: (v: unknown) =>
+      typeof v === "bigint" ? v.toString() : (v as any),
+  },
+});
+
 function defaultTransport(entry: LogEntry): void {
-  // JSON-per-line format: compatible with CloudWatch, Loki, Datadog, etc.
-  // eslint-disable-next-line no-console
-  const output = JSON.stringify(entry, (_k, v) =>
-    typeof v === "bigint" ? v.toString() : v,
-  );
-  if (entry.level === "error" || entry.level === "fatal") {
-    // eslint-disable-next-line no-console
-    console.error(output);
-  } else if (entry.level === "warn") {
-    // eslint-disable-next-line no-console
-    console.warn(output);
-  } else {
-    // eslint-disable-next-line no-console
-    console.log(output);
-  }
+  // Map our LogLevel to pino's level names (pino uses 'fatal' too).
+  const data = { ...entry } as Record<string, unknown>;
+  delete data.ts;          // pino adds its own timestamp
+  delete data.level;       // pino adds its own level
+  delete data.msg;         // pino takes msg as first arg
+  data.event = entry.event;
+  data.ts = entry.ts;      // keep our ISO timestamp as a field for backward compat
+
+  pinoLogger[entry.level](data, entry.msg);
 }
 
 // ─── Module state ─────────────────────────────────────────────────────────────
