@@ -30,11 +30,11 @@ jobs:
         # Failure here blocks merge: names the failed crate in cargo output.
 
       - name: cargo audit (high-severity advisories)
-        # Advisory-only: does not block merge (see dependency-advisory job).
+        # Enforced gate: fails the Contracts job when a high-severity advisory
+        # is found.  Add unavoidable upstream advisories to .github/audit-ignore.json.
         run: |
           cargo install cargo-audit --locked --quiet
           cd contracts && cargo audit
-        continue-on-error: true
 
   # ── TypeScript SDK ──────────────────────────────────────────────────────────
   sdk:
@@ -76,10 +76,9 @@ jobs:
         run: npm run check:api --workspace=sdk
 
       - name: npm audit (high-severity advisories)
-        # Auditing is advisory-only: upstream packages may carry known CVEs that
-        # have no fix yet (e.g. ip-address via express-rate-limit). Failures are
-        # visible in the job log but do not block merges — see the separate
-        # 'dependency-advisory' job for a full audit report.
+        # Known unavoidable advisories are documented in .github/audit-ignore.json.
+        # This step is non-blocking only because ip-address (via express-rate-limit)
+        # has no upstream fix. Remove continue-on-error once the advisory is resolved.
         run: npm audit --omit=dev --audit-level=high
         continue-on-error: true
 
@@ -291,3 +290,20 @@ jobs:
         run: npm ci
       - name: Build SDK
         run: npm run build:sdk
+
+  # ── Commit message lint (Conventional Commits) ──────────────────────────────
+  commitlint:
+    name: Commit message lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install commitlint
+        run: npm install --global @commitlint/cli @commitlint/config-conventional
+      - name: Lint commit messages
+        run: npx commitlint --from HEAD~10 --to HEAD --verbose
