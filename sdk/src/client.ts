@@ -18,15 +18,17 @@ import {
   scI128,
   scBool,
   scAddressVec,
-  attachMetadata,
   DEFAULT_FULL_STATE_CACHE_TTL_MS,
   formatMismatchMessage,
-  normalizeNotInitializedError,
-  normalizeCircleNotActiveError,
   isConfigAbsent,
   isCircleNotActive,
   DEFAULT_INDEXER_TIMEOUT_MS,
 } from './circleUpClient';
+import {
+  attachMetadata,
+  normalizeNotInitializedError,
+  normalizeCircleNotActiveError,
+} from './simulationHelpers';
 import type {
   PollConfig,
   WriteOptions,
