@@ -11,6 +11,7 @@ import { connectWithRetry, pool } from "./db/pool";
 import { runMigrations, checkMigrationHealth } from "./db/migrate";
 import { startIndexer, stopIndexer } from "./indexer";
 import { createApp } from "./api";
+import { log } from "./logger";
 import type { Server } from "http";
 
 let shuttingDown = false;
@@ -58,10 +59,10 @@ async function gracefulShutdown(server: Server, signal: string): Promise<void> {
       pool:        "Postgres pool did not release connections",
       complete:    "unexpected: shutdown appeared complete but timer fired",
     };
-    console.error(
-      `[circleup-indexer] Shutdown did not complete within ${SHUTDOWN_GRACE_PERIOD_MS}ms ` +
-        `— stuck at phase "${shutdownPhase}": ${stuck[shutdownPhase]}. Forcing exit.`,
-    );
+    log("fatal", "indexer_stopped", {
+      phase: shutdownPhase,
+      detail: stuck[shutdownPhase],
+    }, `Shutdown timed out after ${SHUTDOWN_GRACE_PERIOD_MS}ms — stuck at "${shutdownPhase}": ${stuck[shutdownPhase]}. Forcing exit.`);
     process.exit(1);
   }, SHUTDOWN_GRACE_PERIOD_MS);
   forceExitTimer.unref();
@@ -109,16 +110,21 @@ async function gracefulShutdown(server: Server, signal: string): Promise<void> {
 }
 
 async function main() {
-  console.log("[circleup-indexer] Booting...");
+  log("info", "indexer_started", {
+    pollIntervalMs: 0,
+    eventsLimit: 0,
+    startLedger: 0,
+  }, "[circleup-indexer] Booting...");
 
   // Wait for Postgres to accept connections before migrating — it's common
   // for the DB container to still be starting up at this point.
   // Retry parameters are read from DB_CONNECT_MAX_RETRIES and
   // DB_CONNECT_BASE_DELAY_MS env vars (defaults: 5 retries, 1000 ms base delay).
-  console.log(
-    `[circleup-indexer] Connecting to Postgres ` +
-      `(max ${DB_CONNECT_MAX_RETRIES} attempt(s), base delay ${DB_CONNECT_BASE_DELAY_MS}ms)...`,
-  );
+  log("info", "indexer_started", {
+    pollIntervalMs: 0,
+    eventsLimit: 0,
+    startLedger: 0,
+  }, `[circleup-indexer] Connecting to Postgres (max ${DB_CONNECT_MAX_RETRIES} attempt(s), base delay ${DB_CONNECT_BASE_DELAY_MS}ms)...`);
   await connectWithRetry();
 
   // Apply DB schema and all pending additive migrations.
@@ -175,7 +181,31 @@ async function main() {
   await startIndexer();
 }
 
+// ── Unhandled error capture ────────────────────────────────────────────────────
+//
+// Catch any error that escapes all other handlers so they land in structured
+// logs rather than crashing silently or printing a raw stack trace.
+process.on("uncaughtException", (err) => {
+  log("fatal", "indexer_stopped", {
+    error: err instanceof Error ? err.message : String(err),
+    stack: err instanceof Error ? err.stack : undefined,
+  }, `[circleup-indexer] Uncaught exception: ${err instanceof Error ? err.message : err}`);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  log("fatal", "indexer_stopped", {
+    error: msg,
+    stack: reason instanceof Error ? reason.stack : undefined,
+  }, `[circleup-indexer] Unhandled promise rejection: ${msg}`);
+  process.exit(1);
+});
+
 main().catch((err) => {
-  console.error("[circleup-indexer] Fatal error:", err);
+  log("fatal", "indexer_stopped", {
+    error: err instanceof Error ? err.message : String(err),
+    stack: err instanceof Error ? err.stack : undefined,
+  }, `[circleup-indexer] Fatal error during startup: ${err instanceof Error ? err.message : err}`);
   process.exit(1);
 });
