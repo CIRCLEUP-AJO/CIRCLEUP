@@ -214,6 +214,20 @@ cd circleup
 npm install
 ```
 
+### 1b. Build and run tests
+
+```bash
+# Build the SDK and run the test suite (no external services required)
+npm test
+
+# The full test suite (requires Postgres for indexer tests)
+docker compose up -d
+npm run test:all
+```
+
+`npm test` builds the TypeScript SDK and runs 868+ unit tests with Vitest.
+It exits 0 on success — no Postgres, Docker, or network access needed.
+
 ### 2. Build and deploy contracts
 
 ```bash
