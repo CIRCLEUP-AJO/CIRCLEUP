@@ -295,6 +295,10 @@ jobs:
         run: npm run build:sdk
 
   # ── Commit message lint (Conventional Commits) ──────────────────────────────
+  # Raises conventional_rate_last_200 by enforcing Conventional Commits on
+  # every commit that reaches main.  The job checks all commits on the branch
+  # that are not yet in the base (origin/main for PRs, HEAD~20 for push events)
+  # so both PR squash-merges and direct pushes are covered.
   commitlint:
     name: Commit message lint
     runs-on: ubuntu-latest
@@ -308,5 +312,10 @@ jobs:
           cache: npm
       - name: Install commitlint
         run: npm install --global @commitlint/cli @commitlint/config-conventional
-      - name: Lint commit messages
-        run: npx commitlint --from HEAD~10 --to HEAD --verbose
+      - name: Lint commit messages (PR range or last 20)
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            npx commitlint --from "${{ github.event.pull_request.base.sha }}" --to HEAD --verbose
+          else
+            npx commitlint --from HEAD~20 --to HEAD --verbose
+          fi

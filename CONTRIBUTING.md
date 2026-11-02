@@ -91,19 +91,70 @@ the supported range and next step.
 
 ## Commit Style
 
-We follow [Conventional Commits](https://www.conventionalcommits.org/):
+CircleUp enforces [Conventional Commits](https://www.conventionalcommits.org/) via
+commitlint in CI. Every commit that reaches `main` — whether via PR squash-merge or
+direct push — is checked. Non-conforming commits **block merge**.
+
+### Format
 
 ```
-type(scope): short description
+<type>(<scope>): <short description>
 
-feat(circle): add grace period before mark_default
+[optional body]
+
+[optional footer(s)]
+```
+
+### Types (required)
+
+| Type | When to use |
+|------|-------------|
+| `feat` | New feature or capability |
+| `fix` | Bug fix |
+| `docs` | Documentation only |
+| `refactor` | Code restructure, no behaviour change |
+| `test` | Adding or updating tests |
+| `ci` | CI/CD workflow changes |
+| `chore` | Maintenance (deps, tooling, config) |
+| `build` | Build system or external dependency changes |
+| `perf` | Performance improvement |
+| `revert` | Reverts a previous commit |
+
+### Scope (optional but recommended)
+
+Use the workspace or module: `sdk`, `indexer`, `app`, `contracts`, `ci`, `docs`
+
+### Examples
+
+```
+feat(sdk): add getCircleCount to FactoryClient
 fix(indexer): handle null contractId in event response
-docs(readme): update quick start steps
-chore(ci): upgrade to Node 24
-test(contracts): add edge case for zero collateral
+docs(readme): update quick start for Node 24
+refactor(sdk): extract rpcRetry helpers into rpcRetry.ts
+test(contracts): add edge case for zero collateral after penalty
+ci: enforce SDK coverage gate (remove continue-on-error)
+chore(deps): bump @stellar/stellar-sdk to 17.3.0
 ```
 
-Types: `feat`, `fix`, `docs`, `test`, `chore`, `refactor`, `ci`, `build`
+### Breaking changes
+
+Add `!` after the type/scope and a `BREAKING CHANGE:` footer:
+
+```
+feat(sdk)!: rename getCircles to listCircles
+
+BREAKING CHANGE: FactoryClient.getCircles renamed to listCircles for consistency
+```
+
+### Validation
+
+Run locally before pushing:
+```bash
+npx commitlint --from HEAD~1 --to HEAD --verbose
+```
+
+CI checks all commits on every PR (`from base SHA to HEAD`) and the last 20
+commits on direct pushes to `main`.
 
 ---
 
