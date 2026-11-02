@@ -45,11 +45,8 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 18
+          node-version: 22
           cache: npm
-
-      - name: Select supported npm line
-        run: npm install --global npm@9
 
       - name: Install dependencies
         run: npm ci
@@ -115,9 +112,6 @@ jobs:
           node-version: 22
           cache: npm
 
-      - name: Select supported npm line
-        run: npm install --global npm@9
-
       - name: Install dependencies
         run: npm ci
 
@@ -148,14 +142,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Test SDK
-        run: npm run test --workspace=sdk
-
-      - name: Select supported npm line
-        run: npm install --global npm@9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Test SDK
+        run: npm run test --workspace=sdk
 
       - name: Lint app
         run: npm run lint --workspace=app
@@ -188,14 +184,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: App visual regression tests
-        run: npm run test:visual --workspace=app
-
-      - name: Select supported npm line
-        run: npm install --global npm@9
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      - name: App visual regression tests
+        run: npm run test:visual --workspace=app
 
       - name: Typecheck scripts
         run: cd scripts && npx tsc --noEmit
@@ -232,11 +230,8 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 18
+          node-version: 22
           cache: npm
-
-      - name: Select supported npm line
-        run: npm install --global npm@9
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -266,6 +261,12 @@ jobs:
           name: dependency-license-inventories
           path: artifacts/licenses-*
 
+  # ── Toolchain compatibility matrix ──────────────────────────────────────────
+  # This job intentionally installs the exact npm version for each Node line
+  # so the preinstall toolchain guard (check-node.cjs) can be validated
+  # against each supported (Node, npm) pair. The global install here is
+  # intentional and correct — it is NOT a workaround for a missing packageManager
+  # field, but a deliberate compatibility test.
   toolchain-compatibility:
     name: Toolchain (Node ${{ matrix.node }}, npm ${{ matrix.npm }})
     runs-on: ubuntu-latest
@@ -285,7 +286,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - name: Select supported npm line
+      - name: Pin npm version for this toolchain matrix entry
         run: npm install --global "npm@${{ matrix.npm }}"
       - name: Validate Node and npm
         run: npm run check:node

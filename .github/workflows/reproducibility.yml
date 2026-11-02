@@ -66,9 +66,6 @@ jobs:
           node-version: "22"
           cache: "npm"
 
-      - name: Select supported npm line
-        run: npm install --global npm@10
-
       - name: Install Node dependencies
         run: npm ci
 
