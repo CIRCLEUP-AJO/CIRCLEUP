@@ -79,11 +79,11 @@ jobs:
         run: npm run check:api --workspace=sdk
 
       - name: npm audit (high-severity advisories)
+        # Enforced gate: fails the SDK job when a high-severity advisory is found.
         # Known unavoidable advisories are documented in .github/audit-ignore.json.
-        # This step is non-blocking only because ip-address (via express-rate-limit)
-        # has no upstream fix. Remove continue-on-error once the advisory is resolved.
+        # All known advisories (ip-address via express-rate-limit) were resolved
+        # by npm audit fix on 2026-10-29; this is now a hard blocking gate.
         run: npm audit --omit=dev --audit-level=high
-        continue-on-error: true
 
       - name: SDK coverage (≥70% threshold)
         # Enforced gate: a drop below 70% fails the SDK job and blocks merge.

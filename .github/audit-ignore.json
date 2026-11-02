@@ -1,21 +1,26 @@
 {
-  "description": "Known upstream advisories that have no fix available yet. These are tracked here so they can be excluded from blocking CI audit gates. Remove an entry when an upstream fix is released and the dependency is updated.",
-  "advisories": [
+  "description": "Known upstream advisories that cannot be resolved by npm audit fix. All entries must include a reason and a date. Remove an entry when an upstream fix is released and the lockfile is updated.",
+  "advisories": [],
+  "resolved": [
     {
       "package": "ip-address",
       "via": "express-rate-limit",
       "advisory": "GHSA-j6r3-76f7-8jcv",
       "severity": "high",
-      "reason": "No fix available in ip-address <=10.7.3. express-rate-limit@8.x depends on this package. Upstream fix pending.",
-      "added": "2026-10-28"
+      "reason": "Resolved 2026-10-29 via npm audit fix. express-rate-limit updated to a version that no longer pulls the vulnerable ip-address.",
+      "resolved": "2026-10-29"
     },
     {
-      "package": "ip-address",
-      "via": "express-rate-limit",
-      "advisory": "GHSA-rpw4-54j3-4h4q",
-      "severity": "moderate",
-      "reason": "Same upstream chain as above.",
-      "added": "2026-10-28"
+      "package": "body-parser",
+      "advisory": "high",
+      "reason": "Resolved 2026-10-29 via npm audit fix.",
+      "resolved": "2026-10-29"
+    },
+    {
+      "package": "follow-redirects",
+      "advisory": "high",
+      "reason": "Resolved 2026-10-29 via npm audit fix.",
+      "resolved": "2026-10-29"
     }
   ]
 }
