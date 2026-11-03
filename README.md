@@ -225,8 +225,22 @@ docker compose up -d
 npm run test:all
 ```
 
-`npm test` builds the TypeScript SDK and runs 868+ unit tests with Vitest.
+`npm test` builds the TypeScript SDK and runs 900+ unit tests with Vitest.
 It exits 0 on success — no Postgres, Docker, or network access needed.
+
+### 1c. Self-contained setup with Docker (optional)
+
+```bash
+# Start Postgres + full dev container (Node 22, Rust, stellar-cli)
+docker compose up -d
+
+# Connect to the dev container
+docker compose exec devcontainer bash
+
+# Inside the container:
+npm test                    # SDK unit tests
+cd contracts && cargo test  # Rust contract tests
+```
 
 ### 2. Build and deploy contracts
 

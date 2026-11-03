@@ -17,5 +17,36 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── Development container ───────────────────────────────────────────────────
+  #
+  # Full-stack dev environment with Node 22, Rust stable, and stellar-cli.
+  # Used by .devcontainer/devcontainer.json for VS Code Dev Containers and
+  # GitHub Codespaces.
+  #
+  # Quick start (no VS Code required):
+  #   docker compose up -d
+  #   docker compose exec devcontainer bash
+  #   npm test                    # 900+ SDK unit tests
+  #   cd contracts && cargo test  # Rust contract tests
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/workspace
+      - node_modules:/workspace/node_modules
+      - cargo_cache:/usr/local/cargo/registry
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/circleup
+      NODE_ENV: development
+      STELLAR_RPC_URL: https://soroban-testnet.stellar.org
+    command: sleep infinity   # keeps container running; connect via exec or VS Code
+
 volumes:
   pgdata:
+  node_modules:
+  cargo_cache:
