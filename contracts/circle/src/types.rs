@@ -4,7 +4,7 @@
 //! Extracted from lib.rs to reduce its LOC.
 //! All items here are re-exported from lib.rs via use crate::types::*.
 
-use soroban_sdk::{contracttype, contracterror, Env, Symbol};
+use soroban_sdk::{contracttype, contracterror, Address, Env, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
