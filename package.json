@@ -29,7 +29,7 @@
     "validate-manifest": "npm run validate-manifest --workspace=scripts",
     "smoke-test": "npm run smoke-test --workspace=scripts",
     "smoke-test:mainnet": "npm run smoke-test:mainnet --workspace=scripts",
-    "lint": "npm run lint --workspace=app",
+    "lint": "npm run lint --workspace=app && npm run lint --workspace=sdk && npm run lint --workspace=indexer",
     "typecheck": "npm run typecheck --workspace=sdk && npm run typecheck --workspace=indexer && npm run typecheck --workspace=app",
     "format:check": "npx prettier --check \"**/*.{ts,tsx,js,json,md,yml,yaml}\" --ignore-path .prettierignore",
     "format": "npx prettier --write \"**/*.{ts,tsx,js,json,md,yml,yaml}\" --ignore-path .prettierignore",
