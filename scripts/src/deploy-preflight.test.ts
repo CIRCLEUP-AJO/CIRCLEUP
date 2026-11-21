@@ -1,9 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   runDeployPreflight,
   resolveNetwork,
   CANONICAL_PASSPHRASES,
   CANONICAL_RPC_URLS,
+  runDeployDryRun,
+  buildResumePlan,
+  DEPLOY_STAGES,
+  type DeployStage,
+  type DeploymentStateRecord,
 } from "./deploy-preflight";
 
 // Valid testnet addresses for testing
@@ -166,5 +171,233 @@ describe("deployPreflight", () => {
     expect(report.ok).toBe(false);
     expect(report.verifiedFacts.tokenStatus).toBe("mismatch");
     expect(report.errors.some((e) => e.includes("canonical Mainnet USDC SAC address"))).toBe(true);
+  });
+});
+
+describe("deployDryRun", () => {
+  const validInputs = () => ({
+    network: "testnet" as const,
+    networkPassphrase: CANONICAL_PASSPHRASES.testnet,
+    rpcUrl: CANONICAL_RPC_URLS.testnet,
+    deployerPublicKey: VALID_DEPLOYER,
+    contractAddresses: {
+      reputation: VALID_CONTRACT_1,
+      circleFactory: VALID_CONTRACT_2,
+    },
+    artifacts: {
+      reputation: { exists: true, path: "target/wasm32/reputation.wasm" },
+      circleFactory: { exists: true, path: "target/wasm32/circle_factory.wasm" },
+    },
+    rpcClient: {
+      getNetwork: async () => ({
+        passphrase: CANONICAL_PASSPHRASES.testnet,
+        protocolVersion: 21,
+      }),
+    },
+  });
+
+  it("reports target network and intended operations without signing", async () => {
+    const signer = vi.fn();
+    const result = await runDeployDryRun(validInputs(), { signer });
+
+    expect(result.ok).toBe(true);
+    expect(result.targetNetwork).toBe("testnet");
+    expect(result.intendedOperations.length).toBeGreaterThan(0);
+    expect(result.intendedOperations.some((op) => op.includes("reputation"))).toBe(true);
+    expect(signer).not.toHaveBeenCalled();
+    expect(result.signerInvoked).toBe(false);
+  });
+
+  it("missing artifacts: reports every missing artifact before any write", async () => {
+    const signer = vi.fn();
+    const inputs = validInputs();
+    inputs.artifacts = {
+      reputation: { exists: false, path: "target/wasm32/reputation.wasm" },
+      circleFactory: { exists: false, path: "target/wasm32/circle_factory.wasm" },
+    };
+
+    const result = await runDeployDryRun(inputs, { signer });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.includes("Missing artifact for reputation"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("Missing artifact for circleFactory"))).toBe(true);
+    expect(result.intendedOperations.length).toBe(0);
+    expect(signer).not.toHaveBeenCalled();
+  });
+
+  it("invalid network: reports before any write", async () => {
+    const signer = vi.fn();
+    const inputs = validInputs();
+    (inputs as any).network = "not-a-network";
+
+    const result = await runDeployDryRun(inputs, { signer });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.includes("Unknown network"))).toBe(true);
+    expect(signer).not.toHaveBeenCalled();
+  });
+
+  it("wrong token: reports token mismatch before any write", async () => {
+    const signer = vi.fn();
+    const inputs = validInputs();
+    (inputs as any).network = "mainnet";
+    (inputs as any).networkPassphrase = CANONICAL_PASSPHRASES.mainnet;
+    (inputs as any).rpcUrl = "https://soroban.stellar.org";
+    inputs.contractAddresses = {
+      ...inputs.contractAddresses,
+      usdc: VALID_CONTRACT_1, // not canonical mainnet
+    };
+    inputs.rpcClient = {
+      getNetwork: async () => ({
+        passphrase: CANONICAL_PASSPHRASES.mainnet,
+        protocolVersion: 21,
+      }),
+    };
+
+    const result = await runDeployDryRun(inputs, { signer });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.includes("canonical Mainnet USDC SAC address"))).toBe(true);
+    expect(signer).not.toHaveBeenCalled();
+  });
+
+  it("existing manifest: reports inconsistent manifest state before any write", async () => {
+    const signer = vi.fn();
+    const inputs = validInputs();
+    (inputs as any).existingManifest = {
+      network: "testnet",
+      contracts: {
+        reputation: VALID_CONTRACT_1,
+        circleFactory: VALID_CONTRACT_2,
+      },
+      complete: false,
+    };
+
+    const result = await runDeployDryRun(inputs, { signer });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.some((e) => e.includes("Existing manifest is incomplete"))).toBe(true);
+    expect(result.errors.some((e) => e.includes("--resume"))).toBe(true);
+    expect(signer).not.toHaveBeenCalled();
+  });
+
+  it("RPC unavailability: reported without signing", async () => {
+    const signer = vi.fn();
+    const inputs = validInputs();
+    inputs.rpcClient = {
+      getNetwork: async () => {
+        throw new Error("connect ECONNREFUSED 127.0.0.1:8000");
+      },
+    };
+
+    const result = await runDeployDryRun(inputs, { signer });
+
+    expect(result.verifiedFacts.remoteRpcStatus).toBe("unavailable");
+    expect(result.warnings.some((w) => w.includes("Remote RPC check unavailable"))).toBe(true);
+    expect(signer).not.toHaveBeenCalled();
+  });
+
+  it("reports every locally detectable failure at once", async () => {
+    const signer = vi.fn();
+    const inputs = validInputs();
+    (inputs as any).network = "not-a-network";
+    inputs.deployerPublicKey = "G_INVALID_ACCOUNT_KEY";
+    inputs.artifacts = {
+      reputation: { exists: false, path: "target/wasm32/reputation.wasm" },
+      circleFactory: { exists: false, path: "target/wasm32/circle_factory.wasm" },
+    };
+
+    const result = await runDeployDryRun(inputs, { signer });
+
+    expect(result.ok).toBe(false);
+    expect(result.errors.length).toBeGreaterThanOrEqual(4);
+    expect(signer).not.toHaveBeenCalled();
+  });
+});
+
+describe("buildResumePlan", () => {
+  const baseState = (): DeploymentStateRecord => ({
+    network: "testnet",
+    operations: DEPLOY_STAGES.map((stage) => ({
+      stage,
+      status: "pending" as const,
+    })),
+  });
+
+  const markThrough = (
+    state: DeploymentStateRecord,
+    lastCompleted: DeployStage | null
+  ): DeploymentStateRecord => {
+    const idx = lastCompleted ? DEPLOY_STAGES.indexOf(lastCompleted) : -1;
+    return {
+      ...state,
+      operations: state.operations.map((op, i) => ({
+        ...op,
+        status: i <= idx ? "complete" : "pending",
+        txHash: i <= idx ? `tx-${op.stage}` : undefined,
+      })),
+    };
+  };
+
+  it("fresh state: plans all stages as mutating steps", () => {
+    const plan = buildResumePlan(baseState());
+    expect(plan.isResumable).toBe(true);
+    expect(plan.steps.length).toBe(DEPLOY_STAGES.length);
+    expect(plan.steps.every((s) => s.action === "execute")).toBe(true);
+    expect(plan.requiresConfirmation).toBe(true);
+  });
+
+  it.each(DEPLOY_STAGES)(
+    "interruption after %s: plan resumes remaining stages without duplication",
+    (stage) => {
+      const state = markThrough(baseState(), stage);
+      const plan = buildResumePlan(state);
+
+      expect(plan.isResumable).toBe(true);
+      const completedIdx = DEPLOY_STAGES.indexOf(stage);
+      plan.steps.forEach((step, i) => {
+        if (i <= completedIdx) {
+          expect(step.action).toBe("skip");
+        } else {
+          expect(step.action).toBe("execute");
+        }
+      });
+      expect(plan.requiresConfirmation).toBe(true);
+    }
+  );
+
+  it("interruption after upload: reuses existing uploaded artifact rather than redeploying", () => {
+    const state = markThrough(baseState(), "upload");
+    const plan = buildResumePlan(state);
+    const deployStep = plan.steps.find((s) => s.stage === "deploy");
+    expect(deployStep?.action).toBe("execute");
+    expect(plan.steps.find((s) => s.stage === "upload")?.action).toBe("skip");
+  });
+
+  it("address exists but no tx hash: never infers safe reuse", () => {
+    const state = baseState();
+    state.operations = state.operations.map((op) =>
+      op.stage === "deploy"
+        ? { ...op, status: "started" as const, address: VALID_CONTRACT_1 }
+        : op
+    );
+    const plan = buildResumePlan(state);
+
+    expect(plan.isResumable).toBe(false);
+    expect(plan.errors.some((e) => e.includes("address exists without transaction evidence"))).toBe(true);
+  });
+
+  it("partial state never yields a complete manifest", () => {
+    const state = markThrough(baseState(), "deploy");
+    const plan = buildResumePlan(state);
+    expect(plan.resultingManifestComplete).toBe(false);
+  });
+
+  it("all stages complete: resulting manifest is complete", () => {
+    const state = markThrough(baseState(), DEPLOY_STAGES[DEPLOY_STAGES.length - 1]);
+    const plan = buildResumePlan(state);
+    expect(plan.isResumable).toBe(true);
+    expect(plan.steps.every((s) => s.action === "skip")).toBe(true);
+    expect(plan.resultingManifestComplete).toBe(true);
   });
 });
