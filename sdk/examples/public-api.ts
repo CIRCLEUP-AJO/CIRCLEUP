@@ -144,6 +144,55 @@ export async function recover(
   return lookup.ok ? lookup.value.status : "lookup_failed";
 }
 
+// ─── API deprecation policy (issue #149) ─────────────────────────────────────
+
+import {
+  readDeprecations,
+  isDeprecated,
+  type Deprecation,
+  type DeprecationHeaders,
+} from "@circleup/sdk";
+
+/**
+ * Observe a deprecation before it breaks anything.
+ *
+ * Deprecated fields and endpoints keep working for the full migration window
+ * (see docs/api-deprecation-policy.md). The indexer advertises each pending
+ * change in the response body's `deprecations` array and mirrors it in the
+ * `Deprecation` / `Sunset` response headers, so a consumer can warn and migrate
+ * without parsing logs. `Sunset` is the RFC 8594 date after which the old form
+ * may be removed; nothing is removed before it.
+ */
+export function pendingDeprecations(
+  headers: DeprecationHeaders,
+  body: { deprecations?: Deprecation[] },
+): { warnings: string[]; sunsetAt: Date | null } {
+  // Headers are the observable signal; the body array carries the detail.
+  const deprecations = readDeprecations(headers, body);
+  const warnings = deprecations.map(
+    (d) => `${d.field} is deprecated in favor of ${d.replacement}; removed after ${d.sunset}`,
+  );
+  const sunsetAt = deprecations.length
+    ? new Date(Math.min(...deprecations.map((d) => Date.parse(d.sunset))))
+    : null;
+  return { warnings, sunsetAt };
+}
+
+/**
+ * Migrate a read model to the replacement field while the old one still works.
+ *
+ * Read the replacement when present and fall back to the deprecated field only
+ * during the window; after `sunset` the fallback can be deleted. `isDeprecated`
+ * lets a consumer assert it is no longer relying on a field slated for removal.
+ */
+export function circleName(row: { name?: string; title?: string }): string {
+  if (isDeprecated("name")) {
+    // Transitional: prefer the replacement, fall back to the old field.
+    return row.title ?? row.name ?? "";
+  }
+  return row.title ?? "";
+}
+
 // ─── Network identity, error taxonomy, and lifecycle (issues #900–#903) ──────
 
 import {

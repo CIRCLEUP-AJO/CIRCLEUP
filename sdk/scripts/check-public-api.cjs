@@ -10,7 +10,10 @@
  *   3. a consumer in this repo, or a doc, imports a deep path such as
  *      "@circleup/sdk/dist/client";
  *   4. test code was emitted into dist/;
- *   5. package.json "exports" exposes anything beyond the root entry point.
+ *   5. package.json "exports" exposes anything beyond the root entry point;
+ *   6. the indexer HTTP API changed its wire contract (a field was removed,
+ *      renamed, or had its wire type changed) without a matching deprecation
+ *      entry — since / sunset / replacement — in the changelog or OpenAPI doc.
  *
  * Every problem is reported at once, and the exit code is non-zero if any were found.
  */
@@ -19,6 +22,7 @@
 const fs = require("fs");
 const path = require("path");
 const ts = require("typescript");
+const { execFileSync } = require("child_process");
 
 const SDK_DIR = path.resolve(__dirname, "..");
 const REPO_DIR = path.resolve(SDK_DIR, "..");
@@ -44,6 +48,22 @@ const ILLUSTRATIVE_DOCS = new Set(["docs/DEPRECATION_POLICY.md"]);
 
 /** Consumer code scanned for deep imports. */
 const CONSUMER_SOURCES = ["app/src", "scripts/src", "indexer/src", "tests", "sdk/examples"];
+
+/** Committed snapshot of the indexer wire contract (routes + response fields). */
+const CONTRACT_SNAPSHOT = "indexer/api-contract.snapshot.json";
+
+/** Documents that may carry a deprecation entry for a wire-breaking change. */
+const DEPRECATION_DOCS = ["CHANGELOG.md", "docs/DEPRECATION_POLICY.md", "indexer/openapi.json", "indexer/openapi.yaml"];
+
+/**
+ * Contracts a wire-breaking change can reach. Reported on failure so release
+ * review can identify every consumer that needs a migration window.
+ */
+const AFFECTED_CONTRACTS = [
+  "app (app/src) — in-repo HTTP client",
+  "sdk (@circleup/sdk) — published client types",
+  "external consumers — third-party indexer API clients",
+];
 
 const problems = [];
 
@@ -162,6 +182,99 @@ if (!pkg.exports || typeof pkg.exports !== "object") {
   for (const key of Object.keys(pkg.exports)) {
     if (!allowedEntries.has(key)) {
       problems.push(`package.json "exports" advertises "${key}"; only the root entry point is stable.`);
+    }
+  }
+}
+
+// ── 6. Indexer wire contract vs committed snapshot ───────────────────────────
+
+/**
+ * Flatten a contract snapshot into `route -> field -> wireType` entries.
+ * A snapshot looks like:
+ *   { "routes": { "GET /api/v1/events": { "fields": { "id": "string", ... } } } }
+ */
+function flattenContract(contract) {
+  const out = new Map();
+  const routes = (contract && contract.routes) || {};
+  for (const [route, def] of Object.entries(routes)) {
+    const fields = (def && def.fields) || {};
+    for (const [field, wireType] of Object.entries(fields)) {
+      out.set(`${route} ${field}`, String(wireType));
+    }
+  }
+  return out;
+}
+
+/** True when a doc records a deprecation entry for `route`/`field`. */
+function hasDeprecationEntry(route, field) {
+  for (const rel of DEPRECATION_DOCS) {
+    const abs = path.join(REPO_DIR, rel);
+    if (!fs.existsSync(abs)) continue;
+    const text = fs.readFileSync(abs, "utf8");
+    const idx = text.indexOf(field);
+    if (idx === -1) continue;
+    // Look at a window around the field mention for the required markers.
+    const window = text.slice(Math.max(0, idx - 400), idx + 400);
+    const mentionsRoute = window.includes(route) || window.includes(route.split(" ").pop());
+    const hasSince = /\bsince\b/i.test(window);
+    const hasSunset = /\bsunset\b/i.test(window);
+    const hasReplacement = /\b(?:replacement|replaced\s+by|use\s+`?[A-Za-z0-9_]+`?\s+instead)\b/i.test(window);
+    if (mentionsRoute && hasSince && hasSunset && hasReplacement) return true;
+  }
+  return false;
+}
+
+/** Build the current contract from the indexer sources. */
+function currentContract() {
+  const script = path.join(REPO_DIR, "indexer", "scripts", "dump-api-contract.cjs");
+  if (!fs.existsSync(script)) return null;
+  try {
+    const json = execFileSync(process.execPath, [script], { cwd: REPO_DIR, encoding: "utf8" });
+    return JSON.parse(json);
+  } catch (err) {
+    problems.push(`could not build the current indexer contract: ${err.message.split("\n")[0]}`);
+    return null;
+  }
+}
+
+const snapshotPath = path.join(REPO_DIR, CONTRACT_SNAPSHOT);
+if (!fs.existsSync(snapshotPath)) {
+  problems.push(`${CONTRACT_SNAPSHOT} is missing — commit the indexer wire contract snapshot.`);
+} else {
+  const previous = flattenContract(JSON.parse(fs.readFileSync(snapshotPath, "utf8")));
+  const current = currentContract();
+  if (current) {
+    const next = flattenContract(current);
+    const breaking = [];
+    for (const [key, wireType] of previous) {
+      const [route, field] = key.split(" ");
+      if (!next.has(key)) {
+        breaking.push({ route, field, kind: "removed" });
+      } else if (next.get(key) !== wireType) {
+        breaking.push({ route, field, kind: `wire type ${wireType} -> ${next.get(key)}` });
+      }
+    }
+    // A field that only appears under a different name on the same route is a rename.
+    for (const [key] of next) {
+      const [route, field] = key.split(" ");
+      if (previous.has(key)) continue;
+      const renamedFrom = [...previous.keys()].find(
+        (k) => k.startsWith(`${route} `) && !next.has(k) && k.split(" ")[1] !== field,
+      );
+      if (renamedFrom) {
+        breaking.push({ route, field, kind: `renamed from "${renamedFrom.split(" ")[1]}"` });
+      }
+    }
+    for (const change of breaking) {
+      if (hasDeprecationEntry(change.route, change.field)) continue;
+      problems.push(
+        `${change.route} field "${change.field}" was ${change.kind} without a deprecation entry ` +
+          `(since / sunset / replacement) in ${DEPRECATION_DOCS.join(", ")}.`,
+      );
+    }
+    if (breaking.length > 0) {
+      console.error("Wire-breaking indexer API changes affect these contracts:");
+      for (const c of AFFECTED_CONTRACTS) console.error(`  - ${c}`);
     }
   }
 }

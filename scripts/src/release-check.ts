@@ -61,6 +61,38 @@ const MIGRATION_SIGNAL_PATTERNS = [
   /indexer\/src\/db\/migrations\//,
 ];
 
+/**
+ * Paths that define the public HTTP wire contract (Issue #149).
+ *
+ * A change to any of these files can alter field names, pagination, status
+ * values, or numeric encoding for external consumers, so it must be paired
+ * with a deprecation/sunset entry (or an explicit no-deprecation
+ * justification) in the [Unreleased] changelog.
+ */
+const HTTP_CONTRACT_SIGNAL_PATTERNS = [
+  /openapi\.(ya?ml|json)$/i,
+  /swagger\.(ya?ml|json)$/i,
+  /indexer\/src\/db\/schema\.sql$/,
+  /indexer\/src\/db\/migrations\//,
+  /indexer\/src\/db\/migrate\.ts$/,
+];
+
+/** Directories scanned for HTTP contract sources, relative to ROOT. */
+const HTTP_CONTRACT_SCAN_DIRS = [
+  path.join('indexer', 'src', 'db'),
+  path.join('indexer', 'src', 'api'),
+  path.join('indexer', 'docs'),
+  path.join('docs', 'api'),
+];
+
+/** Changelog markers that satisfy the deprecation policy. */
+const DEPRECATION_MARKERS = [
+  /\bdeprecat/i,
+  /\bsunset\b/i,
+  /\bno[- ]deprecation\b/i,
+  /\bno deprecation\b/i,
+];
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function readJson<T>(filePath: string): T | null {
@@ -522,6 +554,94 @@ export function checkArtifactHashDocumentation(overrideContent?: string): CheckR
   );
 }
 
+/**
+ * Check 9 — Deprecation policy for HTTP API / indexer read models (Issue #149).
+ *
+ * When the public HTTP contract sources (OpenAPI document, indexer schema or
+ * migrations) are present, the [Unreleased] changelog must carry a
+ * `Deprecation` / `Sunset` entry — or an explicit `no-deprecation`
+ * justification — so external consumers get a documented warning and
+ * migration window before any breaking wire change.
+ *
+ * The failure message lists the affected app, SDK, and external-consumer
+ * contracts so release review can identify every impacted surface.
+ *
+ * Accepts optional `overrideContent` for testing without touching the filesystem.
+ */
+export function checkHttpDeprecationPolicy(overrideContent?: string): CheckResult {
+  const changelogPath = path.join(ROOT, 'CHANGELOG.md');
+  const changelog = overrideContent ?? (readFile(changelogPath) ?? '');
+
+  // Detect whether any HTTP contract source files exist in the repo.
+  const contractFiles: string[] = [];
+  for (const relDir of HTTP_CONTRACT_SCAN_DIRS) {
+    const dir = path.join(ROOT, relDir);
+    if (!fs.existsSync(dir)) continue;
+    try {
+      const entries = fs.readdirSync(dir, {
+        recursive: true,
+      } as fs.ObjectEncodingOptions & { withFileTypes?: false }) as string[];
+      for (const entry of entries) {
+        const normalized = entry.split(path.sep).join('/');
+        if (HTTP_CONTRACT_SIGNAL_PATTERNS.some(p => p.test(normalized))) {
+          contractFiles.push(path.join(relDir, entry));
+        }
+      }
+    } catch {
+      // Unreadable directory — skip rather than fail the whole release check.
+    }
+  }
+
+  if (contractFiles.length === 0) {
+    return pass(
+      'http-deprecation',
+      'No HTTP contract sources detected — deprecation entry not required',
+    );
+  }
+
+  const lines = changelog.split('\n');
+  const unreleasedIdx = lines.findIndex(l => /^##\s+\[Unreleased\]/i.test(l));
+  if (unreleasedIdx === -1) {
+    return fail(
+      'http-deprecation',
+      'HTTP contract sources present but CHANGELOG.md has no [Unreleased] section',
+      'Add ## [Unreleased] with a Deprecation / Sunset entry (or a no-deprecation justification).',
+    );
+  }
+
+  const block: string[] = [];
+  for (let i = unreleasedIdx + 1; i < lines.length; i++) {
+    if (/^##\s+\[/.test(lines[i])) break;
+    block.push(lines[i]);
+  }
+  const unreleased = block.join('\n');
+
+  if (DEPRECATION_MARKERS.some(p => p.test(unreleased))) {
+    return pass(
+      'http-deprecation',
+      '[Unreleased] documents a deprecation/sunset (or no-deprecation justification) for HTTP contract changes',
+    );
+  }
+
+  const affected = [
+    'app — consumes indexer read models via the SDK',
+    'sdk — @circleup/sdk types and client methods mirror the wire contract',
+    'external consumers — third-party tools calling the indexer HTTP API directly',
+  ];
+
+  return fail(
+    'http-deprecation',
+    'HTTP contract sources changed but [Unreleased] has no Deprecation / Sunset entry',
+    `Contract sources detected:\n` +
+      contractFiles.map(f => `  • ${f}`).join('\n') +
+      `\n\nAffected contracts:\n` +
+      affected.map(a => `  • ${a}`).join('\n') +
+      `\n\nAdd a "### Deprecation" entry to [Unreleased] describing the warning period\n` +
+      `and sunset date, or state "no-deprecation" with a justification when the change\n` +
+      `is wire-compatible. See docs/api/DEPRECATION_POLICY.md.`,
+  );
+}
+
 // ── Runner ────────────────────────────────────────────────────────────────────
 
 function runChecks(): void {
@@ -536,6 +656,7 @@ function runChecks(): void {
     checkDeploymentOrderGuidance,
     checkSdkCompatibilityNotes,
     checkArtifactHashDocumentation,
+    checkHttpDeprecationPolicy,
   ];
 
   const results: CheckResult[] = checks.map(fn => {

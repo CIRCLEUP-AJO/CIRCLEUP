@@ -9,6 +9,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Versioned API deprecation policy** (#985, Issue 149): `docs/API_DEPRECATION_POLICY.md`
+  defines how the indexer HTTP API and its read models evolve. Changes are
+  additive-only by default: new fields, new optional query parameters and new
+  enum values may ship in any release, while renaming, removing or retyping a
+  field, changing pagination semantics, changing status values, or changing
+  numeric encoding is a wire-breaking change. Deprecated fields and endpoints
+  stay supported for a minimum window of **two minor releases or 90 days,
+  whichever is longer**, and are announced with `Deprecation` and `Sunset`
+  response headers (RFC 8594 / RFC 9745 semantics) plus a `deprecated` marker
+  in the SDK types and API reference. Wire-breaking changes that cannot be made
+  additively are versioned under a `/v2` path prefix; no version prefix is
+  added to current routes because no compatibility need exists yet. The release
+  checklist (`CONTRIBUTING.md`, PR template) now requires reviewers to identify
+  affected app, SDK and external-consumer contracts before a release, and
+  `indexer/src/__tests__/apiDeprecation.test.ts` covers the transition form
+  (old and new response shapes served side by side) and the sunset signal.
+  See `docs/INDEXER_API_COMPATIBILITY.md` for the per-response compatibility
+  matrix.
 - **Explicit SDK retry policy** (#900): `RETRY_POLICY` documents per-stage
   retry rules (bounded read retries with backoff, no wallet retries,
   submission resends only the identical envelope), and `classifyRpcFailure`

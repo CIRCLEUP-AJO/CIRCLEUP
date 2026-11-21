@@ -243,12 +243,63 @@ npm run migrate:check --workspace=indexer   # must show "Health state: clean"
   update TypeScript types.
 - [ ] If removing or renaming: follow the [Deprecation Policy](./docs/DEPRECATION_POLICY.md)
   notice procedure before merging.
-- [ ] `CHANGELOG.md` — add a bullet.
+- [ ] Deprecation entry — record the field or endpoint in the deprecation
+  registry with `since` (release that introduced the deprecation), `sunset`
+  (earliest release that may remove it, at least the
+  [minimum support window](#api-versioning-and-deprecation-strategy) after
+  `since`), and `replacement` (the field or endpoint consumers should migrate
+  to, or `none` if the data is simply going away).
+- [ ] Deprecation signalling — the deprecated field or endpoint emits the
+  `Deprecation` and `Sunset` response headers (RFC 8594 / RFC 9745) on every
+  response that still serves it, and the compatibility table links the
+  registry entry.
+- [ ] Compatibility test — add a test that exercises the transition window and
+  asserts both the old and the new response forms are served and parseable
+  (old form still present, new form populated, deprecation headers set). See
+  `sdk/src/__tests__/indexerContract.test.ts` and
+  `indexer/src/api.compat.test.ts`.
+- [ ] Affected contracts note — list in the PR description every consumer
+  contract touched: app interfaces, SDK wire schemas and exported types, and
+  known external consumers (documented in
+  `docs/INDEXER_API_COMPATIBILITY.md`). State for each whether it is updated
+  in this PR or covered by the migration window.
+- [ ] `CHANGELOG.md` — add a bullet under `[Unreleased]` naming the deprecated
+  field, its `sunset` release, and the replacement.
 
 Verify:
 ```bash
 npx tsc --noEmit --project app/tsconfig.json
+npm test --workspace=indexer -- api.compat
+npm run check:api --workspace=sdk
 ```
+
+### API versioning and deprecation strategy
+
+The indexer HTTP API is consumed by the app, the SDK, and external tools. It
+follows an **additive-only** versioning strategy:
+
+- **Additive changes ship without a version bump.** New optional fields, new
+  endpoints, and new enum values that consumers can ignore are added to the
+  current (unversioned) routes. Consumers must tolerate unknown fields.
+- **Non-additive changes require a new version prefix.** Removing or renaming a
+  field, changing a field's type or numeric encoding, changing pagination
+  semantics, or changing the meaning of a status value is wire-breaking. These
+  changes are published under a new prefix (`/v2`, `/v3`, …) alongside the
+  existing routes. The current routes stay unversioned until the first such
+  change; do not add a version prefix without a concrete compatibility need.
+- **Minimum support window.** A deprecated field or endpoint remains served for
+  at least **two minor releases or 90 days, whichever is longer**, after the
+  release that first marks it deprecated. Removal is only allowed in a release
+  at or after the recorded `sunset` value.
+- **Observable sunset signal.** Deprecated responses carry `Deprecation` and
+  `Sunset` headers so external consumers can detect the window without reading
+  release notes. The deprecation registry in
+  `docs/INDEXER_API_COMPATIBILITY.md` is the source of truth for `since`,
+  `sunset`, and `replacement`.
+- **Release review.** Every release review checks the deprecation registry for
+  entries whose `sunset` has arrived, and confirms that the app, SDK, and
+  documented external consumers have migrated before the old form is removed.
+=======
 
 ### SDK export added, removed, or type changed
 

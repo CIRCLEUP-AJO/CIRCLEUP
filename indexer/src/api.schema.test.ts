@@ -260,7 +260,187 @@ test("#850 api.ts serves the spec file at GET /openapi/v1.json", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 9. Pagination parameters documented for paginated routes
+// 9. Issue #985: deprecation policy — inventory, headers, and additive evolution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * The deprecation inventory lives next to the spec.  It records every public
+ * route, whether it is deprecated, and (for deprecated routes) the sunset
+ * date and replacement.  See docs/api/DEPRECATION.md for the policy.
+ */
+const INVENTORY_PATH = path.resolve(__dirname, "../../docs/api/v1/deprecations.json");
+
+interface DeprecationEntry {
+  path: string;
+  deprecated: boolean;
+  sunset?: string;
+  replacement?: string;
+}
+
+function loadInventory(): { routes: DeprecationEntry[] } {
+  const raw = fs.readFileSync(INVENTORY_PATH, "utf-8");
+  return JSON.parse(raw) as { routes: DeprecationEntry[] };
+}
+
+test("#985 deprecation inventory exists and is valid JSON", () => {
+  assert.ok(
+    fs.existsSync(INVENTORY_PATH),
+    `Deprecation inventory not found at: ${INVENTORY_PATH}`,
+  );
+  const inventory = loadInventory();
+  assert.ok(Array.isArray(inventory.routes), "inventory must have a 'routes' array");
+});
+
+test("#985 every Express GET route is present in the deprecation inventory", () => {
+  const source = loadApiSource();
+  const inventory = loadInventory();
+  const inventoried = new Set(inventory.routes.map((r) => r.path));
+
+  const missing = extractExpressRoutes(source)
+    .map(expressToOpenApi)
+    .filter((p) => !inventoried.has(p));
+
+  assert.deepEqual(
+    missing,
+    [],
+    `The following routes are missing from deprecations.json:\n${missing.map((r) => `  • ${r}`).join("\n")}`,
+  );
+});
+
+test("#985 every inventoried route is documented in openapi.json", () => {
+  const spec = loadSpec();
+  const paths = spec.paths as Record<string, unknown>;
+  const inventory = loadInventory();
+
+  const missing = inventory.routes
+    .map((r) => r.path)
+    .filter((p) => !(p in paths));
+
+  assert.deepEqual(
+    missing,
+    [],
+    `The following inventoried routes are missing from openapi.json:\n${missing.map((r) => `  • ${r}`).join("\n")}`,
+  );
+});
+
+test("#985 deprecated routes carry sunset, replacement, and a deprecated marker in the spec", () => {
+  const spec = loadSpec();
+  const paths = spec.paths as Record<string, Record<string, unknown>>;
+  const inventory = loadInventory();
+
+  const problems: string[] = [];
+  for (const entry of inventory.routes) {
+    if (!entry.deprecated) continue;
+
+    if (!entry.sunset || !/^\d{4}-\d{2}-\d{2}$/.test(entry.sunset)) {
+      problems.push(`${entry.path}: inventory entry missing valid 'sunset' (YYYY-MM-DD)`);
+    }
+    if (!entry.replacement) {
+      problems.push(`${entry.path}: inventory entry missing 'replacement'`);
+    }
+
+    const pathItem = paths[entry.path];
+    const getOp = pathItem?.get as Record<string, unknown> | undefined;
+    if (!getOp) {
+      problems.push(`${entry.path}: no GET operation to mark deprecated`);
+      continue;
+    }
+    if (getOp.deprecated !== true) {
+      problems.push(`${entry.path}: GET operation must set 'deprecated: true'`);
+    }
+    const responses = getOp.responses as Record<string, unknown> | undefined;
+    const ok = responses?.["200"] as Record<string, unknown> | undefined;
+    const headers = ok?.headers as Record<string, unknown> | undefined;
+    if (!headers || !("Deprecation" in headers)) {
+      problems.push(`${entry.path}: 200 response must document a 'Deprecation' header`);
+    }
+    if (!headers || !("Sunset" in headers)) {
+      problems.push(`${entry.path}: 200 response must document a 'Sunset' header`);
+    }
+  }
+
+  assert.deepEqual(
+    problems,
+    [],
+    `Deprecated routes are not fully signalled:\n${problems.map((p) => `  • ${p}`).join("\n")}`,
+  );
+});
+
+test("#985 api.ts emits Deprecation and Sunset headers for deprecated routes", () => {
+  const source = loadApiSource();
+  const inventory = loadInventory();
+  const deprecated = inventory.routes.filter((r) => r.deprecated);
+
+  // The helper that sets the headers must exist whenever any route is deprecated.
+  if (deprecated.length > 0) {
+    assert.match(
+      source,
+      /setDeprecationHeaders/,
+      "api.ts must define/use setDeprecationHeaders for deprecated routes",
+    );
+    assert.match(
+      source,
+      /["']Deprecation["']/,
+      "api.ts must set a 'Deprecation' response header",
+    );
+    assert.match(
+      source,
+      /["']Sunset["']/,
+      "api.ts must set a 'Sunset' response header",
+    );
+  }
+});
+
+/**
+ * Additive-only evolution: a fixture representing the pre-deprecation response
+ * shape must still validate against the current schema, and the new shape must
+ * validate too.  This pins the rule that fields may be added but not removed
+ * or renamed without a version bump.
+ */
+test("#985 legacy and new response shapes both validate against the schema", () => {
+  const spec = loadSpec();
+  const components = spec.components as Record<string, unknown> | undefined;
+  const schemas = (components?.schemas as Record<string, Record<string, unknown>>) ?? {};
+
+  const fixturePath = path.resolve(__dirname, "fixtures/compat-shapes.json");
+  assert.ok(fs.existsSync(fixturePath), `compat fixture not found at: ${fixturePath}`);
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf-8")) as {
+    schema: string;
+    legacy: Record<string, unknown>;
+    current: Record<string, unknown>;
+  };
+
+  const schema = schemas[fixture.schema];
+  assert.ok(schema, `fixture references unknown schema '${fixture.schema}'`);
+
+  const required = (schema.required as string[] | undefined) ?? [];
+  const properties = (schema.properties as Record<string, unknown> | undefined) ?? {};
+
+  function validateShape(shape: Record<string, unknown>, label: string): string[] {
+    const errs: string[] = [];
+    for (const key of required) {
+      if (!(key in shape)) errs.push(`${label}: missing required field '${key}'`);
+    }
+    for (const key of Object.keys(shape)) {
+      if (!(key in properties)) errs.push(`${label}: unexpected field '${key}'`);
+    }
+    return errs;
+  }
+
+  const errs = [
+    ...validateShape(fixture.legacy, "legacy"),
+    ...validateShape(fixture.current, "current"),
+  ];
+
+  assert.deepEqual(
+    errs,
+    [],
+    `Response shapes do not satisfy the additive-only rule:\n${errs.map((e) => `  • ${e}`).join("\n")}`,
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 10. Pagination parameters documented for paginated routes
 // ═══════════════════════════════════════════════════════════════════════════════
 
 test("#850 paginated routes document page and limit query parameters", () => {

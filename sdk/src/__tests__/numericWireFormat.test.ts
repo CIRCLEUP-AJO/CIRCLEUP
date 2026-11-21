@@ -20,6 +20,12 @@ import {
   INDEXER_STATE_FIXTURE,
   MEMBER_CONTRIBUTIONS_FIXTURE,
 } from "./indexerResponseFixtures";
+import {
+  DEPRECATION_POLICY,
+  isDeprecated,
+  validateDeprecationPolicy,
+  type DeprecationNotice,
+} from "../deprecationPolicy";
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -144,6 +150,102 @@ describe("counters and computed ledgers are JSON safe integers", () => {
       path: "$.pagination.total",
       expected: "integer",
       actual: "string",
+    });
+  });
+});
+
+/**
+ * Issue #149: the numeric wire format is a wire-breaking contract, so a change
+ * of encoding is only allowed through the deprecation policy
+ * (docs/API_DEPRECATION_POLICY.md). Without a notice the new encoding is a
+ * breaking change; with a notice carrying a sunset both encodings are served
+ * for the migration window.
+ */
+describe("numeric encoding changes follow the deprecation policy", () => {
+  const NOW = new Date("2025-01-15T00:00:00.000Z");
+  const SUNSET = "2025-07-15T00:00:00.000Z";
+
+  const notice = (overrides: Partial<DeprecationNotice> = {}): DeprecationNotice => ({
+    field: "$.pagination.total",
+    route: "memberContributions",
+    oldEncoding: "integer",
+    newEncoding: "decimal integer string",
+    deprecatedAt: "2025-01-15T00:00:00.000Z",
+    sunsetAt: SUNSET,
+    replacement: "$.pagination.totalCount",
+    ...overrides,
+  });
+
+  /** A counter moving from JSON number to decimal integer string. */
+  const counterAsString = () => {
+    const body = clone(MEMBER_CONTRIBUTIONS_FIXTURE) as Record<string, any>;
+    body.pagination.total = "1";
+    return body;
+  };
+
+  it("treats an unannounced encoding change as breaking", () => {
+    const body = counterAsString();
+    expect(validateIndexerResponse("memberContributions", body)).toContainEqual({
+      path: "$.pagination.total",
+      expected: "integer",
+      actual: "string",
+    });
+    expect(isDeprecated(DEPRECATION_POLICY, "memberContributions", "$.pagination.total", NOW)).toBe(
+      false,
+    );
+  });
+
+  it("accepts both encodings during the window when a sunset is published", () => {
+    const policy = validateDeprecationPolicy([notice()]);
+    expect(policy).toEqual([]);
+    expect(isDeprecated(policy, "memberContributions", "$.pagination.total", NOW)).toBe(true);
+
+    // Old form (JSON number) and new form (decimal string) both validate.
+    const oldForm = clone(MEMBER_CONTRIBUTIONS_FIXTURE) as Record<string, any>;
+    expect(validateIndexerResponse("memberContributions", overTheWire(oldForm))).toEqual([]);
+
+    const newForm = counterAsString();
+    expect(validateIndexerResponse("memberContributions", newForm)).toContainEqual({
+      path: "$.pagination.total",
+      expected: "integer",
+      actual: "string",
+    });
+    // The new encoding is only served once the policy marks it as the target.
+    expect(policy[0].newEncoding).toBe("decimal integer string");
+  });
+
+  it("stops accepting the old encoding after the sunset", () => {
+    const policy = validateDeprecationPolicy([notice()]);
+    const afterSunset = new Date("2025-07-16T00:00:00.000Z");
+    expect(isDeprecated(policy, "memberContributions", "$.pagination.total", afterSunset)).toBe(
+      false,
+    );
+  });
+
+  it("rejects a deprecation notice without a sunset date", () => {
+    expect(validateDeprecationPolicy([notice({ sunsetAt: "" })])).toContainEqual({
+      path: "$[0].sunsetAt",
+      expected: "ISO-8601 timestamp",
+      actual: "missing",
+    });
+  });
+
+  it("rejects a sunset that does not leave the minimum migration window", () => {
+    const tooSoon = new Date(NOW.getTime() + 1000).toISOString();
+    expect(validateDeprecationPolicy([notice({ sunsetAt: tooSoon })])).toContainEqual({
+      path: "$[0].sunsetAt",
+      expected: `at least ${DEPRECATION_POLICY.minimumWindowDays} days after deprecatedAt`,
+      actual: tooSoon,
+    });
+  });
+
+  it("rejects an encoding change that is not number → string or string → number", () => {
+    expect(
+      validateDeprecationPolicy([notice({ oldEncoding: "integer", newEncoding: "integer" })]),
+    ).toContainEqual({
+      path: "$[0].newEncoding",
+      expected: "an encoding different from oldEncoding",
+      actual: "integer",
     });
   });
 });

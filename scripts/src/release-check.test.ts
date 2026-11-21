@@ -11,6 +11,7 @@ import {
   checkDeploymentOrderGuidance,
   checkSdkCompatibilityNotes,
   checkArtifactHashDocumentation,
+  checkHttpContractDeprecation,
 } from "./release-check";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -180,5 +181,55 @@ test("checkArtifactHashDocumentation: detects 'cargo' keyword as contract signal
 
 test("checkArtifactHashDocumentation: skipped when no [Unreleased] section", () => {
   const result = checkArtifactHashDocumentation("# Changelog\n\n## [0.1.0]\n- init\n");
+  assert.equal(result.pass, true, "Missing [Unreleased] → check skipped (passes)");
+});
+
+// ── checkHttpContractDeprecation ─────────────────────────────────────────────
+
+test("checkHttpContractDeprecation: passes when HTTP contract is unchanged", () => {
+  const content = makeChangelog("### Added\n- new indexer query helper\n");
+  const result = checkHttpContractDeprecation(content, false);
+  assert.equal(result.pass, true, "Unchanged contract snapshot → no deprecation entry required");
+});
+
+test("checkHttpContractDeprecation: fails when contract snapshot changed without deprecation entry", () => {
+  const content = makeChangelog("### Changed\n- Renamed indexer response field\n");
+  const result = checkHttpContractDeprecation(content, true);
+  assert.equal(result.pass, false, "Changed contract snapshot without deprecation entry → must fail");
+  assert.ok(result.message.includes("deprecation"), "Message must mention deprecation");
+});
+
+test("checkHttpContractDeprecation: passes when deprecation entry has since/sunset/replacement", () => {
+  const content = makeChangelog([
+    "### Deprecated",
+    "- `GET /api/events` `page` field: since 0.2.0, sunset 0.4.0, replacement `cursor`.",
+  ].join("\n"));
+  const result = checkHttpContractDeprecation(content, true);
+  assert.equal(result.pass, true, "Complete deprecation entry satisfies the requirement");
+});
+
+test("checkHttpContractDeprecation: fails when deprecation entry is missing sunset", () => {
+  const content = makeChangelog([
+    "### Deprecated",
+    "- `GET /api/events` `page` field: since 0.2.0, replacement `cursor`.",
+  ].join("\n"));
+  const result = checkHttpContractDeprecation(content, true);
+  assert.equal(result.pass, false, "Deprecation entry without sunset → must fail");
+});
+
+test("checkHttpContractDeprecation: failure message names app, SDK, and external-consumer contracts", () => {
+  const content = makeChangelog("### Changed\n- Renamed indexer response field\n");
+  const result = checkHttpContractDeprecation(content, true);
+  assert.equal(result.pass, false);
+  assert.ok(result.message.includes("app"), "Message must name the app contract");
+  assert.ok(result.message.includes("SDK"), "Message must name the SDK contract");
+  assert.ok(
+    result.message.includes("external-consumer"),
+    "Message must name the external-consumer contract",
+  );
+});
+
+test("checkHttpContractDeprecation: skipped when no [Unreleased] section", () => {
+  const result = checkHttpContractDeprecation("# Changelog\n\n## [0.1.0]\n- init\n", true);
   assert.equal(result.pass, true, "Missing [Unreleased] → check skipped (passes)");
 });
