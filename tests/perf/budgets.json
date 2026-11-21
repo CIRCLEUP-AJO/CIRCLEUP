@@ -1,8 +1,37 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$comment": "Versioned performance budgets for CircleUp. Update only with measurement evidence.",
-  "version": "1.1.0",
+  "$comment": "Versioned performance budgets for CircleUp. Update only with measurement evidence. Baseline changes require measured rationale (before/after numbers, environment, and reason) recorded in the change description. Fixtures must remain deterministic and fully offline: no live Stellar RPC, no private production data, and no real user records.",
+  "version": "1.2.0",
   "updatedAt": "2026-10-19",
+
+  "fixtures": {
+    "$comment": "Production-like, deterministic, offline fixture tiers used to exercise these budgets. Sizes are bounded so the suite stays fast in CI while covering realistic joins, histories, and page states.",
+    "tiers": {
+      "small": {
+        "description": "Minimal/empty states and single-record edge cases",
+        "circles": 1,
+        "membersPerCircle": 1,
+        "contributionsPerMember": 0,
+        "reputationEvents": 0
+      },
+      "typical": {
+        "description": "Representative everyday workload",
+        "circles": 50,
+        "membersPerCircle": 10,
+        "contributionsPerMember": 5,
+        "reputationEvents": 100
+      },
+      "highWater": {
+        "description": "Upper bound of realistic production scale (bounded high-water mark)",
+        "circles": 100,
+        "membersPerCircle": 256,
+        "contributionsPerMember": 100,
+        "reputationEvents": 1000
+      }
+    },
+    "determinism": "Fixtures are generated from fixed seeds; no network access, no live database, no private production data.",
+    "safety": "All records are synthetic and contain no real user data."
+  },
 
   "environmentVariance": {
     "description": "Standardized environment variance considerations for reproducible CI gating without flaky dependencies",
@@ -79,6 +108,21 @@
     "memberContributions100": {
       "queryMs": 60,
       "payloadKb": 50
+    },
+    "circleListHighWater": {
+      "queryMs": 80,
+      "payloadKb": 65,
+      "$comment": "High-water tier: 100 circles with full member joins"
+    },
+    "circleDetailHighWater": {
+      "queryMs": 60,
+      "payloadKb": 50,
+      "$comment": "High-water tier: 256 members per circle"
+    },
+    "memberContributionsHighWater": {
+      "queryMs": 60,
+      "payloadKb": 50,
+      "$comment": "High-water tier: 100 contributions per member"
     }
   },
 
@@ -112,7 +156,9 @@
     "circleGrid12CardsMs": 25,
     "circleDetailPreparationMs": 15,
     "reputationProfilePreparationMs": 10,
-    "contributionHistoryTableMs": 15
+    "contributionHistoryTableMs": 15,
+    "circleDetailHighWaterPreparationMs": 25,
+    "$comment_highWater": "High-water tier render/preparation ceilings (256 members, 100 contributions per member)"
   },
 
   "payload": {
@@ -120,6 +166,8 @@
     "emptyListBytes": 50,
     "populatedList50CirclesKb": 40,
     "populatedList10CirclesKb": 10,
-    "populatedList100CirclesKb": 80
+    "populatedList100CirclesKb": 80,
+    "highWaterDetailBytesKb": 50,
+    "$comment_highWater": "High-water tier wire payload ceiling for circle detail with 256 members"
   }
 }

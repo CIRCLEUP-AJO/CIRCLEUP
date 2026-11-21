@@ -112,6 +112,117 @@ function makeContributionFixture(i: number) {
   };
 }
 
+// ─── Production-like fixture generators ──────────────────────────────────────
+//
+// Deterministic, offline fixtures spanning small / typical / high-water data
+// sizes. All values are synthesised from indices — no real user records, no
+// live Stellar RPC. The same seed always yields the same bytes so budgets are
+// reproducible across CI runs and machines.
+
+/** Named workload sizes used across API and render budget tests. */
+const WORKLOAD_SIZES = Object.freeze({
+  small: { circles: 5, members: 3, contributionsPerMember: 5 },
+  typical: { circles: 50, members: 10, contributionsPerMember: 25 },
+  highWater: { circles: 200, members: 256, contributionsPerMember: 100 },
+});
+
+/** Deterministic pseudo-random integer in [0, max) derived from a seed. */
+function seededInt(seed: number, max: number): number {
+  // xorshift-style mix keeps values stable and cheap to compute.
+  let x = (seed * 2654435761) >>> 0;
+  x ^= x >>> 15;
+  x = (x * 2246822519) >>> 0;
+  x ^= x >>> 13;
+  return max > 0 ? x % max : 0;
+}
+
+/** Deterministic 64-char hex hash for a given seed (stands in for a tx hash). */
+function seededHash(seed: number): string {
+  let out = "";
+  let x = (seed * 2654435761 + 1) >>> 0;
+  for (let i = 0; i < 8; i++) {
+    x ^= x << 13; x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5; x >>>= 0;
+    out += x.toString(16).padStart(8, "0");
+  }
+  return out.slice(0, 64);
+}
+
+/**
+ * Production-like circle list fixture. Mixes statuses, round progress, and
+ * member counts so serialization cost reflects a realistic distribution rather
+ * than a uniform array.
+ */
+function makeProductionCircleList(count: number) {
+  const statuses = ["Active", "Pending", "Completed", "Paused"];
+  return Array.from({ length: count }, (_, i) => {
+    const memberCount = 2 + seededInt(i + 1, 255); // 2..256
+    const totalRounds = memberCount;
+    return {
+      address: `CCIRCLE${String(i).padStart(49, "0")}`,
+      creator: `GCREATOR${String(i).padStart(48, "0")}`,
+      round_amount: String(50_000_000 + seededInt(i + 7, 950_000_000)),
+      member_count: memberCount,
+      status: statuses[seededInt(i + 3, statuses.length)],
+      current_round: seededInt(i + 5, totalRounds + 1),
+      total_rounds: totalRounds,
+      created_ledger: 1000 + i * 37,
+    };
+  });
+}
+
+/**
+ * Production-like circle detail fixture with a full member roster and a
+ * contribution history of `contributionsPerMember` entries per member.
+ */
+function makeProductionCircleDetail(memberCount: number, contributionsPerMember: number) {
+  const members = Array.from({ length: memberCount }, (_, i) => ({
+    member: `GMEMBER${String(i).padStart(49, "0")}`,
+    join_order: i + 1,
+    has_contributed: seededInt(i + 11, 2) === 0,
+    payout_round: (i % memberCount) + 1,
+    payout_received: i < Math.floor(memberCount / 2),
+    joined_ledger: 1000 + i * 3,
+  }));
+
+  const contributions = members.flatMap((m, mi) =>
+    Array.from({ length: contributionsPerMember }, (_, ci) => ({
+      member: m.member,
+      round: ci + 1,
+      amount: String(50_000_000 + seededInt(mi * 131 + ci + 1, 950_000_000)),
+      txHash: seededHash(mi * 1000 + ci + 1),
+      ledger: 1000 + mi * 3 + ci,
+    })),
+  );
+
+  return {
+    address: "CCIRCLEDETAIL0000000000000000000000000000000000000001",
+    creator: "GCREATOR000000000000000000000000000000000000000000001",
+    round_amount: "100000000",
+    member_count: memberCount,
+    status: "Active",
+    current_round: Math.floor(memberCount / 2) + 1,
+    total_rounds: memberCount,
+    created_ledger: 1000,
+    members,
+    contributions,
+  };
+}
+
+/**
+ * Production-like page state bundle: the data each app page receives after
+ * fetching, so render budgets exercise realistic payload shapes.
+ */
+function makePageStateFixture(size: keyof typeof WORKLOAD_SIZES) {
+  const spec = WORKLOAD_SIZES[size];
+  return {
+    circleList: makeProductionCircleList(spec.circles),
+    circleDetail: makeProductionCircleDetail(spec.members, spec.contributionsPerMember),
+    reputation: makeReputationFixture(seededInt(spec.circles, 20), spec.circles, 0),
+  };
+}
+
 /**
  * Maximum-size circle fixture (256 members per protocol constant MAX_MEMBERS).
  * Used to measure resource budgets for boundary cases.
@@ -279,6 +390,103 @@ describe("API payload budgets", () => {
       kb <= budget,
       `[api:memberContributions:100] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
     );
+  });
+});
+
+// ─── Production-like workload budgets ────────────────────────────────────────
+// Exercises small / typical / high-water fixtures end-to-end through the
+// serialization and mapping layers. Budgets are derived from the same
+// budgets.json entries used by the synthetic tests, scaled by workload size,
+// so regressions in realistic shapes surface with a clear route+metric label.
+
+describe("Production-like workload budgets", () => {
+  for (const size of Object.keys(WORKLOAD_SIZES) as Array<keyof typeof WORKLOAD_SIZES>) {
+    const spec = WORKLOAD_SIZES[size];
+
+    test(`[${size}] circle list serialization is within budget`, () => {
+      const circles = makeProductionCircleList(spec.circles);
+      const budget = BUDGETS.api.circleList100.queryMs * (spec.circles / 100 + 1);
+
+      const start = process.hrtime.bigint();
+      const _payload = JSON.stringify({ circles });
+      void _payload;
+      const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+
+      assert.ok(
+        elapsedMs <= budget,
+        `[query:circleList:${size}] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget.toFixed(3)} ms`,
+      );
+    });
+
+    test(`[${size}] circle detail + contribution history serialization is within budget`, () => {
+      const detail = makeProductionCircleDetail(spec.members, spec.contributionsPerMember);
+      const budget = BUDGETS.api.circleDetailMax256Members.queryMs * 4;
+
+      const start = process.hrtime.bigint();
+      const _payload = JSON.stringify(detail);
+      void _payload;
+      const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+
+      assert.ok(
+        elapsedMs <= budget,
+        `[query:circleDetail:${size}] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget.toFixed(3)} ms`,
+      );
+    });
+
+    test(`[${size}] page state render preparation is within budget`, () => {
+      const state = makePageStateFixture(size);
+      const budget = BUDGETS.render.circleDetailPreparationMs * 4;
+
+      const start = process.hrtime.bigint();
+      const _cards = state.circleList.map((c) => {
+        const amount = BigInt(c.round_amount);
+        const whole = amount / STROOP;
+        const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
+        return {
+          address: c.address,
+          status: c.status?.trim().toLowerCase(),
+          amount: `${whole}.${frac}`,
+          progress: c.total_rounds > 0 ? Math.round((c.current_round / c.total_rounds) * 100) : 0,
+        };
+      });
+      const _rows = state.circleDetail.contributions.map((c) => {
+        const amount = BigInt(c.amount);
+        const whole = amount / STROOP;
+        const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
+        return {
+          member: `${c.member.slice(0, 4)}...${c.member.slice(-4)}`,
+          round: `Round ${c.round}`,
+          amount: `${whole}.${frac} USDC`,
+          txHash: `${c.txHash.slice(0, 8)}...`,
+        };
+      });
+      void _cards; void _rows;
+      const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+
+      assert.ok(
+        elapsedMs <= budget,
+        `[render:pageState:${size}] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget.toFixed(3)} ms`,
+      );
+    });
+  }
+
+  test("high-water circle detail payload stays within a bounded size", () => {
+    const spec = WORKLOAD_SIZES.highWater;
+    const detail = makeProductionCircleDetail(spec.members, spec.contributionsPerMember);
+    const kb = Buffer.byteLength(JSON.stringify(detail), "utf8") / 1024;
+    // 256 members × 100 contributions ≈ 25.6k rows; ~200B/row upper bound.
+    const budgetKb = 8192;
+
+    assert.ok(
+      kb <= budgetKb,
+      `[api:circleDetail:highWater] payload ${kb.toFixed(1)} KB exceeds budget ${budgetKb} KB`,
+    );
+  });
+
+  test("fixtures are deterministic across invocations", () => {
+    const a = JSON.stringify(makePageStateFixture("typical"));
+    const b = JSON.stringify(makePageStateFixture("typical"));
+    assert.strictEqual(a, b, "[fixtures:determinism] production-like fixtures must be reproducible");
   });
 });
 

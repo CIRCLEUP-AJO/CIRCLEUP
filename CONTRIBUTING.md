@@ -64,9 +64,86 @@ npm run test:incidents --workspace=indexer
 
 # Type-check the app
 npx tsc --noEmit --project app/tsconfig.json
+
+# Fast local verification tier (see Verification Tiers below)
+npm run verify:fast
+
+# Full release verification tier (see Verification Tiers below)
+npm run verify:full
 ```
 
 See the [RUNBOOK](./docs/RUNBOOK.md) for full environment variable setup.
+
+### Verification Tiers
+
+Two root commands cover the local suite. Both run every child command
+sequentially (never in parallel), preserve each child's exit code, and print a
+summary of completed and skipped checks when they finish.
+
+**`npm run verify:fast`** — fast feedback tier. Runs the checks that need no
+database, no browser, and no network, in this deterministic order:
+
+1. `npm run check:toolchain`
+2. `npm run build:sdk`
+3. `npm run lint --workspace=app`
+4. `npx tsc --noEmit --project app/tsconfig.json`
+5. `npm run check:api --workspace=sdk`
+6. `npm test --workspace=indexer` (unit tests only; Postgres-backed tests are
+   skipped when `DATABASE_URL` is unset)
+7. `npm run test:incidents --workspace=indexer`
+8. `node --require ts-node/register --test app/src/lib/gating.mutation.test.ts`
+9. `node --require ts-node/register --test app/src/lib/telemetry.test.ts`
+
+**`npm run verify:full`** — release tier. Runs everything in `verify:fast`
+first, then the integration and contract checks in this order:
+
+1. `npm run verify:fast`
+2. `npm run migrate --workspace=indexer` and
+   `npm run migrate:check --workspace=indexer` (requires `DATABASE_URL`)
+3. `npm test --workspace=indexer` with `DATABASE_URL` set (integration tests)
+4. `cd contracts && cargo fmt --check && cargo test`
+5. `cd contracts && cargo build --target wasm32-unknown-unknown --release`
+6. `npm run test:perf` (offline performance budgets, see below)
+7. `npm run test:e2e` (requires Playwright browsers, see below)
+
+**Failure propagation.** The parent command exits non-zero as soon as any child
+command fails, and the summary names the failing check. Failures are never
+masked by shell pipelines (`|`, `|| true`) or by continuing past a failed step.
+
+**Skipped checks.** When a check cannot run because a prerequisite is missing,
+the summary reports it explicitly rather than silently passing:
+
+| Check | Prerequisite | Reported as |
+|---|---|---|
+| Indexer integration tests | `DATABASE_URL` pointing at a migrated Postgres | `SKIPPED (DATABASE_URL unset)` |
+| `migrate` / `migrate:check` | `DATABASE_URL` | `SKIPPED (DATABASE_URL unset)` |
+| Contract tests and WASM build | `cargo`, `wasm32-unknown-unknown` target | `SKIPPED (cargo not found)` |
+| Performance budgets | `cargo`/Node only — always runs offline | — |
+| End-to-end flows | Playwright browsers (`npx playwright install`) | `SKIPPED (Playwright browsers not installed)` |
+
+A skipped check is not a pass: `verify:full` still exits non-zero if a required
+prerequisite is missing unless you pass `--allow-skipped` (used by CI jobs that
+intentionally run without a database).
+
+### Performance Budgets
+
+Performance budgets live in `tests/perf/budgets.json` and are exercised by
+`npm run test:perf`. Fixtures are synthetic, deterministic, and fully offline —
+they never call live Stellar RPC or use production data. They cover small,
+typical, and high-water circle sizes, member histories, database row counts, and
+app page states so that query cost, response size, and render budgets reflect
+realistic workloads.
+
+Budgets may only be changed with measured rationale. A PR that edits
+`tests/perf/budgets.json` must record in its description:
+
+- the before and after numbers for each changed budget,
+- the fixture size and profile used for the measurement,
+- the environment (Node version, hardware class, CI runner) the numbers came
+  from, and
+- why the new value is correct rather than a regression being accepted.
+
+Budget changes without this evidence are rejected in review.
 
 Supported toolchains are Node.js 18.18+ with npm 9, Node.js 22 with npm 10, or
 Node.js 24 with npm 11; Rust 1.81.0; Soroban SDK 21.7.7; and the
@@ -739,6 +816,9 @@ This table maps each command to the gates it satisfies. Run the commands locally
 | `npm run test:incidents --workspace=indexer` | C2, F4 |
 | `npm run migrate --workspace=indexer` | C3 |
 | `npm run migrate:check --workspace=indexer` | C3, G2, G5 |
+| `npm run verify:fast` | B1, B3, B4, C1, C2, D1, F3, F4 |
+| `npm run verify:full` | A1, A3, A4, A8, B1–B6, C1–C3, D1, E1–E4, F3, F4, G2, G5 |
+| `npm run test:perf` | Performance budgets (see [Performance Budgets](#performance-budgets)) |
 
 ---
 

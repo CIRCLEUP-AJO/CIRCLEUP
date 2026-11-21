@@ -16,6 +16,7 @@
     "install:all": "npm install",
     "build:sdk": "npm run build --workspace=sdk",
     "build:app": "npm run build --workspace=app",
+    "build:indexer": "npm run build --workspace=indexer",
     "dev:app": "npm run dev --workspace=app",
     "dev:indexer": "npm run dev --workspace=indexer",
     "dev": "npm run dev:indexer & npm run dev:app",
@@ -37,7 +38,12 @@
     "test:all": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
     "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
     "test:keyboard": "node --experimental-strip-types --test tests/keyboard-navigation.test.ts",
-    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts"
+    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts",
+    "test:visual": "node --experimental-strip-types --test tests/visual/visual-regression.test.ts",
+    "test:contracts": "cargo test --manifest-path contracts/Cargo.toml",
+    "check:api": "npm run check:api --workspace=sdk",
+    "verify:fast": "node scripts/verify.cjs fast",
+    "verify:full": "node scripts/verify.cjs full"
   },
   "devDependencies": {
     "typescript": "^7.0.2"
