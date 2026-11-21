@@ -39,7 +39,8 @@ jobs:
         uses: actions/checkout@v7
 
       # Install the exact Rust toolchain declared in contracts/rust-toolchain.toml.
-      # The toolchain file is picked up automatically by rustup.
+      # The toolchain file is picked up automatically by rustup; we install only
+      # the targets/components declared there (no default profile extras).
       - name: Install pinned Rust toolchain
         working-directory: contracts
         run: |
@@ -47,6 +48,12 @@ jobs:
           rustup show active-toolchain
           cargo --version
           rustc --version
+
+      # Fail early if the active toolchain/targets/components drift from the
+      # checked-in declaration, printing expected vs actual versions.
+      - name: Validate toolchain against rust-toolchain.toml
+        working-directory: contracts
+        run: npx ts-node ../scripts/src/check-toolchain.ts
 
       # Cache compiled dependencies to speed up repeated runs.
       - name: Cache Cargo registry
@@ -77,10 +84,11 @@ jobs:
           echo "=== First-pass artifact sizes ==="
           ls -lh target/wasm32-unknown-unknown/release/*.wasm
 
-      # Generate provenance metadata for the built artifacts
+      # Generate provenance metadata for the built artifacts, including the
+      # active toolchain versions so artifact reports are self-describing.
       - name: Generate build provenance metadata
         working-directory: scripts
-        run: npx ts-node src/check-artifact-hashes.ts --provenance
+        run: npx ts-node src/check-artifact-hashes.ts --provenance --toolchain
 
       # Verify hashes against contracts/expected-hashes.json.
       # Fails CI if there is any bytecode drift or unpopulated expected hashes.
@@ -125,3 +133,41 @@ jobs:
           rustc --version
           cargo --version
           rustup show
+
+  # Compact Node matrix for the SDK, indexer, and app packages. Contract
+  # artifact reproducibility stays on the single pinned Rust toolchain above;
+  # this matrix only exercises the declared Node support range.
+  node-matrix:
+    name: Node ${{ matrix.node }} — ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "22"]
+        package: [sdk, indexer, app]
+        exclude:
+          # The app requires Node 20+ per its package engines.
+          - node: "18"
+            package: app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: "npm"
+
+      - name: Report runtime
+        run: |
+          echo "package=${{ matrix.package }} node=$(node --version)"
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build and test ${{ matrix.package }} (Node ${{ matrix.node }})
+        run: |
+          npm run build --workspace=${{ matrix.package }}
+          npm test --workspace=${{ matrix.package }}

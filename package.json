@@ -13,6 +13,7 @@
     "preinstall": "node scripts/check-node.cjs",
     "check:node": "node scripts/check-node.cjs",
     "check:toolchain": "ts-node scripts/src/validate-toolchain.ts",
+    "validate:docs": "node scripts/src/validate-docs.cjs",
     "install:all": "npm install",
     "build:sdk": "npm run build --workspace=sdk",
     "build:app": "npm run build --workspace=app",
@@ -45,6 +46,19 @@
   "engines": {
     "node": ">=18.18.0 <19 || >=22 <23 || >=24 <25",
     "npm": ">=9 <12"
+  },
+  "supportPolicy": {
+    "node": [
+      "18.18.0",
+      "22",
+      "24"
+    ],
+    "npm": [
+      "9",
+      "10",
+      "11"
+    ],
+    "note": "Each listed Node major is exercised by the CI matrix; update this list and .github/workflows CI matrix together when a runtime reaches end of life."
   },
   "packageManager": "npm@11.16.0",
   "repository": {

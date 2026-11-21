@@ -1695,6 +1695,21 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         `SELECT * FROM reputation WHERE member_address = $1`,
         [member],
       );
+
+      // Freshness context: how far the indexer has processed, and when that
+      // state row was last written.  Read from the same indexer_state row the
+      // rest of the API uses (no extra unbounded request).  A missing state
+      // row means the indexer has never recorded progress — history is then
+      // reported as unavailable rather than as "no records".
+      const stateRow = await queryOne<IndexerStateAuditRow>(
+        `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
+      );
+      const lastProcessedLedger = stateRow
+        ? toSafeInteger(stateRow.last_ledger, "lastProcessedLedger")
+        : null;
+      const lastProcessedAt = stateRow?.updated_at ?? null;
+      const indexerAvailable = stateRow != null;
+
       const scope = `SELECT circle_address FROM contributions WHERE member_address = $1
         UNION SELECT circle_address FROM defaults WHERE member_address = $1`;
       const scopeSql = `SELECT circle_address FROM (${scope}) scope ${circleFilter ? "WHERE circle_address = $2" : ""}`;
@@ -1728,6 +1743,18 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       // COUNT(*) in PostgreSQL always comes back as a string over the wire;
       // cast to number here so the JSON response shape matches the declared
       // ApiReputationResponse type in sdk/src/types.ts.
+      //
+      // Provenance / freshness (issue #131):
+      //   • `scoreSource` — "indexed" when a reputation row exists (a verified
+      //     read of indexed on-chain reputation events), "none" when the
+      //     member has no record.  Never claims the indexer is the contract's
+      //     authorization source.
+      //   • `historyAvailable` — false only when the indexer has no state row,
+      //     i.e. indexed history cannot be trusted to be complete.  An empty
+      //     history with historyAvailable:true means "no records", not
+      //     "unavailable".
+      //   • `lastProcessedLedger` / `lastProcessedAt` — indexer freshness.
+      const historyAvailable = indexerAvailable;
       res.json({
         member,
         found: row != null,
@@ -1743,6 +1770,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
             `reputation/increment event has not been indexed.`
           : undefined,
         score: row?.score ?? 0,
+        // Provenance: the score is an indexed projection of on-chain
+        // reputation events, not a live contract read.
+        scoreSource: row != null ? "indexed" : "none",
+        historyAvailable,
+        lastProcessedLedger,
+        lastProcessedAt,
         contributions: contributions.map((c) => ({
           circle_address: c.circle_address,
           contributions: Number(c.contributions),
