@@ -9,6 +9,19 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Reusable token behavior fixtures** (#888): a shared named-mode fixture
+  (`success`, `insufficient funds`, `authorization rejected`, `explicit
+  transfer failure`) drives every circle token transfer site, asserts rollback
+  and event behavior, and keeps deployed-USDC trust assertions separate.
+- **Member-count boundary lifecycle tests** (#889): min/max member circles
+  exercise first and last rotation slots, counters, completion and close, while
+  factory tests prove out-of-range creation leaves the registry unchanged.
+- **Deadline ledger boundary specification** (#890): documented strict
+  `sequence > deadline_ledger` semantics with three-adjacent-ledger tests for
+  contribution, default and settlement, plus aligned SDK/app gating tests.
+- **Contract trust-boundary guide** (#896): `docs/CONTRACT_TRUST_BOUNDARIES.md`
+  separates code-enforced invariants, tooling checks and operator/user
+  assumptions, with evidence links for every high-impact claim.
 - **Explicit SDK retry policy** (#900): `RETRY_POLICY` documents per-stage
   retry rules (bounded read retries with backoff, no wallet retries,
   submission resends only the identical envelope), and `classifyRpcFailure`
@@ -102,6 +115,15 @@ Versions follow [Semantic Versioning](https://semver.org/).
   section and two new checklist items; `CONTRIBUTING.md` Governance References
   links to the checklist.  The document explicitly states that completing the
   checklist does not replace a specialist security audit.
+
+### Fixed
+- **Deadline documentation and display consistency** (#890): corrected the
+  contradictory "strict on both sides" README claim, aligned the app's
+  exact-deadline label test with the contract, and replaced wall-clock default
+  eligibility tests with ledger-based ones.
+- **Stale authorization and custody documentation** (#896): corrected caller
+  signature claims for permissionless settlement methods, admin initialization
+  semantics, and non-existent on-chain admin rotation.
 
 ### Changed (SDK)
 - **Strict RPC decoding** (`sdk/src/types.ts`): reads now fail at the

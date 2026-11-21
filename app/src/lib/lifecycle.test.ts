@@ -6,7 +6,7 @@
  * - Action eligibility is correctly enforced per status
  * - Status display helpers return expected values
  * - Edge cases (unknown statuses, invalid transitions) are handled
- * - mark_default is only permitted at/after the exact deadline boundary
+ * - mark_default is only permitted strictly after the deadline ledger
  * - Closing is only permitted after completion or cancellation
  */
 
@@ -229,38 +229,35 @@ describe("close after completion and cancellation", () => {
 // ─── mark_default deadline boundaries ────────────────────────────────────────
 
 /**
- * mark_default is only valid once the contribution deadline has been reached.
- * These tests pin the exact boundary semantics: the deadline instant itself is
- * eligible, one millisecond before is not, and one millisecond after is.
+ * The contract uses `sequence > deadline_ledger` (see
+ * `contracts/circle/src/lib.rs::deadline_passed`). The deadline ledger is the
+ * last accepted contribution ledger, so default becomes eligible only on the
+ * next ledger. Wall-clock time is never the authority for this decision.
  */
 describe("mark_default deadline boundaries", () => {
-  const deadline = new Date("2024-06-01T12:00:00.000Z");
+  const deadlineLedger = 5_000;
 
-  const isDefaultEligible = (now: Date, due: Date): boolean =>
-    now.getTime() >= due.getTime();
+  const isDefaultEligible = (latestLedger: number, dueLedger: number): boolean =>
+    latestLedger > dueLedger;
 
-  it("is eligible at the exact deadline instant", () => {
-    expect(isDefaultEligible(new Date(deadline.getTime()), deadline)).toBe(true);
+  it("is not eligible at the exact deadline ledger", () => {
+    expect(isDefaultEligible(deadlineLedger, deadlineLedger)).toBe(false);
   });
 
-  it("is not eligible one millisecond before the deadline", () => {
-    const justBefore = new Date(deadline.getTime() - 1);
-    expect(isDefaultEligible(justBefore, deadline)).toBe(false);
+  it("is not eligible one ledger before the deadline", () => {
+    expect(isDefaultEligible(deadlineLedger - 1, deadlineLedger)).toBe(false);
   });
 
-  it("is eligible one millisecond after the deadline", () => {
-    const justAfter = new Date(deadline.getTime() + 1);
-    expect(isDefaultEligible(justAfter, deadline)).toBe(true);
+  it("is eligible one ledger after the deadline", () => {
+    expect(isDefaultEligible(deadlineLedger + 1, deadlineLedger)).toBe(true);
   });
 
   it("is not eligible well before the deadline", () => {
-    const earlier = new Date(deadline.getTime() - 60 * 60 * 1000);
-    expect(isDefaultEligible(earlier, deadline)).toBe(false);
+    expect(isDefaultEligible(deadlineLedger - 1_000, deadlineLedger)).toBe(false);
   });
 
   it("is eligible well after the deadline", () => {
-    const later = new Date(deadline.getTime() + 60 * 60 * 1000);
-    expect(isDefaultEligible(later, deadline)).toBe(true);
+    expect(isDefaultEligible(deadlineLedger + 1_000, deadlineLedger)).toBe(true);
   });
 
   it("only allows the default action while the circle is Active", () => {

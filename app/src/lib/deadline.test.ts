@@ -118,11 +118,14 @@ describe("deadline — ledger math and thresholds", () => {
     expect(d.human).toBe("overdue");
   });
 
-  it("is overdue exactly at the deadline (boundary)", () => {
+  it("is due now, not overdue, exactly at the deadline ledger (boundary)", () => {
     const d = displayFor({ deadlineLedger: 5000, latestLedger: 5000 });
-    expect(d.isOverdue).toBe(true);
+    expect(d.ledgersRemaining).toBe(0);
+    expect(d.isOverdue).toBe(false);
+    expect(d.human).toBe("due now");
     expect(d.isEstimate).toBe(true);
     expect(d.label).toMatch(/estimate/i);
+    expect(d.label).not.toMatch(/overdue/i);
   });
 
   it("is not overdue one ledger before the deadline", () => {

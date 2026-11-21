@@ -41,8 +41,12 @@ Questions to answer for every new or modified entry-point:
   `contracts/circle/src/mutation_guards.rs`).
 
 Existing tested guarantees:
-- `circle.join`, `contribute`, `payout`, `mark_default`, `close` all require the
-  caller to sign.  Tests are in `adversarial_tests.rs`.
+- `circle.join`, `contribute`, `initialize`, `cancel`, `close`, `pause` and
+  `resume` require the relevant address to sign. `payout`, `mark_default` and
+  `settle_round` are deliberately permissionless; their recipient/default
+  targets are derived from stored state rather than caller input. See
+  [`AUTHORIZATION_MATRIX.md`](./AUTHORIZATION_MATRIX.md) and
+  [`adversarial_tests.rs`](../contracts/circle/src/adversarial_tests.rs).
 - `reputation.increment` rejects any caller not in `AuthorizedCallers` and
   rejects revoked callers before checking the allowlist.  Tests are in
   `contracts/reputation/src/lib.rs` unit tests.

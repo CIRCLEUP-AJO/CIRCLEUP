@@ -87,6 +87,12 @@ mod cancellation_invariants_tests; // cancellation and collateral recovery invar
 mod payout_integration_tests; // payout cross-contract boundary: token + reputation atomicity
 #[cfg(test)]
 mod payout_event_sequence_tests; // compound operation event ordering (docs/EVENTS.md)
+#[cfg(test)]
+mod token_behavior_fixture; // reusable token behavior fixtures (#888)
+#[cfg(test)]
+mod member_boundary_tests; // min/max member lifecycle bounds (#889)
+#[cfg(test)]
+mod deadline_boundary_tests; // deadline ledger inclusivity (#890)
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,

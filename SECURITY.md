@@ -73,7 +73,9 @@ The core attack surface is in `contracts/circle`:
 | **Default penalty** | Capped at 20% per missed round (2000 BPS); cannot exceed current collateral balance |
 | **Contribution auth** | `member.require_auth()` — only the member themselves can contribute for their slot |
 | **Idempotency** | Temporary storage key prevents double-contribution in the same round |
-| **Round advancement** | Only happens inside `payout` after full contribution; no manual override |
+| **Round advancement** | Happens in `payout` after full contribution or in permissionless `settle_round` after the deadline; recipients are fixed by the member list |
+
+For the boundary between these on-chain protections and deployment, wallet, token and upgrade assumptions, see [`docs/CONTRACT_TRUST_BOUNDARIES.md`](./docs/CONTRACT_TRUST_BOUNDARIES.md).
 
 ---
 

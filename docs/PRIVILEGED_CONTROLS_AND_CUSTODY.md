@@ -55,9 +55,9 @@ pub fn pause(env: Env, admin: Address) -> Result<(), PauseError> {
 
 ---
 
-#### 3. initialize(env, members, round_amount, usdc_token, reputation_contract, round_deadline_ledgers)
+#### 3. initialize(env, admin, members, round_amount, usdc_token, reputation_contract, round_deadline_ledgers)
 
-**Access Control**: Anyone can call this, but only once per contract.
+**Access Control**: The `admin` argument must sign (`admin.require_auth()`), and the call succeeds only once per contract.
 
 **Initialization Sequence**:
 1. All validation passes without any state mutation (except reentrancy guard).
@@ -66,15 +66,15 @@ pub fn pause(env: Env, admin: Address) -> Result<(), PauseError> {
    - `Status` is set to `Pending`.
    - `CurrentRound` is initialized with round_index=0, recipient=members[0], contributions_received=0.
    - `RoundsCompleted` is set to 0.
-   - `Admin` is set to the **caller address** (not a parameter).
+   - `Admin` is set to the **signed `admin` argument**.
    - `UsdcToken` is set to the immutable `usdc_token` address.
    - Reentrancy guard (`Initializing`) is cleared.
 
-**Key Custody Decision**: The caller becomes the admin. Typically:
-- In factory deployments: Factory sets itself as admin and later transfers admin authority to a governance contract or multisig.
-- In direct deployments: The deployer is the admin until transferred via a governance or manual coordination mechanism.
+**Key Custody Decision**: The signed `admin` argument becomes the admin. Typically:
+- In factory deployments: the factory sets itself as admin, so a correctly governed factory controls pause/resume for its circles.
+- In direct deployments: the deployer chooses the admin at initialization; choose a multisig or governance contract from the outset.
 
-**No Transfer Mechanism**: There is **no `set_admin()` or `transfer_admin()`** entry-point. The admin address is locked at initialization and cannot be changed.
+**No Transfer Mechanism**: There is **no `set_admin()` or `transfer_admin()`** entry-point. The admin address is locked at initialization and cannot be changed on an existing contract; a different admin requires deploying a correctly configured replacement contract and migrating state/events.
 
 **Recovery Limitation**: If the deployer loses the initialization key, the circle's admin is "locked in" and cannot be changed. Deployers **must** use governance multisigs or deployment automation that ensures the admin address is correct before initialization.
 
@@ -361,7 +361,7 @@ env.events().publish(
 
 **Mitigation**:
 - Use multisig wallets (e.g., Stellar multisig) for the admin address so no single key loss causes lockout.
-- Pre-coordinate with governance to authorize admin key rotation via multisig amendment.
+- There is no on-chain rotation path: if the stored admin is unusable, deploy a replacement contract with the correct admin and follow [`UPGRADE_COMPATIBILITY.md`](./UPGRADE_COMPATIBILITY.md) for state/event migration.
 
 ---
 
@@ -416,7 +416,7 @@ All privileged operations are tested against unauthorized callers:
 | `test_334_non_admin_cannot_resume` | `tests.rs` | Non-admin resume rejection. |
 | `test_334_stranger_cannot_pause` | `tests.rs` | Unrelated account pause rejection. |
 | `test_adversarial_pause_not_authorized` | `adversarial_tests.rs` | Adversarial pause attempt. |
-| `test_adversarial_mark_default_by_stranger` | `adversarial_tests.rs` | Stranger mark_default rejection. |
+| `adv_circle_mark_default_stranger_rejected` | `adversarial_tests.rs` | Rejects a default target outside `config.members` (caller auth is intentionally not required). |
 | `test_adversarial_close_not_authorized` | `adversarial_tests.rs` | Non-member close rejection. |
 | `test_reputation_increments_only_from_registered_circles` | `tests.rs` | Unregistered circle rejected. |
 | `test_reputation_remove_authorized_caller_blocks_increment` | `tests.rs` | Revocation blocks reputation. |
