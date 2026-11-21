@@ -8,7 +8,44 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Create-circle call and creator participation** (#873): the create form
+  sent `create_circle` a `name` argument the factory does not accept. It now
+  sends exactly `(creator, members, round_amount, round_deadline_ledgers)`.
+  The form also refused the creator's own address with the claim "the
+  creator is automatically a member", which was false (the factory never adds
+  the creator); creators can now list themselves.
+- **Incorrect product copy**: defaults no longer claim to "compensate
+  affected members" (forfeited penalties stay in the contract), and payout
+  order is no longer described as "recorded at join time" (it is fixed by
+  list position at creation).
+- **Pause documentation** (#876): `PAUSE_RECOVERY_SEMANTICS.md` wrongly said
+  Completed and Cancelled circles cannot be paused and that paused time does
+  not count against the round deadline. Both are corrected; a pause on a
+  terminal circle blocks `close` until resume.
+
 ### Added
+- **Terminal close semantics** (#875): `docs/TERMINAL_CLOSE_SEMANTICS.md`
+  states that `close` is a single global settlement. It covers check order,
+  per-member release rules, and the `total_expected_collateral` caveat for
+  cancelled circles. `contracts/circle/tests/terminal_close_tests.rs` covers
+  full, penalised and zero-collateral members, call orders, duplicate and
+  stranger closes, and pause.
+- **Default penalty rounding** (#874): `docs/DEFAULT_PENALTY_ROUNDING.md`
+  documents the floor rule. New in this change: boundary, double-charge,
+  depleted-balance and property tests
+  (`default_penalty_boundary_tests.rs`), SDK `computeDefaultPenalty` /
+  `projectCollateralAfterDefaults` / `PENALTY_ROUNDING`, and an app
+  `previewDefaultPenalty` shown in the mark-default dialog.
+- **Pause authority tests** (#876): `pause_semantics_tests.rs` and
+  `circle_factory/tests/pause_authority_tests.rs` cover authority,
+  transitions, terminal states, reads, deadlines, and the fact that
+  factory-deployed circles cannot be paused. The indexer test pins that
+  pause/resume never touch `status`.
+- **Member order semantics** (#873): `docs/MEMBER_ORDER_SEMANTICS.md` traces
+  the list end to end. New in this change: `member_order_tests.rs`
+  (non-sorted 2-member and 256-member full cycles), SDK `payoutSchedule` /
+  `recipientForRound` / `payoutSlotOf`, and app `buildCreateCircleArgs`.
 - **Explicit SDK retry policy** (#900): `RETRY_POLICY` documents per-stage
   retry rules (bounded read retries with backoff, no wallet retries,
   submission resends only the identical envelope), and `classifyRpcFailure`

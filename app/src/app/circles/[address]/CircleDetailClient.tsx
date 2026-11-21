@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { Address, xdr } from "@stellar/stellar-sdk";
 import { getWalletAddress, invokeContract, type LocalCancelResult } from "@/lib/stellar";
 import { shortAddress, formatUsdc, indexerEndpoint, getExplorerLink, ACTIVE_NETWORK, NETWORK_PASSPHRASE } from "@/lib/config";
+import { previewDefaultPenalty, PENALTY_RULE_TEXT } from "@/lib/penalty";
 import { leaseKey, tryAcquireLease, releaseLease } from "@/lib/actionLease";
 import { subscribeIndexerUpdates } from "@/lib/indexerUpdates";
 import { parseMemberRows } from "@/lib/members";
@@ -1394,6 +1395,21 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
                 <dt className="font-medium w-16 shrink-0">Round</dt>
                 <dd>{defaultConfirm.roundIndex}</dd>
               </div>
+              {(() => {
+                const preview = previewDefaultPenalty(
+                  data.members.find((m) => m.member_address === defaultConfirm.memberAddress)?.collateral,
+                );
+                if (!preview) return null;
+                return (
+                  <div className="flex gap-2">
+                    <dt className="font-medium w-16 shrink-0">Penalty</dt>
+                    <dd>
+                      {formatUsdc(preview.penalty)} USDC ({preview.penalty.toString()} stroops) —
+                      collateral {formatUsdc(preview.remaining)} USDC afterwards (indexed estimate)
+                    </dd>
+                  </div>
+                );
+              })()}
               {data.circle.deadline_ledger != null && (
                 <div className="flex gap-2">
                   <dt className="font-medium w-16 shrink-0">Deadline</dt>
@@ -1409,8 +1425,9 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
               )}
             </dl>
             <p className="text-xs text-amber-700">
-              A penalty will be deducted from this member&apos;s locked collateral.
-              This action is irreversible once confirmed on-chain. Cancel if you
+              The contract deducts {PENALTY_RULE_TEXT} The forfeited amount stays
+              in the circle contract. This action is irreversible once confirmed
+              on-chain. Cancel if you
               are not certain the contribution window has closed.
             </p>
             <div className="flex gap-2">

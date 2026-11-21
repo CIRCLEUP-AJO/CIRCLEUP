@@ -380,8 +380,15 @@ impl CircleFactory {
         // ── 5. Initialize the circle ─────────────────────────────────────────
         // Runs inside the same transaction. A panic here rolls back the deploy
         // via the host's transaction-level abort, leaving the registry clean.
-        // The factory contract itself is passed as the circle admin so it
-        // retains pause/resume authority over every circle it deploys.
+        // The factory contract itself is passed as the circle admin.  The
+        // factory exposes no pause/resume (or forwarding) entrypoint and a
+        // contract address can only authorize its own calls, so in practice
+        // no account can pause a factory-deployed circle (#876).  Adding such
+        // an entrypoint would create a new emergency authority and needs an
+        // explicit governance decision — see docs/PAUSE_RECOVERY_SEMANTICS.md.
+        //
+        // `members` is forwarded unchanged (#873): its order is the payout
+        // rotation and the creator is not inserted.
         let init_args = soroban_sdk::vec![
             &env,
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(

@@ -18,7 +18,7 @@ import {
 } from "@/lib/config";
 import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
-import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import { buildCreateCircleArgs } from "@/lib/createCircleArgs";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -555,7 +555,7 @@ export default function CreateClient() {
       }
       setFieldErrors({});
 
-      const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
+      const { validMembers, amountStroops, roundDays: days } = validation.values;
 
       // ── Step 2: wallet check ──────────────────────────────────────────────
       let walletAddress: string | null;
@@ -585,15 +585,10 @@ export default function CreateClient() {
         return;
       }
 
-      // Self-address check — creator must not be in the member list
-      const creatorLower = walletAddress.toLowerCase();
-      if (validMembers.some((m) => m.toLowerCase() === creatorLower)) {
-        setSubmitError(
-          "Your wallet address cannot be included in the member list. " +
-            "The circle creator is automatically a member.",
-        );
-        return;
-      }
+      // Creator participation (#873): the factory never adds the creator as a
+      // member. A creator who wants to take part lists their own address, in
+      // the rotation slot they want; omitting it creates a circle they only
+      // organise.
 
       // ── Step 3: factory address guard ─────────────────────────────────────
       if (!CIRCLE_FACTORY_ADDRESS) {
@@ -604,20 +599,19 @@ export default function CreateClient() {
       // ── Step 4: submit ────────────────────────────────────────────────────
       setLoading(true);
       announce(ANNOUNCEMENTS.txSubmitting.message, ANNOUNCEMENTS.txSubmitting.politeness);
-      const membersVec = xdr.ScVal.scvVec(
-        validMembers.map((m) => new Address(m).toScVal()),
-      );
-
+      // Exactly the factory's `create_circle(creator, members, round_amount,
+      // round_deadline_ledgers)`. Members keep the order shown in the form —
+      // that order is the payout rotation. The circle name is display-only
+      // and is not an on-chain argument.
       const result = await invokeContract(
         CIRCLE_FACTORY_ADDRESS,
         "create_circle",
-        [
-          new Address(walletAddress).toScVal(),
-          nativeToScVal(circleName, { type: "string" }),
-          membersVec,
-          nativeToScVal(amountStroops, { type: "i128" }),
-          nativeToScVal(daysToLedgers(days), { type: "u32" }),
-        ],
+        buildCreateCircleArgs({
+          creator: walletAddress,
+          members: validMembers,
+          amountStroops,
+          deadlineLedgers: daysToLedgers(days),
+        }),
         walletAddress,
         actionCtrl.signal,
       );
@@ -676,9 +670,11 @@ export default function CreateClient() {
         Create a Circle
       </h1>
       <p className="text-slate-500 text-sm mb-8">
-        Set up the members, contribution amount, and schedule. The rotation order
-        is the same as the member list — members contribute in the order listed,
-        top to bottom.
+        Set up the members, contribution amount, and schedule. Every member
+        contributes every round; the payout rotation follows the member list
+        exactly as entered — the first address receives round 1&apos;s pot, the
+        second round 2&apos;s, and so on. Addresses are not sorted. You are not
+        added automatically: include your own address if you want to take part.
       </p>
 
       <form

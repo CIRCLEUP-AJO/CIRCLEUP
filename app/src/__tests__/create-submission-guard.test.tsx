@@ -62,8 +62,8 @@ import CreateClient from "../app/create/CreateClient";
 
 /**
  * Deterministic, checksum-valid addresses. The connected wallet and the two
- * member addresses are intentionally distinct, so the component's self-address
- * guard (creator must not appear in the member list) never fires.
+ * member addresses are distinct; the creator may also be listed as a member
+ * (the factory never adds the creator automatically — #873).
  */
 const addrFor = (seed: number): string =>
   Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();

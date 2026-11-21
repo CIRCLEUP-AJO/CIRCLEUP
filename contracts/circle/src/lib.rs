@@ -1359,11 +1359,14 @@ impl CircleContract {
         // Equivalently:  collateral_N = initial − Σ(penalty_i for i in 0..N)
         //   where penalty_i = collateral_i × PENALTY_BPS / BPS_DENOM
         //
-        // Integer arithmetic note: BPS_DENOM is 10_000, so for a collateral of
-        // 100_000_000 stroops the penalty is exactly 20_000_000 stroops.
-        // Integer truncation only occurs for non-multiple-of-10_000 balances
-        // (rare in practice since initial collateral == round_amount which is
-        // typically a whole USDC amount).
+        // Rounding rule (#874): `collateral` is never negative, so i128
+        // division truncates toward zero = FLOOR.  Fractional stroops are
+        // dropped in the member's favour; nothing is rounded up or rejected.
+        // penalty == floor(collateral / 5), so collateral 1..=4 incurs a zero
+        // penalty (the default is still recorded and counted) and positive
+        // collateral can never reach zero through penalties.  Pinned by
+        // tests/default_penalty_boundary_tests.rs; mirrored by
+        // sdk/src/penalty.ts and app/src/lib/penalty.ts.
         //
         // The `initialize` guard already rejects any `round_amount` that would
         // overflow `round_amount * PENALTY_BPS`, and collateral starts as
