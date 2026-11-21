@@ -23,6 +23,8 @@
     "mainnet:readiness": "npm run --workspace=scripts mainnet:readiness --",
     "seed:demo": "npm run seed:demo --workspace=scripts",
     "migrate": "npm run migrate:dev --workspace=indexer",
+    "db:setup": "npm run db:setup --workspace=indexer",
+    "db:reset:volume": "npm run db:reset:volume --workspace=indexer --",
     "hash-artifacts": "npm run hash-artifacts --workspace=scripts",
     "verify-artifacts": "npm run verify-artifacts --workspace=scripts",
     "funding-diagnostics": "npm run funding-diagnostics --workspace=scripts",
