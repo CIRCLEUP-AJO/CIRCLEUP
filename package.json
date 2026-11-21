@@ -13,6 +13,8 @@
     "preinstall": "node scripts/check-node.cjs",
     "check:node": "node scripts/check-node.cjs",
     "check:toolchain": "ts-node scripts/src/validate-toolchain.ts",
+    "check:env-parity": "ts-node scripts/src/check-env-parity.ts",
+    "validate:templates": "ts-node scripts/src/validate-templates.ts",
     "install:all": "npm install",
     "build:sdk": "npm run build --workspace=sdk",
     "build:app": "npm run build --workspace=app",
@@ -37,7 +39,8 @@
     "test:all": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
     "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
     "test:keyboard": "node --experimental-strip-types --test tests/keyboard-navigation.test.ts",
-    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts"
+    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts",
+    "test:scripts": "npm run test --workspace=scripts"
   },
   "devDependencies": {
     "typescript": "^7.0.2"

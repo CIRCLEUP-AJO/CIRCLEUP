@@ -102,6 +102,17 @@ Versions follow [Semantic Versioning](https://semver.org/).
   section and two new checklist items; `CONTRIBUTING.md` Governance References
   links to the checklist.  The document explicitly states that completing the
   checklist does not replace a specialist security audit.
+- **Issue 150**: Added `docs/ISSUE_TEST_TRACEABILITY.md` — a lightweight
+  convention mapping each cross-package acceptance criterion to the affected
+  packages and the verification commands that support it.  The issue and PR
+  templates gain a compact "Package impact and verification" section (plain
+  lines, no checkboxes) that lists touched packages, the evidence per
+  criterion, and the release checks run.  Worked examples cover a contract
+  event change, an indexer schema change, and an app-only behavior change.
+  `CONTRIBUTING.md` links to the convention, and a non-blocking CI check
+  (`scripts/check-traceability.ts`) warns when a cross-package change omits
+  the section or names no verification for a touched package, without failing
+  unrelated work.
 
 ### Changed (SDK)
 - **Strict RPC decoding** (`sdk/src/types.ts`): reads now fail at the

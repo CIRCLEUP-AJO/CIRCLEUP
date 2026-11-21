@@ -23,10 +23,24 @@
 
 import fs from 'fs';
 import path from 'path';
+import { redactSecrets } from './redact';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const ROOT = path.resolve(__dirname, '..', '..');
+
+/** Runtime packages that own environment variables. */
+export type Component = 'app' | 'sdk' | 'indexer' | 'scripts';
+
+/** Deployment profile files that declare environment variables. */
+const PROFILE_FILES: Array<{ name: string; file: string }> = [
+  { name: 'docker-compose', file: path.join(ROOT, 'docker-compose.yml') },
+  { name: 'deploy-profile', file: path.join(ROOT, 'deploy', 'profile.env.example') },
+];
+
+/** Runbook that documents environment variables in a table. */
+const RUNBOOK_FILE = path.join(ROOT, 'docs', 'RUNBOOK.md');
+=======
 
 /**
  * Variables that are set by the runtime, OS, or CI and are intentionally not
@@ -69,6 +83,33 @@ export interface ParityResult {
 export interface ParityReport {
   results: ParityResult[];
   /** true when every component has zero undocumented reads and zero stale entries. */
+  clean: boolean;
+}
+
+/** A single documented/observed environment variable and its contract. */
+export interface EnvVarEntry {
+  /** Variable name (never a value). */
+  name: string;
+  /** Owning package or profile. */
+  owner: string;
+  /** Whether the variable must be set for the owner to run. */
+  required: boolean;
+  /** Documented default behavior, or null when there is no default. */
+  defaultBehavior: string | null;
+  /** Where the variable was observed (source read, example, profile, runbook). */
+  sources: string[];
+}
+
+/** Structured inventory of every supported environment variable. */
+export interface EnvInventory {
+  entries: EnvVarEntry[];
+  /** Names read in code but absent from examples/docs. */
+  missing: string[];
+  /** Names present in examples/docs but never read in code. */
+  stale: string[];
+  /** Names read in code but absent from the runbook table. */
+  undocumented: string[];
+  /** true when missing, stale, and undocumented are all empty. */
   clean: boolean;
 }
 
@@ -175,7 +216,7 @@ export function compareEnvParity(
 // ── Per-component check ───────────────────────────────────────────────────────
 
 export function checkComponentParity(
-  component: 'app' | 'indexer' | 'scripts',
+  component: Component,
 ): ParityResult {
   const componentDir = path.join(ROOT, component);
   const srcDir = path.join(componentDir, 'src');
@@ -193,10 +234,172 @@ export function checkComponentParity(
   return { component, undocumented, stale };
 }
 
+// ── Inventory building ────────────────────────────────────────────────────────
+
+/**
+ * Parse a .env.example file into a map of name → documented default behavior.
+ * Only KEY names and the presence/absence of a default are captured; the raw
+ * value is never returned so secrets cannot leak into reports.
+ */
+export function parseEnvExampleDefaults(filePath: string): Map<string, string | null> {
+  const found = new Map<string, string | null>();
+  if (!fs.existsSync(filePath)) return found;
+
+  const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq === -1) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key)) continue;
+    const value = line.slice(eq + 1).trim();
+    // Record only whether a default exists — never echo the value itself.
+    found.set(key, value.length > 0 ? '(documented default)' : null);
+  }
+  return found;
+}
+
+/**
+ * Parse the RUNBOOK environment-variable table and return documented names.
+ * Rows are expected to be markdown table rows beginning with a backticked name.
+ */
+export function parseRunbookEnvTable(filePath: string): Set<string> {
+  const found = new Set<string>();
+  if (!fs.existsSync(filePath)) return found;
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  const rowRe = /^\|\s*`([A-Z][A-Z0-9_]*)`/gm;
+  let m: RegExpExecArray | null;
+  while ((m = rowRe.exec(content)) !== null) {
+    found.add(m[1]);
+  }
+  return found;
+}
+
+/**
+ * Parse a deployment profile file (docker-compose or profile.env.example) for
+ * environment variable names. Only names are captured, never values.
+ */
+export function parseProfileEnvNames(filePath: string): Set<string> {
+  const found = new Set<string>();
+  if (!fs.existsSync(filePath)) return found;
+
+  const content = fs.readFileSync(filePath, 'utf8');
+  // ${VAR}, ${VAR:-default}, ${VAR:?err}
+  const interpRe = /\$\{([A-Z][A-Z0-9_]*)(?::[-?][^}]*)?\}/g;
+  let m: RegExpExecArray | null;
+  while ((m = interpRe.exec(content)) !== null) {
+    found.add(m[1]);
+  }
+  // KEY=value lines (env_file style)
+  const lineRe = /^\s*([A-Z][A-Z0-9_]*)\s*=/gm;
+  while ((m = lineRe.exec(content)) !== null) {
+    found.add(m[1]);
+  }
+  return found;
+}
+
+/**
+ * Build a structured inventory of every supported environment variable across
+ * runtime packages and deployment profiles, capturing name, owner,
+ * requiredness, and default behavior. Reports names only — never values.
+ */
+export function buildEnvInventory(components: Component[]): EnvInventory {
+  const entries = new Map<string, EnvVarEntry>();
+  const readsByComponent = new Map<string, Set<string>>();
+  const exampleNames = new Set<string>();
+  const runbookNames = parseRunbookEnvTable(RUNBOOK_FILE);
+
+  const upsert = (
+    name: string,
+    owner: string,
+    required: boolean,
+    defaultBehavior: string | null,
+    source: string,
+  ): void => {
+    const existing = entries.get(name);
+    if (existing) {
+      existing.required = existing.required || required;
+      if (existing.defaultBehavior === null && defaultBehavior !== null) {
+        existing.defaultBehavior = defaultBehavior;
+      }
+      if (!existing.sources.includes(source)) existing.sources.push(source);
+    } else {
+      entries.set(name, { name, owner, required, defaultBehavior, sources: [source] });
+    }
+  };
+
+  for (const component of components) {
+    const componentDir = path.join(ROOT, component);
+    const srcDir = path.join(componentDir, 'src');
+    const exampleFile = path.join(componentDir, '.env.example');
+
+    const reads = scanEnvReads(srcDir);
+    readsByComponent.set(component, reads);
+    const defaults = parseEnvExampleDefaults(exampleFile);
+
+    for (const name of reads) {
+      // A read is required unless the example documents a default for it.
+      const hasDefault = defaults.has(name) && defaults.get(name) !== null;
+      upsert(name, component, !hasDefault, defaults.get(name) ?? null, `${component}:src`);
+    }
+    for (const name of defaults.keys()) {
+      exampleNames.add(name);
+      upsert(name, component, false, defaults.get(name) ?? null, `${component}:.env.example`);
+    }
+  }
+
+  for (const profile of PROFILE_FILES) {
+    for (const name of parseProfileEnvNames(profile.file)) {
+      upsert(name, profile.name, false, null, `${profile.name}:profile`);
+    }
+  }
+
+  for (const name of runbookNames) {
+    if (entries.has(name)) {
+      const e = entries.get(name)!;
+      if (!e.sources.includes('runbook')) e.sources.push('runbook');
+    }
+  }
+
+  const allReads = new Set<string>();
+  for (const reads of readsByComponent.values()) {
+    for (const name of reads) allReads.add(name);
+  }
+
+  const missing: string[] = [];
+  for (const name of allReads) {
+    if (!exampleNames.has(name) && !GLOBAL_ALLOWLIST.has(name)) missing.push(name);
+  }
+
+  const stale: string[] = [];
+  for (const name of exampleNames) {
+    if (!allReads.has(name) && !GLOBAL_ALLOWLIST.has(name)) stale.push(name);
+  }
+
+  const undocumented: string[] = [];
+  for (const name of allReads) {
+    if (!runbookNames.has(name) && !GLOBAL_ALLOWLIST.has(name)) undocumented.push(name);
+  }
+
+  const sortedEntries = Array.from(entries.values()).sort((a, b) =>
+    a.name.localeCompare(b.name),
+  );
+
+  return {
+    entries: sortedEntries,
+    missing: missing.sort(),
+    stale: stale.sort(),
+    undocumented: undocumented.sort(),
+    clean: missing.length === 0 && stale.length === 0 && undocumented.length === 0,
+  };
+}
+
 // ── Runner ────────────────────────────────────────────────────────────────────
 
 export function runParityCheck(
-  components: Array<'app' | 'indexer' | 'scripts'>,
+  components: Component[],
 ): ParityReport {
   const results: ParityResult[] = components.map(checkComponentParity);
   const clean = results.every(r => r.undocumented.length === 0 && r.stale.length === 0);
@@ -209,17 +412,17 @@ if (require.main === module) {
   const args = process.argv.slice(2);
   const idx = args.indexOf('--component');
   const componentArg = idx !== -1 ? args[idx + 1] : 'all';
-  const valid = ['app', 'indexer', 'scripts', 'all'];
+  const valid = ['app', 'sdk', 'indexer', 'scripts', 'all'];
 
   if (!valid.includes(componentArg ?? '')) {
     console.error(`Error: --component must be one of: ${valid.join(', ')}`);
     process.exit(1);
   }
 
-  const components: Array<'app' | 'indexer' | 'scripts'> =
+  const components: Component[] =
     componentArg === 'all'
-      ? ['app', 'indexer', 'scripts']
-      : [componentArg as 'app' | 'indexer' | 'scripts'];
+      ? ['app', 'sdk', 'indexer', 'scripts']
+      : [componentArg as Component];
 
   console.log('CircleUp environment variable parity check\n');
 
@@ -239,7 +442,35 @@ if (require.main === module) {
     console.log('');
   }
 
-  if (report.clean) {
+  const inventory = buildEnvInventory(components);
+
+  console.log('── Inventory (names only) ──');
+  for (const e of inventory.entries) {
+    const req = e.required ? 'required' : 'optional';
+    const def = e.defaultBehavior ?? 'no default';
+    console.log(`  ${e.name} [${e.owner}] ${req}, ${def}`);
+  }
+  console.log('');
+
+  if (inventory.missing.length > 0) {
+    console.log(`  ✗ Missing from .env.example: ${inventory.missing.join(', ')}`);
+  }
+  if (inventory.stale.length > 0) {
+    console.log(`  ✗ Stale .env.example entries: ${inventory.stale.join(', ')}`);
+  }
+  if (inventory.undocumented.length > 0) {
+    console.log(`  ✗ Undocumented in RUNBOOK: ${inventory.undocumented.join(', ')}`);
+  }
+
+  // Any echoed context is passed through redactSecrets so no secret values leak.
+  const summary = redactSecrets(
+    `parity: ${report.clean ? 'clean' : 'violations'}, inventory: ${
+      inventory.clean ? 'clean' : 'violations'
+    }`,
+  );
+  console.log(summary);
+
+  if (report.clean && inventory.clean) {
     console.log('All components have clean environment variable parity.');
     process.exit(0);
   } else {
