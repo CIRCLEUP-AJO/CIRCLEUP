@@ -40,10 +40,65 @@ Thank you for helping build trustless savings circles for the world. Every contr
 
 ## Development Setup
 
-```bash
-# Install Node dependencies
-npm install
+### Installing dependencies (root workspace only)
 
+CircleUp is an npm workspaces monorepo with a **single root `package-lock.json`**.
+Always install from the repository root — never from inside `app/`, `sdk/`, or
+`indexer/`.
+
+```bash
+# From the repository root — installs every workspace from the committed lockfile
+npm ci
+```
+
+`npm ci` is the supported installation path. It installs exactly what the
+committed lockfile specifies and fails if `package.json` and
+`package-lock.json` disagree, so it is also the fastest way to catch a
+forgotten lockfile update locally.
+
+`npm install` at the root is acceptable only when you are intentionally
+changing dependencies (see [Updating dependencies](#updating-dependencies)).
+Running `npm install` inside a package directory creates a nested
+`node_modules/` and `package-lock.json` that shadow the root workspace and will
+be rejected by CI.
+
+### When to use package-specific commands
+
+Package-specific commands are for **running scripts**, not for installing:
+
+```bash
+npm test --workspace=indexer
+npm run build:sdk
+npm run dev:app
+```
+
+If a package-specific command fails with a "cannot find module" error, do not
+run `npm install` in that package — re-run `npm ci` from the repository root.
+
+### Updating dependencies
+
+1. Edit the relevant `package.json` (root or workspace).
+2. From the repository root, run `npm install` to update the root lockfile.
+3. Commit the `package.json` change **and** the updated `package-lock.json`
+   together in the same commit.
+4. Verify with `npm ci` from the root before pushing.
+
+CI installs strictly from the committed lockfile and then checks that the
+workspace manifests are still synchronized. If you change a manifest without
+regenerating the lockfile, CI fails with a message like:
+
+```
+Lockfile drift detected: package.json files changed but package-lock.json
+was not updated. Run `npm install` from the repository root and commit the
+resulting package-lock.json.
+```
+
+A nested lockfile (e.g. `app/package-lock.json`) produces a similar failure
+naming the offending file; delete it and re-run `npm ci` from the root.
+
+### Common commands
+
+```bash
 # Build the SDK
 npm run build:sdk
 
@@ -72,7 +127,7 @@ Supported toolchains are Node.js 18.18+ with npm 9, Node.js 22 with npm 10, or
 Node.js 24 with npm 11; Rust 1.81.0; Soroban SDK 21.7.7; and the
 `wasm32-unknown-unknown` target. CI tests each supported tuple. Rust and Soroban are pinned for
 reproducible WASM builds. Run `npm run check:toolchain` after installing Rust
-and the target. Unsupported Node/npm versions fail during `npm install` with
+and the target. Unsupported Node/npm versions fail during `npm ci` with
 the supported range and next step.
 
 ---
@@ -160,7 +215,7 @@ commits on direct pushes to `main`.
 
 ## Pull Request Process
 
-1. Make sure CI passes (TypeScript build + Rust compile + ESLint)
+1. Make sure CI passes (lockfile/workspace sync check + TypeScript build + Rust compile + ESLint)
 2. Keep PRs focused — one feature or fix per PR
 3. Update `CHANGELOG.md` under `[Unreleased]` with what you changed, following the issue reference format in the [Traceability Policy](./docs/TRACEABILITY_POLICY.md)
 4. Fill in the PR template, including the Definition of Done checklist for your scope
@@ -739,6 +794,7 @@ This table maps each command to the gates it satisfies. Run the commands locally
 | `npm run test:incidents --workspace=indexer` | C2, F4 |
 | `npm run migrate --workspace=indexer` | C3 |
 | `npm run migrate:check --workspace=indexer` | C3, G2, G5 |
+| `npm ci` (from repository root) | Lockfile/workspace sync check |
 
 ---
 

@@ -48,6 +48,34 @@ jobs:
           cargo --version
           rustc --version
 
+      # Fail fast if the active toolchain differs from the pinned one, or if the
+      # wasm32-unknown-unknown target is missing. This prevents a silently
+      # floating toolchain from rewriting artifact hashes.
+      - name: Verify pinned toolchain and target
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          PINNED_CHANNEL="$(grep -E '^[[:space:]]*channel[[:space:]]*=' rust-toolchain.toml | head -n1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+          if [ -z "${PINNED_CHANNEL}" ]; then
+            echo "::error::Could not read pinned channel from contracts/rust-toolchain.toml"
+            exit 1
+          fi
+          ACTIVE_CHANNEL="$(rustup show active-toolchain | awk '{print $1}')"
+          echo "Pinned channel: ${PINNED_CHANNEL}"
+          echo "Active toolchain: ${ACTIVE_CHANNEL}"
+          case "${ACTIVE_CHANNEL}" in
+            "${PINNED_CHANNEL}"*) ;;
+            *)
+              echo "::error::Active toolchain '${ACTIVE_CHANNEL}' does not match pinned '${PINNED_CHANNEL}'"
+              exit 1
+              ;;
+          esac
+          if ! rustup target list --installed --toolchain "${ACTIVE_CHANNEL}" | grep -qx 'wasm32-unknown-unknown'; then
+            echo "::error::wasm32-unknown-unknown target is not installed for ${ACTIVE_CHANNEL}"
+            exit 1
+          fi
+          echo "wasm32-unknown-unknown target is installed"
+
       # Cache compiled dependencies to speed up repeated runs.
       - name: Cache Cargo registry
         uses: actions/cache@v6
@@ -76,6 +104,11 @@ jobs:
           cargo build --release --target wasm32-unknown-unknown
           echo "=== First-pass artifact sizes ==="
           ls -lh target/wasm32-unknown-unknown/release/*.wasm
+          mkdir -p ../.repro/first-pass
+          cp target/wasm32-unknown-unknown/release/*.wasm ../.repro/first-pass/
+          (cd ../.repro/first-pass && sha256sum *.wasm | sort -k2 > ../first-pass.sha256)
+          echo "=== First-pass hashes ==="
+          cat ../.repro/first-pass.sha256
 
       # Generate provenance metadata for the built artifacts
       - name: Generate build provenance metadata
@@ -96,11 +129,76 @@ jobs:
           cargo build --release --target wasm32-unknown-unknown
           echo "=== Second-pass artifact sizes ==="
           ls -lh target/wasm32-unknown-unknown/release/*.wasm
+          mkdir -p ../.repro/second-pass
+          cp target/wasm32-unknown-unknown/release/*.wasm ../.repro/second-pass/
+          (cd ../.repro/second-pass && sha256sum *.wasm | sort -k2 > ../second-pass.sha256)
+          echo "=== Second-pass hashes ==="
+          cat ../.repro/second-pass.sha256
 
       # Both passes must produce identical hashes.
       - name: Compare first and second pass hashes
+        working-directory: .repro
+        run: |
+          set -euo pipefail
+          if ! diff -u first-pass.sha256 second-pass.sha256; then
+            echo "::error::First and second build passes produced different WASM hashes"
+            exit 1
+          fi
+          echo "Both build passes produced identical WASM hashes"
+
+      # Verify hashes against the reviewed expected-hashes.json.
+      - name: Verify artifact hashes against expected-hashes.json
         working-directory: scripts
         run: npx ts-node src/check-artifact-hashes.ts
+
+      # Emit the exact toolchain, SDK, target, and build flags used, alongside
+      # the WASM hashes, so any compiler/SDK change is visible in release output.
+      - name: Report toolchain and artifact evidence
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          {
+            echo "## Contract build toolchain evidence"
+            echo ""
+            echo "- rustc: \`$(rustc --version)\`"
+            echo "- cargo: \`$(cargo --version)\`"
+            echo "- active toolchain: \`$(rustup show active-toolchain)\`"
+            echo "- target: \`wasm32-unknown-unknown\`"
+            echo "- build flags: \`--release --target wasm32-unknown-unknown\`"
+            echo ""
+            echo "### Soroban SDK versions"
+            echo ""
+            echo '```'
+            grep -E '^name = "soroban-sdk"' -A1 Cargo.lock || true
+            echo '```'
+            echo ""
+            echo "### WASM hashes"
+            echo ""
+            echo '```'
+            cat ../.repro/first-pass.sha256
+            echo '```'
+          } | tee ../.repro/toolchain-evidence.md
+          {
+            echo "rustc=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "toolchain=$(rustup show active-toolchain)"
+            echo "target=wasm32-unknown-unknown"
+            echo "build_flags=--release --target wasm32-unknown-unknown"
+            grep -E '^name = "soroban-sdk"' -A1 Cargo.lock | tr '\n' ' ' || true
+            echo ""
+          } > ../.repro/toolchain-evidence.txt
+          cat ../.repro/toolchain-evidence.txt
+
+      - name: Upload toolchain evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: contract-toolchain-evidence
+          path: |
+            .repro/toolchain-evidence.md
+            .repro/toolchain-evidence.txt
+            .repro/first-pass.sha256
+            .repro/second-pass.sha256
+          if-no-files-found: error
 
       # Upload release provenance artifact
       - name: Upload build provenance metadata
@@ -125,3 +223,4 @@ jobs:
           rustc --version
           cargo --version
           rustup show
+          rustup target list --installed || true

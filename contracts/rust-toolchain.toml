@@ -4,11 +4,25 @@
 # compiled WASM artifacts are byte-for-byte identical across machines
 # (build reproducibility, issue #396).
 #
+# The pinned channel below, together with the Soroban SDK version declared
+# in the contract Cargo manifests, fully determines the WASM artifact
+# hashes recorded in scripts/expected-hashes.json (issue #971). CI reports
+# the exact compiler and target versions used for every WASM artifact, and
+# any change to the channel or SDK version must be reviewed alongside the
+# resulting expected-hashes.json changes.
+#
 # To update:
-#   1. Change the channel below.
+#   1. Change the channel below (and/or the Soroban SDK version in the
+#      contract Cargo manifests).
 #   2. Rebuild all contracts: cargo build --release --target wasm32-unknown-unknown
 #   3. Re-run scripts/src/check-artifact-hashes.ts to update expected-hashes.json
 #   4. Commit rust-toolchain.toml + expected-hashes.json together.
+#
+# Stable security updates are adopted deliberately: bump the channel to a
+# specific released version (never a floating "stable"), rebuild, and review
+# the artifact hash diff as part of the same change. The reproducibility
+# workflow rebuilds twice in clean contexts and fails if the reviewed hash
+# in expected-hashes.json does not match.
 
 [toolchain]
 channel  = "1.81.0"

@@ -75,6 +75,12 @@ async function checkA11y(container: HTMLElement) {
 import { WalletButton } from "@/components/WalletButton";
 import { CircleCard, type Circle } from "@/components/CircleCard";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
+import {
+  CSP_ENFORCEMENT_STAGE,
+  buildCspHeader,
+  isEnforced,
+  type CspStage,
+} from "@/lib/csp";
 
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -167,7 +173,95 @@ describe("a11y: ReputationLegend", () => {
   });
 });
 
+// ── CSP: required app assets under the enforced policy ────────────────────────
+
+/**
+ * These tests pin the resources the app shell actually needs (scripts, styles,
+ * fonts, images) to the enforced CSP policy. If a directive is tightened past
+ * what the app requires, or a required source is dropped from the reviewed
+ * allowlist, these tests fail before enforcement can break the app.
+ *
+ * The policy is built for the enforced stage explicitly so the tests do not
+ * depend on the current rollout stage of the deployment.
+ */
+describe("csp: enforced policy allows required app assets", () => {
+  const enforcedHeader = buildCspHeader("enforced" as CspStage);
+  const directives = parseCspHeader(enforcedHeader);
+
+  it("enforced stage is recognised as enforcing", () => {
+    expect(isEnforced("enforced" as CspStage)).toBe(true);
+    expect(isEnforced("report-only" as CspStage)).toBe(false);
+  });
+
+  it("does not use broad wildcard sources to suppress reports", () => {
+    for (const [directive, sources] of Object.entries(directives)) {
+      if (directive === "report-uri" || directive === "report-to") continue;
+      expect(sources, `${directive} must not allow *`).not.toContain("*");
+      expect(
+        sources.some((s) => s === "https:" || s === "http:"),
+        `${directive} must not allow a bare scheme source`
+      ).toBe(false);
+    }
+  });
+
+  it("allows the Next.js runtime scripts", () => {
+    expect(directives["script-src"]).toBeDefined();
+    expect(directives["script-src"]).toContain("'self'");
+    // Next.js injects inline bootstrap scripts; nonce/hash based policies are
+    // preferred, but 'unsafe-inline' must never be paired with a wildcard.
+    expect(directives["script-src"]).not.toContain("*");
+  });
+
+  it("allows required styles", () => {
+    expect(directives["style-src"]).toBeDefined();
+    expect(directives["style-src"]).toContain("'self'");
+  });
+
+  it("allows required fonts", () => {
+    expect(directives["font-src"]).toBeDefined();
+    expect(directives["font-src"]).toContain("'self'");
+  });
+
+  it("allows required images", () => {
+    expect(directives["img-src"]).toBeDefined();
+    expect(directives["img-src"]).toContain("'self'");
+  });
+
+  it("restricts connections to reviewed origins only", () => {
+    expect(directives["connect-src"]).toBeDefined();
+    expect(directives["connect-src"]).toContain("'self'");
+    expect(directives["connect-src"]).not.toContain("*");
+  });
+
+  it("blocks framing and object embedding", () => {
+    expect(directives["frame-ancestors"]).toEqual(["'none'"]);
+    expect(directives["object-src"]).toEqual(["'none'"]);
+  });
+
+  it("report-only stage still emits a report endpoint", () => {
+    const reportOnly = parseCspHeader(buildCspHeader("report-only" as CspStage));
+    const endpoint =
+      reportOnly["report-uri"]?.[0] ?? reportOnly["report-to"]?.[0] ?? "";
+    expect(endpoint).not.toBe("");
+  });
+
+  it("current rollout stage is a known stage", () => {
+    expect(["report-only", "enforced"]).toContain(CSP_ENFORCEMENT_STAGE);
+  });
+});
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+function parseCspHeader(header: string): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const part of header.split(";")) {
+    const tokens = part.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+    const [name, ...sources] = tokens;
+    out[name.toLowerCase()] = sources;
+  }
+  return out;
+}
 
 function formatViolations(violations: axe.Result[]): string {
   if (violations.length === 0) return "";

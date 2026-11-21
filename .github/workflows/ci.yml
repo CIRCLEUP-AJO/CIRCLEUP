@@ -247,6 +247,58 @@ jobs:
           node --require ts-node/register --test
           scripts/src/validate-templates.test.ts
 
+  # ── Workspace / lockfile consistency ────────────────────────────────────────
+  # Issue #136: Guarantees that the committed root package-lock.json is the
+  # single source of truth for the npm workspace.  A clean `npm ci` from the
+  # repository root must succeed without touching tracked dependency metadata,
+  # and every workspace manifest must be reflected in the lockfile.
+  workspace-lockfile:
+    name: Workspace lockfile consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Reject nested lockfiles
+        # Only the root package-lock.json is supported.  A package-local
+        # lockfile means someone ran `npm install` inside a workspace instead
+        # of from the repository root, which silently forks the dependency tree.
+        run: |
+          nested=$(git ls-files '*package-lock.json' '*npm-shrinkwrap.json' '*yarn.lock' '*pnpm-lock.yaml' \
+            | grep -v '^package-lock.json$' || true)
+          if [ -n "$nested" ]; then
+            echo "::error::Nested lockfiles found. This repo uses a single root lockfile."
+            echo "Remove the following files and re-run 'npm install' from the repository root:"
+            echo "$nested" | sed 's/^/  - /'
+            exit 1
+          fi
+
+      - name: Install strictly from the committed lockfile
+        # `npm ci` fails if package.json and package-lock.json disagree, which
+        # is exactly the drift we want to surface.  --workspaces ensures every
+        # workspace manifest is validated against the lockfile.
+        run: npm ci --workspaces --include-workspace-root
+
+      - name: Verify workspace manifests match the lockfile
+        run: npm run check:workspace-lockfile
+
+      - name: Verify install did not modify tracked dependency metadata
+        # A clean `npm ci` must be a no-op for tracked files.  Any diff here
+        # means the lockfile was stale or a manifest was edited without
+        # regenerating it.
+        run: |
+          if ! git diff --quiet -- package.json package-lock.json '*/package.json'; then
+            echo "::error::Dependency metadata changed during 'npm ci'."
+            echo "The lockfile is out of sync with the workspace manifests."
+            echo "Fix: run 'npm install' from the repository root and commit the updated package-lock.json."
+            git --no-pager diff -- package.json package-lock.json '*/package.json'
+            exit 1
+          fi
+
   # ── Dependency license policy ───────────────────────────────────────────────
   license-policy:
     name: Dependency license policy
