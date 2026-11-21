@@ -12,6 +12,7 @@ import { parseContractError, userMessageForError, type ContractAppError } from "
 import {
   buildAppSnapshot,
   computeActionEligibility,
+  isDeadlinePassedByLedger,
   isGateBlocked,
   type NetworkCheckState,
 } from "@/lib/gating";
@@ -592,11 +593,13 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
     { maxSnapshotAgeMs: Infinity },
   );
 
-  // True when the indexed latest ledger is past the round deadline
-  const deadlinePassed =
-    data.circle.deadline_ledger != null &&
-    data.latestLedger != null &&
-    data.latestLedger > data.circle.deadline_ledger;
+  // True only when the indexed latest ledger is strictly past the round
+  // deadline ledger. Ledger state is authoritative: no wall-clock estimate
+  // (lib/deadline.ts) is consulted, and missing ledger data is never "passed".
+  const deadlinePassed = isDeadlinePassedByLedger(
+    data.circle.deadline_ledger,
+    data.latestLedger,
+  );
 
   // GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½ Manual refresh GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½GÃ¯Â¿Â½Ã¯Â¿Â½
   //

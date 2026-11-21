@@ -3,11 +3,13 @@ import { useState, useEffect } from "react";
 import {
   computeDeadlineDisplay,
   DEADLINE_MAX_DATA_AGE_MS as MAX_DATA_AGE_MS,
-  SECONDS_PER_LEDGER,
 } from "@/lib/deadline";
 
 // Re-export so callers that imported MAX_DATA_AGE_MS from this module keep building.
 export { MAX_DATA_AGE_MS };
+
+/** How often the component re-checks data staleness (not a countdown tick). */
+export const STALENESS_RECHECK_MS = 15_000;
 
 interface DeadlineProps {
   deadlineLedger: number | null | undefined;
@@ -80,24 +82,25 @@ export function RoundDeadlineStatus({
   fetchedAtMs,
   checkpointTime = null,
 }: DeadlineProps) {
+  // Re-evaluate staleness on a coarse 15 s cadence. There is deliberately no
+  // second-by-second countdown: the time estimate is derived from ledger
+  // sequences that only change when the indexer reports a new ledger, so a
+  // per-second tick would imply precision the inputs do not have.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (status !== "Active") return;
+    const id = setInterval(() => setNowMs(Date.now()), STALENESS_RECHECK_MS);
+    return () => clearInterval(id);
+  }, [status]);
+
   const display = computeDeadlineDisplay({
     deadlineLedger,
     latestLedger,
     status,
     fetchedAtMs,
     checkpointTime,
+    nowMs,
   });
-
-  // Only tick for fresh data on an Active circle.  Stale or missing data is
-  // never presented as a live, precise countdown — it stays a static estimate
-  // (or is shown as unavailable) so users aren't misled about when a default
-  // is permitted.
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    if (status !== "Active" || display.kind !== "fresh") return;
-    const id = setInterval(() => setTick((t) => t + 1), 1000);
-    return () => clearInterval(id);
-  }, [status, display.kind]);
 
   if (status !== "Active") {
     return (
@@ -121,14 +124,26 @@ export function RoundDeadlineStatus({
 
   if (display.kind === "unavailable") {
     return (
-      <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-start gap-3">
+      <div
+        className="bg-slate-50 border border-slate-200 rounded-xl p-4 flex items-start gap-3"
+        role="status"
+        aria-label={display.srText}
+        data-deadline-phase={display.phase}
+        data-deadline-kind={display.kind}
+      >
         <span className="text-xl mt-0.5" aria-hidden="true">⏱️</span>
         <div>
           <p className="text-xs text-slate-500 font-medium uppercase tracking-wide">
             Round deadline
           </p>
-          <p className="text-sm text-slate-400 mt-0.5">
-            Deadline data not available for this circle
+          <p className="text-sm text-slate-500 mt-0.5">
+            {display.deadlineLedger !== null
+              ? `Deadline at ledger ${display.deadlineLedger.toLocaleString("en-US")} · latest ledger unavailable`
+              : "Deadline data not available for this circle"}
+          </p>
+          <p className="text-xs text-slate-500 mt-0.5">
+            <span className="font-medium">{display.freshnessLabel}</span> · time estimate
+            hidden until ledger data loads
           </p>
           {/* Explicitly report missing checkpoint — absence itself is diagnostic. */}
           <CheckpointAgeRow checkpointTime={display.checkpointTime} />
@@ -138,24 +153,38 @@ export function RoundDeadlineStatus({
   }
 
   const isStale = display.kind === "stale";
-  const { human, isOverdue, urgency, ledgersRemaining } = display;
+  const { human, isOverdue, urgency, ledgersRemaining, phase } = display;
 
+  // Visual urgency comes from the same ledger-derived `urgency` that drives
+  // the text label, so colour and wording can never disagree.
   const colorMap = {
     green:  "bg-brand-50 border-brand-200 text-brand-800",
     yellow: "bg-amber-50 border-amber-300 text-amber-800",
     red:    "bg-red-50 border-red-300 text-red-800",
   } as const;
 
-  const boxClasses = `border rounded-xl p-4 flex items-start gap-3 ${
-    isStale ? "bg-amber-50 border-amber-200 text-amber-800" : colorMap[urgency]
+  const boxClasses = `border rounded-xl p-4 flex items-start gap-3 ${colorMap[urgency]}${
+    isStale ? " border-dashed" : ""
   }`;
+
+  const progress =
+    phase === "passed"
+      ? `${Math.abs(ledgersRemaining!).toLocaleString("en-US")} ledger${
+          Math.abs(ledgersRemaining!) !== 1 ? "s" : ""
+        } past deadline`
+      : `${ledgersRemaining!.toLocaleString("en-US")} ledger${
+          ledgersRemaining !== 1 ? "s" : ""
+        } remaining`;
 
   return (
     <div
       className={boxClasses}
       role="status"
       aria-live="polite"
-      aria-label={`Round deadline: ${display.label}, ${human}`}
+      aria-label={display.srText}
+      data-deadline-phase={phase}
+      data-deadline-kind={display.kind}
+      data-deadline-urgency={urgency}
     >
       <span className="text-xl mt-0.5" aria-hidden="true">
         {isOverdue ? "🔴" : "⏱️"}
@@ -164,19 +193,24 @@ export function RoundDeadlineStatus({
         <p className="text-xs font-medium uppercase tracking-wide opacity-70">
           {display.label}
         </p>
-        <p className="text-lg font-bold mt-0.5 tabular-nums">{human}</p>
-        <p className="text-xs opacity-60 mt-0.5">
-          Deadline at ledger {deadlineLedger!.toLocaleString()} ·{" "}
-          {Math.abs(ledgersRemaining!).toLocaleString()} ledger
-          {Math.abs(ledgersRemaining!) !== 1 ? "s" : ""}{" "}
-          {isOverdue ? "past deadline" : "remaining"}{" "}
-          · ~{SECONDS_PER_LEDGER}s per ledger (estimate)
-          {isStale
-            ? ` · indexed data is ${Math.round(
-                (display.dataAgeMs ?? 0) / 1000,
-              )}s old — refresh for an accurate deadline`
-            : ""}
+        <p className="text-lg font-bold mt-0.5">{human}</p>
+        {display.timeEstimate !== null && (
+          <p className="text-xs opacity-70 mt-0.5">
+            Approximate — assumes ~{display.secondsPerLedger}s per ledger. The
+            deadline ledger is authoritative.
+          </p>
+        )}
+        <p className="text-xs opacity-70 mt-0.5">
+          Deadline at ledger {display.deadlineLedger!.toLocaleString("en-US")} · latest
+          indexed ledger {display.latestLedger!.toLocaleString("en-US")} · {progress}
         </p>
+        {isStale && (
+          <p className="text-xs font-medium mt-0.5">
+            {display.freshnessLabel} — indexed data is{" "}
+            {Math.round((display.dataAgeMs ?? 0) / 1000)}s old; time estimate hidden
+            {phase === "open" ? " and the deadline may already have passed" : ""}.
+          </p>
+        )}
         {/* Checkpoint age separates ledger distance from approximate processing age.
             Always rendered — if absent the row labels that explicitly. */}
         <CheckpointAgeRow checkpointTime={display.checkpointTime} />

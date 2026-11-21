@@ -9,6 +9,24 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Soroban resource budgets** (#868): `contracts/circle/tests/resource_budget_tests.rs`
+  measures instructions, memory, read/write entries and bytes, and event size
+  for `create`, `join`, `contribute`, `payout`, `default`, `cancel` and `close`
+  at 2 / 8 / 256 members. Each run writes `resource-report-<tier>.json` with
+  toolchain metadata and tolerances, and CI uploads the reports. See
+  `docs/RESOURCE_BUDGETS.md`.
+- **Release smoke-test matrix** (#865): `docs/RELEASE_SMOKE_TEST_MATRIX.md`
+  documents the four-layer testnet/mainnet matrix with sign-off and blocking
+  rules. `smoke-test.ts` gains resource-report, storage-fixture, SDK-fixture
+  and app-build evidence checks (warnings on testnet, failures on mainnet).
+  `smoke-write-gate.ts` restricts write-based smoke tests to funded,
+  disposable testnet accounts and refuses mainnet unconditionally. Added the
+  `smoke-test`, `smoke-test:mainnet` and `release:verify` scripts.
+- **Storage & upgrade compatibility matrix** (#867):
+  `docs/STORAGE_COMPATIBILITY.md` inventories each contract's keys, scopes,
+  initialization rules and upgrade paths. Historical-layout fixtures in
+  `contracts/fixtures/storage/` come with `storage_compatibility_tests.rs` for
+  circle, factory and reputation.
 - **Explicit SDK retry policy** (#900): `RETRY_POLICY` documents per-stage
   retry rules (bounded read retries with backoff, no wallet retries,
   submission resends only the identical envelope), and `classifyRpcFailure`
@@ -289,6 +307,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
   end-to-end threading through `CircleClient.join`)
 
 ### Changed
+- **Ledger-authoritative round deadlines** (#866): deadline state
+  (open / due / passed) now comes only from `deadline_ledger` vs.
+  `latestLedger` (`ledgerDeadlinePhase` in `app/src/lib/gating.ts`). Time
+  estimates are coarse and marked "≈", and they're hidden when ledger data is
+  missing or stale. The per-second countdown tick is gone. Urgency colour and
+  label now come from the same ledger thresholds. Seconds-per-ledger can be
+  set with `NEXT_PUBLIC_SECONDS_PER_LEDGER`.
 - **Indexer numeric wire format** (#897): every numeric response field now
   has exactly one documented JSON type (`docs/INDEXER_NUMERIC_WIRE_FORMAT.md`).
   Amounts are decimal strings, persisted BIGINT ledgers are decimal strings,

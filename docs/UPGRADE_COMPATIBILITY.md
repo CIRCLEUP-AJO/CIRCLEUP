@@ -14,6 +14,10 @@ circle status variants, and all declared numeric error discriminants. SDK wire
 fixtures additionally pin public method arguments and return shapes; see
 [`CONTRACT_FIXTURES.md`](./CONTRACT_FIXTURES.md).
 
+Historical storage-layout fixtures run against candidate contract code, and
+the per-key scope/initialization/upgrade-path inventory, are in
+[`STORAGE_COMPATIBILITY.md`](./STORAGE_COMPATIBILITY.md) (#867).
+
 Persisted state currently includes:
 
 | Contract | Keys and values | Compatibility concern |

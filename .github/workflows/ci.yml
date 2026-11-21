@@ -29,6 +29,22 @@ jobs:
         run: cd contracts && cargo test
         # Failure here blocks merge: names the failed crate in cargo output.
 
+      # Issue #868: Soroban resource budget report. Fails on regressions beyond
+      # tolerance or mainnet-limit overruns in the min/typical tiers; the max
+      # tier is report-only. See docs/RESOURCE_BUDGETS.md.
+      - name: Soroban resource budget report (Issue #868)
+        env:
+          CIRCLEUP_RESOURCE_REPORT_DIR: ${{ github.workspace }}/artifacts
+        run: cd contracts && cargo test -p circle --test resource_budget_tests -- --nocapture
+
+      - name: Upload resource budget report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resource-budget-report
+          path: artifacts/resource-report-*.json
+          if-no-files-found: warn
+
       - name: cargo audit (high-severity advisories)
         # Enforced gate: fails the Contracts job when a high-severity advisory
         # is found.  Add unavoidable upstream advisories to .github/audit-ignore.json.
@@ -231,6 +247,26 @@ jobs:
           scripts/src/deployment-manifest.test.ts
           scripts/src/mainnet-readiness.test.ts
           scripts/src/deploy-network-guard.test.ts
+          scripts/src/smoke-test.test.ts
+          scripts/src/smoke-test.evidence.test.ts
+          scripts/src/smoke-write-gate.test.ts
+
+      # Issue #865: non-mutating release smoke-test matrix. Read-only on every
+      # environment; never submits transactions. SMOKE_TESTNET is deliberately
+      # NOT set here, so the testnet write gate reports "skip".
+      - name: Release smoke-test matrix (read-only, testnet RC)
+        run: >-
+          TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
+          node --require ts-node/register
+          scripts/src/smoke-test.ts --env=testnet --json > smoke-report.json || true
+
+      - name: Upload smoke-test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-smoke-report
+          path: smoke-report.json
+          if-no-files-found: warn
 
       - name: Validate contributor templates (links + safety notices)
         # Checks every relative link in .github templates and asserts that
