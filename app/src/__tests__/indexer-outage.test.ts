@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { fetchCircleData } from "../app/circles/[address]/CircleDetailClient";
+import { fetchWithTimeout } from "../lib/fetchWithTimeout";
 
 const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
@@ -123,5 +124,147 @@ describe("error kind distinguishability", () => {
     // These must be distinct so the UI can show different recovery guidance.
     const kinds = new Set(["network", "parse", "server", "misconfigured", "indexer_outage"]);
     expect(kinds.size).toBe(5);
+  });
+});
+
+// ─── Server-rendered indexer reads: bounded timeout + retry ───────────────────
+//
+// The homepage performs a server-side GET to the indexer. A connection that
+// stays pending must not hang the render: the request has a finite deadline,
+// at most one bounded retry for safe GETs, and any timeout/cancellation/upstream
+// error must reach the existing fallback rather than an empty successful list.
+
+describe("fetchWithTimeout — deadline, abort, and bounded retry", () => {
+  it("aborts a slow response that exceeds the deadline and reports a timeout", async () => {
+    // fetch never resolves on its own; it only settles when the abort signal fires.
+    global.fetch = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("timeout");
+    // A timeout must never be reported as a successful (empty) list.
+    expect(result.error).not.toBe("network");
+  });
+
+  it("passes an abort signal to fetch and surfaces cancellation as a timeout", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    global.fetch = vi.fn((_url: string, init?: RequestInit) => {
+      receivedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 0,
+    });
+
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("timeout");
+  });
+
+  it("retries exactly once after a timeout, then gives up", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("timeout");
+    // Initial attempt + exactly one bounded retry.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers successfully when the retry returns a valid response", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce((_url: string, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] }),
+      } as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry non-retryable upstream errors (e.g. 503 outage)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({}),
+    } as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("indexer_outage");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares a single bounded request across parallel Suspense consumers", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [] }),
+    } as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const [a, b, c] = await Promise.all([
+      fetchWithTimeout("https://indexer.example/api", { timeoutMs: 50, retries: 1 }),
+      fetchWithTimeout("https://indexer.example/api", { timeoutMs: 50, retries: 1 }),
+      fetchWithTimeout("https://indexer.example/api", { timeoutMs: 50, retries: 1 }),
+    ]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(c.ok).toBe(true);
+    // Deduplicated: parallel consumers must not multiply upstream requests.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

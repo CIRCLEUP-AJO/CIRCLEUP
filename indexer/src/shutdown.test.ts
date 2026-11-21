@@ -339,6 +339,241 @@ describe("Shutdown phase tracking", () => {
   });
 });
 
+// ─── Coordinated shutdown sequence (#932) ────────────────────────────────────
+//
+// The entrypoint must run a single, ordered shutdown sequence:
+//
+//   stop accepting new work → drain poller → close HTTP server → close pool
+//
+// Each resource must be released exactly once, even when several signals
+// arrive, and a bounded drain deadline must report the unfinished phase.
+
+describe("Coordinated shutdown sequence (#932)", () => {
+  type Phase = "not_started" | "poller" | "http" | "pool" | "complete";
+
+  interface ShutdownHarness {
+    phase: Phase;
+    pollerStopped: boolean;
+    serverClosed: number;
+    poolClosed: number;
+    unfinished: Phase | null;
+    shutdown: (signal?: AbortSignal) => Promise<void>;
+  }
+
+  /**
+   * Build a harness that mirrors the entrypoint's shutdown ordering with
+   * injectable, observable resources. `drainMs` bounds the whole sequence.
+   */
+  function makeHarness(opts: {
+    drainMs?: number;
+    stopPoller?: (signal?: AbortSignal) => Promise<void>;
+    closeServer?: () => Promise<void>;
+    closePool?: () => Promise<void>;
+    onDeadline?: (phase: Phase) => void;
+  } = {}): ShutdownHarness {
+    const drainMs = opts.drainMs ?? 1000;
+    const h: ShutdownHarness = {
+      phase: "not_started",
+      pollerStopped: false,
+      serverClosed: 0,
+      poolClosed: 0,
+      unfinished: null,
+      shutdown: async () => {},
+    };
+
+    let inFlight: Promise<void> | null = null;
+
+    const run = async (signal?: AbortSignal): Promise<void> => {
+      h.phase = "poller";
+      await (opts.stopPoller ?? (async () => {}))(signal);
+      h.pollerStopped = true;
+
+      h.phase = "http";
+      await (opts.closeServer ?? (async () => {}))();
+      h.serverClosed += 1;
+
+      h.phase = "pool";
+      await (opts.closePool ?? (async () => {}))();
+      h.poolClosed += 1;
+
+      h.phase = "complete";
+    };
+
+    h.shutdown = (signal?: AbortSignal): Promise<void> => {
+      // Repeated signals join the in-flight sequence instead of re-entering it.
+      if (inFlight) return inFlight;
+
+      inFlight = (async () => {
+        let timer: NodeJS.Timeout | undefined;
+        const deadline = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => {
+            h.unfinished = h.phase;
+            (opts.onDeadline ?? (() => {}))(h.phase);
+            reject(new Error(`shutdown drain deadline exceeded during phase: ${h.phase}`));
+          }, drainMs);
+        });
+
+        try {
+          await Promise.race([run(signal), deadline]);
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      })();
+
+      return inFlight;
+    };
+
+    return h;
+  }
+
+  test("idle shutdown runs poller → http → pool in order and completes", async () => {
+    const order: string[] = [];
+    const h = makeHarness({
+      stopPoller: async () => { order.push("poller"); },
+      closeServer: async () => { order.push("http"); },
+      closePool: async () => { order.push("pool"); },
+    });
+
+    await h.shutdown();
+
+    assert.deepEqual(order, ["poller", "http", "pool"]);
+    assert.equal(h.phase, "complete");
+    assert.equal(h.pollerStopped, true);
+    assert.equal(h.serverClosed, 1);
+    assert.equal(h.poolClosed, 1);
+    assert.equal(h.unfinished, null);
+  });
+
+  test("shutdown during an RPC wait waits for the poller to finish", async () => {
+    let rpcResolved = false;
+    const h = makeHarness({
+      stopPoller: async () => {
+        // Simulate an in-flight RPC call that takes 30ms to settle.
+        await new Promise((r) => setTimeout(r, 30));
+        rpcResolved = true;
+      },
+    });
+
+    await h.shutdown();
+
+    assert.equal(rpcResolved, true, "poller must be allowed to finish the RPC wait");
+    assert.equal(h.poolClosed, 1, "pool must not close before the RPC wait settles");
+    assert.equal(h.phase, "complete");
+  });
+
+  test("shutdown during an active ledger transaction lets it commit before pool close", async () => {
+    let committed = false;
+    const h = makeHarness({
+      stopPoller: async () => {
+        // In-flight checkpoint transaction commits within the drain window.
+        await new Promise((r) => setTimeout(r, 20));
+        committed = true;
+      },
+    });
+
+    await h.shutdown();
+
+    assert.equal(committed, true, "in-flight transaction must be allowed to commit");
+    assert.equal(h.poolClosed, 1);
+  });
+
+  test("shutdown during an active ledger transaction allows rollback on failure", async () => {
+    let rolledBack = false;
+    const h = makeHarness({
+      stopPoller: async () => {
+        try {
+          await new Promise((_r, reject) => setTimeout(() => reject(new Error("tx aborted")), 10));
+        } catch {
+          rolledBack = true; // poller rolls back, then reports done
+        }
+      },
+    });
+
+    await h.shutdown();
+
+    assert.equal(rolledBack, true, "failed transaction must roll back before pool close");
+    assert.equal(h.poolClosed, 1);
+    assert.equal(h.phase, "complete");
+  });
+
+  test("shutdown during an active API request closes the server after the request drains", async () => {
+    let requestDrained = false;
+    const h = makeHarness({
+      closeServer: async () => {
+        // server.close() resolves only once in-flight requests complete.
+        await new Promise((r) => setTimeout(r, 20));
+        requestDrained = true;
+      },
+    });
+
+    await h.shutdown();
+
+    assert.equal(requestDrained, true, "in-flight API request must drain before close resolves");
+    assert.equal(h.serverClosed, 1);
+    assert.equal(h.poolClosed, 1);
+  });
+
+  test("repeated shutdown signals close each resource exactly once", async () => {
+    const h = makeHarness({
+      stopPoller: async () => { await new Promise((r) => setTimeout(r, 20)); },
+    });
+
+    // Three signals arrive in quick succession.
+    await Promise.all([h.shutdown(), h.shutdown(), h.shutdown()]);
+
+    assert.equal(h.pollerStopped, true);
+    assert.equal(h.serverClosed, 1, "HTTP server must be closed exactly once");
+    assert.equal(h.poolClosed, 1, "pool must be closed exactly once");
+    assert.equal(h.phase, "complete");
+  });
+
+  test("exceeding the drain deadline reports the unfinished phase and rejects", async () => {
+    const reported: Phase[] = [];
+    const h = makeHarness({
+      drainMs: 30,
+      stopPoller: () => new Promise<void>(() => {}), // never finishes
+      onDeadline: (phase) => reported.push(phase),
+    });
+
+    await assert.rejects(
+      () => h.shutdown(),
+      /drain deadline exceeded during phase: poller/,
+    );
+
+    assert.deepEqual(reported, ["poller"], "unfinished phase must be reported");
+    assert.equal(h.unfinished, "poller");
+    assert.equal(h.poolClosed, 0, "pool must not be closed after a deadline breach");
+  });
+
+  test("deadline breach during the HTTP phase identifies the http phase", async () => {
+    const h = makeHarness({
+      drainMs: 30,
+      closeServer: () => new Promise<void>(() => {}), // never drains
+    });
+
+    await assert.rejects(
+      () => h.shutdown(),
+      /drain deadline exceeded during phase: http/,
+    );
+    assert.equal(h.unfinished, "http");
+    assert.equal(h.poolClosed, 0);
+  });
+
+  test("deadline breach during the pool phase identifies the pool phase", async () => {
+    const h = makeHarness({
+      drainMs: 30,
+      closePool: () => new Promise<void>(() => {}), // pool.end() hangs
+    });
+
+    await assert.rejects(
+      () => h.shutdown(),
+      /drain deadline exceeded during phase: pool/,
+    );
+    assert.equal(h.unfinished, "pool");
+    assert.equal(h.serverClosed, 1, "server must already be closed before pool phase");
+  });
+});
+
 // ─── PostgreSQL Pool Shutdown (#935) ──────────────────────────────────────────
 
 describe("PostgreSQL pool shutdown (#935)", () => {

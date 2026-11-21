@@ -373,6 +373,26 @@ export interface ClosePoolOptions {
   signal?: AbortSignal;
 }
 
+/** Error raised when the pool drain deadline is exceeded. */
+export class PoolDrainTimeoutError extends Error {
+  constructor(public readonly timeoutMs: number) {
+    super(`[db] Pool shutdown timed out after ${timeoutMs}ms`);
+    this.name = "PoolDrainTimeoutError";
+  }
+}
+
+/** Error raised when the pool drain is aborted via AbortSignal. */
+export class PoolDrainAbortedError extends Error {
+  constructor(reason?: unknown) {
+    super(
+      `[db] Pool shutdown aborted${
+        reason instanceof Error ? `: ${reason.message}` : reason ? `: ${String(reason)}` : ""
+      }`,
+    );
+    this.name = "PoolDrainAbortedError";
+  }
+}
+
 /**
  * Cleanly releases all PostgreSQL connections in the shared pool.
  *
@@ -391,10 +411,13 @@ export async function closePool(options: ClosePoolOptions = {}): Promise<void> {
   const isDefaultPool = targetPool === pool;
 
   if (isDefaultPool) {
+    // Already fully closed: resolve immediately without re-ending the pool.
     if (poolClosed || pool.ended) {
       poolClosed = true;
       return;
     }
+    // A close is already in progress: share the existing promise so repeated
+    // shutdown signals never double-end the pool or race each other.
     if (poolClosePromise) {
       return poolClosePromise;
     }
@@ -405,27 +428,31 @@ export async function closePool(options: ClosePoolOptions = {}): Promise<void> {
 
   const executionPromise = (async () => {
     let timer: NodeJS.Timeout | undefined;
-    try {
-      const endPromise = targetPool.end();
+    let onAbort: (() => void) | undefined;
+    const signal = options.signal;
 
+    // Start draining. pg's pool.end() waits for checked-out clients to be
+    // released; in-flight transactions therefore get a chance to COMMIT or
+    // ROLLBACK before their connections are torn down.
+    const endPromise = targetPool.end();
+
+    try {
       if (options.timeoutMs && options.timeoutMs > 0) {
+        const timeoutMs = options.timeoutMs;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            reject(new Error(`[db] Pool shutdown timed out after ${options.timeoutMs}ms`));
-          }, options.timeoutMs);
+            reject(new PoolDrainTimeoutError(timeoutMs));
+          }, timeoutMs);
           timer.unref?.();
         });
         await Promise.race([endPromise, timeoutPromise]);
-      } else if (options.signal) {
-        if (options.signal.aborted) {
-          throw options.signal.reason ?? new Error("[db] Pool shutdown aborted");
+      } else if (signal) {
+        if (signal.aborted) {
+          throw new PoolDrainAbortedError(signal.reason);
         }
         const abortPromise = new Promise<never>((_, reject) => {
-          options.signal?.addEventListener(
-            "abort",
-            () => reject(options.signal?.reason ?? new Error("[db] Pool shutdown aborted")),
-            { once: true },
-          );
+          onAbort = () => reject(new PoolDrainAbortedError(signal.reason));
+          signal.addEventListener("abort", onAbort, { once: true });
         });
         await Promise.race([endPromise, abortPromise]);
       } else {
@@ -436,13 +463,27 @@ export async function closePool(options: ClosePoolOptions = {}): Promise<void> {
         poolClosed = true;
       }
     } catch (err) {
+      // The drain deadline/abort fired before end() resolved. Do NOT swallow
+      // the underlying end() failure: attach a handler so a late rejection
+      // from end() is reported rather than becoming an unhandled rejection.
+      endPromise.catch((endErr) => {
+        console.error(
+          "[db] Pool end() failed after drain deadline exceeded:",
+          redactCredentialsInText(endErr instanceof Error ? endErr.message : String(endErr)),
+        );
+      });
+
       if (isDefaultPool && !pool.ended) {
+        // Allow a later closePool() call to retry the drain.
         poolClosing = false;
         poolClosePromise = null;
       }
       throw err;
     } finally {
       if (timer) clearTimeout(timer);
+      if (onAbort && signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
     }
   })();
 

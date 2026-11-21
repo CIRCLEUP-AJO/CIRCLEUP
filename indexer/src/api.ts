@@ -555,12 +555,40 @@ interface CircleStatusCountRow {
 }
 
 
-export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
+export function createApp(options: {
+  cachedMigrationHealth?: MigrationHealth | null;
+  /** Returns true once the coordinated shutdown sequence has begun. */
+  isShuttingDown?: () => boolean;
+} = {}) {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
   app.use(requestTracing);
   app.use(cors({ ...buildCorsOptions(), exposedHeaders: ["X-Request-ID"] }));
   app.use(express.json());
+
+  // ── Shutdown gate ──────────────────────────────────────────────────────────
+  //
+  // The entrypoint owns the HTTP server and calls server.close() (stop
+  // accepting new connections) followed by closeAllConnections() once the
+  // bounded drain deadline elapses.  This middleware makes the transition
+  // observable to handlers: once shutdown has begun, new requests are refused
+  // with 503 + Connection: close so clients retry elsewhere instead of
+  // starting work that would race the pool being closed.  Requests already
+  // in flight are unaffected — they finish normally (or are cut off by
+  // closeAllConnections at the deadline).
+  //
+  // Handlers in this module are all request-scoped: none of them schedule
+  // timers, spawn background tasks, or hold a connection past the response,
+  // so no additional cleanup is required here beyond refusing new work.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (options.isShuttingDown?.()) {
+      res.setHeader("Connection", "close");
+      res.setHeader("Retry-After", "1");
+      sendError(res, 503, "Server is shutting down");
+      return;
+    }
+    next();
+  });
 
   // Issue 97: Instrument HTTP requests with bounded route and status-code classes
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -2147,6 +2175,53 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   return app;
+}
+
+/**
+ * Close an HTTP server created from createApp() with a bounded drain period.
+ *
+ * Sequence (matches the coordinated shutdown in the entrypoint):
+ *   1. server.close() — stop accepting new connections; in-flight requests
+ *      are allowed to finish and their sockets close naturally.
+ *   2. If the server has not closed within `drainMs`, force-close every
+ *      remaining socket via closeAllConnections() so a stuck request cannot
+ *      block process replacement indefinitely.
+ *
+ * Resolves with `{ drained: true }` when all connections finished within the
+ * deadline, or `{ drained: false, forced: true }` when the deadline was hit
+ * and remaining connections were terminated.  Never rejects — callers log the
+ * outcome and proceed to close the pool.  Safe to call more than once: a
+ * second call on an already-closed server resolves immediately without
+ * touching sockets again.
+ */
+export async function closeHttpServer(
+  server: import("node:http").Server,
+  drainMs: number,
+): Promise<{ drained: boolean; forced: boolean }> {
+  if (!server.listening) {
+    return { drained: true, forced: false };
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  const closed = new Promise<{ drained: boolean; forced: boolean }>((resolve) => {
+    server.close(() => resolve({ drained: true, forced: false }));
+    timer = setTimeout(() => {
+      // Deadline exceeded: terminate remaining sockets.  server.close()'s
+      // callback still fires once the sockets are gone, but we resolve now so
+      // the caller is not held up by a socket that refuses to close.
+      try {
+        server.closeAllConnections();
+      } catch {
+        // Older Node versions without closeAllConnections — nothing to do.
+      }
+      resolve({ drained: false, forced: true });
+    }, drainMs);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+
+  const result = await closed;
+  if (timer) clearTimeout(timer);
+  return result;
 }
 
 function parseHistoryPage(req: Request, res: Response): { page: number; limit: number; offset: number } | null {

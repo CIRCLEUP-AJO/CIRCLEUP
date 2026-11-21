@@ -67,6 +67,62 @@ export interface CreateFormErrors {
   membersGeneral?: string;
 }
 
+/**
+ * Stable identifiers for every field that can carry a validation message.
+ *
+ * Member rows are keyed by their row index (`member:0`, `member:1`, …) so a
+ * message can be tied to exactly one input and cleared independently when that
+ * row is corrected. `members` is the list-level key (count/duplicates) and
+ * `wallet` is deliberately *not* a form field: wallet and RPC failures live in
+ * a separate channel so they are never mislabeled as local input errors.
+ */
+export type FieldKey =
+  | "name"
+  | "amount"
+  | "days"
+  | "members"
+  | `member:${number}`;
+
+/** A single structured validation issue tied to a field key. */
+export interface FieldError {
+  key: FieldKey;
+  message: string;
+}
+
+/** DOM id for the inline error message belonging to a field key. */
+export function fieldErrorId(formId: string, key: FieldKey): string {
+  return `${formId}-${key.replace(":", "-")}-err`;
+}
+
+/**
+ * Flatten a CreateFormErrors object into an ordered list of structured issues.
+ *
+ * Order matches the visual order of the form (name → amount → duration →
+ * member rows → member list), which is also the order the error summary lists
+ * them and the order focus moves through them.
+ */
+export function toFieldErrorList(errors: CreateFormErrors): FieldError[] {
+  const list: FieldError[] = [];
+  if (errors.name) list.push({ key: "name", message: errors.name });
+  if (errors.amount) list.push({ key: "amount", message: errors.amount });
+  if (errors.days) list.push({ key: "days", message: errors.days });
+  errors.members?.forEach((message, i) => {
+    if (message) list.push({ key: `member:${i}`, message });
+  });
+  if (errors.membersGeneral) list.push({ key: "members", message: errors.membersGeneral });
+  return list;
+}
+
+/** Human-readable label for a field key, used in the error summary. */
+export function fieldLabel(key: FieldKey): string {
+  if (key === "name") return "Circle name";
+  if (key === "amount") return "Contribution amount";
+  if (key === "days") return "Round duration";
+  if (key === "members") return "Members";
+  const idx = Number(key.slice("member:".length));
+  return `Member ${idx + 1}`;
+}
+
 /** The normalised values returned when validation passes. */
 export interface ValidatedCreateForm {
   name: string;
@@ -409,6 +465,8 @@ export default function CreateClient() {
 
   // ── Submission state ───────────────────────────────────────────────────────
   const [loading, setLoading] = useState(false);
+  // Wallet / RPC / contract failures. Kept separate from `fieldErrors` so a
+  // wallet or network problem is never rendered as a local input error.
   const [submitError, setSubmitError] = useState("");
   const [supportError, setSupportError] = useState<ContractAppError | null>(null);
   const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
@@ -433,10 +491,12 @@ export default function CreateClient() {
   const membersHintId = useId();
   const submitErrId   = useId();
   const successId     = useId();
+  const summaryId     = useId();
 
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
+  const summaryRef     = useRef<HTMLDivElement>(null);
   // One ref per member row for focusing the first invalid field
   const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
@@ -473,12 +533,18 @@ export default function CreateClient() {
   const potDisplay = formatPot(roundStroops, filledCount);
   const memberAmountDisplay = formatUsdc(roundStroops);
 
-  // Live-validate after first submit attempt so errors update as user types
+  // Live-validate after first submit attempt so errors update as user types.
+  // Only the fields that actually changed are re-evaluated, so correcting one
+  // input clears its own message without touching unrelated ones.
   useEffect(() => {
     if (!validated) return;
     const result = validateCreateForm(name, members, roundUSDC, roundDays);
     setFieldErrors(result.ok ? {} : result.errors);
   }, [validated, name, members, roundUSDC, roundDays]);
+
+  // Structured, ordered list of issues for the summary and focus management.
+  const fieldErrorList = toFieldErrorList(fieldErrors);
+  const hasFieldErrors = fieldErrorList.length > 0;
 
   // ── Member helpers ──────────────────────────────────────────────────────────
 
@@ -511,17 +577,56 @@ export default function CreateClient() {
   }
 
   // ── Focus first error ────────────────────────────────────────────────────────
+  //
+  // Moves focus to the first invalid input (in visual order). When the only
+  // issue is list-level (member count/duplicates) there is no single offending
+  // input, so focus the error summary instead — it is focusable and links to
+  // each affected field.
   function focusFirstError(errors: CreateFormErrors) {
-    if (errors.name) { nameRef.current?.focus(); return; }
-    if (errors.amount) { amountRef.current?.focus(); return; }
-    if (errors.days) { daysRef.current?.focus(); return; }
-    if (errors.members) {
-      const firstIdx = errors.members.findIndex((e) => e !== undefined);
-      if (firstIdx !== -1) { memberRefs.current[firstIdx]?.focus(); return; }
+    const first = toFieldErrorList(errors)[0];
+    if (!first) return;
+    switch (first.key) {
+      case "name":
+        nameRef.current?.focus();
+        return;
+      case "amount":
+        amountRef.current?.focus();
+        return;
+      case "days":
+        daysRef.current?.focus();
+        return;
+      case "members":
+        summaryRef.current?.focus();
+        return;
+      default: {
+        const idx = Number(first.key.slice("member:".length));
+        memberRefs.current[idx]?.focus();
+        return;
+      }
     }
-    // membersGeneral — focus the first empty member slot if it exists
-    const firstEmpty = members.findIndex((m) => m.trim() === "");
-    if (firstEmpty !== -1) { memberRefs.current[firstEmpty]?.focus(); }
+  }
+
+  /** Move focus to the input (or summary) for a field key from the summary. */
+  function focusField(key: FieldKey) {
+    switch (key) {
+      case "name":
+        nameRef.current?.focus();
+        return;
+      case "amount":
+        amountRef.current?.focus();
+        return;
+      case "days":
+        daysRef.current?.focus();
+        return;
+      case "members":
+        membersHintId && document.getElementById(membersHintId)?.focus();
+        return;
+      default: {
+        const idx = Number(key.slice("member:".length));
+        memberRefs.current[idx]?.focus();
+        return;
+      }
+    }
   }
 
   // ── Submit ──────────────────────────────────────────────────────────────────
@@ -554,6 +659,9 @@ export default function CreateClient() {
         return; // never reach wallet
       }
       setFieldErrors({});
+      // Local input is valid — clear any stale wallet/RPC message so it is not
+      // mistaken for a form error on this attempt.
+      setSubmitError("");
 
       const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
 
@@ -689,6 +797,38 @@ export default function CreateClient() {
         noValidate
       >
 
+        {/* ── Error summary ────────────────────────────────────────────────────
+            Rendered only for local input errors. Wallet/RPC failures use the
+            separate submit-level region below and never appear here. */}
+        {hasFieldErrors && (
+          <div
+            id={summaryId}
+            ref={summaryRef}
+            role="alert"
+            tabIndex={-1}
+            aria-labelledby={`${summaryId}-title`}
+            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 focus:outline-none focus:ring-2 focus:ring-red-400"
+          >
+            <p id={`${summaryId}-title`} className="font-semibold mb-1">
+              Please fix {fieldErrorList.length} issue
+              {fieldErrorList.length === 1 ? "" : "s"} before creating the circle:
+            </p>
+            <ul className="list-disc pl-5 space-y-0.5">
+              {fieldErrorList.map((err) => (
+                <li key={err.key}>
+                  <button
+                    type="button"
+                    onClick={() => focusField(err.key)}
+                    className="underline text-left hover:text-red-900"
+                  >
+                    {fieldLabel(err.key)}: {err.message}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
         {/* ── Circle name ──────────────────────────────────────────────────── */}
         <div>
           <label
@@ -710,10 +850,15 @@ export default function CreateClient() {
             }`}
             aria-required="true"
             aria-invalid={fieldErrors.name ? "true" : undefined}
-            aria-describedby={fieldErrors.name ? `${nameId}-err` : undefined}
+            aria-describedby={
+              fieldErrors.name ? fieldErrorId(formId, "name") : undefined
+            }
             autoComplete="off"
           />
-          <FieldError id={`${nameId}-err`} message={fieldErrors.name} />
+          <FieldError
+            id={fieldErrorId(formId, "name")}
+            message={fieldErrors.name}
+          />
           <p className="mt-1 text-xs text-slate-400">
             {name.trim().length}/{MAX_NAME_LENGTH} characters
           </p>
@@ -747,7 +892,7 @@ export default function CreateClient() {
                 aria-invalid={fieldErrors.amount ? "true" : undefined}
                 aria-describedby={[
                   amountHintId,
-                  fieldErrors.amount ? `${amountId}-err` : null,
+                  fieldErrors.amount ? fieldErrorId(formId, "amount") : null,
                 ].filter(Boolean).join(" ")}
                 aria-label="Contribution amount in USDC"
               />
@@ -758,7 +903,10 @@ export default function CreateClient() {
               {filledCount > 0 ? filledCount : "…"} member
               {filledCount !== 1 ? "s" : ""} = ${potDisplay}
             </p>
-            <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
+            <FieldError
+              id={fieldErrorId(formId, "amount")}
+              message={fieldErrors.amount}
+            />
           </div>
 
           <div>
@@ -783,10 +931,15 @@ export default function CreateClient() {
               }`}
               aria-required="true"
               aria-invalid={fieldErrors.days ? "true" : undefined}
-              aria-describedby={fieldErrors.days ? `${daysId}-err` : undefined}
+              aria-describedby={
+                fieldErrors.days ? fieldErrorId(formId, "days") : undefined
+              }
               aria-label="Round duration in days"
             />
-            <FieldError id={`${daysId}-err`} message={fieldErrors.days} />
+            <FieldError
+              id={fieldErrorId(formId, "days")}
+              message={fieldErrors.days}
+            />
           </div>
         </div>
 
@@ -816,7 +969,7 @@ export default function CreateClient() {
             {members.map((m, i) => {
               const fieldErr = fieldErrors.members?.[i];
               const inputId  = `member-${i}`;
-              const errId    = `member-${i}-err`;
+              const errId    = fieldErrorId(formId, `member:${i}`);
               const atMin    = members.length <= MIN_MEMBERS;
               return (
                 <li key={i} className="flex flex-col gap-0.5">
@@ -883,6 +1036,7 @@ export default function CreateClient() {
           {/* List-level member error (count, duplicates) */}
           {fieldErrors.membersGeneral && (
             <p
+              id={fieldErrorId(formId, "members")}
               role="alert"
               className="mt-2 text-xs text-red-600 flex items-center gap-1"
             >
@@ -910,7 +1064,8 @@ export default function CreateClient() {
           {/* Live count status, so the bounds are visible before the first submit. */}
           <p
             id={membersHintId}
-            className={`text-xs mt-1 ${
+            tabIndex={-1}
+            className={`text-xs mt-1 focus:outline-none focus:ring-2 focus:ring-brand-500 rounded ${
               memberSummary.status === "ok" ? "text-slate-400" : "text-amber-700"
             }`}
             aria-live="polite"
@@ -956,7 +1111,9 @@ export default function CreateClient() {
           </ul>
         </div>
 
-        {/* ── Submit-level error ────────────────────────────────────────────── */}
+        {/* ── Submit-level error (wallet / RPC / contract) ─────────────────────
+            Separate channel from field errors: these are never local input
+            problems, so they are not listed in the error summary above. */}
         {submitError && (
           <div
             id={submitErrId}

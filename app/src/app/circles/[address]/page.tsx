@@ -26,6 +26,16 @@ import CircleErrorBody from "./CircleErrorBody";
 // a malformed address never reaches the indexer, CircleHeader, or
 // CircleDetailClient.
 import { isSorobanContractId } from "@/lib/address";
+// Issue #129: canonical origin + network-aware explorer helpers. The canonical
+// origin comes from configured SITE_URL (never the request Host header), and
+// explorer links carry the active network so a testnet page is never presented
+// as mainnet evidence.
+import {
+  getCanonicalUrl,
+  getExplorerLink,
+  getNetworkLabel,
+  isTestnet,
+} from "@/lib/network";
 
 export async function generateMetadata({
   params,
@@ -34,6 +44,7 @@ export async function generateMetadata({
 }): Promise<Metadata> {
   const rawAddress = typeof params?.address === "string" ? params.address.trim() : "";
   const safeAddress = isSorobanContractId(rawAddress) ? rawAddress : null;
+  const networkLabel = getNetworkLabel();
 
   if (!safeAddress) {
     return {
@@ -47,6 +58,10 @@ export async function generateMetadata({
     };
   }
 
+  // Canonical URL is built from the configured SITE_URL, not the request host.
+  const canonical = getCanonicalUrl(`/circles/${safeAddress}`);
+  const explorerLink = getExplorerLink("contract", safeAddress);
+
   try {
     const result = await getCircleDetail(safeAddress);
     if (result.ok) {
@@ -54,27 +69,29 @@ export async function generateMetadata({
       const status = String(circle.status).replace(/[<>"'&]/g, "");
       const pot = `$${formatPot(circle.round_amount, circle.member_count)}`;
       const roundAmount = `$${formatUsdc(circle.round_amount)}`;
+      const networkSuffix = isTestnet() ? ` (${networkLabel})` : "";
       return {
-        title: `${roundAmount}/round Circle (${status}) \u2014 CircleUp`,
+        title: `${roundAmount}/round Circle (${status})${networkSuffix} \u2014 CircleUp`,
         description:
           `${pot} pot \u00b7 ${circle.member_count} members \u00b7 round ${circle.current_round} of ${circle.total_rounds}. ` +
-          `Savings circle at ${safeAddress} on CircleUp.`,
+          `Savings circle at ${safeAddress} on ${networkLabel} via CircleUp.`,
         alternates: {
-          canonical: `/circles/${safeAddress}`,
+          canonical,
         },
         openGraph: {
-          title: `${roundAmount}/round Circle (${status}) \u2014 CircleUp`,
+          title: `${roundAmount}/round Circle (${status})${networkSuffix} \u2014 CircleUp`,
           description:
             `${pot} pot \u00b7 ${circle.member_count} members \u00b7 round ${circle.current_round} of ${circle.total_rounds}.`,
-          url: `/circles/${safeAddress}`,
+          url: canonical,
           type: "website",
         },
         twitter: {
           card: "summary",
-          title: `${roundAmount}/round Circle (${status}) \u2014 CircleUp`,
+          title: `${roundAmount}/round Circle (${status})${networkSuffix} \u2014 CircleUp`,
           description:
             `${pot} pot ┬╖ ${circle.member_count} members ┬╖ round ${circle.current_round} of ${circle.total_rounds}.`,
         },
+        other: explorerLink ? { "stellar:explorer": explorerLink } : {},
       };
     } else if (result.error === "not_found") {
       return {
@@ -94,15 +111,16 @@ export async function generateMetadata({
   const shortAddr = safeAddress.slice(0, 8);
   return {
     title: `Circle ${shortAddr}ΓÇª ΓÇö CircleUp`,
-    description: `Savings circle at ${safeAddress} on CircleUp. Track rotation order, round progress, and contribution history.`,
+    description: `Savings circle at ${safeAddress} on ${networkLabel} via CircleUp. Track rotation order, round progress, and contribution history.`,
     alternates: {
-      canonical: `/circles/${safeAddress}`,
+      canonical,
     },
     twitter: {
       card: "summary",
       title: `Circle ${shortAddr}ΓÇª ΓÇö CircleUp`,
-      description: `Savings circle at ${safeAddress} on CircleUp.`,
+      description: `Savings circle at ${safeAddress} on ${networkLabel} via CircleUp.`,
     },
+    other: explorerLink ? { "stellar:explorer": explorerLink } : {},
   };
 }
 
@@ -245,6 +263,13 @@ interface CircleHeaderProps {
 }
 
 function CircleHeader({ address, circle }: CircleHeaderProps) {
+  // Issue #129: only build an explorer link for a validated contract ID, and
+  // label it with the active network so testnet pages are not mistaken for
+  // mainnet evidence.
+  const explorerLink = isSorobanContractId(address)
+    ? getExplorerLink("contract", address)
+    : null;
+  const networkLabel = getNetworkLabel();
   const stats: Array<{ label: string; value: React.ReactNode }> = [
     {
       label: "Status",
@@ -303,6 +328,17 @@ function CircleHeader({ address, circle }: CircleHeaderProps) {
           <p className="font-mono text-sm text-slate-500 break-all select-all">
             {address}
           </p>
+          {explorerLink ? (
+            <a
+              href={explorerLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 mt-1 text-xs font-medium text-indigo-600 hover:text-indigo-700"
+            >
+              View on explorer ({networkLabel})
+              <span aria-hidden="true">Γåù</span>
+            </a>
+          ) : null}
         </div>
       </div>
 

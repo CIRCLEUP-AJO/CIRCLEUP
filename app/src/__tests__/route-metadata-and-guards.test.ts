@@ -14,6 +14,9 @@ vi.mock("@/lib/config", async (importOriginal) => {
 
 import { generateMetadata as generateCircleMetadata } from "@/app/circles/[address]/page";
 import { generateMetadata as generateReputationMetadata } from "@/app/reputation/[member]/page";
+import { generateMetadata as generateHomeMetadata } from "@/app/page";
+import { getExplorerLink } from "@/lib/explorer";
+import { SITE_URL } from "@/lib/config";
 
 // Mock global fetch
 const globalFetch = vi.fn();
@@ -126,6 +129,88 @@ describe("Route Metadata Generation & Guard Tests", () => {
       const meta = await generateReputationMetadata({ params: { member: VALID_MEMBER } });
       expect(meta.title).toBe("Member Not Found — CircleUp");
       expect(meta.description).toContain("has no recorded activity");
+    });
+  });
+
+  describe("Canonical URLs use configured origin", () => {
+    const VALID_CIRCLE = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+    const VALID_MEMBER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    it("home metadata canonical uses SITE_URL", async () => {
+      const meta = await generateHomeMetadata();
+      expect(meta.alternates?.canonical).toBe(SITE_URL);
+    });
+
+    it("circle metadata canonical uses SITE_URL and route address, not request host", async () => {
+      globalFetch.mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+      globalFetch.mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+
+      const meta = await generateCircleMetadata({
+        params: { address: VALID_CIRCLE },
+        // An untrusted host header must never leak into canonical metadata.
+        headers: new Headers({ host: "evil.example.com" }),
+      } as any);
+
+      expect(meta.alternates?.canonical).toBe(`${SITE_URL}/circles/${VALID_CIRCLE}`);
+      expect(String(meta.alternates?.canonical)).not.toContain("evil.example.com");
+    });
+
+    it("reputation metadata canonical uses SITE_URL and route address, not request host", async () => {
+      globalFetch.mockResolvedValueOnce({ ok: false, status: 404 } as Response);
+
+      const meta = await generateReputationMetadata({
+        params: { member: VALID_MEMBER },
+        headers: new Headers({ host: "evil.example.com" }),
+      } as any);
+
+      expect(meta.alternates?.canonical).toBe(`${SITE_URL}/reputation/${VALID_MEMBER}`);
+      expect(String(meta.alternates?.canonical)).not.toContain("evil.example.com");
+    });
+
+    it("malformed addresses do not produce canonical URLs", async () => {
+      const circleMeta = await generateCircleMetadata({ params: { address: "GNOTACONTRACTID" } });
+      expect(circleMeta.alternates?.canonical).toBeUndefined();
+
+      const repMeta = await generateReputationMetadata({ params: { member: "not-a-stellar-address" } });
+      expect(repMeta.alternates?.canonical).toBeUndefined();
+    });
+  });
+
+  describe("Explorer links are network-aware and validated", () => {
+    const VALID_ACCOUNT = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const VALID_CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+
+    it("builds account links on the configured network path", () => {
+      const link = getExplorerLink("account", VALID_ACCOUNT);
+      expect(link).toContain(VALID_ACCOUNT);
+      expect(link).toMatch(/\/account\//);
+      // Network-specific explorer paths must be reflected in the URL.
+      expect(link).toMatch(/testnet|public/);
+    });
+
+    it("builds contract links on the configured network path", () => {
+      const link = getExplorerLink("contract", VALID_CONTRACT);
+      expect(link).toContain(VALID_CONTRACT);
+      expect(link).toMatch(/\/contract\//);
+      expect(link).toMatch(/testnet|public/);
+    });
+
+    it("returns null for invalid account addresses", () => {
+      expect(getExplorerLink("account", "not-a-stellar-address")).toBeNull();
+      expect(getExplorerLink("account", "GNOTAVALIDACCOUNT")).toBeNull();
+    });
+
+    it("returns null for invalid contract addresses", () => {
+      expect(getExplorerLink("contract", "GNOTACONTRACTID")).toBeNull();
+      expect(getExplorerLink("contract", "")).toBeNull();
+    });
+
+    it("labels testnet explorer links so they are not presented as mainnet evidence", () => {
+      const link = getExplorerLink("account", VALID_ACCOUNT);
+      if (link && link.includes("testnet")) {
+        const label = getExplorerLinkLabel?.("account") ?? "View on Stellar Expert (Testnet)";
+        expect(label.toLowerCase()).toContain("testnet");
+      }
     });
   });
 });

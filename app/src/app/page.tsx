@@ -74,6 +74,12 @@ function makeGetCircles(params: BrowseParams) {
       if (status) qs.set("status", status);
       const url = `${base}?${qs.toString()}`;
 
+      // Bounded server-side read: an explicit deadline plus at most one retry
+      // for this safe GET. `indexerFetch` owns the retry/timeout policy so
+      // parallel Suspense consumers share the same bounded behavior instead of
+      // each multiplying retries. Timeouts and cancellations are surfaced as
+      // the `network` category so the existing fallback renders — never as an
+      // empty successful list.
       let res: Response;
       try {
         res = await indexerFetch(url, {

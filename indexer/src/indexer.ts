@@ -1653,13 +1653,25 @@ export async function startIndexer() {
 }
 
 /**
- * Stop the event poller cleanly: clear the interval, refuse new ticks, and
- * wait for any in-flight poll cycle to finish so we don't exit mid-write.
+ * Stop the event poller cleanly with a bounded drain.
  *
- * Accepts an optional AbortSignal so the caller (gracefulShutdown in index.ts)
- * can impose its own deadline.  When the signal fires before the in-flight
- * cycle resolves, stopIndexer rejects with an AbortError so the caller's
- * grace-period timer can force-exit rather than hanging indefinitely.
+ * Sequence:
+ *   1. Set `shuttingDown` so no new ticks are accepted (and any in-flight
+ *      backfill loop observes the flag at its next durable ledger boundary).
+ *   2. Clear the poll interval so the timer cannot schedule further work.
+ *   3. Await the in-flight poll cycle, racing it against the caller's
+ *      AbortSignal so a stuck RPC call or transaction cannot block the
+ *      process past the configured drain deadline.
+ *
+ * The pool is NOT closed here: pool lifecycle is owned by the entrypoint
+ * coordinator, which must close it only after this function settles (or the
+ * drain deadline is exceeded) so checkpoint transactions are never cut off.
+ *
+ * Idempotent: repeated calls (e.g. a second SIGTERM) never double-clear the
+ * timer or double-await in a way that skips rollback — they simply wait on
+ * the same in-flight cycle under the same abort semantics.  When the signal
+ * fires before the cycle resolves, this rejects with an AbortError whose
+ * message names the unfinished phase so the caller can log it.
  */
 export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   if (!indexerStarted && !pollTimer && !pollInFlight) {
@@ -1670,7 +1682,11 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   if (shuttingDown) {
     log("info", "indexer_stopped", {}, "Shutdown already in progress — waiting...");
     if (pollInFlight) {
-      await raceWithAbort(pollInFlight.catch(() => undefined), signal);
+      await raceWithAbort(
+        pollInFlight.catch(() => undefined),
+        signal,
+        "indexer poll cycle (already draining)",
+      );
     }
     return;
   }
@@ -1678,6 +1694,7 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   shuttingDown = true;
   log("info", "indexer_stopped", {}, "Graceful shutdown requested — stopping event poller...");
 
+  // Stop accepting new work before waiting on anything in flight.
   if (pollTimer) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -1686,8 +1703,14 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
   if (pollInFlight) {
     log("info", "indexer_stopped", {}, "Waiting for in-flight poll cycle to finish...");
     // Race the in-flight cycle against the abort signal so a stuck RPC call
-    // does not block the process past the configured grace period.
-    await raceWithAbort(pollInFlight.catch(() => undefined), signal);
+    // or ledger transaction does not block the process past the drain
+    // deadline.  The in-flight transaction is allowed to commit or roll back
+    // on its own; we never force-close the pool from here.
+    await raceWithAbort(
+      pollInFlight.catch(() => undefined),
+      signal,
+      "indexer poll cycle (in-flight ledger transaction or RPC wait)",
+    );
   }
 
   indexerStarted = false;
@@ -1698,26 +1721,28 @@ export async function stopIndexer(signal?: AbortSignal): Promise<void> {
  * Race a promise against an optional AbortSignal.
  *
  * If the signal fires before `promise` settles the returned promise rejects
- * with an AbortError (name === "AbortError"), propagating the cancellation to
- * the caller.  When no signal is provided the promise races against nothing
- * and this is a transparent pass-through.
+ * with an AbortError (name === "AbortError") whose message names the
+ * unfinished `phase`, so the caller can log exactly what could not drain.
+ * When no signal is provided the promise races against nothing and this is a
+ * transparent pass-through.
  */
-function raceWithAbort(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+function raceWithAbort(
+  promise: Promise<void>,
+  signal?: AbortSignal,
+  phase = "shutdown",
+): Promise<void> {
   if (!signal) return promise;
-  if (signal.aborted) {
-    return Promise.reject(
-      Object.assign(new Error("Shutdown aborted: grace period exceeded"), {
-        name: "AbortError",
-      }),
+  const abortError = () =>
+    Object.assign(
+      new Error(`Shutdown aborted: drain deadline exceeded during ${phase}`),
+      { name: "AbortError" },
     );
+  if (signal.aborted) {
+    return Promise.reject(abortError());
   }
   return new Promise<void>((resolve, reject) => {
     const onAbort = () => {
-      reject(
-        Object.assign(new Error("Shutdown aborted: grace period exceeded"), {
-          name: "AbortError",
-        }),
-      );
+      reject(abortError());
     };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
