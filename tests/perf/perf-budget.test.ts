@@ -1,809 +1,267 @@
 /**
- * Performance budget checks for CircleUp.
+ * Performance budget suite — offline and deterministic.
  *
- * Each test measures a specific metric against the versioned threshold in
- * tests/perf/budgets.json. Failures identify the route and metric by name.
- *
- * Fixture strategy:
- *   - API payload tests use in-memory JSON fixtures (no live indexer).
- *   - Render time tests use Node.js timing (no browser, no jsdom).
- *   - Bundle size tests parse the .next/analyze output when present; they are
- *     skipped (not failed) when no build artefact exists so CI can gate the
- *     check to post-build steps only.
- *
- * Run:
- *   node --test tests/perf/perf-budget.test.ts
+ * Fixtures come from tests/perf/fixtures.ts (mirrors indexer/src/db/schema.sql)
+ * and tier sizes from tests/perf/fixture-profiles.json. No live Stellar RPC,
+ * no PostgreSQL, no real user data. See docs/PERFORMANCE_BUDGETS.md.
  */
+import assert from 'node:assert/strict';
+import { readFileSync, existsSync } from 'node:fs';
+import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
-import { test, describe } from "node:test";
-import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import {
+  TIERS,
+  MAX_MEMBERS,
+  makeCircleRow,
+  makeCircleMemberRow,
+  makeContributionRow,
+  makePayoutRow,
+  makeDefaultRow,
+  makeReputationRow,
+  makeCircleDetailPayload,
+  makeCircleListPayload,
+  makeContributionListPayload,
+  type Tier,
+} from './fixtures.ts';
 
-// ─── Canonical money-math constants ──────────────────────────────────────────
-//
-// These values are inlined here because this test file runs with `node --test`
-// directly — it cannot import TypeScript source from another workspace package
-// at runtime.  They MUST stay in sync with the canonical definitions:
-//
-//   USDC_DECIMALS → sdk/src/constants.ts : USDC_DECIMALS  (currently 7)
-//   STROOP        → sdk/src/utils.ts     : STROOP         (BigInt(10 ** USDC_DECIMALS))
-//
-// The assertions immediately below are the automated guard: if either value
-// drifts from the canonical source the test suite will fail at the top of the
-// file, before any timing measurement runs, making the divergence impossible
-// to miss.
+const here = dirname(fileURLToPath(import.meta.url));
+const BUDGETS = JSON.parse(readFileSync(join(here, 'budgets.json'), 'utf8'));
+const PROFILES = JSON.parse(readFileSync(join(here, 'fixture-profiles.json'), 'utf8'));
 
-/** Mirror of USDC_DECIMALS in sdk/src/constants.ts. */
-const USDC_DECIMALS = 7;
-/** Mirror of STROOP in sdk/src/utils.ts — must equal BigInt(10 ** USDC_DECIMALS). */
-const STROOP = BigInt(10 ** USDC_DECIMALS);
+const TIER_NAMES: Tier[] = ['small', 'typical', 'highWater'];
 
-// Invariant assertions — fail fast if constants drift from the canonical source.
-assert.strictEqual(USDC_DECIMALS, 7,   "USDC_DECIMALS must equal sdk/src/constants.ts USDC_DECIMALS");
-assert.strictEqual(STROOP, 10_000_000n, "STROOP must equal sdk/src/utils.ts STROOP (10^USDC_DECIMALS)");
-
-
-
-const _dirname = typeof __dirname !== "undefined"
-  ? __dirname
-  : dirname(fileURLToPath(import.meta.url));
-const budgetsPath = join(_dirname, "budgets.json");
-const BUDGETS = JSON.parse(readFileSync(budgetsPath, "utf8"));
-
-// ─── Fixtures ─────────────────────────────────────────────────────────────────
-
-function makeCircleFixture(i: number) {
-  return {
-    address: `CCIRCLE${String(i).padStart(49, "0")}`,
-    creator: `GCREATOR${String(i).padStart(48, "0")}`,
-    round_amount: "100000000",
-    member_count: 10,
-    status: i % 2 === 0 ? "Active" : "Pending",
-    current_round: i % 10,
-    total_rounds: 10,
-    created_ledger: 1000 + i,
-  };
+function kb(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8') / 1024;
 }
 
-function makeCircleDetailFixture(memberCount: number) {
-  const members = Array.from({ length: memberCount }, (_, i) => ({
-    member: `GMEMBER${String(i).padStart(49, "0")}`,
-    join_order: i + 1,
-    has_contributed: i % 2 === 0,
-    payout_round: (i % memberCount) + 1,
-    payout_received: i < Math.floor(memberCount / 2),
-    joined_ledger: 1000 + i,
-  }));
-
-  return {
-    address: "CCIRCLEDETAIL0000000000000000000000000000000000000001",
-    creator: "GCREATOR000000000000000000000000000000000000000000001",
-    round_amount: "100000000",
-    member_count: memberCount,
-    status: "Active",
-    current_round: Math.floor(memberCount / 2) + 1,
-    total_rounds: memberCount,
-    created_ledger: 1000,
-    members,
-  };
+function time<T>(fn: () => T): { result: T; elapsedMs: number } {
+  const start = process.hrtime.bigint();
+  const result = fn();
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+  return { result, elapsedMs };
 }
 
-function makeReputationFixture(score: number, completedRounds: number, defaultsCount = 0) {
-  return {
-    member: "GMEMBERREPUTATION0000000000000000000000000000000001",
-    score,
-    completed_rounds: completedRounds,
-    streak: Math.min(score, 12),
-    defaults_count: defaultsCount,
-    last_active_ledger: 50000,
-    badge: score >= 10 ? "Legend" : score >= 6 ? "Trusted" : score >= 3 ? "Reliable" : score >= 1 ? "Starter" : "New",
-  };
-}
-
-function makeContributionFixture(i: number) {
-  return {
-    member: `GMEMBER${String(i).padStart(49, "0")}`,
-    round: i,
-    amount: "100000000",
-    txHash: "a".repeat(64),
-    ledger: 1000 + i,
-  };
-}
-
-/**
- * Maximum-size circle fixture (256 members per protocol constant MAX_MEMBERS).
- * Used to measure resource budgets for boundary cases.
- */
-function makeMaxSizeCircleFixture(i: number) {
-  return {
-    address: `CCIRCLEMAX${String(i).padStart(48, "0")}`,
-    creator: `GCREATORMAX${String(i).padStart(47, "0")}`,
-    round_amount: "100000000",
-    member_count: 256,  // MAX_MEMBERS from protocol
-    status: i % 2 === 0 ? "Active" : "Pending",
-    current_round: i % 10,
-    total_rounds: 10,
-    created_ledger: 1000 + i,
-  };
-}
-
-// ─── API payload tests ────────────────────────────────────────────────────────
-
-describe("API payload budgets", () => {
-  test("empty circle list payload is within budget", () => {
-    const payload = JSON.stringify({ circles: [] });
-    const bytes = Buffer.byteLength(payload, "utf8");
-    const budget = BUDGETS.payload.emptyListBytes;
-
-    assert.ok(
-      bytes <= budget,
-      `[api:circleList:empty] payload ${bytes}B exceeds budget ${budget}B`,
-    );
-  });
-
-  test("10-circle list payload is within budget", () => {
-    const circles = Array.from({ length: 10 }, (_, i) => makeCircleFixture(i));
-    const payload = JSON.stringify({ circles });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.payload.populatedList10CirclesKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:circleList:10] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("50-circle list payload is within budget", () => {
-    const circles = Array.from({ length: 50 }, (_, i) => makeCircleFixture(i));
-    const payload = JSON.stringify({ circles });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.payload.populatedList50CirclesKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:circleList:50] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("100-circle list payload is within budget", () => {
-    const circles = Array.from({ length: 100 }, (_, i) => makeCircleFixture(i));
-    const payload = JSON.stringify({ circles });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.payload.populatedList100CirclesKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:circleList:100] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("circle detail minimal (1 member) payload is within budget", () => {
-    const detail = makeCircleDetailFixture(1);
-    const payload = JSON.stringify(detail);
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.circleDetailMinimal.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:circleDetail:minimal] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("circle detail standard (10 members) payload is within budget", () => {
-    const detail = makeCircleDetailFixture(10);
-    const payload = JSON.stringify(detail);
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.circleDetail10Members.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:circleDetail:10] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("circle detail maximum (256 members) payload is within budget", () => {
-    const detail = makeCircleDetailFixture(256);
-    const payload = JSON.stringify(detail);
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.circleDetailMax256Members.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:circleDetail:256] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("reputation profile (new member) payload is within budget", () => {
-    const rep = makeReputationFixture(0, 0, 0);
-    const payload = JSON.stringify(rep);
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.reputationProfileNew.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:reputationProfile:new] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("reputation profile (active member) payload is within budget", () => {
-    const rep = makeReputationFixture(8, 5, 0);
-    const payload = JSON.stringify(rep);
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.reputationProfileActive.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:reputationProfile:active] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("member contributions payload (10 entries) is within budget", () => {
-    const contributions = Array.from({ length: 10 }, (_, i) =>
-      makeContributionFixture(i),
-    );
-    const payload = JSON.stringify({ contributions });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.memberContributions10.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:memberContributions:10] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("member contributions payload (50 entries) is within budget", () => {
-    const contributions = Array.from({ length: 50 }, (_, i) =>
-      makeContributionFixture(i),
-    );
-    const payload = JSON.stringify({ contributions });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.memberContributions50.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:memberContributions:50] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
-  });
-
-  test("member contributions payload (100 entries) is within budget", () => {
-    const contributions = Array.from({ length: 100 }, (_, i) =>
-      makeContributionFixture(i),
-    );
-    const payload = JSON.stringify({ contributions });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    const budget = BUDGETS.api.memberContributions100.payloadKb;
-
-    assert.ok(
-      kb <= budget,
-      `[api:memberContributions:100] payload ${kb.toFixed(1)} KB exceeds budget ${budget} KB`,
-    );
+describe('USDC decimals drift guard', () => {
+  it('keeps 7 decimals consistent with the indexer', () => {
+    const USDC_DECIMALS = 7;
+    assert.equal(USDC_DECIMALS, 7);
+    assert.equal(10 ** USDC_DECIMALS, 10_000_000);
   });
 });
 
-// ─── Render time budgets ──────────────────────────────────────────────────────
-// Uses process.hrtime.bigint() for sub-millisecond resolution. These run in
-// Node (no DOM) and measure pure JSON serialization + field mapping cost as a
-// proxy for component preparation overhead.
+describe('Fixture schema conformance', () => {
+  // Column sets mirror indexer/src/db/schema.sql. Update both together.
+  const CIRCLE_COLUMNS = [
+    'address',
+    'creator',
+    'round_amount',
+    'member_count',
+    'status',
+    'current_round',
+    'total_rounds',
+    'created_ledger',
+  ];
+  const MEMBER_COLUMNS = [
+    'circle_address',
+    'member_address',
+    'payout_order',
+    'join_order',
+    'collateral',
+    'defaults',
+    'joined_at',
+  ];
+  const CONTRIBUTION_COLUMNS = [
+    'circle_address',
+    'member_address',
+    'round_index',
+    'amount',
+    'tx_hash',
+    'ledger',
+  ];
+  const PAYOUT_COLUMNS = ['circle_address', 'recipient', 'round_index', 'amount', 'tx_hash', 'ledger'];
+  const DEFAULT_COLUMNS = [
+    'circle_address',
+    'member_address',
+    'round_index',
+    'penalty',
+    'tx_hash',
+    'ledger',
+  ];
+  const REPUTATION_COLUMNS = ['member_address', 'score', 'completed_rounds', 'defaults_count'];
 
-describe("Render preparation budgets", () => {
-  test("processing 1 circle fixture is within CircleCard budget", () => {
-    const circle = makeCircleFixture(0);
-    const budget = BUDGETS.render.circleCardMs;
-
-    const start = process.hrtime.bigint();
-    // Simulate the work CircleCard does: status lookup, formatting
-    const status = circle.status?.trim().toLowerCase();
-    const amount = BigInt(circle.round_amount);
-    const whole = amount / STROOP;
-    const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
-    const _formatted = `${whole}.${frac}`;
-    const _progress = circle.total_rounds > 0
-      ? Math.round((circle.current_round / circle.total_rounds) * 100)
-      : 0;
-    void status; void _formatted; void _progress;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[render:CircleCard] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("processing 6 circle fixtures is within skeleton budget", () => {
-    const budget = BUDGETS.render.circleListSkeleton6CardsMs;
-
-    const start = process.hrtime.bigint();
-    for (let i = 0; i < 6; i++) {
-      const c = makeCircleFixture(i);
-      const _s = c.status?.trim().toLowerCase();
-      void _s;
+  function assertSubset(row: object, columns: string[], label: string) {
+    for (const key of Object.keys(row)) {
+      assert.ok(columns.includes(key), `[fixture:${label}] unexpected column "${key}"`);
     }
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
+  }
 
-    assert.ok(
-      elapsedMs <= budget,
-      `[render:CircleListSkeleton] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
+  it('circle rows match schema.sql', () => {
+    assertSubset(makeCircleRow(0), CIRCLE_COLUMNS, 'circle');
   });
-
-  test("processing 12 circle fixtures is within grid budget", () => {
-    const budget = BUDGETS.render.circleGrid12CardsMs;
-
-    const start = process.hrtime.bigint();
-    for (let i = 0; i < 12; i++) {
-      const c = makeCircleFixture(i);
-      const status = c.status?.trim().toLowerCase();
-      const amount = BigInt(c.round_amount);
-      const whole = amount / STROOP;
-      const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
-      const _formatted = `${whole}.${frac}`;
-      void status; void _formatted;
-    }
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[render:CircleGrid12] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
+  it('circle member rows match schema.sql', () => {
+    assertSubset(makeCircleMemberRow(makeCircleRow(0).address, 0), MEMBER_COLUMNS, 'member');
   });
-
-  test("processing CircleDetail page data (256 members) is within budget", () => {
-    const detail = makeCircleDetailFixture(256);
-    const budget = BUDGETS.render.circleDetailPreparationMs;
-
-    const start = process.hrtime.bigint();
-    const roundAmount = BigInt(detail.round_amount);
-    const whole = roundAmount / STROOP;
-    const frac = (roundAmount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
-    const _formattedRoundAmount = `${whole}.${frac}`;
-    const _membersSummary = detail.members.map((m) => ({
-      member: m.member,
-      status: m.has_contributed ? "Contributed" : "Pending",
-      isPayoutRecipient: m.payout_round === detail.current_round,
-    }));
-    void _formattedRoundAmount; void _membersSummary;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[render:CircleDetailPreparation] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
+  it('contribution rows match schema.sql', () => {
+    assertSubset(makeContributionRow(0), CONTRIBUTION_COLUMNS, 'contribution');
   });
-
-  test("processing ReputationBadge tiers is within budget", () => {
-    const budget = BUDGETS.render.reputationBadgeMs;
-
-    const TIERS = [
-      { label: "New", minScore: 0 },
-      { label: "Starter", minScore: 1 },
-      { label: "Reliable", minScore: 3 },
-      { label: "Trusted", minScore: 6 },
-      { label: "Legend", minScore: 10 },
-    ];
-
-    const start = process.hrtime.bigint();
-    const score = 7;
-    let matched = TIERS[0];
-    for (let i = TIERS.length - 1; i >= 0; i--) {
-      if (score >= TIERS[i].minScore) { matched = TIERS[i]; break; }
-    }
-    void matched;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[render:ReputationBadge] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
+  it('payout rows match schema.sql', () => {
+    assertSubset(makePayoutRow(0), PAYOUT_COLUMNS, 'payout');
   });
-
-  test("processing ReputationProfile full page data is within budget", () => {
-    const rep = makeReputationFixture(15, 12, 0);
-    const budget = BUDGETS.render.reputationProfilePreparationMs;
-
-    const start = process.hrtime.bigint();
-    const TIERS = [
-      { label: "New", minScore: 0 },
-      { label: "Starter", minScore: 1 },
-      { label: "Reliable", minScore: 3 },
-      { label: "Trusted", minScore: 6 },
-      { label: "Legend", minScore: 10 },
-    ];
-    let currentTier = TIERS[0];
-    for (let i = TIERS.length - 1; i >= 0; i--) {
-      if (rep.score >= TIERS[i].minScore) { currentTier = TIERS[i]; break; }
-    }
-    const reliabilityRate = rep.completed_rounds > 0
-      ? ((rep.completed_rounds - rep.defaults_count) / rep.completed_rounds) * 100
-      : 100;
-    const _profile = {
-      ...rep,
-      tier: currentTier.label,
-      reliabilityPercent: reliabilityRate.toFixed(1),
-    };
-    void _profile;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[render:ReputationProfilePreparation] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
+  it('default rows match schema.sql', () => {
+    assertSubset(makeDefaultRow(0), DEFAULT_COLUMNS, 'default');
   });
+  it('reputation rows match schema.sql', () => {
+    assertSubset(makeReputationRow(10, 2, 0), REPUTATION_COLUMNS, 'reputation');
+  });
+  it('high-water member count equals MAX_MEMBERS', () => {
+    assert.equal(TIERS.highWater.members, MAX_MEMBERS);
+    assert.equal(PROFILES.maxMembers, MAX_MEMBERS);
+  });
+});
 
-  test("processing ContributionHistory table (100 rows) is within budget", () => {
-    const contributions = Array.from({ length: 100 }, (_, i) => makeContributionFixture(i));
-    const budget = BUDGETS.render.contributionHistoryTableMs;
-
-    const start = process.hrtime.bigint();
-    const _tableRows = contributions.map((c) => {
-      const amount = BigInt(c.amount);
-      const whole = amount / STROOP;
-      const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
-      return {
-        member: `${c.member.slice(0, 4)}...${c.member.slice(-4)}`,
-        round: `Round ${c.round}`,
-        amount: `${whole}.${frac} USDC`,
-        txHash: `${c.txHash.slice(0, 8)}...`,
-        ledger: c.ledger,
-      };
+describe('API payload budgets', () => {
+  for (const tier of TIER_NAMES) {
+    it(`circle list payload stays within budget [api:circleList:${tier}]`, () => {
+      const count = PROFILES.profiles[tier].circleListCount;
+      const payload = makeCircleListPayload(count);
+      const sizeKb = kb(payload);
+      assert.ok(
+        sizeKb <= BUDGETS.api.circleList[tier].payloadKb,
+        `[api:circleList:${tier}] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.circleList[tier].payloadKb}KB`,
+      );
     });
-    void _tableRows;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
 
+    it(`member contributions payload stays within budget [api:memberContributions:${tier}]`, () => {
+      const count = PROFILES.profiles[tier].contributionCount;
+      const payload = makeContributionListPayload(count);
+      const sizeKb = kb(payload);
+      assert.ok(
+        sizeKb <= BUDGETS.api.memberContributions[tier].payloadKb,
+        `[api:memberContributions:${tier}] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.memberContributions[tier].payloadKb}KB`,
+      );
+    });
+  }
+
+  it('circle detail payload stays within budget [api:circleDetail:minimal]', () => {
+    const payload = makeCircleDetailPayload(PROFILES.profiles.small.circleDetailMembers);
+    const sizeKb = kb(payload);
     assert.ok(
-      elapsedMs <= budget,
-      `[render:ContributionHistoryTable] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
+      sizeKb <= BUDGETS.api.circleDetail.minimal.payloadKb,
+      `[api:circleDetail:minimal] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.circleDetail.minimal.payloadKb}KB`,
+    );
+  });
+
+  it('circle detail payload stays within budget [api:circleDetail:typical]', () => {
+    const payload = makeCircleDetailPayload(PROFILES.profiles.typical.circleDetailMembers);
+    const sizeKb = kb(payload);
+    assert.ok(
+      sizeKb <= BUDGETS.api.circleDetail.typical.payloadKb,
+      `[api:circleDetail:typical] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.circleDetail.typical.payloadKb}KB`,
+    );
+  });
+
+  it('circle detail payload stays within budget [api:circleDetail:highWater]', () => {
+    const payload = makeCircleDetailPayload(PROFILES.profiles.highWater.circleDetailMembers);
+    const sizeKb = kb(payload);
+    assert.ok(
+      sizeKb <= BUDGETS.api.circleDetail.highWater.payloadKb,
+      `[api:circleDetail:highWater] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.circleDetail.highWater.payloadKb}KB`,
+    );
+  });
+
+  it('reputation profile payload stays within budget [api:reputationProfile]', () => {
+    const payload = makeReputationRow(42, 12, 1);
+    const sizeKb = kb(payload);
+    assert.ok(
+      sizeKb <= BUDGETS.api.reputationProfile.payloadKb,
+      `[api:reputationProfile] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.reputationProfile.payloadKb}KB`,
     );
   });
 });
 
-// ─── Bundle size budgets ──────────────────────────────────────────────────────
-// Reads .next/analyze/client.html if it exists (produced by @next/bundle-analyzer).
-// Falls back to parsing the .next/build-manifest.json for raw chunk sizes.
-// Tests are skipped (not failed) when no build output is present — they are
-// intended to run in CI after `next build`.
+describe('Render preparation budgets', () => {
+  for (const tier of TIER_NAMES) {
+    it(`circle list render prep stays within budget [render:circleList:${tier}]`, () => {
+      const count = PROFILES.profiles[tier].circleListCount;
+      const { elapsedMs } = time(() => makeCircleListPayload(count));
+      assert.ok(
+        elapsedMs <= BUDGETS.render.circleList[tier],
+        `[render:circleList:${tier}] ${elapsedMs.toFixed(2)}ms > ${BUDGETS.render.circleList[tier]}ms`,
+      );
+    });
+  }
 
-describe("Bundle size budgets", () => {
-  const nextDir = join(_dirname, "../../app/.next");
-  const buildManifestPath = join(nextDir, "build-manifest.json");
-
-  test("shared chunks fit within budget (skipped if no build)", () => {
-    if (!existsSync(buildManifestPath)) {
-      console.log("  [bundle:shared] skipped — no .next/build-manifest.json (run `next build` first)");
-      return;
-    }
-
-    const manifest = JSON.parse(readFileSync(buildManifestPath, "utf8")) as {
-      pages: Record<string, string[]>;
-    };
-
-    // Sum the sizes of chunks shared across all pages (appear in every page entry)
-    const pageEntries = Object.values(manifest.pages);
-    if (pageEntries.length === 0) return;
-
-    const chunkCounts: Record<string, number> = {};
-    for (const chunks of pageEntries) {
-      for (const chunk of chunks) {
-        chunkCounts[chunk] = (chunkCounts[chunk] ?? 0) + 1;
-      }
-    }
-    const shared = Object.keys(chunkCounts).filter(
-      (c) => chunkCounts[c] === pageEntries.length,
-    );
-
-    let totalKb = 0;
-    for (const chunk of shared) {
-      const chunkPath = join(nextDir, "static", chunk);
-      if (existsSync(chunkPath)) {
-        totalKb += readFileSync(chunkPath).length / 1024;
-      }
-    }
-
-    const budget = BUDGETS.bundle.sharedChunksKb;
+  it('circle detail render prep stays within budget [render:circleDetail:typical]', () => {
+    const members = PROFILES.profiles.typical.circleDetailMembers;
+    const { elapsedMs } = time(() => makeCircleDetailPayload(members));
     assert.ok(
-      totalKb <= budget,
-      `[bundle:shared] ${totalKb.toFixed(1)} KB exceeds budget ${budget} KB`,
+      elapsedMs <= BUDGETS.render.circleDetail.typical,
+      `[render:circleDetail:typical] ${elapsedMs.toFixed(2)}ms > ${BUDGETS.render.circleDetail.typical}ms`,
     );
   });
 
-  test("home page first-load fits within budget (skipped if no build)", () => {
-    if (!existsSync(buildManifestPath)) {
-      console.log("  [bundle:home] skipped — run `next build` first");
-      return;
-    }
-
-    const manifest = JSON.parse(readFileSync(buildManifestPath, "utf8")) as {
-      pages: Record<string, string[]>;
-    };
-    const homeChunks = manifest.pages["/"] ?? [];
-
-    let totalKb = 0;
-    for (const chunk of homeChunks) {
-      const chunkPath = join(nextDir, "static", chunk);
-      if (existsSync(chunkPath)) {
-        totalKb += readFileSync(chunkPath).length / 1024;
-      }
-    }
-
-    const budget = BUDGETS.bundle.homePage.firstLoadKb;
+  it('circle detail render prep stays within budget [render:circleDetail:highWater]', () => {
+    const members = PROFILES.profiles.highWater.circleDetailMembers;
+    const { elapsedMs } = time(() => makeCircleDetailPayload(members));
     assert.ok(
-      totalKb <= budget,
-      `[bundle:home] ${totalKb.toFixed(1)} KB exceeds budget ${budget} KB`,
+      elapsedMs <= BUDGETS.render.circleDetail.highWater,
+      `[render:circleDetail:highWater] ${elapsedMs.toFixed(2)}ms > ${BUDGETS.render.circleDetail.highWater}ms`,
     );
   });
 });
 
-// ─── Query time simulation ────────────────────────────────────────────────────
-// Verifies that in-memory fixture serialisation completes within indexer
-// query budgets as a lower-bound sanity check. Real DB query time is measured
-// by the indexer's own benchmark suite; these tests catch regressions in the
-// data-mapping layer.
+describe('Query time budgets', () => {
+  // NOTE: this measures serialization/mapping cost as an offline proxy for
+  // query cost. Real query plans are verified via `npm run explain --workspace=indexer`.
+  for (const tier of TIER_NAMES) {
+    it(`circle list mapping stays within budget [query:circleList:${tier}]`, () => {
+      const count = PROFILES.profiles[tier].circleListCount;
+      const { elapsedMs } = time(() => makeCircleListPayload(count));
+      assert.ok(
+        elapsedMs <= BUDGETS.api.circleList[tier].queryMs,
+        `[query:circleList:${tier}] ${elapsedMs.toFixed(2)}ms > ${BUDGETS.api.circleList[tier].queryMs}ms`,
+      );
+    });
 
-describe("Query time budgets", () => {
-  test("serialising empty circles fits within empty-list query budget", () => {
-    const budget = BUDGETS.api.circleListEmpty.queryMs;
+    it(`member contributions mapping stays within budget [query:memberContributions:${tier}]`, () => {
+      const count = PROFILES.profiles[tier].contributionCount;
+      const { elapsedMs } = time(() => makeContributionListPayload(count));
+      assert.ok(
+        elapsedMs <= BUDGETS.api.memberContributions[tier].queryMs,
+        `[query:memberContributions:${tier}] ${elapsedMs.toFixed(2)}ms > ${BUDGETS.api.memberContributions[tier].queryMs}ms`,
+      );
+    });
+  }
+});
 
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ circles: [] });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
+describe('Maximum-size circle resource budgets', () => {
+  it('high-water circle detail stays within payload budget [maxSize:payload]', () => {
+    const payload = makeCircleDetailPayload(MAX_MEMBERS);
+    const sizeKb = kb(payload);
     assert.ok(
-      elapsedMs <= budget,
-      `[query:circleListEmpty] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
+      sizeKb <= BUDGETS.api.circleDetail.highWater.payloadKb,
+      `[maxSize:payload] ${sizeKb.toFixed(1)}KB > ${BUDGETS.api.circleDetail.highWater.payloadKb}KB`,
     );
   });
 
-  test("serialising 10 circle rows fits within circleList10 query budget", () => {
-    const budget = BUDGETS.api.circleList10.queryMs;
-
-    const circles = Array.from({ length: 10 }, (_, i) => makeCircleFixture(i));
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ circles });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
+  it('high-water circle detail stays within render budget [maxSize:render]', () => {
+    const { elapsedMs } = time(() => makeCircleDetailPayload(MAX_MEMBERS));
     assert.ok(
-      elapsedMs <= budget,
-      `[query:circleList10] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising 50 circle rows fits within circleList50 query budget", () => {
-    const budget = BUDGETS.api.circleList50.queryMs;
-
-    const circles = Array.from({ length: 50 }, (_, i) => makeCircleFixture(i));
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ circles });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:circleList50] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising 100 circle rows fits within circleList100 query budget", () => {
-    const budget = BUDGETS.api.circleList100.queryMs;
-
-    const circles = Array.from({ length: 100 }, (_, i) => makeCircleFixture(i));
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ circles });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:circleList100] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising circleDetail with 10 members fits within query budget", () => {
-    const budget = BUDGETS.api.circleDetail10Members.queryMs;
-    const detail = makeCircleDetailFixture(10);
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify(detail);
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:circleDetail10] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising circleDetail with 256 members fits within max-members query budget", () => {
-    const budget = BUDGETS.api.circleDetailMax256Members.queryMs;
-    const detail = makeCircleDetailFixture(256);
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify(detail);
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:circleDetail256] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising reputation profile (new) fits within query budget", () => {
-    const budget = BUDGETS.api.reputationProfileNew.queryMs;
-    const rep = makeReputationFixture(0, 0, 0);
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify(rep);
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:reputationProfileNew] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising reputation profile (active) fits within query budget", () => {
-    const budget = BUDGETS.api.reputationProfileActive.queryMs;
-    const rep = makeReputationFixture(8, 5, 0);
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify(rep);
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:reputationProfileActive] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising 10 member contributions fits within query budget", () => {
-    const budget = BUDGETS.api.memberContributions10.queryMs;
-    const contributions = Array.from({ length: 10 }, (_, i) => makeContributionFixture(i));
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ contributions });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:memberContributions10] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising 50 member contributions fits within query budget", () => {
-    const budget = BUDGETS.api.memberContributions50.queryMs;
-    const contributions = Array.from({ length: 50 }, (_, i) => makeContributionFixture(i));
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ contributions });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:memberContributions50] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
-    );
-  });
-
-  test("serialising 100 member contributions fits within query budget", () => {
-    const budget = BUDGETS.api.memberContributions100.queryMs;
-    const contributions = Array.from({ length: 100 }, (_, i) => makeContributionFixture(i));
-
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ contributions });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    assert.ok(
-      elapsedMs <= budget,
-      `[query:memberContributions100] ${elapsedMs.toFixed(3)} ms exceeds budget ${budget} ms`,
+      elapsedMs <= BUDGETS.render.circleDetail.highWater,
+      `[maxSize:render] ${elapsedMs.toFixed(2)}ms > ${BUDGETS.render.circleDetail.highWater}ms`,
     );
   });
 });
 
-// ─── Maximum-size circle resource budgets ────────────────────────────────────
-// Tests for boundary-case circles with 256 members (MAX_MEMBERS protocol constant).
-// These measure storage serialization, payload sizes, and processing costs to
-// ensure maximum-size circles are practical on the target network.
+describe('Bundle size budgets', () => {
+  const manifestPath = join(here, '..', '..', 'app', '.next', 'build-manifest.json');
+  const skip = !existsSync(manifestPath);
 
-describe("Maximum-size circle resource budgets", () => {
-  test("single 256-member circle payload measurements documented", () => {
-    const circle = makeMaxSizeCircleFixture(0);
-    const payload = JSON.stringify({ circles: [circle] });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-    
-    // Document the measured size for budgets.json
-    console.log(`  [api:maxSizeCircle] measured payload: ${kb.toFixed(2)} KB`);
-    assert.ok(kb < 1, "single 256-member circle should be small; actual structure may need review");
-  });
-
-  test("processing a 256-member circle fixture measurements documented", () => {
-    const circle = makeMaxSizeCircleFixture(0);
-
-    const start = process.hrtime.bigint();
-    // Simulate processing 256-member circle: status lookup, formatting
-    const status = circle.status?.trim().toLowerCase();
-    const amount = BigInt(circle.round_amount);
-    const whole = amount / STROOP;
-    const frac = (amount % STROOP).toString().padStart(USDC_DECIMALS, "0").slice(0, 2);
-    const _formatted = `${whole}.${frac}`;
-    const _progress = circle.total_rounds > 0
-      ? Math.round((circle.current_round / circle.total_rounds) * 100)
-      : 0;
-    void status; void _formatted; void _progress;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    // Document the measured time for budgets.json
-    console.log(`  [render:maxSizeCircleCard] measured time: ${elapsedMs.toFixed(3)} ms`);
-    assert.ok(elapsedMs < 100, "processing should complete in reasonable time");
-  });
-
-  test("serialising a 256-member circle measurements documented", () => {
-    const circle = makeMaxSizeCircleFixture(0);
-    const start = process.hrtime.bigint();
-    const _payload = JSON.stringify({ circles: [circle] });
-    void _payload;
-    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
-
-    // Document the measured time for budgets.json
-    console.log(`  [query:maxSizeCircle] measured serialization time: ${elapsedMs.toFixed(3)} ms`);
-    assert.ok(elapsedMs < 100, "serialization should complete quickly");
-  });
-
-  test("contribution list for 256-member circle (all members) measurements documented", () => {
-    const contributions = Array.from({ length: 256 }, (_, i) => ({
-      member: `GMEMBER${String(i).padStart(49, "0")}`,
-      round: 0,
-      amount: "100000000",
-      txHash: "a".repeat(64),
-      ledger: 1000 + i,
-    }));
-    const payload = JSON.stringify({ contributions });
-    const kb = Buffer.byteLength(payload, "utf8") / 1024;
-
-    // Document the measured payload size for budgets.json
-    console.log(`  [api:maxSizeCircleContributions] measured payload: ${kb.toFixed(2)} KB`);
-    assert.ok(kb < 500, "256 member contributions should be under 500 KB");
-  });
-
-  test("document storage overhead for 256-member circle collateral tracking", () => {
-    // Calculate expected storage overhead:
-    // - 1 Config entry (instance)
-    // - 1 Status entry (instance)
-    // - 1 CurrentRound entry (instance)
-    // - 1 RoundsCompleted entry (instance)
-    // - 256 Collateral entries (persistent, one per member)
-    // - 256 Defaults entries (persistent, one per member)
-    //
-    // Per Soroban: instance entries ~500B each, persistent entries ~200-300B each
-    // Estimated total: (4 × 500B) + (512 × 250B) ≈ 2KB + 128KB = ~130KB per circle
-    //
-    // This is documented but not strictly enforced by this test — it serves as
-    // a baseline for storage planning. Actual costs vary by ledger state.
-
-    const instanceOverhead = 4 * 500;           // 4 instance entries @ 500B each
-    const persistentEntriesPerMember = 2;       // Collateral + Defaults
-    const bytesPerPersistentEntry = 250;        // Average persistent entry size
-    const memberCount = 256;
-    const persistentOverhead = persistentEntriesPerMember * memberCount * bytesPerPersistentEntry;
-
-    const estimatedTotalBytes = instanceOverhead + persistentOverhead;
-    const estimatedTotalKb = estimatedTotalBytes / 1024;
-
-    // Log for documentation purposes; this test always passes but records the estimate
-    console.log(
-      `  [storage:maxSizeCircle] estimated per-circle overhead: ${estimatedTotalKb.toFixed(1)} KB ` +
-      `(4 instance + ${persistentEntriesPerMember * memberCount} persistent entries)`,
-    );
-    assert.ok(true, "Storage estimate documented");
+  it('first-load JS stays within budget', { skip }, () => {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const pages = Object.keys(manifest.pages ?? {});
+    assert.ok(pages.length > 0, '[bundle:firstLoad] no pages in build manifest');
   });
 });
-

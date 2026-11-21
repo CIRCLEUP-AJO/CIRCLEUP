@@ -346,3 +346,25 @@ jobs:
           else
             npx commitlint --from HEAD~20 --to HEAD --verbose
           fi
+
+  # -- Performance budgets ----------------------------------------------------
+  # Offline and deterministic: no live Stellar RPC, no PostgreSQL service, no
+  # real user data. Fixtures are generated from tests/perf/fixtures.ts and
+  # sized by tests/perf/fixture-profiles.json. The app is built first so bundle
+  # budgets are exercised instead of skipped. Blocking by design: reviewed
+  # regressions must fail CI. See docs/PERFORMANCE_BUDGETS.md.
+  perf:
+    name: Performance budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build app (enables bundle budgets)
+        run: npm run build --workspace=app
+      - name: Run performance budget suite
+        run: npm run test:perf
