@@ -7,21 +7,37 @@ interface Props {
   reset: () => void;
 }
 
+type FailureKind = "rpc" | "indexer" | "unknown";
+
 /**
- * Heuristically detect indexer outage from the error message.
+ * Heuristically classify the failure from the error message.
  * Structured error codes don't survive Next.js error boundaries, so we
  * inspect the message string as a best-effort signal.
+ *
+ * RPC failures mean the on-chain reputation score could not be read, so the
+ * score is unverified. Indexer failures mean contribution/default history is
+ * temporarily unavailable. These are distinct states for the user.
  */
-function isLikelyIndexerOutage(error: Error): boolean {
+function classifyFailure(error: Error): FailureKind {
   const msg = error.message.toLowerCase();
-  return (
+  const looksLikeRpc =
+    msg.includes("rpc") ||
+    msg.includes("contract read") ||
+    msg.includes("reputation contract") ||
+    msg.includes("revert") ||
+    msg.includes("call exception") ||
+    msg.includes("could not decode") ||
+    msg.includes("eth_call");
+  if (looksLikeRpc) return "rpc";
+  const looksLikeIndexer =
     msg.includes("503") ||
     msg.includes("indexer") ||
     msg.includes("degraded") ||
     msg.includes("unreachable") ||
     msg.includes("network") ||
-    msg.includes("fetch failed")
-  );
+    msg.includes("fetch failed");
+  if (looksLikeIndexer) return "indexer";
+  return "unknown";
 }
 
 export default function ReputationError({ error, reset }: Props) {
@@ -29,7 +45,7 @@ export default function ReputationError({ error, reset }: Props) {
     console.error("[reputation-route-error]", error.digest ?? "(no digest)");
   }, [error]);
 
-  const outage = isLikelyIndexerOutage(error);
+  const failure = classifyFailure(error);
 
   return (
     <div
@@ -37,18 +53,30 @@ export default function ReputationError({ error, reset }: Props) {
       className="bg-red-50 border border-red-200 rounded-xl px-5 py-8 flex flex-col items-center gap-4 text-center max-w-xl mx-auto"
     >
       <span className="text-3xl" aria-hidden="true">
-        {outage ? "🔌" : "⚠️"}
+        {failure === "rpc" ? "⛓️" : failure === "indexer" ? "🔌" : "⚠️"}
       </span>
       <div>
-        {outage ? (
+        {failure === "rpc" ? (
           <>
             <p className="font-semibold text-red-800">
-              Indexer unavailable
+              Reputation score unavailable
             </p>
             <p className="text-red-700 text-sm mt-1">
-              The indexer is unreachable or currently degraded. Reputation data
-              cannot be loaded right now. This is usually temporary — try again
-              in a few minutes.
+              The on-chain reputation contract could not be read, so this
+              member&apos;s score could not be verified. This does not mean the
+              score is zero — it is currently unknown. Try again in a moment.
+            </p>
+          </>
+        ) : failure === "indexer" ? (
+          <>
+            <p className="font-semibold text-red-800">
+              History temporarily unavailable
+            </p>
+            <p className="text-red-700 text-sm mt-1">
+              The indexer is unreachable or currently degraded, so contribution
+              and default history cannot be loaded right now. This does not mean
+              the member has no activity — the history is simply unavailable.
+              This is usually temporary — try again in a few minutes.
             </p>
           </>
         ) : (

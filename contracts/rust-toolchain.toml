@@ -1,8 +1,21 @@
 # Pin the Rust toolchain used to build Soroban contracts.
 #
-# All contributors and CI must build with this exact toolchain so that
-# compiled WASM artifacts are byte-for-byte identical across machines
-# (build reproducibility, issue #396).
+# This file is the SINGLE SOURCE OF TRUTH for the Rust toolchain used to
+# build, test, and report on Soroban contracts. Both local development and
+# CI must honor this pin so that compiled WASM artifacts are byte-for-byte
+# identical across machines (build reproducibility, issue #396), and so that
+# local behavior, resource reports, and artifact hashes do not diverge from
+# CI (issue #137).
+#
+# CI reads this file directly (via `rustup` toolchain auto-detection) and
+# installs only the targets and components declared below. Local setups must
+# use the same pin: running any `cargo`/`rustc` command from within the
+# `contracts/` directory (or any subdirectory) automatically selects this
+# toolchain through `rustup`. Do not override the toolchain locally (e.g. via
+# `RUSTUP_TOOLCHAIN` or `cargo +<other>`), or local builds may diverge from CI.
+#
+# Required targets:    wasm32-unknown-unknown (contract compilation)
+# Required components: rustfmt, clippy (formatting and linting in CI)
 #
 # To update:
 #   1. Change the channel below.

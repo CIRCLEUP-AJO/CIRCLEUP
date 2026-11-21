@@ -246,8 +246,40 @@ User navigates to /reputation/[address]
   ΓåÆ ReputationPage (Server Component) passes address to ReputationClient
   ΓåÆ ReputationClient (Client Component) fetches:
       GET /reputation/:member ΓåÆ score + per-circle contributions + defaults
+      GET /indexer/state      ΓåÆ indexer freshness (lastLedger, updatedAt)
+  ΓåÆ Reads the reputation contract score directly via RPC (on-chain read)
   ΓåÆ Renders score card, participation table, defaults table
 ```
+
+The reputation page mixes two data sources, and the UI labels each one so a
+user can tell them apart:
+
+| Section | Source | Provenance label |
+|---|---|---|
+| Score | Reputation contract `score` view via Soroban RPC | On-chain read |
+| Participation / defaults history | Indexer REST API (derived from events) | Indexed projection |
+| Freshness | `GET /indexer/state` (`lastLedger`, `updatedAt`) | Indexer cursor |
+
+The indexer is a derived read-model. It is **not** the contract's authorization
+source: the reputation contract's allowlist and revocation list decide who may
+call `increment`, and the indexer only records the resulting events. The page
+must not imply otherwise.
+
+The page renders four distinct states rather than collapsing them into one
+empty view:
+
+| State | Meaning | Rendering |
+|---|---|---|
+| Verified zero | Contract read succeeded and returned `0` | Score shown as `0` with an "On-chain read" label |
+| Score unavailable | Contract read failed (RPC error/timeout) | Score replaced by "Score unavailable" with the RPC error; never shown as `0` |
+| Empty history | Indexer responded and has no records for this member | "No indexed activity yet" with the indexer freshness timestamp |
+| History unavailable | Indexer unreachable or returned an error | "History unavailable" with a retry hint; never shown as "no activity" |
+
+Freshness is displayed next to the history section as the indexer's
+`updatedAt` and `lastLedger`. When the cursor is behind the current chain
+ledger, the history is labelled as possibly stale rather than complete. These
+fields come from the existing `/indexer/state` response, so the page adds no
+extra unbounded RPC or database requests.
 
 ---
 
@@ -273,6 +305,96 @@ cargo install --locked stellar-cli --features opt
 Run `npm run check:node` to validate the Node/npm pair. After Rust and the WASM
 target are installed, run `npm run check:toolchain` to validate the complete
 pinned build tuple before compiling contracts.
+
+### Supported Runtime Policy
+
+The supported runtimes are declared in package metadata and enforced by CI. A
+runtime is "supported" only if at least one CI job builds and tests it; the
+`engines` field must never claim a range that CI does not exercise.
+
+| Runtime | Declared support | CI coverage | Notes |
+|---|---|---|---|
+| Node.js 18.18+ / npm 9 | Minimum supported boundary | `node-18` matrix leg (sdk, indexer, app) | Lower boundary of `engines.node`; keep until EOL |
+| Node.js 22.x / npm 10 | Supported | `node-22` matrix leg (sdk, indexer, app) | Current LTS |
+| Node.js 24.x / npm 11 | Supported | `node-24` matrix leg (sdk, indexer, app) | Newest tested runtime |
+| Rust 1.81.0 | Pinned, single version | `contracts` job only | `contracts/rust-toolchain.toml` is authoritative |
+
+Node/npm pairs are validated by `npm run check:node`, which fails with the
+expected and actual versions when the pair is not one of the tuples above.
+
+**Package-specific exclusions from the Node matrix:**
+
+- `contracts/` is not part of the Node matrix. Contract artifacts must be
+  reproducible, so they are built only on the pinned Rust toolchain declared in
+  `contracts/rust-toolchain.toml`; duplicating the contracts job across Node
+  versions would add cost without coverage.
+- `scripts/` runs only on the primary Node leg. It is an operator tool that
+  deploys and seeds testnet, not a published package, so it is not part of the
+  support claim.
+- The `app` matrix leg runs `lint` and `tsc --noEmit` only; the full Next.js
+  production build runs once on the primary Node leg to keep CI time bounded.
+
+When a runtime reaches end of life, remove it from the matrix and narrow
+`engines` in the same change. Never widen `engines` without adding a matrix leg.
+
+### Rust Toolchain Policy
+
+`contracts/rust-toolchain.toml` is the single source of truth for the compiler
+version, the required targets, and the required components. CI does not select
+a Rust version independently: it installs the toolchain declared in that file
+and fails early if the active compiler differs.
+
+```toml
+# contracts/rust-toolchain.toml (abridged)
+[toolchain]
+channel = "1.81.0"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]
+```
+
+`.cargo/config.toml` must not override the toolchain channel. If a local
+`rustup override` or a different default toolchain is active, `rustup` resolves
+the pin from `rust-toolchain.toml` whenever a cargo command runs inside
+`contracts/`.
+
+**Verification step.** Both CI and local setup run the same check before
+compiling:
+
+```bash
+npm run check:toolchain
+# Prints the active rustc/cargo versions, the pinned channel, and the
+# installed targets/components, then exits non-zero on any mismatch:
+#   expected rustc 1.81.0 (from contracts/rust-toolchain.toml)
+#   actual   rustc 1.83.0
+```
+
+The same version data is written into the contract artifact report so a WASM
+hash difference can be traced to a compiler difference rather than guessed at.
+
+### Local Setup from a Clean Environment
+
+The following sequence works from a machine with no Rust or Node toolchain
+installed and produces the same compiler and target as CI:
+
+```bash
+# 1. Install the pinned Rust toolchain, target, and components
+rustup toolchain install 1.81.0 --profile minimal \
+  --target wasm32-unknown-unknown --component rustfmt --component clippy
+
+# 2. Confirm the pin resolves inside contracts/ (rustup reads the file)
+cd contracts && rustup show active-toolchain
+# Expected: 1.81.0-<host> (overridden by 'contracts/rust-toolchain.toml')
+
+# 3. Verify the full build tuple before compiling anything
+cd .. && npm run check:toolchain
+
+# 4. Build the contracts on the pinned toolchain
+cd contracts && cargo build --target wasm32-unknown-unknown --release
+```
+
+If step 3 reports a mismatch, do not continue: fix the toolchain first. A
+mismatch that surfaces later appears as an opaque WASM artifact hash
+difference, not as a compiler error.
 
 ### Step-by-Step
 
@@ -1018,17 +1140,28 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 
 ### Reputation page shows no data
 
-**Symptom:** `/reputation/[address]` shows "No reputation record found."
+**Symptom:** `/reputation/[address]` shows "No indexed activity yet", "History unavailable", or "Score unavailable".
 
-**Cause:** This is not an error. It means the address has no `reputation/score_updated` events in the indexer database. The member has not yet completed a full payout round in any circle.
+**Diagnosis:** These are three different states and must not be treated as one.
 
-**If reputation should exist:**
-1. Check `REPUTATION_ADDRESS` in `indexer/.env` matches the deployed contract.
-2. Check the `reputation` table in Postgres directly:
+| Message | Meaning | Action |
+|---|---|---|
+| Score shown as `0` with "On-chain read" | Verified zero: the contract read succeeded | None ΓÇö the member has no completed rounds |
+| "Score unavailable" | The reputation contract read failed (RPC error or timeout) | Check `NEXT_PUBLIC_STELLAR_RPC_URL` and RPC reachability; retry |
+| "No indexed activity yet" | The indexer responded and has no `reputation/score_updated` events for this member | Expected for a new member; check freshness below |
+| "History unavailable" | The indexer could not be reached or returned an error | Check `curl http://localhost:3001/health` and `NEXT_PUBLIC_INDEXER_URL` |
+
+**If history should exist:**
+1. Check the freshness label on the page ΓÇö compare `lastLedger` with the current chain ledger. A lagging cursor means the history is delayed, not absent.
+2. Check `REPUTATION_ADDRESS` in `indexer/.env` matches the deployed contract.
+3. Check the `reputation` table in Postgres directly:
    ```sql
    SELECT * FROM reputation WHERE member_address = '<address>';
    ```
-3. If the row is missing but you know a payout occurred, replay from the payout ledger.
+4. If the row is missing but you know a payout occurred, replay from the payout ledger.
+
+The indexer is a derived read-model and is not the contract's authorization
+source; a missing indexer row never means the on-chain score is wrong.
 
 ---
 
@@ -1589,8 +1722,19 @@ Any future change to a guard listed in either test file requires updating the co
 - Integration tests gated on `DATABASE_URL` are skipped automatically in CI environments without Postgres ΓÇö run them locally before landing schema changes.
 - When modifying a financial guard in `contracts/circle/src/lib.rs` or `app/src/lib/gating.ts`, update the corresponding mutation guard test in `mutation_guards.rs` or `gating.mutation.test.ts`. If the guard is intentionally excluded from mutation testing, add a rationale to the [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations) table.
 
+**Documentation checks**
+- CI validates repository-relative Markdown links and referenced npm scripts/workspace paths. Broken local links and unknown commands fail with the source file and line.
+- External links are not fetched in CI, so builds never depend on network availability. External URLs are only checked by the optional, manually triggered link job.
+- Anchors, fenced code blocks, inline code spans, and generated links are handled by the checker's fixtures so they do not produce false positives.
+- To suppress a valid nonstandard reference, add a comment on the line above it:
+  ```markdown
+  <!-- docs-check-ignore: path is generated at deploy time -->
+  [deployment manifest](./generated/deployed-manifest.json)
+  ```
+  Suppressions must state a reason. Blanket file-level suppression is not supported.
+
 **Branching and commits**
 - Follow [Conventional Commits](https://www.conventionalcommits.org/): `feat(scope): description`, `fix(scope): description`, etc.
 - One feature or fix per PR. Keep PRs focused to make review tractable.
 - Update `CHANGELOG.md` under `[Unreleased]` with every user-visible change.
-- CI runs on every PR: TypeScript build (`tsc --noEmit`), Rust WASM compile (`cargo build --target wasm32-unknown-unknown`), and ESLint. All checks must pass before merging.
+- CI runs on every PR: TypeScript build (`tsc --noEmit`), Rust WASM compile (`cargo build --target wasm32-unknown-unknown`) on the pinned toolchain, ESLint, the Node runtime matrix, and the documentation link/command check. All checks must pass before merging.
