@@ -6,6 +6,9 @@
 #
 #   artifacts/licenses-*.csv       — JS deps, including devDependencies, per workspace
 #   artifacts/licenses-rust.json    — Rust crate licenses (cargo-license)
+#   artifacts/licenses-inventory.json — sorted, diffable inventory used for
+#                                     change detection against the committed
+#                                     baseline artifacts/licenses-baseline.json
 #
 # Requirements
 # ────────────
@@ -80,6 +83,85 @@ else
   )
   echo "[license-inventory] Written: artifacts/licenses-rust.json"
 fi
+
+# ── Stable, diffable JSON inventory (Issue #977) ─────────────────────────────
+# Derived from the CSVs and Rust JSON above, sorted by workspace, package and
+# version so that change detection against the committed baseline produces
+# stable diffs. The baseline lives at artifacts/licenses-baseline.json and is
+# updated ONLY via a reviewed pull request — never automatically.
+echo "[license-inventory] Building artifacts/licenses-inventory.json..."
+node -e '
+const fs = require("fs");
+const path = require("path");
+const artifacts = process.argv[1];
+const workspaces = ["app", "indexer", "sdk", "scripts"];
+const entries = [];
+
+function splitCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === "\"") {
+      quoted = !quoted;
+    } else if (ch === "," && !quoted) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+for (const workspace of workspaces) {
+  const file = path.join(artifacts, `licenses-${workspace}.csv`);
+  if (!fs.existsSync(file)) continue;
+  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean);
+  for (const line of lines.slice(1)) {
+    const cols = splitCsvLine(line);
+    if (cols.length < 2) continue;
+    const name = cols[0].trim();
+    const license = cols[1].trim();
+    const at = name.lastIndexOf("@");
+    const pkg = at > 0 ? name.slice(0, at) : name;
+    const version = at > 0 ? name.slice(at + 1) : "";
+    entries.push({ workspace, package: pkg, version, license });
+  }
+}
+
+const rustFile = path.join(artifacts, "licenses-rust.json");
+if (fs.existsSync(rustFile)) {
+  try {
+    const rust = JSON.parse(fs.readFileSync(rustFile, "utf8"));
+    for (const crate of Array.isArray(rust) ? rust : []) {
+      entries.push({
+        workspace: "contracts",
+        package: String(crate.name || ""),
+        version: String(crate.version || ""),
+        license: String(crate.license || ""),
+      });
+    }
+  } catch (error) {
+    console.error(`[license-inventory] WARN: unable to parse licenses-rust.json: ${error.message}`);
+  }
+}
+
+entries.sort((a, b) =>
+  a.workspace.localeCompare(b.workspace) ||
+  a.package.localeCompare(b.package) ||
+  a.version.localeCompare(b.version) ||
+  a.license.localeCompare(b.license),
+);
+
+fs.writeFileSync(
+  path.join(artifacts, "licenses-inventory.json"),
+  `${JSON.stringify(entries, null, 2)}\n`,
+);
+' "${ARTIFACTS}"
+echo "[license-inventory] Written: artifacts/licenses-inventory.json"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

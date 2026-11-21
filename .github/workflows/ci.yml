@@ -271,7 +271,9 @@ jobs:
         run: cd contracts && cargo fetch --locked
 
       - name: Install inventory tool
-        run: cargo install cargo-license --version 0.6.1 --locked
+        run: |
+          cargo install cargo-license --version 0.6.1 --locked
+          cargo install cargo-audit --version 0.20.1 --locked
 
       - name: Enforce Rust dependency policy
         run: |
@@ -281,11 +283,29 @@ jobs:
       - name: Generate and enforce license inventories
         run: bash scripts/license-inventory.sh
 
+      # Issue #977: apply the same policy gate as the scheduled
+      # .github/workflows/dependency-audit.yml run so PRs cannot introduce an
+      # unexcepted finding. Read-only: no installs, fixes, or publishes.
+      - name: Enforce dependency audit policy (Issue #977)
+        run: |
+          mkdir -p artifacts
+          npm audit --workspaces --json > artifacts/npm-audit.json || true
+          (cd contracts && cargo audit --json > ../artifacts/cargo-audit.json || true)
+          npx ts-node scripts/src/dependency-audit-policy.ts \
+            --npm-audit artifacts/npm-audit.json \
+            --cargo-audit artifacts/cargo-audit.json \
+            --licenses-dir artifacts/
+
       - name: Upload dependency license inventories
         uses: actions/upload-artifact@v7
         with:
           name: dependency-license-inventories
-          path: artifacts/licenses-*
+          retention-days: 90
+          path: |
+            artifacts/licenses-*
+            artifacts/npm-audit.json
+            artifacts/cargo-audit.json
+            artifacts/dependency-audit-report.json
 
   # ── Toolchain compatibility matrix ──────────────────────────────────────────
   # This job intentionally installs the exact npm version for each Node line

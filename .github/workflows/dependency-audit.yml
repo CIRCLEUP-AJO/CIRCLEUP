@@ -1,0 +1,125 @@
+# Scheduled dependency audit and license checks (Issue #977).
+#
+# Runs on the cadence defined in .github/dependency-audit-policy.json, on
+# demand, and whenever the dependency graph or audit policy changes. Produces
+# reviewable artifacts and fails when a finding is not covered by a valid,
+# time-bounded exception.
+#
+# This workflow is read-only: it never modifies dependencies, never runs
+# `npm audit fix` / `npm install` / `cargo update`, and never publishes.
+name: Dependency Audit
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC — aligned with the Dependabot schedule.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+  push:
+    paths:
+      - 'package-lock.json'
+      - 'contracts/Cargo.lock'
+      - '.github/audit-ignore.json'
+      - '.github/dependency-audit-policy.json'
+      - 'scripts/license-inventory.sh'
+      - 'scripts/src/dependency-audit-policy.ts'
+      - 'artifacts/licenses-baseline.json'
+  pull_request:
+    paths:
+      - 'package-lock.json'
+      - 'contracts/Cargo.lock'
+      - '.github/audit-ignore.json'
+      - '.github/dependency-audit-policy.json'
+      - 'scripts/license-inventory.sh'
+      - 'scripts/src/dependency-audit-policy.ts'
+      - 'artifacts/licenses-baseline.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Dependency audit and license policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.81.0
+
+      - name: Fetch Rust dependencies
+        working-directory: contracts
+        run: cargo fetch --locked
+
+      - name: Install audit tooling
+        run: |
+          cargo install cargo-license --version 0.6.1 --locked
+          cargo install cargo-audit --version 0.20.1 --locked
+
+      - name: Capture npm audit findings
+        run: |
+          mkdir -p artifacts
+          npm audit --workspaces --json > artifacts/npm-audit.json || true
+
+      - name: Capture cargo audit findings
+        working-directory: contracts
+        run: cargo audit --json > ../artifacts/cargo-audit.json || true
+
+      - name: Generate license inventory
+        run: bash scripts/license-inventory.sh
+
+      - name: Enforce dependency audit policy
+        run: |
+          npx ts-node scripts/src/dependency-audit-policy.ts \
+            --npm-audit artifacts/npm-audit.json \
+            --cargo-audit artifacts/cargo-audit.json \
+            --licenses-dir artifacts/
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Dependency audit report"
+            echo ""
+            echo "Policy: \`.github/dependency-audit-policy.json\`"
+            echo "Exceptions: \`.github/audit-ignore.json\` (owner: @CIRCLEUP-AJO/maintainers)"
+            echo ""
+            if [ -f artifacts/dependency-audit-report.json ]; then
+              echo '```json'
+              cat artifacts/dependency-audit-report.json
+              echo '```'
+            else
+              echo "No report was produced — see the job logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            artifacts/npm-audit.json
+            artifacts/cargo-audit.json
+            artifacts/licenses-*.csv
+            artifacts/licenses-rust.json
+            artifacts/licenses-inventory.json
+            artifacts/dependency-audit-report.json
