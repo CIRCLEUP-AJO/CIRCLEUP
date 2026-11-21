@@ -80,6 +80,108 @@ export interface PreflightReport {
   summary: string;
 }
 
+/**
+ * A single intended contract operation surfaced by the preflight summary.
+ * Purely descriptive — nothing here is executed by the preflight.
+ */
+export interface IntendedOperation {
+  /** Logical contract name, e.g. "circleFactory". */
+  name: string;
+  /** What the deploy script would do with this contract. */
+  action: "upload" | "deploy" | "initialize" | "reuse" | "unknown";
+  /** Existing address from config/manifest, if any. */
+  address?: string;
+  /** Local artifact path the operation would consume, if known. */
+  artifactPath?: string;
+  /** Whether the local artifact exists (undefined when not checked). */
+  artifactPresent?: boolean;
+}
+
+/**
+ * Result of the no-write dry-run path. Extends the standard report with a
+ * human-readable target-network/operations summary and an explicit guarantee
+ * flag that no signing material was requested.
+ */
+export interface DryRunReport extends PreflightReport {
+  /** Always true — the dry-run never constructs or signs a transaction. */
+  readOnly: true;
+  /** Target network and intended operations summary. */
+  targetSummary: string;
+  /** Intended contract operations, in deploy order. */
+  intendedOperations: IntendedOperation[];
+}
+
+// ── Resume Plan Types (Issue #146) ────────────────────────────────────────────
+
+export type DeploymentStage =
+  | "started"
+  | "uploaded"
+  | "deployed"
+  | "initialized"
+  | "complete";
+
+export type ResumeDecision = "reuse" | "redeploy" | "resume" | "blocked";
+
+export interface ResumePlanEntry {
+  name: string;
+  /** Last recorded stage from persisted state, if any. */
+  recordedStage?: DeploymentStage;
+  /** Captured transaction hash for the recorded stage, if any. */
+  transactionHash?: string;
+  /** Existing on-chain address from evidence, if any. */
+  address?: string;
+  /** What the resume plan recommends. */
+  decision: ResumeDecision;
+  /** Why the decision was reached. */
+  reason: string;
+}
+
+export interface ResumePlan {
+  /** Always true — building a resume plan performs no writes. */
+  readOnly: true;
+  network: string;
+  /** Path to the persisted deployment state file, if one was found. */
+  statePath?: string;
+  /** Whether a persisted state file was found and parsed. */
+  statePresent: boolean;
+  /** Whether a complete manifest was found. */
+  manifestComplete: boolean;
+  entries: ResumePlanEntry[];
+  /** Problems that block a safe resume. */
+  blockers: string[];
+  /** Whether the operator must confirm before any mutating recovery step. */
+  requiresConfirmation: boolean;
+  summary: string;
+}
+
+/**
+ * Persisted deployment state record. Written by the deploy script as it
+ * progresses; read (never written) by the resume planner.
+ */
+export interface DeploymentStateRecord {
+  network: string;
+  contracts: Record<
+    string,
+    {
+      stage: DeploymentStage;
+      transactionHash?: string;
+      address?: string;
+      artifactHash?: string;
+    }
+  >;
+}
+
+export interface ResumePlanInput {
+  network?: string;
+  /** Explicit path to the persisted deployment state file. */
+  statePath?: string;
+  /** Explicit path to the deployment manifest. */
+  manifestPath?: string;
+  /** Contract names expected by the deploy script, in deploy order. */
+  expectedContracts?: string[];
+  env?: NodeJS.ProcessEnv;
+}
+
 // ── Canonical Constants ───────────────────────────────────────────────────────
 
 export const CANONICAL_PASSPHRASES: Record<string, string> = {
@@ -426,6 +528,253 @@ export async function runDeployPreflight(
   };
 }
 
+// ── No-Write Dry Run (Issue #144) ─────────────────────────────────────────────
+
+/**
+ * Build a descriptive list of the operations the deploy script would perform.
+ * This inspects local artifacts and configured addresses only; it never
+ * contacts the network and never signs anything.
+ */
+export function describeIntendedOperations(
+  report: PreflightReport,
+  artifactDir?: string
+): IntendedOperation[] {
+  const ops: IntendedOperation[] = [];
+  const contracts = report.configuredFacts.contractAddresses;
+
+  for (const [name, address] of Object.entries(contracts)) {
+    const artifactPath = artifactDir
+      ? path.join(artifactDir, `${name}.wasm`)
+      : undefined;
+    const artifactPresent = artifactPath ? fs.existsSync(artifactPath) : undefined;
+
+    ops.push({
+      name,
+      action: address ? "reuse" : "deploy",
+      address,
+      artifactPath,
+      artifactPresent,
+    });
+  }
+
+  return ops;
+}
+
+/**
+ * No-write deployment preflight (Issue #144).
+ *
+ * Performs only local validation plus read-only RPC checks and returns an
+ * aggregated report together with a target-network/operations summary.
+ *
+ * Guarantees:
+ * - Never constructs, signs, or submits a transaction.
+ * - Never reads or requests a deployer secret key or signature.
+ * - Only the read-only `getNetwork` / `simulateTransaction` RPC calls are made.
+ */
+export async function runDeployDryRun(
+  input: PreflightConfigInput = {},
+  env: NodeJS.ProcessEnv = process.env,
+  artifactDir?: string
+): Promise<DryRunReport> {
+  // The dry-run must never touch signing material. Strip any deployer secret
+  // from the environment view passed to the preflight so it cannot be used.
+  const sanitizedEnv: NodeJS.ProcessEnv = { ...env };
+  delete sanitizedEnv.DEPLOYER_SECRET_KEY;
+  delete sanitizedEnv.DEPLOYER_SECRET;
+  delete sanitizedEnv.STELLAR_SECRET_KEY;
+
+  const report = await runDeployPreflight(input, sanitizedEnv);
+
+  const intendedOperations = describeIntendedOperations(report, artifactDir);
+
+  const targetSummary = [
+    `Target network: ${report.configuredFacts.resolvedNetwork}`,
+    `RPC: ${report.configuredFacts.rpcUrl || "(unset)"}`,
+    `Passphrase: ${report.configuredFacts.networkPassphrase || "(unset)"}`,
+    `Deployer public key: ${report.configuredFacts.deployerPublicKey ?? "(unset)"}`,
+    `Intended operations: ${
+      intendedOperations.length === 0
+        ? "(none configured)"
+        : intendedOperations
+            .map((op) => `${op.name}:${op.action}${op.address ? `(${op.address})` : ""}`)
+            .join(", ")
+    }`,
+  ].join("\n");
+
+  return {
+    ...report,
+    readOnly: true,
+    targetSummary,
+    intendedOperations,
+  };
+}
+
+// ── Read-Only Resume Plan (Issue #146) ────────────────────────────────────────
+
+const DEFAULT_STATE_FILENAME = "deployment-state.json";
+
+function resolveStatePath(input: ResumePlanInput, env: NodeJS.ProcessEnv): string | undefined {
+  if (input.statePath) return input.statePath;
+  if (env.DEPLOYMENT_STATE_PATH) return env.DEPLOYMENT_STATE_PATH;
+  const candidate = path.join(__dirname, "../", DEFAULT_STATE_FILENAME);
+  return fs.existsSync(candidate) ? candidate : undefined;
+}
+
+function resolveManifestPath(input: ResumePlanInput, env: NodeJS.ProcessEnv): string | undefined {
+  if (input.manifestPath) return input.manifestPath;
+  const candidate = path.join(__dirname, "../deployed-manifest.json");
+  return fs.existsSync(candidate) ? candidate : undefined;
+}
+
+/**
+ * Build a read-only resume plan (Issue #146).
+ *
+ * Inspects persisted deployment state and existing evidence (manifest,
+ * recorded transaction hashes, addresses) and decides, per contract, whether
+ * to reuse, resume, redeploy, or block. It never mutates anything and never
+ * infers that a partial deployment is safe solely because an address exists.
+ */
+export function buildResumePlan(input: ResumePlanInput = {}): ResumePlan {
+  const env = input.env ?? process.env;
+  const blockers: string[] = [];
+  const entries: ResumePlanEntry[] = [];
+
+  let network = "";
+  try {
+    network = resolveNetwork(input.network, env);
+  } catch (err: any) {
+    blockers.push(err.message);
+    network = "unresolved";
+  }
+
+  const statePath = resolveStatePath(input, env);
+  const manifestPath = resolveManifestPath(input, env);
+
+  let state: DeploymentStateRecord | undefined;
+  if (statePath) {
+    try {
+      state = JSON.parse(fs.readFileSync(statePath, "utf8")) as DeploymentStateRecord;
+      if (state.network && state.network !== network) {
+        blockers.push(
+          `Persisted state network "${state.network}" does not match selected network "${network}".`
+        );
+      }
+    } catch (err: any) {
+      blockers.push(`Failed to read deployment state at ${statePath}: ${err.message}`);
+    }
+  }
+
+  let manifestComplete = false;
+  if (manifestPath) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as DeploymentManifest;
+      const validation = validateManifest(manifestPath, network);
+      manifestComplete = validation.ok;
+      if (!validation.ok) {
+        blockers.push(
+          `Manifest at ${manifestPath} is incomplete or inconsistent: ${validation.errors.join("; ")}`
+        );
+      }
+    } catch (err: any) {
+      blockers.push(`Failed to read manifest at ${manifestPath}: ${err.message}`);
+    }
+  }
+
+  const expected = input.expectedContracts ?? Object.keys(state?.contracts ?? {});
+  for (const name of expected) {
+    const record = state?.contracts?.[name];
+    if (!record) {
+      entries.push({
+        name,
+        decision: "redeploy",
+        reason: "No persisted state for this contract; a fresh deploy is required.",
+      });
+      continue;
+    }
+
+    switch (record.stage) {
+      case "complete":
+        entries.push({
+          name,
+          recordedStage: record.stage,
+          transactionHash: record.transactionHash,
+          address: record.address,
+          decision: "reuse",
+          reason: "Recorded as complete with captured transaction evidence.",
+        });
+        break;
+      case "initialized":
+        entries.push({
+          name,
+          recordedStage: record.stage,
+          transactionHash: record.transactionHash,
+          address: record.address,
+          decision: "resume",
+          reason: "Initialized but not marked complete; resume finalization only.",
+        });
+        break;
+      case "deployed":
+        entries.push({
+          name,
+          recordedStage: record.stage,
+          transactionHash: record.transactionHash,
+          address: record.address,
+          decision: "resume",
+          reason: "Deployed but not initialized; resume initialization (no redeploy).",
+        });
+        break;
+      case "uploaded":
+        entries.push({
+          name,
+          recordedStage: record.stage,
+          transactionHash: record.transactionHash,
+          address: record.address,
+          decision: "resume",
+          reason: "WASM uploaded but not deployed; resume deployment.",
+        });
+        break;
+      case "started":
+      default:
+        entries.push({
+          name,
+          recordedStage: record.stage,
+          transactionHash: record.transactionHash,
+          address: record.address,
+          decision: "blocked",
+          reason:
+            "Operation started but no captured transaction hash; cannot confirm whether it landed. " +
+            "Manual verification required before redeploying.",
+        });
+        blockers.push(
+          `Contract "${name}" is in stage "${record.stage}" without a captured transaction hash; ` +
+          `refusing to infer safety from an address alone.`
+        );
+        break;
+    }
+  }
+
+  const requiresConfirmation = entries.some((e) => e.decision !== "reuse");
+  const ok = blockers.length === 0;
+  const summary = ok
+    ? `Resume plan for network "${network}": ${entries.length} contract(s) analyzed, ` +
+      `${entries.filter((e) => e.decision === "reuse").length} reusable, ` +
+      `${entries.filter((e) => e.decision === "resume").length} resumable, ` +
+      `${entries.filter((e) => e.decision === "redeploy").length} to redeploy.`
+    : `Resume plan blocked for network "${network}" with ${blockers.length} blocker(s).`;
+
+  return {
+    readOnly: true,
+    network,
+    statePath,
+    statePresent: !!state,
+    manifestComplete,
+    entries,
+    blockers,
+    requiresConfirmation,
+    summary,
+  };
+}
+
 // ── CLI Runner ────────────────────────────────────────────────────────────────
 
 if (require.main === module) {
@@ -441,22 +790,75 @@ if (require.main === module) {
   const rpcArg = getArg("--rpc");
   const passphraseArg = getArg("--passphrase");
   const manifestArg = getArg("--manifest");
+  const stateArg = getArg("--state");
+  const artifactDirArg = getArg("--artifacts");
   const strictArg = args.includes("--strict");
   const jsonArg = args.includes("--json");
+  const dryRunArg = args.includes("--dry-run");
+  const resumeArg = args.includes("--resume-plan");
 
-  runDeployPreflight({
-    network: networkArg,
-    rpcUrl: rpcArg,
-    networkPassphrase: passphraseArg,
-    manifestPath: manifestArg,
-    strict: strictArg,
-  })
+  if (resumeArg) {
+    const plan = buildResumePlan({
+      network: networkArg,
+      statePath: stateArg,
+      manifestPath: manifestArg,
+    });
+    if (jsonArg) {
+      console.log(JSON.stringify(plan, null, 2));
+    } else {
+      console.log("\n========================================================");
+      console.log("         CIRCLEUP DEPLOYMENT RESUME PLAN (READ-ONLY)     ");
+      console.log("========================================================\n");
+      console.log(`[Target Network] : ${plan.network}`);
+      console.log(`[State File]     : ${plan.statePath ?? "(none)"}`);
+      console.log(`[Manifest]       : ${plan.manifestComplete ? "COMPLETE" : "INCOMPLETE/ABSENT"}`);
+      console.log("\n--------------------------------------------------------");
+      plan.entries.forEach((e) => {
+        console.log(`  ${e.name}: ${e.decision.toUpperCase()} — ${e.reason}`);
+      });
+      if (plan.blockers.length > 0) {
+        console.log("\nBLOCKERS:");
+        plan.blockers.forEach((b) => console.log(`  ❌ ${b}`));
+      }
+      if (plan.requiresConfirmation) {
+        console.log("\n⚠ Operator confirmation is required before any mutating recovery step.");
+      }
+      console.log("\nSUMMARY: " + plan.summary + "\n");
+    }
+    process.exit(plan.blockers.length === 0 ? 0 : 1);
+  }
+
+  const run = dryRunArg
+    ? runDeployDryRun(
+        {
+          network: networkArg,
+          rpcUrl: rpcArg,
+          networkPassphrase: passphraseArg,
+          manifestPath: manifestArg,
+          strict: strictArg,
+        },
+        process.env,
+        artifactDirArg
+      )
+    : runDeployPreflight({
+        network: networkArg,
+        rpcUrl: rpcArg,
+        networkPassphrase: passphraseArg,
+        manifestPath: manifestArg,
+        strict: strictArg,
+      });
+
+  run
     .then((report) => {
       if (jsonArg) {
         console.log(JSON.stringify(report, null, 2));
       } else {
         console.log("\n========================================================");
-        console.log("       CIRCLEUP DEPLOYMENT CONFIGURATION PREFLIGHT       ");
+        console.log(
+          dryRunArg
+            ? "     CIRCLEUP DEPLOYMENT DRY-RUN PREFLIGHT (READ-ONLY)   "
+            : "       CIRCLEUP DEPLOYMENT CONFIGURATION PREFLIGHT       "
+        );
         console.log("========================================================\n");
         console.log(`[Target Network] : ${report.configuredFacts.resolvedNetwork}`);
         console.log(`[Configured RPC] : ${report.configuredFacts.rpcUrl}`);
@@ -471,6 +873,13 @@ if (require.main === module) {
         console.log(`[Addresses Valid]: ${report.verifiedFacts.addressTypesValid ? "YES" : "NO"}`);
         console.log(`[Token Status]   : ${(report.verifiedFacts.tokenStatus ?? "SKIPPED").toUpperCase()}`);
         console.log(`[Manifest Valid] : ${report.verifiedFacts.manifestConsistencyVerified ? "YES" : "NO"}`);
+        if ("targetSummary" in report) {
+          const dry = report as DryRunReport;
+          console.log("\n--------------------------------------------------------");
+          console.log("TARGET & INTENDED OPERATIONS:");
+          console.log(dry.targetSummary);
+          console.log("\nNo transaction was constructed, signed, or submitted.");
+        }
         console.log("\n--------------------------------------------------------");
         if (report.warnings.length > 0) {
           console.log("\nWARNINGS:");

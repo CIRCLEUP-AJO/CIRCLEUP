@@ -37,7 +37,10 @@
     "test:all": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
     "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
     "test:keyboard": "node --experimental-strip-types --test tests/keyboard-navigation.test.ts",
-    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts"
+    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts",
+    "docker:build": "node scripts/src/docker-packaging.ts build",
+    "docker:scan": "node scripts/src/docker-packaging.ts scan",
+    "docker:verify": "node scripts/src/docker-packaging.ts verify"
   },
   "devDependencies": {
     "typescript": "^7.0.2"

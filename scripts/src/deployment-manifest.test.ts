@@ -6,6 +6,18 @@ import path from "node:path";
 import test from "node:test";
 import { validateManifest, writeManifest, type ManifestInput } from "./deployment-manifest";
 
+const FIXTURES_DIR = path.join(import.meta.dirname, "..", "fixtures", "deployment-manifest");
+
+function readFixture(name: string): Record<string, any> {
+  return JSON.parse(fs.readFileSync(path.join(FIXTURES_DIR, name), "utf8"));
+}
+
+function copyFixtureTo(name: string, directory: string): string {
+  const manifestPath = path.join(directory, "manifest.json");
+  fs.copyFileSync(path.join(FIXTURES_DIR, name), manifestPath);
+  return manifestPath;
+}
+
 const input: ManifestInput = {
   network: "testnet",
   deployerPublicKey: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
@@ -107,5 +119,97 @@ test("requires schema 2 fields to be explicitly versioned", () => {
     const result = validateManifest(manifestPath);
     assert.equal(result.ok, false);
     assert.match(result.errors.join("\n"), /unknown schema 2 field: manifest\.extraMetadata/i);
+  });
+});
+
+test("historical schema 1 fixture remains readable", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = copyFixtureTo("v1-valid.json", directory);
+    const result = validateManifest(manifestPath, "testnet");
+    assert.equal(result.ok, true, result.errors.join("\n"));
+  });
+});
+
+test("current schema 2 fixture validates", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = copyFixtureTo("v2-valid.json", directory);
+    const result = validateManifest(manifestPath, "testnet");
+    assert.equal(result.ok, true, result.errors.join("\n"));
+  });
+});
+
+test("rejects malformed nested contract fields with field-level errors", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = path.join(directory, "manifest.json");
+    const manifest = writeManifest(input, manifestPath) as unknown as Record<string, any>;
+    delete manifest.contracts.reputation.contractId;
+    manifest.contracts.circleFactory.wasmHash = 42;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const result = validateManifest(manifestPath);
+    assert.equal(result.ok, false);
+    const errors = result.errors.join("\n");
+    assert.match(errors, /contracts\.reputation\.contractId/i);
+    assert.match(errors, /contracts\.circleFactory\.wasmHash/i);
+  });
+});
+
+test("rejects invalid addresses and hashes that are merely non-empty strings", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = path.join(directory, "manifest.json");
+    const manifest = writeManifest(input, manifestPath) as unknown as Record<string, any>;
+    manifest.contracts.reputation.contractId = "not-a-contract";
+    manifest.contracts.circleFactory.contractId = "C" + "Z".repeat(55);
+    manifest.contracts.circlWasmHash = "xyz";
+    manifest.contracts.usdc = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const result = validateManifest(manifestPath);
+    assert.equal(result.ok, false);
+    const errors = result.errors.join("\n");
+    assert.match(errors, /contracts\.reputation\.contractId/i);
+    assert.match(errors, /contracts\.circleFactory\.contractId/i);
+    assert.match(errors, /contracts\.circlWasmHash/i);
+    assert.match(errors, /contracts\.usdc/i);
+  });
+});
+
+test("rejects a bad checksum with an integrity error", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = path.join(directory, "manifest.json");
+    const manifest = writeManifest(input, manifestPath) as unknown as Record<string, any>;
+    manifest.integrityHash = "0".repeat(64);
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const result = validateManifest(manifestPath);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /integrity hash mismatch/i);
+  });
+});
+
+test("rejects unsupported versions with a clear message", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = path.join(directory, "manifest.json");
+    const manifest = writeManifest(input, manifestPath) as unknown as Record<string, any>;
+    manifest.manifestVersion = "0";
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+    const result = validateManifest(manifestPath);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /unsupported manifestVersion/i);
+  });
+});
+
+test("partial deployment fixtures are never accepted as a complete manifest", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = copyFixtureTo("v2-partial.json", directory);
+    const result = validateManifest(manifestPath, "testnet");
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /incomplete|partial|missing/i);
+  });
+});
+
+test("fixtures with malformed nested fields fail validation", () => {
+  inTempDirectory((directory) => {
+    const manifestPath = copyFixtureTo("v2-malformed-nested.json", directory);
+    const result = validateManifest(manifestPath, "testnet");
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /contracts\./i);
   });
 });
