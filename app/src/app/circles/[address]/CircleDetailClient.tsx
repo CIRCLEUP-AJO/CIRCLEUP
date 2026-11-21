@@ -77,6 +77,8 @@ import { ContributionStatusBadge } from "@/components/ContributionStatusBadge";
 
 import { WorkflowBanner } from "@/components/WorkflowBanner";
 import { useAnnouncer, ANNOUNCEMENTS } from "@/lib/useAnnouncer";
+import { CopyControl } from "@/components/CopyControl";
+import { getStatusPresentation, isKnownStatus } from "@/lib/circleStatus";
 interface Props {
   circleAddress: string;
   circleData: CircleDetailData;
@@ -292,8 +294,7 @@ export function CircleDetailClient({ circleAddress, circleData }: Props) {
   const [defaultConfirm,      setDefaultConfirm]      = useState<DefaultConfirmState | null>(null);
   const defaultConfirmRef = useRef<HTMLDivElement>(null);
   const defaultConfirmTriggerRef = useRef<HTMLElement | null>(null);
-  const [inviteCopyState,     setInviteCopyState]     = useState<CopyState>("idle");
-  const [receiptCopyState,    setReceiptCopyState]    = useState<CopyState>("idle");
+
 
   const dismissDefaultConfirm = useCallback(() => {
     setDefaultConfirm(null);

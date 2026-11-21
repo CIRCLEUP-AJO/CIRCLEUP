@@ -22,6 +22,7 @@ import {
   isTerminalStatus,
   type CircleLifecycleStatus,
 } from "./lifecycle";
+import { getStatusPresentation, isKnownStatus } from "./statusPresentation";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -118,6 +119,7 @@ export type GateResult = GateAllowed | GateBlocked;
 export type GateBlockReason =
   | "stale_snapshot"
   | "wrong_status"
+  | "unsupported_status"
   | "not_a_member"
   | "already_joined"
   | "already_contributed"
@@ -165,6 +167,27 @@ function checkNetworkGate(snap: AppStateSnapshot): GateBlocked | null {
       "network_mismatch",
       "Your wallet is connected to a different Stellar network than this app. " +
         "Switch your wallet to the correct network to enable transactions.",
+    );
+  }
+  return null;
+}
+
+/**
+ * Returns a {@link GateBlocked} result when the snapshot's status is not a
+ * recognised lifecycle state (e.g. a future contract version, or a malformed
+ * indexer value), or `null` when the status is known.
+ *
+ * Unknown statuses fail closed: no write is ever enabled for a state the
+ * client does not understand.  Read-only details may still render when their
+ * fields validate — this gate only governs mutations.
+ */
+function checkStatusGate(snap: AppStateSnapshot): GateBlocked | null {
+  if (!isKnownStatus(snap.status)) {
+    const presentation = getStatusPresentation(snap.status);
+    return blocked(
+      "unsupported_status",
+      `This circle is in a state this app version does not support ` +
+        `(${presentation.label}). Actions are disabled until the app is updated.`,
     );
   }
   return null;
@@ -344,11 +367,12 @@ export function computeActionEligibility(
 ): GateResult {
   const nowMs  = opts.nowMs  ?? Date.now();
   const maxAge = opts.maxSnapshotAgeMs ?? DEFAULT_MAX_SNAPSHOT_AGE_MS;
-  const networkGate = checkNetworkGate(snapshot);
-  if (networkGate) return networkGate;
 
   const netGate = checkNetworkGate(snapshot);
   if (netGate) return netGate;
+
+  const statusGate = checkStatusGate(snapshot);
+  if (statusGate) return statusGate;
 
   switch (action) {
     case "join":       return gateJoin(snapshot, nowMs, maxAge);

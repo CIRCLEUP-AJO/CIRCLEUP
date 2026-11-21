@@ -75,6 +75,7 @@ async function checkA11y(container: HTMLElement) {
 import { WalletButton } from "@/components/WalletButton";
 import { CircleCard, type Circle } from "@/components/CircleCard";
 import { ReputationBadge, ReputationLegend } from "@/components/ReputationBadge";
+import { CopyControl } from "@/components/CopyControl";
 
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -162,6 +163,112 @@ describe("a11y: ReputationBadge", () => {
 describe("a11y: ReputationLegend", () => {
   it("legend table has no violations", async () => {
     const { container } = render(<ReputationLegend />);
+    const violations = await checkA11y(container);
+    expect(violations, formatViolations(violations)).toHaveLength(0);
+  });
+});
+
+// ── CopyControl ───────────────────────────────────────────────────────────────
+
+describe("a11y: CopyControl", () => {
+  const HASH = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+  function setClipboard(value: unknown) {
+    Object.defineProperty(navigator, "clipboard", {
+      value,
+      configurable: true,
+      writable: true,
+    });
+  }
+
+  function restoreClipboard() {
+    // Remove the override so the next test sees the jsdom default again.
+    delete (navigator as unknown as Record<string, unknown>).clipboard;
+  }
+
+  it("successful copy announces copied state via aria-live", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    setClipboard({ writeText });
+    try {
+      const { getByRole, findByText } = render(
+        <CopyControl value={HASH} label="Transaction hash" />
+      );
+      getByRole("button", { name: /copy transaction hash/i }).click();
+      expect(await findByText(/copied/i)).toBeTruthy();
+      expect(writeText).toHaveBeenCalledWith(HASH);
+      const status = document.querySelector("[aria-live]");
+      expect(status?.textContent).toMatch(/copied/i);
+    } finally {
+      restoreClipboard();
+    }
+  });
+
+  it("missing clipboard API announces unavailable and keeps text selectable", async () => {
+    setClipboard(undefined);
+    try {
+      const { getByRole, findByText } = render(
+        <CopyControl value={HASH} label="Transaction hash" />
+      );
+      getByRole("button", { name: /copy transaction hash/i }).click();
+      expect(await findByText(/unavailable/i)).toBeTruthy();
+      const field = document.querySelector("input, textarea") as
+        | HTMLInputElement
+        | HTMLTextAreaElement
+        | null;
+      expect(field).toBeTruthy();
+      expect(field?.readOnly).toBe(true);
+      expect(field?.value).toBe(HASH);
+      expect(document.activeElement).toBe(field);
+      expect(field?.selectionStart).toBe(0);
+      expect(field?.selectionEnd).toBe(HASH.length);
+    } finally {
+      restoreClipboard();
+    }
+  });
+
+  it("permission denial announces failure and focuses/selects the text", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("NotAllowedError"));
+    setClipboard({ writeText });
+    try {
+      const { getByRole, findByText } = render(
+        <CopyControl value={HASH} label="Transaction hash" />
+      );
+      getByRole("button", { name: /copy transaction hash/i }).click();
+      expect(await findByText(/failed/i)).toBeTruthy();
+      const field = document.querySelector("input, textarea") as
+        | HTMLInputElement
+        | HTMLTextAreaElement
+        | null;
+      expect(field).toBeTruthy();
+      expect(document.activeElement).toBe(field);
+      expect(field?.selectionStart).toBe(0);
+      expect(field?.selectionEnd).toBe(HASH.length);
+    } finally {
+      restoreClipboard();
+    }
+  });
+
+  it("repeated attempts never announce a false copied state", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("NotAllowedError"));
+    setClipboard({ writeText });
+    try {
+      const { getByRole, findByText } = render(
+        <CopyControl value={HASH} label="Transaction hash" />
+      );
+      const button = getByRole("button", { name: /copy transaction hash/i });
+      button.click();
+      expect(await findByText(/failed/i)).toBeTruthy();
+      button.click();
+      expect(await findByText(/failed/i)).toBeTruthy();
+      const status = document.querySelector("[aria-live]");
+      expect(status?.textContent ?? "").not.toMatch(/copied/i);
+    } finally {
+      restoreClipboard();
+    }
+  });
+
+  it("has no axe violations in idle state", async () => {
+    const { container } = render(<CopyControl value={HASH} label="Transaction hash" />);
     const violations = await checkA11y(container);
     expect(violations, formatViolations(violations)).toHaveLength(0);
   });

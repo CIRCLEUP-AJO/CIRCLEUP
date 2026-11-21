@@ -1,4 +1,4 @@
-﻿// ΓöÇΓöÇΓöÇ Shared typed response contracts for circle API data (Issue #513) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+// ΓöÇΓöÇΓöÇ Shared typed response contracts for circle API data (Issue #513) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 //
 // This module is the single authoritative source of type definitions and
 // runtime validators for every indexer API response consumed by the app.
@@ -34,39 +34,30 @@
 
 import { isCanonicalStellarAddress } from "@/lib/address";
 import { isStellarPublicKey, hasValidStrKeyChecksum } from "@/lib/address";
+import {
+  CIRCLE_API_STATUSES,
+  isCircleApiStatus,
+  normalizeStatus,
+  type CircleApiStatus,
+  type CircleStatus,
+} from "@/lib/circleStatus";
 
 // ΓöÇΓöÇΓöÇ Status values ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+//
+// The canonical lifecycle status union, its runtime membership check, and the
+// unknown-status normaliser live in lib/circleStatus.ts (Issue #130). They are
+// re-exported here so existing imports from circleTypes keep working and so
+// there is exactly one definition of the status union across the app.
+//
+// @see ApiCircleStatus in sdk/src/types.ts
 
-/**
- * All lifecycle states a circle can be in, as returned by the indexer.
- * The first four mirror the on-chain CircleStatus Rust enum; "Closed" is an
- * indexer-only projection (contract records this as a DataKey::Closed boolean).
- *
- * @see ApiCircleStatus in sdk/src/types.ts
- */
-export type CircleApiStatus =
-  | "Pending"
-  | "Active"
-  | "Completed"
-  | "Cancelled"
-  | "Closed";
-
-/** All recognised status values as a frozen tuple ΓÇö use for runtime membership checks. */
-export const CIRCLE_API_STATUSES = [
-  "Pending",
-  "Active",
-  "Completed",
-  "Cancelled",
-  "Closed",
-] as const;
-
-/** Returns true when `value` is a recognised CircleApiStatus string. */
-export function isCircleApiStatus(value: unknown): value is CircleApiStatus {
-  return (
-    typeof value === "string" &&
-    (CIRCLE_API_STATUSES as readonly string[]).includes(value)
-  );
-}
+export {
+  CIRCLE_API_STATUSES,
+  isCircleApiStatus,
+  normalizeStatus,
+  type CircleApiStatus,
+  type CircleStatus,
+};
 
 export const CIRCLE_STATUS_OPTIONS = CIRCLE_API_STATUSES;
 export type CircleStatusFilter = CircleApiStatus;
@@ -140,6 +131,11 @@ export function getBrowseState(
  * A single circle row as returned by GET /circles and GET /circles/:address.
  * `round_amount` is in stroops, serialised as a string.
  *
+ * `status` is the normalised {@link CircleStatus}: a recognised lifecycle
+ * state, or "unknown" for a future / malformed value crossing the versioned
+ * deployment boundary. The raw value is preserved separately in
+ * {@link CircleRow.raw_status} for safe diagnostics.
+ *
  * @see ApiCircleRow in sdk/src/types.ts
  */
 export interface CircleRow {
@@ -148,7 +144,13 @@ export interface CircleRow {
   /** Per-member contribution per round, in stroops (string-serialised). */
   round_amount: string;
   member_count: number;
-  status: CircleApiStatus;
+  status: CircleStatus;
+  /**
+   * The original, un-normalised status string from the indexer. Present only
+   * when `status === "unknown"`. Must never be interpolated as raw HTML ΓÇö
+   * render it as escaped text in diagnostics only.
+   */
+  raw_status?: string;
   current_round: number;
   total_rounds: number;
   created_ledger: number;
@@ -352,9 +354,14 @@ export interface CircleDetailData {
  * Subset of CircleRow fields needed by the detail view's circle header.
  * Keeps the type surface minimal for components that only need status / round
  * counts and not the full row.
+ *
+ * `status` is the normalised {@link CircleStatus}; `raw_status` carries the
+ * original string when the status is unrecognised.
  */
 export interface CircleState {
-  status: string;
+  status: CircleStatus;
+  /** Original status string when `status === "unknown"`; safe for diagnostics. */
+  raw_status?: string;
   current_round: number;
   total_rounds: number;
   round_amount: string;
@@ -493,6 +500,10 @@ export function parseCircleRound(raw: unknown): CircleRound | null {
 /**
  * Parse and validate the CircleState shape from an unknown indexer response.
  * Returns null if the object is missing any required numeric or string field.
+ *
+ * The status is normalised through {@link normalizeStatus}: a recognised
+ * lifecycle value is preserved, anything else becomes "unknown" with the
+ * original string retained in `raw_status` for diagnostics.
  */
 export function parseCircleState(raw: unknown): CircleState | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -502,8 +513,10 @@ export function parseCircleState(raw: unknown): CircleState | null {
   if (!isNonNegativeInt(r.total_rounds)) return null;
   if (!isString(r.round_amount)) return null;
   if (!isNonNegativeInt(r.member_count)) return null;
+  const status = normalizeStatus(r.status);
   return {
-    status: r.status,
+    status,
+    ...(status === "unknown" ? { raw_status: r.status } : {}),
     current_round: r.current_round,
     total_rounds: r.total_rounds,
     round_amount: r.round_amount,
@@ -520,6 +533,11 @@ export function parseCircleState(raw: unknown): CircleState | null {
  *
  * Used by the home page list and any other call site that consumes raw
  * GET /circles responses.
+ *
+ * The status is normalised through {@link normalizeStatus}: a recognised
+ * lifecycle value is preserved, anything else becomes "unknown" with the
+ * original string retained in `raw_status` for diagnostics. Unknown statuses
+ * are never coerced to a default (e.g. "Pending") and never enable writes.
  */
 export function parseCircleRow(raw: unknown): CircleRow | null {
   if (typeof raw !== "object" || raw === null) return null;
@@ -535,15 +553,15 @@ export function parseCircleRow(raw: unknown): CircleRow | null {
   if (!isNonNegativeInt(r.created_ledger)) return null;
   if (!isString(r.updated_at)) return null;
 
+  const status = normalizeStatus(r.status);
+
   return {
     address: r.address,
     creator: r.creator,
     round_amount: r.round_amount,
     member_count: r.member_count,
-    // Status is validated as a non-empty string; consumers that need the exact
-    // CircleApiStatus union should call isCircleApiStatus() separately. The
-    // UI renders unknown statuses via getStatusMeta's fallback path.
-    status: r.status as CircleApiStatus,
+    status,
+    ...(status === "unknown" ? { raw_status: r.status } : {}),
     current_round: r.current_round,
     total_rounds: r.total_rounds,
     created_ledger: r.created_ledger,
@@ -666,76 +684,4 @@ export function parseRoundsResponse(raw: unknown): RoundsResponse {
   };
 }
 
-// ΓöÇΓöÇΓöÇ Reputation response parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-
-/**
- * Parse an unknown GET /reputation/:member response body into a typed
- * {@link ReputationResponse}. Returns null when the response is structurally
- * invalid (missing required fields).
- */
-export function parseReputationResponse(raw: unknown): ReputationResponse | null {
-  if (typeof raw !== "object" || raw === null) return null;
-  const r = raw as Record<string, unknown>;
-
-  if (!isNonEmptyString(r.member)) return null;
-  if (typeof r.found !== "boolean") return null;
-  if (typeof r.score !== "number" && r.score !== null) return null;
-
-  const detail = isString(r.detail) ? r.detail : undefined;
-
-  const contributions = Array.isArray(r.contributions)
-    ? r.contributions
-        .filter(
-          (c): c is { circle_address: string; contributions: number; total_rounds: number } => {
-            if (typeof c !== "object" || c === null) return false;
-            const row = c as Record<string, unknown>;
-            return (
-              isNonEmptyString(row.circle_address) &&
-              typeof row.contributions === "number" &&
-              typeof row.total_rounds === "number"
-            );
-          },
-        )
-        .map((c) => ({
-          circle_address: c.circle_address,
-          contributions: c.contributions,
-          total_rounds: c.total_rounds,
-        }))
-    : [];
-
-  const defaults = Array.isArray(r.defaults)
-    ? r.defaults
-        .filter((d): d is { circle_address: string; count: number } => {
-          if (typeof d !== "object" || d === null) return false;
-          const row = d as Record<string, unknown>;
-          return isNonEmptyString(row.circle_address) && typeof row.count === "number";
-        })
-        .map((d) => ({ circle_address: d.circle_address, count: d.count }))
-    : [];
-
-  const events = Array.isArray(r.events)
-    ? r.events
-        .filter((e): e is { type: string; delta: number; timestamp?: string } => {
-          if (typeof e !== "object" || e === null) return false;
-          const row = e as Record<string, unknown>;
-          return typeof row.type === "string" && typeof row.delta === "number";
-        })
-        .map((e) => ({
-          type: e.type,
-          delta: e.delta,
-          ...(typeof e.timestamp === "string" ? { timestamp: e.timestamp } : {}),
-        }))
-    : undefined;
-
-  return {
-    member: r.member,
-    found: r.found,
-    score: r.score,
-    detail,
-    contributions,
-    defaults,
-    ...(events ? { events } : {}),
-    updatedAt: isString(r.updatedAt) ? r.updatedAt : null,
-    ...(events ? { events } : {}),
-  };
-}
+// ΓöÇΓöÇΓöÇ Reputation response parser ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ

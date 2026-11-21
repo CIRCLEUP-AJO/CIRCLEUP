@@ -4,6 +4,7 @@ import { parseContractError, userMessageForError, type ContractAppError } from "
 import { observeWalletChanges } from "@/lib/walletIdentity";
 import { useAnnouncer, ANNOUNCEMENTS } from "@/lib/useAnnouncer";
 import { useDeploymentVerified, deploymentVerified } from "@/lib/deploymentState";
+import { CopyControl } from "@/components/CopyControl";
 import { useState, useId, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -414,7 +415,11 @@ export default function CreateClient() {
   const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
   const [txHash, setTxHash] = useState("");
   const [confirmed, setConfirmed] = useState(false);
-  const [copied, setCopied] = useState(false);
+  // Verified circle address derived from the factory event / transaction
+  // result. Only set when the data is trustworthy; never guessed.
+  const [circleAddress, setCircleAddress] = useState("");
+  // Whether the user has opted to stay on the receipt instead of navigating.
+  const [stayOnReceipt, setStayOnReceipt] = useState(false);
 
   // Whether validation has been attempted — controls when inline errors appear.
   // Before first submit, per-field errors are hidden so the form isn't
@@ -423,6 +428,20 @@ export default function CreateClient() {
 
   // Guards against concurrent submissions (rapid double-click, etc.)
   const submittingRef = useRef(false);
+
+  // Owned timer for the post-success redirect. Stored in a ref so it can be
+  // cleared on unmount, on user navigation, or when the user chooses to stay.
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearRedirectTimer = useCallback(() => {
+    if (redirectTimerRef.current !== null) {
+      clearTimeout(redirectTimerRef.current);
+      redirectTimerRef.current = null;
+    }
+  }, []);
+
+  // Always clear any pending redirect when the component unmounts.
+  useEffect(() => clearRedirectTimer, [clearRedirectTimer]);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -450,6 +469,19 @@ export default function CreateClient() {
   useEffect(() => {
     if (txHash && successRef.current) successRef.current.focus();
   }, [txHash]);
+
+  // Lifecycle-aware success redirect: only schedule when the transaction is
+  // confirmed AND a verified circle address exists. The timer is owned by this
+  // effect and cleared on cleanup (unmount, dependency change, or user opting
+  // to stay), so it can never fire against an unmounted or navigated page.
+  useEffect(() => {
+    if (!confirmed || !circleAddress || stayOnReceipt) return;
+    redirectTimerRef.current = setTimeout(() => {
+      redirectTimerRef.current = null;
+      router.push(`/circles/${circleAddress}`);
+    }, 5000);
+    return () => clearRedirectTimer();
+  }, [confirmed, circleAddress, stayOnReceipt, router, clearRedirectTimer]);
 
   // ── Derived values ──────────────────────────────────────────────────────────
   // Distinct filled addresses only: blank rows and repeated addresses never
@@ -497,18 +529,6 @@ export default function CreateClient() {
     memberRefs.current = memberRefs.current.filter((_, idx) => idx !== i);
   }
 
-  // ── Copy helper ─────────────────────────────────────────────────────────────
-  async function copyTxHash() {
-    const hash = txHash;
-    if (!hash) return;
-    try {
-      await navigator.clipboard.writeText(hash);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // clipboard API unavailable — silently skip
-    }
-  }
 
   // ── Focus first error ────────────────────────────────────────────────────────
   function focusFirstError(errors: CreateFormErrors) {
@@ -539,11 +559,13 @@ export default function CreateClient() {
     actionAbortRef.current = actionCtrl;
 
     try {
+      clearRedirectTimer();
       setSubmitError("");
       setSupportError(null);
       setTxHash("");
       setConfirmed(false);
-      setCopied(false);
+      setCircleAddress("");
+      setStayOnReceipt(false);
       setValidated(true);
 
       // ── Step 1: field validation ──────────────────────────────────────────
@@ -635,8 +657,11 @@ export default function CreateClient() {
 
       setConfirmed(true);
       setTxHash(result.txHash ?? "");
+      // Only trust a circle address that the factory/transaction result
+      // actually returned. If it is absent, the receipt is shown without a
+      // detail link and no redirect is scheduled.
+      setCircleAddress(result.circleAddress ?? "");
       announce(ANNOUNCEMENTS.circleCreated.message, ANNOUNCEMENTS.circleCreated.politeness);
-      setTimeout(() => router.push("/"), 5000);
     } catch (err: unknown) {
       if (actionCtrl.signal.aborted) return;
       const safeError = parseContractError(err instanceof Error ? err.message : "");
@@ -980,10 +1005,10 @@ export default function CreateClient() {
             tabIndex={-1}
             className="bg-brand-50 border border-brand-200 rounded-lg p-4 text-sm text-brand-700 space-y-3 focus:outline-none"
           >
-            <p className="font-semibold text-brand-800 flex items-center gap-1.5">
+            <p className="font-semibold text-brand-800 flex items-center gap-1.5 break-words">
               <span aria-hidden="true">{confirmed ? "✅" : "ℹ"}</span> {confirmed ? "Circle created successfully!" : "Transaction receipt — check status before another write"}
             </p>
-            <a href="/transactions" className="underline">Reopen transaction status</a>
+            <a href="/transactions" className="underline break-words">Reopen transaction status</a>
             <div>
               <p
                 className="text-xs text-brand-600 mb-1 font-medium"
@@ -991,36 +1016,56 @@ export default function CreateClient() {
               >
                 Transaction hash
               </p>
-              <div className="flex items-center gap-2 bg-white border border-brand-200 rounded-lg px-3 py-2">
-                <span
-                  className="font-mono text-xs text-slate-700 flex-1 break-all select-all min-w-0"
-                  aria-labelledby={`${successId}-hash-label`}
-                >
-                  {txHash}
-                </span>
-                <button
-                  type="button"
-                  onClick={copyTxHash}
-                  className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
-                  aria-pressed={copied}
-                >
-                  {copied ? "✓ Copied" : "Copy"}
-                </button>
-              </div>
+              <CopyControl
+                value={txHash}
+                label="Transaction hash"
+                labelledBy={`${successId}-hash-label`}
+                className="bg-white border border-brand-200 rounded-lg px-3 py-2"
+              />
             </div>
             {explorerTxUrl && (
               <a
                 href={explorerTxUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
+                className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900 break-all"
               >
                 View on Stellar Expert ↗
               </a>
             )}
-            <p className="text-xs text-slate-500" aria-live="polite" aria-atomic="true">
-              {confirmed ? "Redirecting to circles list in a few seconds…" : "Confirmation was not established. Open Recent transactions to check this hash."}
+            {/* Explicit navigation actions — the user stays in control. */}
+            <div className="flex flex-wrap items-center gap-2">
+              {confirmed && circleAddress && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearRedirectTimer();
+                    router.push(`/circles/${circleAddress}`);
+                  }}
+                  className="inline-flex items-center justify-center bg-brand-600 text-white text-xs font-semibold px-3 py-2 rounded-lg hover:bg-brand-700 min-h-[44px]"
+                >
+                  View circle
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  clearRedirectTimer();
+                  setStayOnReceipt(true);
+                }}
+                className="inline-flex items-center justify-center border border-brand-300 text-brand-700 text-xs font-semibold px-3 py-2 rounded-lg hover:bg-brand-100 min-h-[44px]"
+              >
+                Stay on receipt
+              </button>
+            </div>
+            <p className="text-xs text-slate-500 break-words" aria-live="polite" aria-atomic="true">
+              {confirmed && circleAddress && !stayOnReceipt
+                ? "Redirecting to your new circle in a few seconds…"
+                : confirmed && circleAddress
+                ? "You chose to stay on this receipt. Use View circle when ready."
+                : confirmed
+                ? "Circle created. The circle address was not returned, so no detail link is available — keep this transaction hash."
+                : "Confirmation was not established. Open Recent transactions to check this hash."}
             </p>
           </div>
         )}
@@ -1039,7 +1084,7 @@ export default function CreateClient() {
           disabled={submitBlocked}
           aria-busy={loading}
           aria-describedby={submitDescribedBy}
-          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg min-h-[48px]"
+          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg min-h-[48px] break-words"
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>
