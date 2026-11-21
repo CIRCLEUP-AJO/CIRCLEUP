@@ -66,6 +66,30 @@ npm run test:incidents --workspace=indexer
 npx tsc --noEmit --project app/tsconfig.json
 ```
 
+### Verification tiers
+
+Two root commands run the existing package commands in a deterministic order.
+Each child command is executed directly (no shell pipelines, no `&&`/`&`
+chaining), so a failed child command always fails the parent command.
+
+| Command | Tier | What it runs |
+|---|---|---|
+| `npm run verify:fast` | Fast local feedback (offline, no external services) | SDK build + tests, indexer typecheck + unit tests, app typecheck + unit tests, scripts typecheck + tests, repository `format:check` |
+| `npm run verify:full` | Full release verification | Everything in the fast tier, plus contracts `cargo test`, indexer build + Postgres-backed integration tests, app build + Playwright visual tests, SDK `check:api`, `verify-artifacts`, `release-check`, and `check:toolchain` |
+
+Prerequisites for the full tier:
+
+- **Contracts:** Rust 1.81.0 with the `wasm32-unknown-unknown` target (`cargo` on `PATH`).
+- **Indexer integration tests:** `DATABASE_URL` pointing at a running Postgres instance.
+- **Visual tests:** Playwright browsers installed (`npx playwright install`), or set `VERIFY_VISUAL=1` to force the check.
+- **Toolchain check:** network access to the npm registry (set `VERIFY_OFFLINE=1` to skip it).
+
+Checks whose prerequisites are not met are **not silently dropped**: the runner
+prints `[SKIP] <check> — prerequisite not met: <prerequisite>` and repeats the
+skip in the final summary. The command still exits `0` when only skips occur,
+and exits `1` as soon as any executed check fails (remaining checks are reported
+as `NOT RUN`).
+
 See the [RUNBOOK](./docs/RUNBOOK.md) for full environment variable setup.
 
 Supported toolchains are Node.js 18.18+ with npm 9, Node.js 22 with npm 10, or
@@ -739,6 +763,8 @@ This table maps each command to the gates it satisfies. Run the commands locally
 | `npm run test:incidents --workspace=indexer` | C2, F4 |
 | `npm run migrate --workspace=indexer` | C3 |
 | `npm run migrate:check --workspace=indexer` | C3, G2, G5 |
+| `npm run verify:fast` | B3, C1, D1 (offline subset) |
+| `npm run verify:full` | A1, A3, B3, C1, C2, D1, G2 |
 
 ---
 

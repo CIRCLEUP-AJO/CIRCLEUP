@@ -17,7 +17,10 @@
     "check:env-parity": "ts-node src/check-env-parity.ts",
     "upgrade-compat-report": "ts-node src/upgrade-compatibility-report.ts",
     "upgrade-compat-report:json": "ts-node src/upgrade-compatibility-report.ts --json",
-    "test": "node --require ts-node/register --test src/check-env-parity.test.ts src/release-check.test.ts src/deployment-manifest.test.ts src/upgrade-compatibility-report.test.ts"
+    "test": "node --require ts-node/register --test src/check-env-parity.test.ts src/release-check.test.ts src/deployment-manifest.test.ts src/upgrade-compatibility-report.test.ts src/verify.test.ts",
+    "verify": "ts-node src/verify.ts",
+    "verify:fast": "ts-node src/verify.ts --tier=fast",
+    "verify:full": "ts-node src/verify.ts --tier=full"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^17.2.1",

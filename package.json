@@ -37,7 +37,10 @@
     "test:all": "npm run test --workspace=sdk && npm run test --workspace=indexer && npm run test --workspace=app",
     "test:e2e": "node --experimental-strip-types --test tests/e2e-demo.test.ts",
     "test:keyboard": "node --experimental-strip-types --test tests/keyboard-navigation.test.ts",
-    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts"
+    "test:perf": "node --experimental-strip-types --test tests/perf/perf-budget.test.ts",
+    "verify": "npm run verify:fast",
+    "verify:fast": "npm run verify:fast --workspace=scripts",
+    "verify:full": "npm run verify:full --workspace=scripts"
   },
   "devDependencies": {
     "typescript": "^7.0.2"
