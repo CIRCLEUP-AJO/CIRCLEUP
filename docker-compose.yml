@@ -68,9 +68,16 @@ services:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/circleup
       NODE_ENV: development
       STELLAR_RPC_URL: https://soroban-testnet.stellar.org
-    command: sleep infinity   # keeps container running; connect via exec or VS Code
+    command: sleep infinity # keeps container running; connect via exec or VS Code
 
 volumes:
+  # `circleup_pgdata` holds ALL local indexer data (schema, migrations,
+  # indexer_state cursor, ledger_checkpoints, ingested_events dedup rows and
+  # every derived circle/member/contribution/payout/reputation row).
+  # `docker compose restart` / `docker compose down` preserve it.
+  # The ONLY supported way to discard it is `npm run db:reset:volume -- --yes`
+  # (see docs/RUNBOOK.md → "Local Postgres Volume and Reset").
   pgdata:
+    name: circleup_pgdata
   node_modules:
   cargo_cache:
