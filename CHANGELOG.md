@@ -14,6 +14,28 @@ Versions follow [Semantic Versioning](https://semver.org/).
 3. Deploy frontend application and SDK consumers.
 
 ### Added
+- **Reputation provenance and freshness** (#967): the reputation page now
+  labels each section with its data source (on-chain score read vs. indexed
+  history projection) and its freshness (last indexed ledger / timestamp).
+  A verified zero score, a failed score read, an empty indexed history, and
+  unavailable indexer data are rendered as distinct states, so a missing
+  history is never presented as "no activity". Provenance copy states that
+  the indexer is a projection of contract events, not the contract's
+  authorization source.
+- **Documentation link and command validation** (#970): a lightweight checker
+  validates repository-relative Markdown links, anchors, and referenced npm
+  scripts / workspace paths, reporting the source file and line. External
+  links are not fetched in CI. Valid nonstandard references can be suppressed
+  with an inline marker, documented in `CONTRIBUTING.md`.
+- **Rust toolchain alignment** (#973): `contracts/rust-toolchain.toml` is the
+  single source of truth for local and CI contract builds. CI installs only
+  the declared targets/components, prints the active versions, and fails
+  early on a mismatch with expected vs. actual versions. Version data is
+  included in artifact reports.
+- **Supported runtime CI matrix** (#975): a compact matrix covers the declared
+  Node.js range for the SDK, indexer, and app, with isolated caches, while
+  contract artifacts stay on the pinned Rust toolchain. The support policy is
+  documented and updated when a runtime reaches end of life.
 - **SDK compatibility and semantic versioning policy** (#909): published
   `docs/SDK_COMPATIBILITY.md` defining public export surface, pre-1.0 SemVer rules,
   deprecation lifecycle, notice periods, and release checklist. Deprecated

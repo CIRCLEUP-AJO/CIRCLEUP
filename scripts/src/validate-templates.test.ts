@@ -835,3 +835,340 @@ function extractRelativeLinks(
 
   return results;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Documentation validator (docs-check) — inline re-implementation
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Mirrors scripts/src/validate-docs.ts so the checker's behaviour can be
+// exercised without spawning a process.  The validator:
+//   - extracts repository-relative Markdown links, ignoring external URLs,
+//     anchor-only links, mailto:, and links inside fenced/inline code spans
+//   - resolves each link against the source file's directory
+//   - verifies referenced npm scripts exist in the owning package.json
+//   - honours a suppression marker for intentional nonstandard references
+//   - reports the source file and 1-based line for every failure
+
+const DOCS_LINK_RE = /\[([^\]]*)\]\(([^)]+)\)/g;
+const SUPPRESSION_MARKER = "docs-check-ignore";
+
+interface DocLink {
+  line: number;
+  rawLink: string;
+  resolvedPath: string;
+}
+
+interface DocIssue {
+  file: string;
+  line: number;
+  message: string;
+}
+
+/** Strip fenced code blocks and inline code spans so they are not scanned. */
+function stripCodeSpans(content: string): string[] {
+  const lines = content.split("\n");
+  const out: string[] = [];
+  let inFence = false;
+  for (const lineText of lines) {
+    if (/^\s*(```|~~~)/.test(lineText)) {
+      inFence = !inFence;
+      out.push("");
+      continue;
+    }
+    if (inFence) {
+      out.push("");
+      continue;
+    }
+    // Blank out inline code spans, preserving line structure.
+    out.push(lineText.replace(/`[^`]*`/g, ""));
+  }
+  return out;
+}
+
+function extractDocLinks(content: string, fileDir: string): DocLink[] {
+  const lines = stripCodeSpans(content);
+  const results: DocLink[] = [];
+  lines.forEach((lineText, idx) => {
+    let match: RegExpExecArray | null;
+    DOCS_LINK_RE.lastIndex = 0;
+    while ((match = DOCS_LINK_RE.exec(lineText)) !== null) {
+      const rawLink = match[2].trim();
+      if (
+        rawLink.startsWith("http://") ||
+        rawLink.startsWith("https://") ||
+        rawLink.startsWith("#") ||
+        rawLink.startsWith("mailto:")
+      ) {
+        continue;
+      }
+      const linkWithoutFragment = rawLink.split("#")[0];
+      if (!linkWithoutFragment) continue;
+      results.push({
+        line: idx + 1,
+        rawLink,
+        resolvedPath: path.resolve(fileDir, linkWithoutFragment),
+      });
+    }
+  });
+  return results;
+}
+
+function isSuppressed(content: string, line: number): boolean {
+  const lines = content.split("\n");
+  const current = lines[line - 1] ?? "";
+  const previous = lines[line - 2] ?? "";
+  return current.includes(SUPPRESSION_MARKER) || previous.includes(SUPPRESSION_MARKER);
+}
+
+function checkDocLinks(
+  filePath: string,
+  content: string,
+): DocIssue[] {
+  const fileDir = path.dirname(filePath);
+  const issues: DocIssue[] = [];
+  for (const link of extractDocLinks(content, fileDir)) {
+    if (isSuppressed(content, link.line)) continue;
+    if (!fs.existsSync(link.resolvedPath)) {
+      issues.push({
+        file: filePath,
+        line: link.line,
+        message: `broken local link: ${link.rawLink}`,
+      });
+    }
+  }
+  return issues;
+}
+
+interface PackageScripts {
+  [pkgJsonPath: string]: Set<string>;
+}
+
+function loadPackageScripts(repoRoot: string): PackageScripts {
+  const result: PackageScripts = {};
+  const candidates = [
+    path.join(repoRoot, "package.json"),
+    path.join(repoRoot, "scripts", "package.json"),
+    path.join(repoRoot, "app", "package.json"),
+    path.join(repoRoot, "indexer", "package.json"),
+  ];
+  for (const pkgPath of candidates) {
+    if (!fs.existsSync(pkgPath)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
+        scripts?: Record<string, string>;
+      };
+      result[pkgPath] = new Set(Object.keys(parsed.scripts ?? {}));
+    } catch {
+      result[pkgPath] = new Set();
+    }
+  }
+  return result;
+}
+
+const NPM_RUN_RE = /npm\s+run\s+([A-Za-z0-9:_-]+)/g;
+
+function checkNpmScripts(
+  filePath: string,
+  content: string,
+  repoRoot: string,
+  scripts: PackageScripts,
+): DocIssue[] {
+  const issues: DocIssue[] = [];
+  const lines = stripCodeSpans(content);
+  // Determine which package.json governs this doc by walking up to repo root.
+  const rel = path.relative(repoRoot, filePath);
+  let governingPkg = path.join(repoRoot, "package.json");
+  if (rel.startsWith("scripts" + path.sep)) {
+    governingPkg = path.join(repoRoot, "scripts", "package.json");
+  } else if (rel.startsWith("app" + path.sep)) {
+    governingPkg = path.join(repoRoot, "app", "package.json");
+  } else if (rel.startsWith("indexer" + path.sep)) {
+    governingPkg = path.join(repoRoot, "indexer", "package.json");
+  }
+  const available = scripts[governingPkg];
+  if (!available) return issues;
+
+  lines.forEach((lineText, idx) => {
+    let match: RegExpExecArray | null;
+    NPM_RUN_RE.lastIndex = 0;
+    while ((match = NPM_RUN_RE.exec(lineText)) !== null) {
+      const scriptName = match[1];
+      if (isSuppressed(content, idx + 1)) continue;
+      if (!available.has(scriptName)) {
+        issues.push({
+          file: filePath,
+          line: idx + 1,
+          message: `unknown npm script: ${scriptName}`,
+        });
+      }
+    }
+  });
+  return issues;
+}
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+function makeRepoFixture(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cu-docs-"));
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ scripts: { build: "tsc", test: "node --test" } }),
+    "utf8",
+  );
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "EXISTS.md"), "# Exists\n", "utf8");
+  fs.mkdirSync(path.join(root, "scripts"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "scripts", "package.json"),
+    JSON.stringify({ scripts: { "validate-templates": "tsx src/validate-templates.ts" } }),
+    "utf8",
+  );
+  return root;
+}
+
+describe("docs validator — link extraction", () => {
+  test("ignores external https:// links (no network dependency)", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "[GitHub](https://github.com/CIRCLEUP-AJO/CIRCLEUP)";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("ignores anchor-only links", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    assert.deepEqual(checkDocLinks(file, "[top](#overview)"), []);
+  });
+
+  test("ignores mailto: links", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    assert.deepEqual(checkDocLinks(file, "[mail](mailto:team@example.com)"), []);
+  });
+
+  test("ignores links inside fenced code blocks", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = ["```md", "[Phantom](./PHANTOM.md)", "```"].join("\n");
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("ignores links inside inline code spans", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "Use `[Phantom](./PHANTOM.md)` as an example.";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("resolves a valid relative link with fragment", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "[Exists](./EXISTS.md#section)";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+});
+
+describe("docs validator — broken local links", () => {
+  test("reports broken link with source file and line", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = ["# Title", "", "[Phantom](./PHANTOM.md)"].join("\n");
+    const issues = checkDocLinks(file, content);
+    assert.equal(issues.length, 1);
+    assert.equal(issues[0].file, file);
+    assert.equal(issues[0].line, 3);
+    assert.match(issues[0].message, /broken local link/);
+  });
+
+  test("reports each broken link on its own line", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = ["[A](./A.md)", "[B](./B.md)"].join("\n");
+    const issues = checkDocLinks(file, content);
+    assert.deepEqual(issues.map((i) => i.line), [1, 2]);
+  });
+
+  test("suppression marker on the same line silences the issue", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "[Phantom](./PHANTOM.md) <!-- docs-check-ignore -->";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("suppression marker on the previous line silences the issue", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = [
+      "<!-- docs-check-ignore -->",
+      "[Phantom](./PHANTOM.md)",
+    ].join("\n");
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("intentional generated link is suppressed and not reported", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = [
+      "<!-- docs-check-ignore: generated by build -->",
+      "[Generated](./generated/OUTPUT.md)",
+    ].join("\n");
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+});
+
+describe("docs validator — npm scripts", () => {
+  test("valid npm script passes", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = "Run `npm run build` to compile.";
+    assert.deepEqual(checkNpmScripts(file, content, root, scripts), []);
+  });
+
+  test("missing npm script is reported with file and line", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = ["# Build", "", "Run `npm run nonexistent`"].join("\n");
+    const issues = checkNpmScripts(file, content, root, scripts);
+    assert.equal(issues.length, 1);
+    assert.equal(issues[0].file, file);
+    assert.equal(issues[0].line, 3);
+    assert.match(issues[0].message, /unknown npm script: nonexistent/);
+  });
+
+  test("package-specific script resolves against its own package.json", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "scripts", "README.md");
+    const content = "Run `npm run validate-templates`.";
+    assert.deepEqual(checkNpmScripts(file, content, root, scripts), []);
+  });
+
+  test("script from another package is not accepted", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "scripts", "README.md");
+    const content = "Run `npm run build`.";
+    const issues = checkNpmScripts(file, content, root, scripts);
+    assert.equal(issues.length, 1);
+    assert.match(issues[0].message, /unknown npm script: build/);
+  });
+
+  test("npm script inside a code span is still checked", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = "Run `npm run missing-script`.";
+    const issues = checkNpmScripts(file, content, root, scripts);
+    assert.equal(issues.length, 1);
+  });
+
+  test("suppression marker silences an unknown npm script", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = "Run `npm run legacy` <!-- docs-check-ignore -->";
+    assert.deepEqual(checkNpmScripts(file, content, root, scripts), []);
+  });
+});

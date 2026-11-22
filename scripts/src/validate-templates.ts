@@ -1,11 +1,22 @@
 #!/usr/bin/env ts-node
 /**
- * validate-templates.ts — Contributor-template integrity checker
+ * validate-templates.ts — Contributor-template & documentation integrity checker
  *
- * Scans every file in `.github/ISSUE_TEMPLATE/` and `.github/PULL_REQUEST_TEMPLATE.md`
- * for relative (repo-local) links and verifies that their targets actually exist on
- * disk.  Also asserts that the bug-report template carries the required safety-notice
- * block so contributors know what NOT to include in public issues.
+ * Two responsibilities:
+ *
+ *   1. Template integrity (issue/PR templates, SUPPORT.md, SECURITY.md):
+ *      verifies relative (repo-local) links resolve on disk and asserts that
+ *      the bug-report / feature-request / PR templates carry their required
+ *      content tokens.
+ *
+ *   2. Documentation validation (all Markdown files in the repo):
+ *      - inventories Markdown files (skipping node_modules, build output, etc.)
+ *      - resolves repository-relative links, including `#anchor` fragments
+ *      - verifies referenced npm scripts (`npm run <script>`) and workspace
+ *        paths against the relevant package.json files
+ *      - ignores external http(s) URLs (no network access required) and code
+ *        spans / fenced code blocks (so example commands are not validated)
+ *      - supports a suppression mechanism for valid nonstandard references
  *
  * Usage (called from CI):
  *   npx ts-node scripts/src/validate-templates.ts
@@ -20,7 +31,23 @@
  *   - Safety-notice check is content-agnostic: it looks for the presence of
  *     known redaction keywords rather than comparing exact prose, so normal
  *     template improvements never trip the check.
+ *   - External links are never fetched; CI never depends on network access.
  *   - No transitive dependencies beyond Node built-ins + ts-node.
+ *
+ * Suppressing a valid nonstandard reference
+ * -----------------------------------------
+ * Some links or commands are intentionally nonstandard (generated files,
+ * example paths, scripts defined outside the scanned package.json, etc.).
+ * To suppress a finding, add a `doc-validate:ignore` HTML comment on the same
+ * line as the reference, or on the line immediately above it:
+ *
+ *   <!-- doc-validate:ignore -->
+ *   [generated](./build/generated/README.md)
+ *
+ *   See [example](./examples/not-yet-committed.md) <!-- doc-validate:ignore -->
+ *
+ * A suppression applies only to the line it annotates (or the next line when
+ * placed on its own line).  Use it sparingly and explain why in the PR.
  */
 
 import fs from "fs";
@@ -30,6 +57,27 @@ import path from "path";
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const GITHUB_DIR = path.join(REPO_ROOT, ".github");
+
+/** Marker that suppresses a finding on the annotated line (or the next line). */
+const SUPPRESSION_MARKER = "doc-validate:ignore";
+
+/** Directories that are never scanned for Markdown documentation. */
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  "coverage",
+  "target",
+  ".next",
+  ".turbo",
+  ".cache",
+  "out",
+  "artifacts",
+]);
+
+/** Directories that hold fixtures for the validator itself. */
+const FIXTURE_DIR = path.join(REPO_ROOT, "scripts", "fixtures", "doc-validate");
 
 /** Template files to scan.  Paths are relative to REPO_ROOT. */
 export function collectTemplatePaths(): string[] {
@@ -56,6 +104,91 @@ export function collectTemplatePaths(): string[] {
   }
 
   return paths;
+}
+
+// ── Markdown inventory ────────────────────────────────────────────────────────
+
+/**
+ * Recursively collects every Markdown file under REPO_ROOT, skipping
+ * dependency/build directories and the validator's own fixtures (which are
+ * intentionally broken and are exercised by the fixture tests instead).
+ */
+export function collectMarkdownFiles(root: string = REPO_ROOT): string[] {
+  const results: string[] = [];
+
+  function walk(dir: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        if (full === FIXTURE_DIR) continue;
+        walk(full);
+      } else if (entry.isFile() && /\.mdx?$/i.test(entry.name)) {
+        results.push(full);
+      }
+    }
+  }
+
+  walk(root);
+  return results.sort();
+}
+
+// ── Suppression handling ──────────────────────────────────────────────────────
+
+/**
+ * Returns a predicate that reports whether a given 1-based line number in the
+ * file is suppressed.  A suppression marker on line N suppresses line N and
+ * line N+1 (so it can sit on its own line above the reference).
+ */
+export function buildSuppressionPredicate(
+  lines: string[],
+): (lineNumber: number) => boolean {
+  const suppressed = new Set<number>();
+  lines.forEach((text, idx) => {
+    if (text.includes(SUPPRESSION_MARKER)) {
+      suppressed.add(idx + 1);
+      suppressed.add(idx + 2);
+    }
+  });
+  return (lineNumber: number) => suppressed.has(lineNumber);
+}
+
+/**
+ * Replaces fenced code blocks and inline code spans with blank placeholders so
+ * that example commands and links inside code are not validated.  Line numbers
+ * are preserved (each replaced character becomes a space, newlines are kept).
+ */
+export function maskCode(content: string): string {
+  const lines = content.split("\n");
+  let inFence = false;
+  let fenceMarker = "";
+
+  const masked = lines.map((line) => {
+    const fenceMatch = line.match(/^\s*(```+|~~~+)/);
+    if (fenceMatch) {
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = fenceMatch[1][0];
+        return " ".repeat(line.length);
+      } else if (fenceMatch[1][0] === fenceMarker) {
+        inFence = false;
+        fenceMarker = "";
+        return " ".repeat(line.length);
+      }
+    }
+    if (inFence) return " ".repeat(line.length);
+
+    // Mask inline code spans (`...`) while preserving surrounding text.
+    return line.replace(/`[^`]*`/g, (span) => " ".repeat(span.length));
+  });
+
+  return masked.join("\n");
 }
 
 // ── Link extraction ────────────────────────────────────────────────────────────
@@ -86,7 +219,8 @@ const RELATIVE_LINK_RE = /\[([^\]]*)\]\(([^)]+)\)/g;
 
 export function extractRelativeLinks(filePath: string): LinkOccurrence[] {
   const content = fs.readFileSync(filePath, "utf8");
-  const lines = content.split("\n");
+  const masked = maskCode(content);
+  const lines = masked.split("\n");
   const results: LinkOccurrence[] = [];
   const fileDir = path.dirname(filePath);
 
@@ -121,6 +255,188 @@ export function extractRelativeLinks(filePath: string): LinkOccurrence[] {
   });
 
   return results;
+}
+
+// ── Anchor validation ─────────────────────────────────────────────────────────
+
+/**
+ * Converts a Markdown heading into the GitHub-style anchor slug.
+ * Lowercases, strips punctuation, and replaces spaces with hyphens.
+ */
+export function slugifyHeading(heading: string): string {
+  return heading
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/\s+/g, "-");
+}
+
+/**
+ * Collects the set of anchor slugs defined by headings in a Markdown file.
+ */
+export function collectAnchors(filePath: string): Set<string> {
+  const content = fs.readFileSync(filePath, "utf8");
+  const masked = maskCode(content);
+  const anchors = new Set<string>();
+  for (const line of masked.split("\n")) {
+    const heading = line.match(/^\s{0,3}#{1,6}\s+(.*?)\s*#*\s*$/);
+    if (heading) anchors.add(slugifyHeading(heading[1]));
+  }
+  return anchors;
+}
+
+interface AnchorOccurrence {
+  file: string;
+  line: number;
+  rawLink: string;
+  /** Absolute path of the file whose anchor is referenced. */
+  targetFile: string;
+  anchor: string;
+}
+
+/**
+ * Extracts links that carry a `#fragment`, so the fragment can be validated
+ * against the target file's headings.  Pure anchors (`#section`) are checked
+ * against the containing file.
+ */
+export function extractAnchorLinks(filePath: string): AnchorOccurrence[] {
+  const content = fs.readFileSync(filePath, "utf8");
+  const masked = maskCode(content);
+  const lines = masked.split("\n");
+  const results: AnchorOccurrence[] = [];
+  const fileDir = path.dirname(filePath);
+
+  lines.forEach((lineText, idx) => {
+    let match: RegExpExecArray | null;
+    RELATIVE_LINK_RE.lastIndex = 0;
+    while ((match = RELATIVE_LINK_RE.exec(lineText)) !== null) {
+      const rawLink = match[2].trim();
+      if (
+        rawLink.startsWith("http://") ||
+        rawLink.startsWith("https://") ||
+        rawLink.startsWith("mailto:")
+      ) {
+        continue;
+      }
+      const hashIndex = rawLink.indexOf("#");
+      if (hashIndex === -1) continue;
+      const anchor = rawLink.slice(hashIndex + 1);
+      if (!anchor) continue;
+      const linkPath = rawLink.slice(0, hashIndex);
+      const targetFile = linkPath
+        ? path.resolve(fileDir, linkPath)
+        : filePath;
+      results.push({
+        file: filePath,
+        line: idx + 1,
+        rawLink,
+        targetFile,
+        anchor,
+      });
+    }
+  });
+
+  return results;
+}
+
+// ── npm script & workspace validation ────────────────────────────────────────
+
+interface PackageJson {
+  name?: string;
+  scripts?: Record<string, string>;
+  workspaces?: string[] | { packages?: string[] };
+}
+
+/** Reads and parses a package.json, returning null when absent/invalid. */
+export function readPackageJson(pkgPath: string): PackageJson | null {
+  if (!fs.existsSync(pkgPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(pkgPath, "utf8")) as PackageJson;
+  } catch {
+    return null;
+  }
+}
+
+interface ScriptReference {
+  file: string;
+  line: number;
+  script: string;
+  /** Directory whose package.json is expected to define the script. */
+  packageDir: string;
+}
+
+/**
+ * Finds `npm run <script>` / `npm run-script <script>` references in prose
+ * (code spans are masked out, so only documented commands are checked).
+ */
+export function extractScriptReferences(filePath: string): ScriptReference[] {
+  const content = fs.readFileSync(filePath, "utf8");
+  const masked = maskCode(content);
+  const lines = masked.split("\n");
+  const results: ScriptReference[] = [];
+  const fileDir = path.dirname(filePath);
+
+  const scriptRe = /\bnpm\s+run(?:-script)?\s+([A-Za-z0-9:_-]+)/g;
+
+  lines.forEach((lineText, idx) => {
+    let match: RegExpExecArray | null;
+    scriptRe.lastIndex = 0;
+    while ((match = scriptRe.exec(lineText)) !== null) {
+      results.push({
+        file: filePath,
+        line: idx + 1,
+        script: match[1],
+        packageDir: fileDir,
+      });
+    }
+  });
+
+  return results;
+}
+
+/**
+ * Walks up from `startDir` to REPO_ROOT looking for the nearest package.json.
+ * Returns the directory containing it, or null when none is found.
+ */
+export function findNearestPackageDir(startDir: string): string | null {
+  let dir = startDir;
+  while (true) {
+    if (fs.existsSync(path.join(dir, "package.json"))) return dir;
+    if (dir === REPO_ROOT) return null;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Verifies that a script is defined in the nearest package.json (or the root
+ * package.json as a fallback for docs that reference root-level scripts).
+ */
+export function scriptExists(script: string, packageDir: string): boolean {
+  const candidates = [packageDir, REPO_ROOT];
+  for (const dir of candidates) {
+    const pkg = readPackageJson(path.join(dir, "package.json"));
+    if (pkg?.scripts && Object.prototype.hasOwnProperty.call(pkg.scripts, script)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Extracts workspace paths declared in the root package.json and verifies each
+ * resolves to an existing directory.
+ */
+export function collectWorkspacePaths(): { pattern: string; resolved: string }[] {
+  const rootPkg = readPackageJson(path.join(REPO_ROOT, "package.json"));
+  if (!rootPkg?.workspaces) return [];
+  const patterns = Array.isArray(rootPkg.workspaces)
+    ? rootPkg.workspaces
+    : rootPkg.workspaces.packages ?? [];
+  return patterns
+    .filter((p) => !p.includes("*"))
+    .map((p) => ({ pattern: p, resolved: path.resolve(REPO_ROOT, p) }));
 }
 
 // ── Safety-notice check ────────────────────────────────────────────────────────
@@ -275,6 +591,73 @@ function relPath(absolute: string): string {
   return path.relative(REPO_ROOT, absolute);
 }
 
+// ── Documentation validation ─────────────────────────────────────────────────
+
+/**
+ * Runs the documentation checks over every Markdown file and returns failures.
+ * External URLs are never fetched, so this is safe to run offline in CI.
+ */
+export function validateDocumentation(
+  markdownFiles: string[] = collectMarkdownFiles(),
+): Failure[] {
+  const failures: Failure[] = [];
+
+  for (const filePath of markdownFiles) {
+    const content = fs.readFileSync(filePath, "utf8");
+    const lines = content.split("\n");
+    const isSuppressed = buildSuppressionPredicate(lines);
+
+    // 1. Relative link targets must exist.
+    for (const link of extractRelativeLinks(filePath)) {
+      if (isSuppressed(link.line)) continue;
+      if (!fs.existsSync(link.resolvedPath)) {
+        failures.push({
+          location: `${relPath(link.file)}:${link.line}`,
+          message: `broken relative link "${link.rawLink}" — target not found: ${relPath(link.resolvedPath)}`,
+        });
+      }
+    }
+
+    // 2. Anchor fragments must match a heading in the target file.
+    for (const anchorLink of extractAnchorLinks(filePath)) {
+      if (isSuppressed(anchorLink.line)) continue;
+      if (!fs.existsSync(anchorLink.targetFile)) continue; // reported above
+      const anchors = collectAnchors(anchorLink.targetFile);
+      if (!anchors.has(anchorLink.anchor.toLowerCase())) {
+        failures.push({
+          location: `${relPath(anchorLink.file)}:${anchorLink.line}`,
+          message: `broken anchor "${anchorLink.rawLink}" — no matching heading in ${relPath(anchorLink.targetFile)}`,
+        });
+      }
+    }
+
+    // 3. Referenced npm scripts must be defined in a package.json.
+    for (const ref of extractScriptReferences(filePath)) {
+      if (isSuppressed(ref.line)) continue;
+      const packageDir = findNearestPackageDir(ref.packageDir);
+      if (!packageDir) continue; // no package.json context — skip
+      if (!scriptExists(ref.script, packageDir)) {
+        failures.push({
+          location: `${relPath(ref.file)}:${ref.line}`,
+          message: `unknown npm script "${ref.script}" — not defined in ${relPath(path.join(packageDir, "package.json"))} or the root package.json`,
+        });
+      }
+    }
+  }
+
+  // 4. Declared workspace paths must resolve to existing directories.
+  for (const ws of collectWorkspacePaths()) {
+    if (!fs.existsSync(ws.resolved)) {
+      failures.push({
+        location: "package.json",
+        message: `workspace path "${ws.pattern}" does not exist: ${relPath(ws.resolved)}`,
+      });
+    }
+  }
+
+  return failures;
+}
+
 // ── Runner ─────────────────────────────────────────────────────────────────────
 
 function run(): void {
@@ -358,7 +741,12 @@ function run(): void {
     });
   }
 
-  // ── 4. PR template must exist and carry security + traceability sections ──
+  // ── 4. Documentation links, anchors, scripts, and workspace paths ─────────
+  //
+  // External http(s) links are never fetched, so this check runs offline.
+  failures.push(...validateDocumentation());
+
+  // ── 5. PR template must exist and carry security + traceability sections ──
   const prTemplatePath = path.join(GITHUB_DIR, "PULL_REQUEST_TEMPLATE.md");
   if (!fs.existsSync(prTemplatePath)) {
     failures.push({
@@ -400,11 +788,13 @@ function run(): void {
 
   // ── Output ────────────────────────────────────────────────────────────────
   const scanned = templatePaths.length;
+  const markdownCount = collectMarkdownFiles().length;
 
   if (failures.length === 0) {
     console.log(
       `validate-templates: all checks passed ` +
-        `(${scanned} file${scanned === 1 ? "" : "s"} scanned, ` +
+        `(${scanned} template file${scanned === 1 ? "" : "s"} and ` +
+        `${markdownCount} Markdown file${markdownCount === 1 ? "" : "s"} scanned, ` +
         `0 failures) ✓`,
     );
     process.exit(0);
@@ -422,7 +812,13 @@ function run(): void {
   console.log(
     "\nFix the issues above to keep contributor templates accurate and safe.",
   );
+  console.log(
+    `To suppress a valid nonstandard reference, add a "${SUPPRESSION_MARKER}" ` +
+      `HTML comment on the same line or the line above it.`,
+  );
   process.exit(1);
 }
 
-run();
+if (require.main === module) {
+  run();
+}

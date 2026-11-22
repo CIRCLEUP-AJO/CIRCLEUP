@@ -4,8 +4,39 @@ import fs from "fs";
 import path from "path";
 
 const ROOT = path.resolve(__dirname, "..", "..");
+const TOOLCHAIN_PATH = path.join(ROOT, "contracts", "rust-toolchain.toml");
 const EXPECTED_RUST = "1.81.0";
 const EXPECTED_SOROBAN_SDK = "29.0.1";
+
+interface ToolchainPin {
+  channel: string;
+  targets: string[];
+  components: string[];
+}
+
+function parseTomlArray(value: string): string[] {
+  const inner = value.replace(/^\[/, "").replace(/\]$/, "").trim();
+  if (!inner) return [];
+  return inner
+    .split(",")
+    .map((entry) => entry.trim().replace(/^["']/, "").replace(/["']$/, ""))
+    .filter((entry) => entry.length > 0);
+}
+
+function readToolchainPin(): ToolchainPin {
+  const raw = fs.readFileSync(TOOLCHAIN_PATH, "utf8");
+  const channelMatch = raw.match(/^\s*channel\s*=\s*"([^"]+)"/m);
+  if (!channelMatch) {
+    throw new Error(`contracts/rust-toolchain.toml must declare a channel, e.g. channel = "1.81.0".`);
+  }
+  const targetsMatch = raw.match(/^\s*targets\s*=\s*(\[[^\]]*\])/m);
+  const componentsMatch = raw.match(/^\s*components\s*=\s*(\[[^\]]*\])/m);
+  return {
+    channel: channelMatch[1],
+    targets: targetsMatch ? parseTomlArray(targetsMatch[1]) : [],
+    components: componentsMatch ? parseTomlArray(componentsMatch[1]) : [],
+  };
+}
 
 function runVersion(command: string, args: string[]): string {
   try {
@@ -20,6 +51,18 @@ function runVersion(command: string, args: string[]): string {
 
 function main(): void {
   let failed = false;
+
+  let pin: ToolchainPin;
+  try {
+    pin = readToolchainPin();
+    console.log(`[toolchain] Expected Rust ${pin.channel} (from contracts/rust-toolchain.toml)`);
+    console.log(`[toolchain] Expected targets: ${pin.targets.length ? pin.targets.join(", ") : "(none declared)"}`);
+    console.log(`[toolchain] Expected components: ${pin.components.length ? pin.components.join(", ") : "(none declared)"}`);
+  } catch (error) {
+    console.error(`[toolchain] FAIL ${(error as Error).message}`);
+    process.exit(1);
+  }
+
   try {
     const nodeCheck = execFileSync(process.execPath, [path.join(ROOT, "scripts", "check-node.cjs")], {
       encoding: "utf8",
@@ -32,17 +75,16 @@ function main(): void {
   }
 
   const rust = runVersion("rustc", ["--version"]);
-  if (!rust.includes(` ${EXPECTED_RUST} `)) {
-    console.error(`[toolchain] FAIL Rust: expected ${EXPECTED_RUST}, found ${rust}.`);
+  const rustVersionMatch = rust.match(/^rustc\s+(\S+)/);
+  const actualRust = rustVersionMatch ? rustVersionMatch[1] : rust;
+  if (!rustVersionMatch || actualRust !== pin.channel) {
+    console.error(
+      `[toolchain] FAIL Rust version mismatch: expected ${pin.channel}, found ${actualRust}. ` +
+        `Run: rustup toolchain install ${pin.channel} (or rustup override set ${pin.channel}).`,
+    );
     failed = true;
   } else {
-    console.log(`[toolchain] PASS Rust ${EXPECTED_RUST}`);
-  }
-
-  const rustToolchain = fs.readFileSync(path.join(ROOT, "contracts", "rust-toolchain.toml"), "utf8");
-  if (!new RegExp(`channel\\s*=\\s*"${EXPECTED_RUST.replace(/\./g, "\\.")}"`).test(rustToolchain)) {
-    console.error(`[toolchain] FAIL contracts/rust-toolchain.toml must pin Rust ${EXPECTED_RUST}.`);
-    failed = true;
+    console.log(`[toolchain] PASS Rust ${actualRust} (expected ${pin.channel})`);
   }
 
   const cargo = runVersion("cargo", ["--version"]);
@@ -53,12 +95,25 @@ function main(): void {
     console.log(`[toolchain] PASS ${cargo}`);
   }
 
-  const targetOutput = runVersion("rustup", ["target", "list", "--installed"]);
-  if (!targetOutput.split(/\r?\n/).includes("wasm32-unknown-unknown")) {
-    console.error("[toolchain] FAIL wasm32-unknown-unknown is not installed. Run: rustup target add wasm32-unknown-unknown");
-    failed = true;
-  } else {
-    console.log("[toolchain] PASS wasm32-unknown-unknown target");
+  const installedTargets = runVersion("rustup", ["target", "list", "--installed"]).split(/\r?\n/).filter(Boolean);
+  const requiredTargets = pin.targets.length ? pin.targets : ["wasm32-unknown-unknown"];
+  for (const target of requiredTargets) {
+    if (!installedTargets.includes(target)) {
+      console.error(`[toolchain] FAIL target ${target} is not installed. Run: rustup target add ${target}`);
+      failed = true;
+    } else {
+      console.log(`[toolchain] PASS target ${target}`);
+    }
+  }
+
+  const installedComponents = runVersion("rustup", ["component", "list", "--installed"]).split(/\r?\n/).filter(Boolean);
+  for (const component of pin.components) {
+    if (!installedComponents.includes(component)) {
+      console.error(`[toolchain] FAIL component ${component} is not installed. Run: rustup component add ${component}`);
+      failed = true;
+    } else {
+      console.log(`[toolchain] PASS component ${component}`);
+    }
   }
 
   const workspaceCargo = fs.readFileSync(path.join(ROOT, "contracts", "Cargo.toml"), "utf8");
@@ -72,7 +127,14 @@ function main(): void {
   }
 
   if (failed) process.exit(1);
-  console.log(`[toolchain] Supported tuples: Node.js 18/npm 9, Node.js 22/npm 10, Node.js 24/npm 11; Rust ${EXPECTED_RUST}, Soroban SDK ${EXPECTED_SOROBAN_SDK}, wasm32-unknown-unknown.`);
+  console.log(
+    `[toolchain] Active versions: rustc ${actualRust}, ${cargo}, targets ${requiredTargets.join(", ")}; ` +
+      `Soroban SDK ${EXPECTED_SOROBAN_SDK}.`,
+  );
+  console.log(
+    `[toolchain] Supported tuples: Node.js 18/npm 9, Node.js 22/npm 10, Node.js 24/npm 11; ` +
+      `Rust ${pin.channel}, Soroban SDK ${EXPECTED_SOROBAN_SDK}, targets ${requiredTargets.join(", ")}.`,
+  );
 }
 
 main();

@@ -11,6 +11,13 @@ import { isCanonicalStellarAddress } from "@/lib/address";
 import { type ReputationResponse, parseReputationResponse } from "@/lib/circleTypes";
 import { classifyFreshness, formatSourceLabel } from "@/lib/fieldSource";
 import { REPUTATION_MSGS } from "@/lib/messages";
+import {
+  type ReputationDataSource,
+  type ScoreState,
+  type HistoryState,
+  describeScoreState,
+  describeHistoryState,
+} from "@/lib/reputationDataSource";
 
 // ─── Reputation event naming & total score semantics ──────────────────────────
 //
@@ -254,6 +261,22 @@ export default function ReputationClient({ member }: { member: string }) {
   const freshness = classifyFreshness(data.updatedAt, dataAgeMs, 120_000);
   const sourceLabel = formatSourceLabel("indexer", freshness);
 
+  // Issue #131: Derive the discriminated score/history states from the shared
+  // data-source helper so the UI can distinguish a verified zero from a failed
+  // read, and an empty indexed history from unavailable history.
+  const dataSource: ReputationDataSource = {
+    score: data.score,
+    events: data.events,
+    found: data.found,
+    updatedAt: data.updatedAt,
+    scoreReadFailed: data.scoreReadFailed === true,
+    historyUnavailable: data.historyUnavailable === true,
+  };
+  const scoreState: ScoreState = describeScoreState(dataSource);
+  const historyState: HistoryState = describeHistoryState(dataSource);
+  const scoreFreshness = classifyFreshness(data.updatedAt, dataAgeMs, 120_000);
+  const historyFreshness = scoreFreshness;
+
   return (
     <div className="max-w-xl mx-auto space-y-6">
       {/*
@@ -314,7 +337,38 @@ export default function ReputationClient({ member }: { member: string }) {
       </div>
 
       {/* State display card */}
-      {isNoRecord ? (
+      {scoreState.kind === "unavailable" ? (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-6 text-center space-y-3">
+          <div className="text-3xl" aria-hidden="true">⚠️</div>
+          <h2 className="text-lg font-semibold text-red-800">
+            Reputation score unavailable
+          </h2>
+          <p className="text-sm text-red-700 max-w-md mx-auto">
+            The on-chain reputation score could not be read. This is not the same
+            as a zero score — the value is unknown right now.
+          </p>
+          <p className="text-xs text-red-600">
+            Source: Live (RPC) · Freshness: unavailable
+          </p>
+        </div>
+      ) : scoreState.kind === "zero" ? (
+        <div className="rounded-lg border border-slate-200 bg-white p-6 text-center space-y-3">
+          <div className="text-3xl" aria-hidden="true">🌱</div>
+          <h2 className="text-lg font-semibold text-slate-800">
+            Verified zero score
+          </h2>
+          <p className="text-sm text-slate-600 max-w-md mx-auto">
+            The on-chain reputation contract returned a score of 0 for this
+            address. This is a verified zero, not a failed read.
+          </p>
+          <div className="pt-2 flex justify-center">
+            <ReputationBadge score={0} />
+          </div>
+          <p className="text-xs text-slate-400">
+            Source: Live (RPC) · Freshness: {scoreFreshness}
+          </p>
+        </div>
+      ) : isNoRecord ? (
         <div className="rounded-lg border border-slate-200 bg-white p-6 text-center space-y-3">
           <div className="text-3xl" aria-hidden="true">🌱</div>
           <h2 className="text-lg font-semibold text-slate-800">No Reputation Record Yet</h2>
@@ -340,23 +394,49 @@ export default function ReputationClient({ member }: { member: string }) {
               ? REPUTATION_MSGS.scoreByEvents
               : REPUTATION_MSGS.scoreByContract}
           </p>
-          {/* Issue #697: source label on the score so users can see this may
-              lag chain state. "unknown freshness" is shown when updatedAt is absent. */}
+          {/* Issue #131: provenance badge on the score card. The score is an
+              on-chain read; freshness reflects the indexer's last processed event. */}
           <p
             className="text-xs text-slate-300 mt-1"
             title="Where this score comes from. Indexed data may lag the chain by one or more ledgers."
           >
-            {sourceLabel}
+            <span className="inline-flex items-center rounded-full bg-emerald-100 px-2 py-0.5 text-emerald-700 font-medium mr-1">
+              Live (RPC)
+            </span>
+            <span>Freshness: {scoreFreshness}</span>
           </p>
         </div>
       )}
 
       {/* Event list */}
       <div>
-        <h2 className="text-sm font-semibold text-slate-700 mb-2">
-          {REPUTATION_MSGS.eventsHeading}
-        </h2>
-        {events.length === 0 ? (
+        <div className="flex items-center justify-between mb-2">
+          <h2 className="text-sm font-semibold text-slate-700">
+            {REPUTATION_MSGS.eventsHeading}
+          </h2>
+          {/* Issue #131: provenance badge on the history section. History is
+              indexed data, not the contract's authorization source. */}
+          <p
+            className="text-xs text-slate-400"
+            title="History is indexed from on-chain events. It may lag the chain and is not the contract's authorization source."
+          >
+            <span className="inline-flex items-center rounded-full bg-sky-100 px-2 py-0.5 text-sky-700 font-medium mr-1">
+              Indexed
+            </span>
+            <span>Freshness: {historyFreshness}</span>
+          </p>
+        </div>
+        {historyState.kind === "unavailable" ? (
+          <p className="text-sm text-red-600">
+            History unavailable — the indexer could not be reached. This is not
+            the same as having no activity.
+          </p>
+        ) : historyState.kind === "stale" ? (
+          <p className="text-sm text-amber-600">
+            History may lag the chain — the indexer has not processed recent
+            events. Showing the last known activity.
+          </p>
+        ) : historyState.kind === "empty" ? (
           <p className="text-sm text-slate-500">{REPUTATION_MSGS.noEvents}</p>
         ) : (
           <ul className="divide-y divide-slate-100 rounded-lg border border-slate-200 bg-white">
@@ -385,7 +465,7 @@ export default function ReputationClient({ member }: { member: string }) {
 
       {/* Badge + legend */}
       <div className="flex flex-col items-center gap-3">
-        {!isNoRecord && <ReputationBadge score={total} />}
+        {scoreState.kind === "value" && <ReputationBadge score={total} />}
         <ReputationLegend />
       </div>
     </div>
