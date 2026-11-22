@@ -527,21 +527,25 @@ export function extractSimulationError(
  * maps the most common ones to sentences that tell the developer what to try
  * next, while keeping the raw message for anything unusual so it is not lost.
  */
+import { redactSecrets, sanitizeEndpointUrl } from "./redact";
+
 export function formatRpcError(raw: string, rpcUrl: string): string {
-  const lower = raw.toLowerCase();
+  const safeRpc = sanitizeEndpointUrl(rpcUrl);
+  const cleanRaw = redactSecrets(raw);
+  const lower = cleanRaw.toLowerCase();
 
   if (
     lower.includes("econnrefused") ||
     lower.includes("connection refused")
   ) {
     return (
-      `Could not connect to the RPC at ${rpcUrl} (connection refused). ` +
+      `Could not connect to the RPC at ${safeRpc} (connection refused). ` +
       `Check that the endpoint is running and that config.rpcUrl is correct.`
     );
   }
   if (lower.includes("enotfound") || lower.includes("name or service not known")) {
     return (
-      `DNS resolution failed for the RPC at ${rpcUrl}. ` +
+      `DNS resolution failed for the RPC at ${safeRpc}. ` +
       `Check the hostname in config.rpcUrl.`
     );
   }
@@ -551,25 +555,25 @@ export function formatRpcError(raw: string, rpcUrl: string): string {
     lower.includes("socket hang up")
   ) {
     return (
-      `The RPC at ${rpcUrl} did not respond in time (${raw}). ` +
+      `The RPC at ${safeRpc} did not respond in time (${cleanRaw}). ` +
       `The node may be overloaded — wait a moment and retry.`
     );
   }
   if (lower.includes("fetch failed") || lower.includes("failed to fetch")) {
     return (
-      `Network fetch to ${rpcUrl} failed. ` +
+      `Network fetch to ${safeRpc} failed. ` +
       `Check your internet connection and that config.rpcUrl is reachable.`
     );
   }
   if (lower.includes("ssl") || lower.includes("certificate")) {
     return (
-      `TLS/SSL error connecting to ${rpcUrl}. ` +
+      `TLS/SSL error connecting to ${safeRpc}. ` +
       `Check the certificate or use an HTTP URL for local development.`
     );
   }
 
   // For short messages pass them through; otherwise trim to avoid log spam
-  return raw.length <= 200 ? raw : raw.slice(0, 197) + "...";
+  return cleanRaw.length <= 200 ? cleanRaw : cleanRaw.slice(0, 197) + "...";
 }
 
 // ─── Config-absent normalisation ─────────────────────────────────────────────

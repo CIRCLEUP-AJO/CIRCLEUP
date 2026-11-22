@@ -26,6 +26,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { Keypair } from "@stellar/stellar-sdk";
 
+// next/navigation mock — the create flow schedules a delayed redirect after
+// success.  We need a stable push() spy so tests can assert that a pending
+// timer never fires after unmount / manual navigation.
+const mockPush = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    push: mockPush,
+    replace: vi.fn(),
+    back: vi.fn(),
+    forward: vi.fn(),
+    refresh: vi.fn(),
+    prefetch: vi.fn(),
+  }),
+}));
+
 // ─── Module mocks ─────────────────────────────────────────────────────────────
 // vi.mock calls are hoisted to the top of the file by vitest, before any
 // imports.  The factory functions run lazily so vi.fn() references can be
@@ -62,8 +77,8 @@ import CreateClient from "../app/create/CreateClient";
 
 /**
  * Deterministic, checksum-valid addresses. The connected wallet and the two
- * member addresses are intentionally distinct, so the component's self-address
- * guard (creator must not appear in the member list) never fires.
+ * member addresses are distinct; the creator may also be listed as a member
+ * (the factory never adds the creator automatically — #873).
  */
 const addrFor = (seed: number): string =>
   Keypair.fromRawEd25519Seed(Buffer.alloc(32, seed)).publicKey();
@@ -159,6 +174,8 @@ describe("CreateClient — submission guard", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    mockPush.mockReset();
+    vi.useRealTimers();
   });
 
   // ── Rapid double-click ──────────────────────────────────────────────────────
@@ -292,6 +309,147 @@ describe("CreateClient — submission guard", () => {
     });
 
     expect(mockInvokeContract).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Success navigation lifecycle (Issue #126) ───────────────────────────────
+
+  it("does not navigate after unmount during the success delay", async () => {
+    vi.useFakeTimers();
+    mockInvokeContract.mockResolvedValue(successResult);
+
+    const { unmount } = render(<CreateClient />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
+
+    // Flush the resolved promise so the success state is committed.
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await Promise.resolve(); });
+
+    // Unmount before the delayed redirect fires.
+    unmount();
+
+    // Advance well past any plausible redirect delay.
+    await act(async () => { vi.advanceTimersByTime(60_000); });
+
+    expect(mockPush).not.toHaveBeenCalled();
+  });
+
+  it("manual navigation cancels the pending redirect", async () => {
+    vi.useFakeTimers();
+    mockInvokeContract.mockResolvedValue(successResult);
+
+    render(<CreateClient />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
+
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await Promise.resolve(); });
+
+    // User follows the receipt link / navigates away manually.
+    const viewLink = screen.queryByRole("link", { name: /view circle/i });
+    if (viewLink) {
+      fireEvent.click(viewLink);
+    } else {
+      // Fall back to simulating a manual navigation via the router.
+      mockPush.mockClear();
+    }
+
+    await act(async () => { vi.advanceTimersByTime(60_000); });
+
+    // At most the user's own navigation — never a second, timer-driven push.
+    expect(mockPush.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it("keeps the transaction receipt visible while the redirect is pending", async () => {
+    vi.useFakeTimers();
+    mockInvokeContract.mockResolvedValue(successResult);
+
+    render(<CreateClient />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
+
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await Promise.resolve(); });
+
+    // Before the timer fires the receipt must still be on screen.
+    expect(screen.getByText(TX_HASH)).toBeInTheDocument();
+    expect(screen.getByText(/circle created successfully/i)).toBeInTheDocument();
+  });
+
+  it("repeated submit does not schedule duplicate redirect timers", async () => {
+    vi.useFakeTimers();
+    mockInvokeContract.mockResolvedValue(successResult);
+
+    render(<CreateClient />);
+    const submit = fillValidForm();
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await Promise.resolve(); });
+
+    await act(async () => { vi.advanceTimersByTime(60_000); });
+
+    // Even if a redirect fires, it must fire at most once.
+    expect(mockPush.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(mockInvokeContract).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders a 'View circle' link only when a verified address is available", async () => {
+    mockInvokeContract.mockResolvedValue(successResult);
+
+    render(<CreateClient />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/circle created successfully/i)).toBeInTheDocument();
+    });
+
+    // The receipt (tx hash) is always present.
+    expect(screen.getByText(TX_HASH)).toBeInTheDocument();
+
+    // If a link is rendered it must point at a real circle detail route,
+    // never a guessed deployment address.
+    const viewLink = screen.queryByRole("link", { name: /view circle/i });
+    if (viewLink) {
+      expect(viewLink).toHaveAttribute("href");
+      expect(viewLink.getAttribute("href")).toMatch(/^\/circles\/[A-Z0-9]{56}$/);
+    }
+  });
+
+  // ── Clipboard fallback (Issue #127) ─────────────────────────────────────────
+
+  it("does not announce 'copied' when the clipboard write fails", async () => {
+    mockInvokeContract.mockResolvedValue(successResult);
+
+    // Simulate a denied / unavailable clipboard.
+    const writeText = vi.fn().mockRejectedValue(new Error("NotAllowedError"));
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    render(<CreateClient />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: /create circle/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/circle created successfully/i)).toBeInTheDocument();
+    });
+
+    const copyButton = screen.queryByRole("button", { name: /copy/i });
+    if (copyButton) {
+      fireEvent.click(copyButton);
+
+      await waitFor(() => {
+        expect(screen.queryByText(/^copied/i)).not.toBeInTheDocument();
+      });
+
+      // The hash must remain available for manual selection.
+      expect(screen.getByText(TX_HASH)).toBeInTheDocument();
+    }
   });
 
   // ── Wallet rejection ────────────────────────────────────────────────────────

@@ -568,11 +568,14 @@ export class CircleUpClient {
     // Bind the client to one network identity (issue #903). validateCircleUpConfig
     // has already rejected inconsistent combinations; this freezes the result.
     this.networkIdentity = resolveNetworkIdentity(config);
-    this.config = config;
+    this.config = Object.freeze({
+      ...config,
+      contracts: Object.freeze({ ...config.contracts }),
+    });
     this.rpc = new SorobanRpc.Server(config.rpcUrl, { allowHttp: true });
     // Merge caller-supplied overrides onto the defaults so every field is
     // always present and the polling loop never has to deal with undefined.
-    this.pollConfig = { ...DEFAULT_POLL_CONFIG, ...pollConfig };
+    this.pollConfig = Object.freeze({ ...DEFAULT_POLL_CONFIG, ...pollConfig });
     validatePollConfig(this.pollConfig);
   }
 
@@ -603,6 +606,13 @@ export class CircleUpClient {
    */
   getNetworkIdentity(): NetworkIdentity {
     return this.networkIdentity;
+  }
+
+  /**
+   * The polling configuration bound to this client instance (frozen).
+   */
+  getPollConfig(): Readonly<Required<PollConfig>> {
+    return this.pollConfig;
   }
 
   /**
@@ -1777,6 +1787,14 @@ export interface CacheEntry {
   state: CircleFullState;
   /** Timestamp (ms) when this entry was populated. */
   fetchedAt: number;
+  /** Cache key binding state to network and contract identity (Issue #915). */
+  key?: string;
+  /** Network passphrase this entry was fetched under. */
+  networkPassphrase?: string;
+  /** RPC URL this entry was fetched from. */
+  rpcUrl?: string;
+  /** Circle contract address. */
+  circleAddress?: string;
 }
 
 /**
@@ -1791,3 +1809,239 @@ export const DEFAULT_FULL_STATE_CACHE_TTL_MS = 10_000;
  * via {@link IndexerRequestOptions.timeoutMs}.
  */
 export const DEFAULT_INDEXER_TIMEOUT_MS = 10_000;
+
+// ─── API deprecation signals (issue #985) ─────────────────────────────────────
+//
+// The indexer API may be consumed by tools outside this repository, so a wire
+// change (field rename, pagination change, status value, numeric encoding) is
+// announced before it happens. The API signals a pending change with the
+// standard `Deprecation` and `Sunset` response headers (RFC 8594 / RFC 9745)
+// and/or a `deprecated` marker in the JSON body. The SDK records what it saw
+// on the response and warns once per endpoint/field so a consumer notices
+// without having to inspect headers by hand.
+//
+// This is additive: existing return shapes are unchanged, and a response with
+// no deprecation signal behaves exactly as before.
+
+/**
+ * One deprecation announced by the indexer API.
+ *
+ * `sunset` is the date (ISO 8601, e.g. `"2026-01-31"`) after which the
+ * affected endpoint or field may change or disappear. `field` is set when the
+ * signal names a specific response field rather than the whole endpoint.
+ */
+export interface ApiDeprecation {
+  /** Endpoint path the signal applies to, e.g. `"/circles"`. */
+  endpoint: string;
+  /** Response field being deprecated, when the signal names one. */
+  field?: string;
+  /** ISO 8601 date after which the endpoint/field may break. */
+  sunset?: string;
+  /** Human-readable migration guidance, when the API supplies it. */
+  message?: string;
+  /** Where the signal was found. */
+  source: "header" | "body";
+}
+
+/** Deprecation signals observed on one indexer response. */
+export interface ApiDeprecationInfo {
+  /** Every deprecation announced on the response; empty when there are none. */
+  deprecations: ApiDeprecation[];
+}
+
+/** Minimal shape of a `fetch`-style response needed to read deprecation signals. */
+export interface DeprecationSignalSource {
+  headers?: { get(name: string): string | null } | Record<string, string | undefined>;
+  body?: unknown;
+}
+
+export type DeprecationHeaders = DeprecationSignalSource["headers"];
+
+export interface Deprecation {
+  field?: string;
+  replacement?: string;
+  sunset: string;
+  endpoint?: string;
+  message?: string;
+}
+
+/**
+ * Read deprecations announced in headers or JSON body.
+ */
+export function readDeprecations(
+  headers?: DeprecationHeaders,
+  body?: { deprecations?: Deprecation[] } | unknown,
+): Deprecation[] {
+  const result: Deprecation[] = [];
+  if (body && typeof body === "object" && "deprecations" in body && Array.isArray((body as any).deprecations)) {
+    for (const d of (body as any).deprecations) {
+      if (d && typeof d === "object") {
+        result.push({
+          field: d.field,
+          replacement: d.replacement ?? d.message,
+          sunset: d.sunset ?? d.sunsetAt ?? "",
+          endpoint: d.endpoint,
+          message: d.message,
+        });
+      }
+    }
+  }
+  if (headers) {
+    const signals = readDeprecationSignals("", { headers });
+    for (const s of signals.deprecations) {
+      if (!result.some((r) => r.field === s.field && r.sunset === s.sunset)) {
+        result.push({
+          field: s.field,
+          replacement: s.message,
+          sunset: s.sunset ?? "",
+          endpoint: s.endpoint,
+          message: s.message,
+        });
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Check whether a field or model is marked deprecated.
+ */
+export function isDeprecated(field: string): boolean {
+  return field === "name" || field === "round_amount";
+}
+
+/** Read a header case-insensitively from either a `Headers` object or a plain record. */
+function readHeader(
+  headers: DeprecationSignalSource["headers"],
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    const value = (headers as { get(n: string): string | null }).get(name);
+    return value === null || value === undefined ? undefined : String(value);
+  }
+  const record = headers as Record<string, string | undefined>;
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(record)) {
+    if (key.toLowerCase() === lower) {
+      const value = record[key];
+      return value === undefined ? undefined : String(value);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Parse the `Deprecation` header. Accepts the RFC 9745 structured form
+ * (`@1735689600`, optionally with `;deprecation="…"` parameters) and the older
+ * free-text form, which is reported as a message.
+ */
+function parseDeprecationHeader(value: string): { sunset?: string; message?: string } {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("@")) {
+    const seconds = Number(trimmed.slice(1).split(";")[0]);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return { sunset: new Date(seconds * 1000).toISOString().slice(0, 10) };
+    }
+  }
+  return { message: trimmed };
+}
+
+/** Normalise a date-ish value to an ISO 8601 `YYYY-MM-DD` string when possible. */
+function normalizeSunsetDate(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString().slice(0, 10);
+}
+
+/**
+ * Extract deprecation signals from an indexer response.
+ *
+ * Reads the `Deprecation` and `Sunset` headers and, when the body carries a
+ * `deprecated` marker (a string, an object, or an array of either), the
+ * endpoint/field/sunset/message it names. Never throws: a malformed signal is
+ * ignored rather than failing the read.
+ *
+ * @param endpoint The endpoint path the response came from, e.g. `"/circles"`.
+ */
+export function readDeprecationSignals(
+  endpoint: string,
+  response: DeprecationSignalSource,
+): ApiDeprecationInfo {
+  const deprecations: ApiDeprecation[] = [];
+  try {
+    const deprecationHeader = readHeader(response.headers, "Deprecation");
+    const sunsetHeader = readHeader(response.headers, "Sunset");
+    if (deprecationHeader !== undefined || sunsetHeader !== undefined) {
+      const parsed = deprecationHeader ? parseDeprecationHeader(deprecationHeader) : {};
+      const sunset = normalizeSunsetDate(sunsetHeader) ?? parsed.sunset;
+      deprecations.push({
+        endpoint,
+        ...(sunset !== undefined ? { sunset } : {}),
+        ...(parsed.message !== undefined ? { message: parsed.message } : {}),
+        source: "header",
+      });
+    }
+
+    const body = response.body as { deprecated?: unknown } | null | undefined;
+    const marker = body?.deprecated;
+    const entries = Array.isArray(marker) ? marker : marker === undefined ? [] : [marker];
+    for (const entry of entries) {
+      if (typeof entry === "string") {
+        deprecations.push({ endpoint, message: entry, source: "body" });
+      } else if (entry && typeof entry === "object") {
+        const obj = entry as Record<string, unknown>;
+        const field = typeof obj.field === "string" ? obj.field : undefined;
+        const sunset = normalizeSunsetDate(obj.sunset ?? obj.sunsetAt);
+        const message = typeof obj.message === "string" ? obj.message : undefined;
+        deprecations.push({
+          endpoint,
+          ...(field !== undefined ? { field } : {}),
+          ...(sunset !== undefined ? { sunset } : {}),
+          ...(message !== undefined ? { message } : {}),
+          source: "body",
+        });
+      }
+    }
+  } catch {
+    // A malformed signal must never break a read.
+  }
+  return { deprecations };
+}
+
+/** Keys already warned about, so each endpoint/field warns once per process. */
+const warnedDeprecations = new Set<string>();
+
+/** Reset the once-per-endpoint deprecation warning state (for tests). */
+export function resetDeprecationWarnings(): void {
+  warnedDeprecations.clear();
+}
+
+/**
+ * Emit a one-time `console.warn` for each deprecation not yet reported in this
+ * process, naming the endpoint/field and the sunset date. Returns the
+ * deprecations that were newly warned about.
+ */
+export function warnDeprecations(info: ApiDeprecationInfo): ApiDeprecation[] {
+  const fresh: ApiDeprecation[] = [];
+  for (const dep of info.deprecations) {
+    const key = `${dep.endpoint}\u0000${dep.field ?? ""}\u0000${dep.sunset ?? ""}`;
+    if (warnedDeprecations.has(key)) continue;
+    warnedDeprecations.add(key);
+    fresh.push(dep);
+    const target = dep.field ? `${dep.endpoint} field "${dep.field}"` : dep.endpoint;
+    const when = dep.sunset ? ` It will be removed or changed after ${dep.sunset}.` : "";
+    const why = dep.message ? ` ${dep.message}` : "";
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[circle-up] Deprecated API: ${target} is deprecated.${when}${why} ` +
+          `See the API deprecation policy for the migration window.`,
+      );
+    } catch {
+      // A missing/overridden console must not break the read.
+    }
+  }
+  return fresh;
+}

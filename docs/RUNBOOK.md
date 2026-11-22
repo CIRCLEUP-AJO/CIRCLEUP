@@ -291,6 +291,74 @@ docker compose up -d
 # Wait for the healthcheck: docker compose ps should show "healthy"
 ```
 
+The compose file defines a PostgreSQL readiness probe (`pg_isready`). A running
+container is not the same as a database ready to accept connections, so always
+wait for `healthy` before running migrations or starting the indexer:
+
+```bash
+# Block until the healthcheck reports healthy (or fail after the timeout)
+docker compose ps postgres
+docker compose exec -T postgres pg_isready -U postgres -d circleup
+# Expected: "postgres:5432 - accepting connections"
+```
+
+Startup order is **start → readiness → migrate → indexer**. Running
+`npm run migrate` against a container that is still initializing fails with a
+connection error; re-run it only after `pg_isready` reports accepting
+connections.
+
+**Local data persistence (named volume)**
+
+Local Postgres data lives in the named Docker volume `circleup_pgdata`
+(declared in `docker-compose.yml`). It contains the entire local database
+cluster: the `circleup` database, all indexer tables (`circles`,
+`circle_members`, `contributions`, `payouts`, `ingested_events`,
+`indexer_state`, `ledger_checkpoints`, `schema_migrations`), and the
+`circleup_restore` database if you ran a restore drill. It does **not** contain
+contract state, which lives on-chain.
+
+Because the volume is named, it survives container recreation:
+
+| Operation | Command | Data in `circleup_pgdata` |
+|---|---|---|
+| Restart the service | `docker compose restart postgres` | Preserved |
+| Stop the service | `docker compose stop postgres` | Preserved |
+| Recreate the container | `docker compose up -d --force-recreate postgres` | Preserved |
+| Rebuild the image | `docker compose up -d --build postgres` | Preserved |
+| **Reset local data** | see below | **Destroyed** |
+
+A restart is not a reset. If the indexer reports stale or inconsistent data,
+prefer `npm run replay` or the restore drill over deleting the volume.
+
+**Resetting local disposable data (irreversible)**
+
+Only do this when you intend to throw away the local database and start from a
+fresh schema. This deletes the named volume and everything in it — there is no
+undo, and it cannot be recovered from the container.
+
+```bash
+# 1. Stop the indexer and the database
+npm run stop:indexer   # or kill the indexer process
+docker compose stop postgres
+
+# 2. Remove ONLY the named local database volume
+docker volume rm circleup_pgdata
+
+# 3. Start fresh, wait for readiness, then migrate
+docker compose up -d postgres
+docker compose exec -T postgres pg_isready -U postgres -d circleup
+npm run migrate
+```
+
+Do not use `docker compose down -v`, `docker volume prune`, or
+`docker system prune --volumes` for this: those commands delete every volume
+on the host, including volumes belonging to other projects and any user data
+you did not intend to touch. Target the single named volume explicitly.
+
+After a reset, the indexer has no cursor and will re-ingest from
+`START_LEDGER`; set it to your deployment ledger to avoid scanning testnet
+genesis (see [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)).
+
 **3. Configure the indexer**
 
 ```bash
@@ -515,6 +583,14 @@ npm run migrate:check    # verify schema is clean before restarting
 ## Database Operations
 
 ### Running Migrations
+
+Migrations require a ready database. Verify readiness first (see
+[Step-by-Step](#step-by-step)):
+
+```bash
+docker compose exec -T postgres pg_isready -U postgres -d circleup
+# Expected: "postgres:5432 - accepting connections"
+```
 
 ```bash
 # Development (uses ts-node, does not require a build)
@@ -1054,6 +1130,26 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 | `round contribution` | Member's balance dropped below `round_amount` since joining | Same as above |
 | `round payout` | Circle contract's USDC balance is insufficient (should not happen normally) | Check for missing contributions ΓÇö call `get_current_round` to verify `contributions_received` |
 | `collateral release` | Token frozen, deauthorized, or missing trustline | Check the member's USDC trustline on stellar.expert |
+
+---
+
+### Indexer fails to connect to Postgres on startup
+
+**Symptom:** The indexer or `npm run migrate` exits with a connection error
+(`ECONNREFUSED`, `the database system is starting up`, or
+`database "circleup" does not exist`).
+
+**Cause:** The Postgres container is running but not yet ready, or the named
+volume was removed and the database has not been re-initialized.
+
+**Resolution:**
+1. Check container health: `docker compose ps postgres` — wait for `healthy`.
+2. Probe readiness directly:
+   `docker compose exec -T postgres pg_isready -U postgres -d circleup`.
+3. Only once it reports accepting connections, run `npm run migrate` and then
+   start the indexer.
+4. If the volume was intentionally reset, the database is recreated empty on
+   the next `docker compose up -d postgres`; migrations must be re-applied.
 
 ---
 

@@ -60,12 +60,14 @@ export function WorkflowBanner({
             <li>
               The contract locks{" "}
               <strong>1× the round contribution</strong> from your wallet as
-              collateral. This secures your spot in the rotation and covers any
-              penalty if you miss a round.
+              collateral. Missing a round forfeits 20% of your remaining
+              collateral (rounded down to the nearest stroop); the rest is
+              returned when the circle closes.
             </li>
             <li>
-              Your payout order is recorded on-chain at join time and cannot be
-              changed later. The circle starts automatically once{" "}
+              Your payout turn is your position in the member list fixed when
+              the circle was created — it does not depend on when you join.
+              The circle starts automatically once{" "}
               <strong>all members have joined</strong>.
             </li>
           </ol>

@@ -1,0 +1,43 @@
+{
+  "schema": "circleup.storage-fixtures.v1",
+  "contract": "circle_factory",
+  "tested_by": "contracts/circle_factory/tests/storage_compatibility_tests.rs",
+  "candidate": "contract code at the commit under test",
+  "layouts": {
+    "L1": {
+      "introduced_by": "8c7a1df (2026-06-29) initial CircleUp",
+      "instance_keys": ["Admin", "CircleWasmHash", "ReputationContract", "UsdcToken", "Circles", "CircleCount"],
+      "notes": "Initializing (reentrancy guard) is set and removed within initialize; never present at rest. Current layout."
+    }
+  },
+  "fixtures": [
+    {
+      "id": "factory.L1.empty-registry",
+      "layout": "L1",
+      "state": "Initialized, no circles created",
+      "expect": "preserved + typed_error",
+      "assertions": ["config getters preserved", "get_circles empty", "get_circle_count == 0", "page(0,10) empty/final", "page(1,10) -> FactoryError::CursorOutOfRange"]
+    },
+    {
+      "id": "factory.L1.populated-registry",
+      "layout": "L1",
+      "state": "Three circles registered",
+      "expect": "preserved",
+      "assertions": ["creation order preserved", "get_circle_count == 3", "page(1,1) == [b], next_cursor == 2"]
+    },
+    {
+      "id": "factory.L1.registry-keys-absent",
+      "layout": "L1",
+      "state": "Config keys present, Circles/CircleCount absent (optional collection state)",
+      "expect": "preserved",
+      "assertions": ["get_circles empty", "get_circle_count == 0", "page(0,1) total == 0"]
+    },
+    {
+      "id": "factory.uninitialized",
+      "layout": "none",
+      "state": "No storage keys",
+      "expect": "deterministic_panic",
+      "assertions": ["get_admin panics 'not initialized' (untyped; known gap)", "page(0,0) -> FactoryError::InvalidPageLimit"]
+    }
+  ]
+}

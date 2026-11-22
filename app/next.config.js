@@ -19,14 +19,19 @@
 //
 // ─── CSP rollout model ────────────────────────────────────────────────────────
 //
-// Phase 1 (current): Content-Security-Policy-Report-Only
+// Phase 1 (default): Content-Security-Policy-Report-Only
 //   Violations are reported to NEXT_PUBLIC_CSP_REPORT_URI without blocking.
 //   This surfaces unexpected third-party requests before enforcement.
+//   Reports are collected, redacted, and grouped by directive + source
+//   (see app/lib/csp-report.ts and app/api/csp-report/route.ts).
 //
 // Phase 2: Enforce
 //   Set NEXT_PUBLIC_CSP_ENFORCE=true in your environment.  The header name
 //   switches from Content-Security-Policy-Report-Only to Content-Security-Policy
-//   and the report-to directive is retained so violations continue to surface.
+//   and the report-uri directive is retained so violations continue to surface.
+//   Enforcement MUST NOT be enabled until the report-only inventory has been
+//   reviewed and every remaining violation is either fixed or allowlisted
+//   below with a documented reason.
 //
 // Review the violation report before flipping Phase 2 in production:
 //   1. Check for Freighter extension injections (expected — the extension
@@ -34,6 +39,15 @@
 //      your CSP blocks wallet interaction after enforcement).
 //   2. Check for unexpected third-party connect-src calls.
 //   3. Add justified exceptions to EXTRA_CONNECT_SRC below with a comment.
+//      Do NOT add broad wildcard sources (e.g. "https:", "*") to suppress
+//      reports — fix the underlying request or document a narrow origin.
+//
+// Rollback: unset NEXT_PUBLIC_CSP_ENFORCE (or set it to "false") and redeploy.
+// The header reverts to Content-Security-Policy-Report-Only, restoring the
+// previous non-blocking behaviour without a code change.  Roll back if a
+// critical flow (Freighter connect/sign prompts, explorer navigation, or
+// required app assets) breaks after enforcement.
+=======
 
 const rpcUrl    = process.env.NEXT_PUBLIC_STELLAR_RPC_URL  || "https://soroban-testnet.stellar.org";
 const indexerUrl = process.env.NEXT_PUBLIC_INDEXER_URL     || "http://localhost:3001";
@@ -80,7 +94,11 @@ const connectSrc = [
 // This is the CSP-level equivalent of X-Frame-Options: DENY and takes
 // precedence in modern browsers.
 
-const reportUri = process.env.NEXT_PUBLIC_CSP_REPORT_URI || "";
+// Report endpoint.  Defaults to the same-origin redacting collector so that
+// report-only findings are captured without sending wallet addresses or
+// transaction payloads to a third party.  Override with an explicit URI only
+// if you operate a trusted collector.
+const reportUri = process.env.NEXT_PUBLIC_CSP_REPORT_URI || "/api/csp-report";
 
 const cspDirectives = [
   "default-src 'self'",
@@ -98,10 +116,13 @@ const cspDirectives = [
   ...(reportUri ? [`report-uri ${reportUri}`] : []),
 ].join("; ");
 
-const CSP_HEADER_NAME =
-  process.env.NEXT_PUBLIC_CSP_ENFORCE === "true"
-    ? "Content-Security-Policy"
-    : "Content-Security-Policy-Report-Only";
+// Enforcement is gated behind an explicit rollout stage.  Anything other than
+// the literal string "true" keeps the policy in report-only mode.
+const CSP_ENFORCE = process.env.NEXT_PUBLIC_CSP_ENFORCE === "true";
+
+const CSP_HEADER_NAME = CSP_ENFORCE
+  ? "Content-Security-Policy"
+  : "Content-Security-Policy-Report-Only";
 
 // ─── Security headers ─────────────────────────────────────────────────────────
 
@@ -166,6 +187,14 @@ async function securityHeaders() {
         {
           key: CSP_HEADER_NAME,
           value: cspDirectives,
+        },
+
+        // ── CSP rollout stage (informational) ────────────────────────────
+        // Exposes the current rollout stage so integration tests and
+        // operators can assert whether enforcement is active.
+        {
+          key: "X-CSP-Rollout-Stage",
+          value: CSP_ENFORCE ? "enforce" : "report-only",
         },
       ],
     },

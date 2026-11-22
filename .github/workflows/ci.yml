@@ -29,6 +29,22 @@ jobs:
         run: cd contracts && cargo test
         # Failure here blocks merge: names the failed crate in cargo output.
 
+      # Issue #868: Soroban resource budget report. Fails on regressions beyond
+      # tolerance or mainnet-limit overruns in the min/typical tiers; the max
+      # tier is report-only. See docs/RESOURCE_BUDGETS.md.
+      - name: Soroban resource budget report (Issue #868)
+        env:
+          CIRCLEUP_RESOURCE_REPORT_DIR: ${{ github.workspace }}/artifacts
+        run: cd contracts && cargo test -p circle --test resource_budget_tests -- --nocapture
+
+      - name: Upload resource budget report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: resource-budget-report
+          path: artifacts/resource-report-*.json
+          if-no-files-found: warn
+
       - name: cargo audit (high-severity advisories)
         # Enforced gate: fails the Contracts job when a high-severity advisory
         # is found.  Add unavoidable upstream advisories to .github/audit-ignore.json.
@@ -70,6 +86,13 @@ jobs:
       - name: Format check
         run: npm run format:check
         continue-on-error: true
+
+      # Issue #916: Compile and execute public SDK examples in CI
+      - name: Typecheck public examples against SDK (Issue #916)
+        run: npm run typecheck:examples
+
+      - name: Execute deterministic public SDK examples in CI (Issue #916)
+        run: npm run test:examples
 
       # Issue #464: Run contract fixture tests as an explicit, named step so a
       # signature change surfaces as "Contract fixture tests" in the CI summary
@@ -231,6 +254,26 @@ jobs:
           scripts/src/deployment-manifest.test.ts
           scripts/src/mainnet-readiness.test.ts
           scripts/src/deploy-network-guard.test.ts
+          scripts/src/smoke-test.test.ts
+          scripts/src/smoke-test.evidence.test.ts
+          scripts/src/smoke-write-gate.test.ts
+
+      # Issue #865: non-mutating release smoke-test matrix. Read-only on every
+      # environment; never submits transactions. SMOKE_TESTNET is deliberately
+      # NOT set here, so the testnet write gate reports "skip".
+      - name: Release smoke-test matrix (read-only, testnet RC)
+        run: >-
+          TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
+          node --require ts-node/register
+          scripts/src/smoke-test.ts --env=testnet --json > smoke-report.json || true
+
+      - name: Upload smoke-test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-smoke-report
+          path: smoke-report.json
+          if-no-files-found: warn
 
       - name: Validate contributor templates (links + safety notices)
         # Checks every relative link in .github templates and asserts that
@@ -246,6 +289,58 @@ jobs:
           TS_NODE_COMPILER_OPTIONS='{"module":"CommonJS"}'
           node --require ts-node/register --test
           scripts/src/validate-templates.test.ts
+
+  # ── Workspace / lockfile consistency ────────────────────────────────────────
+  # Issue #136: Guarantees that the committed root package-lock.json is the
+  # single source of truth for the npm workspace.  A clean `npm ci` from the
+  # repository root must succeed without touching tracked dependency metadata,
+  # and every workspace manifest must be reflected in the lockfile.
+  workspace-lockfile:
+    name: Workspace lockfile consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Reject nested lockfiles
+        # Only the root package-lock.json is supported.  A package-local
+        # lockfile means someone ran `npm install` inside a workspace instead
+        # of from the repository root, which silently forks the dependency tree.
+        run: |
+          nested=$(git ls-files '*package-lock.json' '*npm-shrinkwrap.json' '*yarn.lock' '*pnpm-lock.yaml' \
+            | grep -v '^package-lock.json$' || true)
+          if [ -n "$nested" ]; then
+            echo "::error::Nested lockfiles found. This repo uses a single root lockfile."
+            echo "Remove the following files and re-run 'npm install' from the repository root:"
+            echo "$nested" | sed 's/^/  - /'
+            exit 1
+          fi
+
+      - name: Install strictly from the committed lockfile
+        # `npm ci` fails if package.json and package-lock.json disagree, which
+        # is exactly the drift we want to surface.  --workspaces ensures every
+        # workspace manifest is validated against the lockfile.
+        run: npm ci --workspaces --include-workspace-root
+
+      - name: Verify workspace manifests match the lockfile
+        run: npm run check:workspace-lockfile
+
+      - name: Verify install did not modify tracked dependency metadata
+        # A clean `npm ci` must be a no-op for tracked files.  Any diff here
+        # means the lockfile was stale or a manifest was edited without
+        # regenerating it.
+        run: |
+          if ! git diff --quiet -- package.json package-lock.json '*/package.json'; then
+            echo "::error::Dependency metadata changed during 'npm ci'."
+            echo "The lockfile is out of sync with the workspace manifests."
+            echo "Fix: run 'npm install' from the repository root and commit the updated package-lock.json."
+            git --no-pager diff -- package.json package-lock.json '*/package.json'
+            exit 1
+          fi
 
   # ── Dependency license policy ───────────────────────────────────────────────
   license-policy:
@@ -271,7 +366,9 @@ jobs:
         run: cd contracts && cargo fetch --locked
 
       - name: Install inventory tool
-        run: cargo install cargo-license --version 0.6.1 --locked
+        run: |
+          cargo install cargo-license --version 0.6.1 --locked
+          cargo install cargo-audit --version 0.20.1 --locked
 
       - name: Enforce Rust dependency policy
         run: |
@@ -281,11 +378,29 @@ jobs:
       - name: Generate and enforce license inventories
         run: bash scripts/license-inventory.sh
 
+      # Issue #977: apply the same policy gate as the scheduled
+      # .github/workflows/dependency-audit.yml run so PRs cannot introduce an
+      # unexcepted finding. Read-only: no installs, fixes, or publishes.
+      - name: Enforce dependency audit policy (Issue #977)
+        run: |
+          mkdir -p artifacts
+          npm audit --workspaces --json > artifacts/npm-audit.json || true
+          (cd contracts && cargo audit --json > ../artifacts/cargo-audit.json || true)
+          npx ts-node scripts/src/dependency-audit-policy.ts \
+            --npm-audit artifacts/npm-audit.json \
+            --cargo-audit artifacts/cargo-audit.json \
+            --licenses-dir artifacts/
+
       - name: Upload dependency license inventories
         uses: actions/upload-artifact@v7
         with:
           name: dependency-license-inventories
-          path: artifacts/licenses-*
+          retention-days: 90
+          path: |
+            artifacts/licenses-*
+            artifacts/npm-audit.json
+            artifacts/cargo-audit.json
+            artifacts/dependency-audit-report.json
 
   # ── Toolchain compatibility matrix ──────────────────────────────────────────
   # This job intentionally installs the exact npm version for each Node line
@@ -346,3 +461,25 @@ jobs:
           else
             npx commitlint --from HEAD~20 --to HEAD --verbose
           fi
+
+  # -- Performance budgets ----------------------------------------------------
+  # Offline and deterministic: no live Stellar RPC, no PostgreSQL service, no
+  # real user data. Fixtures are generated from tests/perf/fixtures.ts and
+  # sized by tests/perf/fixture-profiles.json. The app is built first so bundle
+  # budgets are exercised instead of skipped. Blocking by design: reviewed
+  # regressions must fail CI. See docs/PERFORMANCE_BUDGETS.md.
+  perf:
+    name: Performance budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build app (enables bundle budgets)
+        run: npm run build --workspace=app
+      - name: Run performance budget suite
+        run: npm run test:perf

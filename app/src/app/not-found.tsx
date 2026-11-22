@@ -17,13 +17,15 @@ export const metadata: Metadata = {
 // ─── 404 page ─────────────────────────────────────────────────────────────────
 //
 // This component is rendered whenever any route in the app calls notFound().
-// The most common triggers are:
-//   • /circles/[address]   — unknown or un-indexed circle address
-//   • /reputation/[member] — unknown reputation member (no recorded activity)
+// Route loaders now normalize their failures before reaching this page, so
+// this page only represents a genuinely unknown entity:
+//   • /circles/[address]   — well-formed address with no known circle
+//   • /reputation/[member] — well-formed address with no recorded activity
 //   • Any typo'd URL
 //
-// The copy is deliberately broad so it reads well for all three cases while
-// still giving circle-specific guidance ("the address may be incorrect").
+// Malformed addresses, delayed indexing, contract read failures and service
+// outages are handled by the route-level error components instead, so the copy
+// here stays focused on "this entity does not exist".
 
 export default function NotFound() {
   return (
@@ -36,9 +38,9 @@ export default function NotFound() {
         The page you&apos;re looking for doesn&apos;t exist or may have moved.
       </p>
       <p className="text-slate-500 mb-8">
-        If you followed a circle or reputation link, double-check the address —
-        it may be incorrect, the circle may not have been indexed yet, or the
-        member may have no recorded activity on CircleUp yet.
+        If you followed a circle or reputation link, the address looks valid but
+        no matching record was found — the circle may not exist on this network,
+        or the member may have no recorded activity on CircleUp yet.
       </p>
 
       {/* Suggestions */}
@@ -46,10 +48,7 @@ export default function NotFound() {
         <p className="font-semibold text-slate-700 mb-2">Things to try:</p>
         <ul className="space-y-1 list-disc list-inside">
           <li>Make sure the contract address in the URL is correct.</li>
-          <li>
-            Wait a moment — newly created circles can take a few seconds for
-            the indexer to process before they become accessible.
-          </li>
+          <li>Check that you&apos;re connected to the right network.</li>
           <li>Browse the full circle list to find the one you&apos;re after.</li>
         </ul>
       </div>

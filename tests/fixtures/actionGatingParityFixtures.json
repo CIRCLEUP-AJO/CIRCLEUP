@@ -1,0 +1,659 @@
+{
+  "version": "1.0.0",
+  "description": "Shared canonical action-gating fixtures for app and SDK parity checks (Issue #910 / Issue 74)",
+  "members": [
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPCIB",
+    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABMHIT"
+  ],
+  "nonMember": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQITI",
+  "cases": [
+    {
+      "id": "stale_snapshot_exceeded",
+      "action": "join",
+      "description": "Snapshot age strictly exceeds maxAgeMs -> stale_snapshot",
+      "snapshot": {
+        "status": "Pending",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": false,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1030001,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "stale_snapshot"
+      }
+    },
+    {
+      "id": "stale_snapshot_exact_boundary",
+      "action": "contribute",
+      "description": "Exact age === maxAgeMs boundary is exclusive -> stale_snapshot",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1030000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "stale_snapshot"
+      }
+    },
+    {
+      "id": "join_pending_fresh_allowed",
+      "action": "join",
+      "description": "Join on fresh Pending circle without locked collateral -> allowed",
+      "snapshot": {
+        "status": "Pending",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 1000,
+        "hasLockedCollateral": false,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "join_wrong_status_active",
+      "action": "join",
+      "description": "Join blocked when circle is already Active -> wrong_status",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 1000,
+        "hasLockedCollateral": false,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "wrong_status"
+      }
+    },
+    {
+      "id": "join_wrong_status_unknown",
+      "action": "join",
+      "description": "Join blocked when status is unrecognized string -> wrong_status",
+      "snapshot": {
+        "status": "UnknownStatus",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 1000,
+        "hasLockedCollateral": false,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "wrong_status"
+      }
+    },
+    {
+      "id": "join_already_joined",
+      "action": "join",
+      "description": "Join blocked when wallet already locked collateral -> already_joined",
+      "snapshot": {
+        "status": "Pending",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 1000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "already_joined"
+      }
+    },
+    {
+      "id": "join_not_a_member",
+      "action": "join",
+      "description": "Join blocked when address is not in configured members -> not_a_member",
+      "snapshot": {
+        "status": "Pending",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 1000,
+        "hasLockedCollateral": false,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQITI"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "not_a_member"
+      }
+    },
+    {
+      "id": "contribute_active_fresh_allowed",
+      "action": "contribute",
+      "description": "Contribute allowed before deadline on Active circle -> allowed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4999,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "contribute_fails_open_null_latest_ledger",
+      "action": "contribute",
+      "description": "Contribute fails open when latestLedger is null -> allowed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": null,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "contribute_fails_open_null_deadline_ledger",
+      "action": "contribute",
+      "description": "Contribute fails open when deadlineLedger is null -> allowed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "contribute_wrong_status_pending",
+      "action": "contribute",
+      "description": "Contribute blocked on Pending circle -> wrong_status",
+      "snapshot": {
+        "status": "Pending",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "wrong_status"
+      }
+    },
+    {
+      "id": "contribute_already_contributed",
+      "action": "contribute",
+      "description": "Contribute blocked when member already contributed this round -> already_contributed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": true,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "already_contributed"
+      }
+    },
+    {
+      "id": "contribute_deadline_passed",
+      "action": "contribute",
+      "description": "Contribute blocked when latestLedger strictly exceeds deadlineLedger -> deadline_passed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 5001,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "deadline_passed"
+      }
+    },
+    {
+      "id": "contribute_not_a_member",
+      "action": "contribute",
+      "description": "Contribute blocked when caller is not in circle's members list -> not_a_member",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQITI"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "not_a_member"
+      }
+    },
+    {
+      "id": "payout_active_complete_allowed",
+      "action": "payout",
+      "description": "Payout allowed when all members have contributed -> allowed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": true,
+        "contributionsReceived": 3,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "payout_round_not_complete",
+      "action": "payout",
+      "description": "Payout blocked when fewer than memberCount contributions received -> round_not_complete",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 2,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "round_not_complete"
+      }
+    },
+    {
+      "id": "payout_wrong_status_pending",
+      "action": "payout",
+      "description": "Payout blocked when circle is not Active -> wrong_status",
+      "snapshot": {
+        "status": "Pending",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 3,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "wrong_status"
+      }
+    },
+    {
+      "id": "default_active_expired_allowed",
+      "action": "default",
+      "description": "Default allowed when deadline has demonstrably passed and member hasn't contributed -> allowed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 5001,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "default_fails_closed_null_latest_ledger",
+      "action": "default",
+      "description": "Default fails closed when latestLedger is null -> deadline_not_passed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": null,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "deadline_not_passed"
+      }
+    },
+    {
+      "id": "default_deadline_not_passed_window_open",
+      "action": "default",
+      "description": "Default blocked when latestLedger <= deadlineLedger -> deadline_not_passed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 5000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "deadline_not_passed"
+      }
+    },
+    {
+      "id": "default_already_contributed",
+      "action": "default",
+      "description": "Default blocked when target member already contributed -> already_contributed",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 6000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": true,
+        "contributionsReceived": 2,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "already_contributed"
+      }
+    },
+    {
+      "id": "default_not_a_member",
+      "action": "default",
+      "description": "Default blocked when target is not a member -> not_a_member",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 6000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQITI"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "not_a_member"
+      }
+    },
+    {
+      "id": "close_completed_allowed",
+      "action": "close",
+      "description": "Close allowed when circle is Completed -> allowed",
+      "snapshot": {
+        "status": "Completed",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 10000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "close_cancelled_allowed",
+      "action": "close",
+      "description": "Close allowed when circle is Cancelled -> allowed",
+      "snapshot": {
+        "status": "Cancelled",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 10000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": true,
+        "reason": null
+      }
+    },
+    {
+      "id": "close_wrong_status_active",
+      "action": "close",
+      "description": "Close blocked when circle is Active -> wrong_status",
+      "snapshot": {
+        "status": "Active",
+        "currentRound": 0,
+        "deadlineLedger": 5000,
+        "latestLedger": 4000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 1,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "wrong_status"
+      }
+    },
+    {
+      "id": "close_not_a_member",
+      "action": "close",
+      "description": "Close blocked when caller is not in members list -> not_a_member",
+      "snapshot": {
+        "status": "Completed",
+        "currentRound": 0,
+        "deadlineLedger": null,
+        "latestLedger": 10000,
+        "hasLockedCollateral": true,
+        "hasContributedCurrentRound": false,
+        "contributionsReceived": 0,
+        "fetchedAtMs": 1000000,
+        "networkCheck": null
+      },
+      "options": {
+        "maxSnapshotAgeMs": 30000,
+        "nowMs": 1005000,
+        "memberAddress": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQITI"
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "not_a_member"
+      }
+    }
+  ]
+}

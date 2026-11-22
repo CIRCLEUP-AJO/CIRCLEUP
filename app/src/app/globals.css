@@ -32,6 +32,13 @@ body {
  *
  * 4. form-row      — two-column form rows collapse to a single column below
  *    the sm breakpoint to prevent input fields being too narrow to type in.
+ *
+ * 5. scroll-container — labeled horizontal scroll region for tables that
+ *    cannot reflow. The label stays visible above the scroll area so users
+ *    know content is scrollable and essential controls are never hidden.
+ *
+ * 6. break-long / break-amount — wrap long Stellar addresses and large
+ *    amounts without breaking card bounds or losing digit grouping.
  */
 
 @layer utilities {
@@ -82,6 +89,49 @@ body {
     .form-row {
       grid-template-columns: 1fr 1fr;
     }
+  }
+
+  /* Labeled horizontal scroll container for wide tables.
+   * The caption is rendered above the scroll area and remains visible so the
+   * relationship between the table and its label is preserved. */
+  .scroll-container {
+    position: relative;
+    max-width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    /* Reserve space so focus ring is not clipped by overflow */
+    padding-bottom: 0.25rem;
+  }
+
+  .scroll-container > .scroll-label {
+    display: block;
+    font-size: 0.75rem; /* text-xs */
+    line-height: 1rem;
+    color: #475569; /* slate-600 */
+    margin-bottom: 0.25rem;
+  }
+
+  /* Keyboard focus on the scroll region itself (tabIndex={0}) */
+  .scroll-container:focus-visible {
+    outline: 2px solid #16a34a; /* brand-600 */
+    outline-offset: 2px;
+    border-radius: 0.375rem;
+  }
+
+  /* Long unbroken strings (addresses, hashes) wrap instead of overflowing */
+  .break-long {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    min-width: 0;
+  }
+
+  /* Amounts keep digit grouping but may wrap at narrow widths */
+  .break-amount {
+    overflow-wrap: break-word;
+    word-break: normal;
+    font-variant-numeric: tabular-nums;
+    min-width: 0;
   }
 }
 

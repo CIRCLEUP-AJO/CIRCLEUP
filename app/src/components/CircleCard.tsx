@@ -11,10 +11,10 @@ import type { Circle } from "@/lib/circleTypes";
 // Shared status presentation model — single source of truth for status labels,
 // descriptions, and visual variants across list cards, the detail header, and
 // the status filter pills.  Re-exported here so existing imports keep working.
-import { getCircleStatusMeta, type CircleStatusPresentation } from "@/lib/circleStatus";
+import { getStatusPresentation, type CircleStatusPresentation } from "@/lib/circleStatus";
 
 export type { CircleStatusPresentation as StatusMeta } from "@/lib/circleStatus";
-export { getCircleStatusMeta as getStatusMeta } from "@/lib/circleStatus";
+export { getStatusPresentation as getStatusMeta } from "@/lib/circleStatus";
 
 // ─── Input guards ─────────────────────────────────────────────────────────────
 //
@@ -66,7 +66,7 @@ function safeFormatPot(stroops: string, memberCount: number): string {
 // have not changed.
 
 export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle }) {
-  const status = getCircleStatusMeta(circle.status);
+  const status = getStatusPresentation(circle.status);
   const totalRounds = circle.total_rounds > 0 ? circle.total_rounds : 0;
   const currentRound = Math.max(0, circle.current_round);
   const progressPct =
@@ -206,6 +206,25 @@ export const CircleCard = memo(function CircleCard({ circle }: { circle: Circle 
               style={{ width: `${progressPct}%` }}
             />
           </div>
+        )}
+
+        {/*
+          Unknown / future statuses: render an explicit unsupported notice
+          instead of silently falling back to a known state.  The raw value is
+          shown as plain text (never interpolated as HTML) so operators can
+          diagnose the mismatch, and no mutation actions are offered.
+        */}
+        {status.isUnknown && (
+          <p
+            className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1 mt-2"
+            role="status"
+          >
+            Unsupported status
+            {typeof circle.status === "string" && circle.status.trim() !== ""
+              ? `: ${circle.status}`
+              : ""}
+            . Actions are disabled until the app is updated.
+          </p>
         )}
 
         <p className="text-xs text-slate-400 mt-2 truncate" title={`Created by ${circle.creator}`}>

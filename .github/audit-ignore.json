@@ -1,5 +1,7 @@
 {
-  "description": "Known upstream advisories that cannot be resolved by npm audit fix. All entries must include a reason and a date. Remove an entry when an upstream fix is released and the lockfile is updated.",
+  "schemaVersion": 1,
+  "reviewIntervalDays": 90,
+  "description": "Known upstream advisories that cannot be resolved by npm audit fix. Every entry in \"advisories\" MUST include: package, advisory (GHSA/CVE id), severity, reason, owner, added (YYYY-MM-DD) and reviewBy (YYYY-MM-DD); optional scope. Exceptions are time-bounded: an entry whose reviewBy has passed fails the scheduled dependency audit (Issue #977) until it is re-reviewed. Never add an entry to silence a finding without review. Remove an entry when an upstream fix is released and the lockfile is updated.",
   "advisories": [],
   "resolved": [
     {

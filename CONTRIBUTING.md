@@ -40,10 +40,65 @@ Thank you for helping build trustless savings circles for the world. Every contr
 
 ## Development Setup
 
-```bash
-# Install Node dependencies
-npm install
+### Installing dependencies (root workspace only)
 
+CircleUp is an npm workspaces monorepo with a **single root `package-lock.json`**.
+Always install from the repository root — never from inside `app/`, `sdk/`, or
+`indexer/`.
+
+```bash
+# From the repository root — installs every workspace from the committed lockfile
+npm ci
+```
+
+`npm ci` is the supported installation path. It installs exactly what the
+committed lockfile specifies and fails if `package.json` and
+`package-lock.json` disagree, so it is also the fastest way to catch a
+forgotten lockfile update locally.
+
+`npm install` at the root is acceptable only when you are intentionally
+changing dependencies (see [Updating dependencies](#updating-dependencies)).
+Running `npm install` inside a package directory creates a nested
+`node_modules/` and `package-lock.json` that shadow the root workspace and will
+be rejected by CI.
+
+### When to use package-specific commands
+
+Package-specific commands are for **running scripts**, not for installing:
+
+```bash
+npm test --workspace=indexer
+npm run build:sdk
+npm run dev:app
+```
+
+If a package-specific command fails with a "cannot find module" error, do not
+run `npm install` in that package — re-run `npm ci` from the repository root.
+
+### Updating dependencies
+
+1. Edit the relevant `package.json` (root or workspace).
+2. From the repository root, run `npm install` to update the root lockfile.
+3. Commit the `package.json` change **and** the updated `package-lock.json`
+   together in the same commit.
+4. Verify with `npm ci` from the root before pushing.
+
+CI installs strictly from the committed lockfile and then checks that the
+workspace manifests are still synchronized. If you change a manifest without
+regenerating the lockfile, CI fails with a message like:
+
+```
+Lockfile drift detected: package.json files changed but package-lock.json
+was not updated. Run `npm install` from the repository root and commit the
+resulting package-lock.json.
+```
+
+A nested lockfile (e.g. `app/package-lock.json`) produces a similar failure
+naming the offending file; delete it and re-run `npm ci` from the root.
+
+### Common commands
+
+```bash
 # Build the SDK
 npm run build:sdk
 
@@ -64,15 +119,116 @@ npm run test:incidents --workspace=indexer
 
 # Type-check the app
 npx tsc --noEmit --project app/tsconfig.json
+
+# Fast local verification tier (see Verification Tiers below)
+npm run verify:fast
+
+# Full release verification tier (see Verification Tiers below)
+npm run verify:full
 ```
 
+### Verification tiers
+
+Two root commands run the existing package commands in a deterministic order.
+Each child command is executed directly (no shell pipelines, no `&&`/`&`
+chaining), so a failed child command always fails the parent command.
+
+| Command | Tier | What it runs |
+|---|---|---|
+| `npm run verify:fast` | Fast local feedback (offline, no external services) | SDK build + tests, indexer typecheck + unit tests, app typecheck + unit tests, scripts typecheck + tests, repository `format:check` |
+| `npm run verify:full` | Full release verification | Everything in the fast tier, plus contracts `cargo test`, indexer build + Postgres-backed integration tests, app build + Playwright visual tests, SDK `check:api`, `verify-artifacts`, `release-check`, and `check:toolchain` |
+
+Prerequisites for the full tier:
+
+- **Contracts:** Rust 1.81.0 with the `wasm32-unknown-unknown` target (`cargo` on `PATH`).
+- **Indexer integration tests:** `DATABASE_URL` pointing at a running Postgres instance.
+- **Visual tests:** Playwright browsers installed (`npx playwright install`), or set `VERIFY_VISUAL=1` to force the check.
+- **Toolchain check:** network access to the npm registry (set `VERIFY_OFFLINE=1` to skip it).
+
+Checks whose prerequisites are not met are **not silently dropped**: the runner
+prints `[SKIP] <check> — prerequisite not met: <prerequisite>` and repeats the
+skip in the final summary. The command still exits `0` when only skips occur,
+and exits `1` as soon as any executed check fails (remaining checks are reported
+as `NOT RUN`).
+
 See the [RUNBOOK](./docs/RUNBOOK.md) for full environment variable setup.
+
+### Verification Tiers
+
+Two root commands cover the local suite. Both run every child command
+sequentially (never in parallel), preserve each child's exit code, and print a
+summary of completed and skipped checks when they finish.
+
+**`npm run verify:fast`** — fast feedback tier. Runs the checks that need no
+database, no browser, and no network, in this deterministic order:
+
+1. `npm run check:toolchain`
+2. `npm run build:sdk`
+3. `npm run lint --workspace=app`
+4. `npx tsc --noEmit --project app/tsconfig.json`
+5. `npm run check:api --workspace=sdk`
+6. `npm test --workspace=indexer` (unit tests only; Postgres-backed tests are
+   skipped when `DATABASE_URL` is unset)
+7. `npm run test:incidents --workspace=indexer`
+8. `node --require ts-node/register --test app/src/lib/gating.mutation.test.ts`
+9. `node --require ts-node/register --test app/src/lib/telemetry.test.ts`
+
+**`npm run verify:full`** — release tier. Runs everything in `verify:fast`
+first, then the integration and contract checks in this order:
+
+1. `npm run verify:fast`
+2. `npm run migrate --workspace=indexer` and
+   `npm run migrate:check --workspace=indexer` (requires `DATABASE_URL`)
+3. `npm test --workspace=indexer` with `DATABASE_URL` set (integration tests)
+4. `cd contracts && cargo fmt --check && cargo test`
+5. `cd contracts && cargo build --target wasm32-unknown-unknown --release`
+6. `npm run test:perf` (offline performance budgets, see below)
+7. `npm run test:e2e` (requires Playwright browsers, see below)
+
+**Failure propagation.** The parent command exits non-zero as soon as any child
+command fails, and the summary names the failing check. Failures are never
+masked by shell pipelines (`|`, `|| true`) or by continuing past a failed step.
+
+**Skipped checks.** When a check cannot run because a prerequisite is missing,
+the summary reports it explicitly rather than silently passing:
+
+| Check | Prerequisite | Reported as |
+|---|---|---|
+| Indexer integration tests | `DATABASE_URL` pointing at a migrated Postgres | `SKIPPED (DATABASE_URL unset)` |
+| `migrate` / `migrate:check` | `DATABASE_URL` | `SKIPPED (DATABASE_URL unset)` |
+| Contract tests and WASM build | `cargo`, `wasm32-unknown-unknown` target | `SKIPPED (cargo not found)` |
+| Performance budgets | `cargo`/Node only — always runs offline | — |
+| End-to-end flows | Playwright browsers (`npx playwright install`) | `SKIPPED (Playwright browsers not installed)` |
+
+A skipped check is not a pass: `verify:full` still exits non-zero if a required
+prerequisite is missing unless you pass `--allow-skipped` (used by CI jobs that
+intentionally run without a database).
+
+### Performance Budgets
+
+Performance budgets live in `tests/perf/budgets.json` and are exercised by
+`npm run test:perf`. Fixtures are synthetic, deterministic, and fully offline —
+they never call live Stellar RPC or use production data. They cover small,
+typical, and high-water circle sizes, member histories, database row counts, and
+app page states so that query cost, response size, and render budgets reflect
+realistic workloads.
+
+Budgets may only be changed with measured rationale. A PR that edits
+`tests/perf/budgets.json` must record in its description:
+
+- the before and after numbers for each changed budget,
+- the fixture size and profile used for the measurement,
+- the environment (Node version, hardware class, CI runner) the numbers came
+  from, and
+- why the new value is correct rather than a regression being accepted.
+
+Budget changes without this evidence are rejected in review.
 
 Supported toolchains are Node.js 18.18+ with npm 9, Node.js 22 with npm 10, or
 Node.js 24 with npm 11; Rust 1.81.0; Soroban SDK 21.7.7; and the
 `wasm32-unknown-unknown` target. CI tests each supported tuple. Rust and Soroban are pinned for
 reproducible WASM builds. Run `npm run check:toolchain` after installing Rust
-and the target. Unsupported Node/npm versions fail during `npm install` with
+and the target. Unsupported Node/npm versions fail during `npm ci` with
 the supported range and next step.
 
 ---
@@ -160,7 +316,7 @@ commits on direct pushes to `main`.
 
 ## Pull Request Process
 
-1. Make sure CI passes (TypeScript build + Rust compile + ESLint)
+1. Make sure CI passes (lockfile/workspace sync check + TypeScript build + Rust compile + ESLint)
 2. Keep PRs focused — one feature or fix per PR
 3. Update `CHANGELOG.md` under `[Unreleased]` with what you changed, following the issue reference format in the [Traceability Policy](./docs/TRACEABILITY_POLICY.md)
 4. Fill in the PR template, including the Definition of Done checklist for your scope
@@ -243,12 +399,63 @@ npm run migrate:check --workspace=indexer   # must show "Health state: clean"
   update TypeScript types.
 - [ ] If removing or renaming: follow the [Deprecation Policy](./docs/DEPRECATION_POLICY.md)
   notice procedure before merging.
-- [ ] `CHANGELOG.md` — add a bullet.
+- [ ] Deprecation entry — record the field or endpoint in the deprecation
+  registry with `since` (release that introduced the deprecation), `sunset`
+  (earliest release that may remove it, at least the
+  [minimum support window](#api-versioning-and-deprecation-strategy) after
+  `since`), and `replacement` (the field or endpoint consumers should migrate
+  to, or `none` if the data is simply going away).
+- [ ] Deprecation signalling — the deprecated field or endpoint emits the
+  `Deprecation` and `Sunset` response headers (RFC 8594 / RFC 9745) on every
+  response that still serves it, and the compatibility table links the
+  registry entry.
+- [ ] Compatibility test — add a test that exercises the transition window and
+  asserts both the old and the new response forms are served and parseable
+  (old form still present, new form populated, deprecation headers set). See
+  `sdk/src/__tests__/indexerContract.test.ts` and
+  `indexer/src/api.compat.test.ts`.
+- [ ] Affected contracts note — list in the PR description every consumer
+  contract touched: app interfaces, SDK wire schemas and exported types, and
+  known external consumers (documented in
+  `docs/INDEXER_API_COMPATIBILITY.md`). State for each whether it is updated
+  in this PR or covered by the migration window.
+- [ ] `CHANGELOG.md` — add a bullet under `[Unreleased]` naming the deprecated
+  field, its `sunset` release, and the replacement.
 
 Verify:
 ```bash
 npx tsc --noEmit --project app/tsconfig.json
+npm test --workspace=indexer -- api.compat
+npm run check:api --workspace=sdk
 ```
+
+### API versioning and deprecation strategy
+
+The indexer HTTP API is consumed by the app, the SDK, and external tools. It
+follows an **additive-only** versioning strategy:
+
+- **Additive changes ship without a version bump.** New optional fields, new
+  endpoints, and new enum values that consumers can ignore are added to the
+  current (unversioned) routes. Consumers must tolerate unknown fields.
+- **Non-additive changes require a new version prefix.** Removing or renaming a
+  field, changing a field's type or numeric encoding, changing pagination
+  semantics, or changing the meaning of a status value is wire-breaking. These
+  changes are published under a new prefix (`/v2`, `/v3`, …) alongside the
+  existing routes. The current routes stay unversioned until the first such
+  change; do not add a version prefix without a concrete compatibility need.
+- **Minimum support window.** A deprecated field or endpoint remains served for
+  at least **two minor releases or 90 days, whichever is longer**, after the
+  release that first marks it deprecated. Removal is only allowed in a release
+  at or after the recorded `sunset` value.
+- **Observable sunset signal.** Deprecated responses carry `Deprecation` and
+  `Sunset` headers so external consumers can detect the window without reading
+  release notes. The deprecation registry in
+  `docs/INDEXER_API_COMPATIBILITY.md` is the source of truth for `since`,
+  `sunset`, and `replacement`.
+- **Release review.** Every release review checks the deprecation registry for
+  entries whose `sunset` has arrived, and confirms that the app, SDK, and
+  documented external consumers have migrated before the old form is removed.
+=======
 
 ### SDK export added, removed, or type changed
 
@@ -739,6 +946,10 @@ This table maps each command to the gates it satisfies. Run the commands locally
 | `npm run test:incidents --workspace=indexer` | C2, F4 |
 | `npm run migrate --workspace=indexer` | C3 |
 | `npm run migrate:check --workspace=indexer` | C3, G2, G5 |
+| `npm ci` (from repository root) | Lockfile/workspace sync check |
+| `npm run verify:fast` | B1, B3, B4, C1, C2, D1, F3, F4 |
+| `npm run verify:full` | A1, A3, A4, A8, B1–B6, C1–C3, D1, E1–E4, F3, F4, G2, G5 |
+| `npm run test:perf` | Performance budgets (see [Performance Budgets](#performance-budgets)) |
 
 ---
 
