@@ -138,6 +138,27 @@ describe("additive changes are compatible", () => {
   });
 });
 
+// ─── Transitional response forms (issue #985) ─────────────────────────────────
+// docs/DEPRECATION_POLICY.md requires that during a migration window the old
+// field and its replacement coexist in the same response, so consumers can move
+// at their own pace. These cases prove the schema machinery tolerates that.
+describe("transitional response forms (issue #985)", () => {
+  it("accepts an old field and its replacement in the same response", () => {
+    const body = clone(CIRCLE_DETAIL_FIXTURE);
+    const circle = body.circle as Record<string, unknown>;
+    expect(circle.deadline_ledger).toBeDefined();
+    circle.deadlineLedger = circle.deadline_ledger;
+    expect(validateIndexerResponse("circleDetail", body)).toEqual([]);
+    expect(listUnknownFields("circleDetail", body)).toEqual(["$.circle.deadlineLedger"]);
+  });
+
+  it("accepts removal of an optional field at sunset", () => {
+    const body = clone(MEMBER_CONTRIBUTIONS_FIXTURE) as Record<string, unknown>;
+    delete body.totalAmount;
+    expect(validateIndexerResponse("memberContributions", body)).toEqual([]);
+  });
+});
+
 // ─── Breaking changes are caught ──────────────────────────────────────────────
 
 describe("incompatible wire drift is reported", () => {

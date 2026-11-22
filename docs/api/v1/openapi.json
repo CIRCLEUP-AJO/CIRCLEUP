@@ -2508,6 +2508,64 @@
           }
         }
       }
+    },
+    "/indexer/deprecations": {
+      "get": {
+        "operationId": "listApiDeprecations",
+        "summary": "List active API deprecations",
+        "description": "Machine-readable sunset signal: every deprecated route with its announcement date, sunset date and optional replacement. See docs/DEPRECATION_POLICY.md.",
+        "parameters": [
+          {
+            "name": "X-Request-ID",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiDeprecationsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Sanitized UUIDv4 for correlating read logs; never authentication.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -5108,22 +5166,70 @@
           "nextCursor"
         ],
         "additionalProperties": true
+      },
+      "ApiDeprecation": {
+        "type": "object",
+        "required": [
+          "route",
+          "method",
+          "since",
+          "sunset"
+        ],
+        "properties": {
+          "route": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET"
+            ]
+          },
+          "since": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sunset": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "replacement": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      },
+      "ApiDeprecationsResponse": {
+        "type": "object",
+        "required": [
+          "deprecations"
+        ],
+        "properties": {
+          "deprecations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ApiDeprecation"
+            }
+          }
+        }
       }
     }
   },
   "x-source-sha256": {
-    "indexer/src/api.ts": "3c3fcb8cfa8cbc72e6bd3301cf8c444a836be92f613e5a809c349b07c423669e",
-    "indexer/src/config.ts": "ed5370adbedbf5e764e3b9476ea1b766102b8fbe16e106e461cd6440b7b0e520",
-    "indexer/src/indexer.ts": "f5ce62d183ca67b0454aae20d3e933e8380019b315471eeeb0481958637c34d5",
+    "indexer/src/api.ts": "2362d352d2b557f4b3d7aa3f35b0641dcfc2038481c4c895f5bab57039738440",
+    "indexer/src/config.ts": "ad9daec1fbd429bd1c4f80f08c9711b6d587f53f775c7a655bc503efdd83bb9d",
+    "indexer/src/indexer.ts": "9aaffe98df59f28cd78d5bd1ce9c76b843c27aa8a80b31140217e8e6aa6b5285",
     "indexer/src/groupRounds.ts": "5f99e3f6863b3ef6055e6c55e5e2c43bfa8124a5bda2e58bc800d601b857d9dd",
-    "indexer/src/health.ts": "7bbe1d45c65a26ba05002e6275b7efa1be67192accea774f0f0ab93c9b0668f7",
-    "indexer/src/eventFailures.ts": "a52687befc2da9d42991112e7dc3248cb74413237139f172e653247c98dd339d",
-    "indexer/src/circleReconciliation.ts": "77991096eeb818e7398486dd50450909dfd14a63f86ee4f515cb5a5f32b95c5e",
+    "indexer/src/health.ts": "eeaa6a97422051191d7ecaa82b955a30e870441819a0c107562c9fb58a1c5516",
+    "indexer/src/eventFailures.ts": "c3706165e71ccbec2c82c6d585b897612b2a422a7ae4f483367531ffa958b675",
+    "indexer/src/circleReconciliation.ts": "208450154206bc6582adc6444562519ac800f2d2a68d5422a46d699ba7db8dcc",
     "indexer/src/csvExport.ts": "abb7911ec696cfb0b12cea8d35e3152514bf39629abbf1eca50ed1242e7f01c2",
     "indexer/src/requestTracing.ts": "07608e5cf4077dd335bfa2a44c5b96b12d44e0ce9e63549abfaf58842e6dca0e",
-    "sdk/src/types.ts": "a3493b62d3d7a201b343d955709c2c06bb051d875ce76a124f76321d36efa444",
-    "sdk/src/indexerSchema.ts": "b011cf93e8d7b2353829c566c8307dbad7c86f6fc951969421a0360d9933be51",
-    "sdk/src/client.ts": "f3a31d631503402e590d5a80c5b161b268d11955190cd0204eac91c159da8afa",
+    "sdk/src/types.ts": "5c9fe86a8339ccdb40b98d4a7d3b1e81b0119afc8affb6e03e646c2ddda13e26",
+    "sdk/src/indexerSchema.ts": "c93fc23e2fdf6dcdd6dd5e128cf2da69222d3b618920aa3171f71b873781aa25",
+    "sdk/src/client.ts": "488af09f23dc5b9f2225df41f54fe0c6cfe075ae5b020495bfac6854c2129c8d",
     "app/src/lib/indexerFetch.ts": "0b0227e571cdd83bb24c71641788193ae08a68d0643dedb807ccecda01c00ba9"
   }
 }

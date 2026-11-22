@@ -29,6 +29,7 @@ import { requestTracing } from "./requestTracing";
  *                                        current round and payouts with the contract's views
  * GET /indexer/state                   → indexer audit: last ledger + event counts + entity totals
  * GET /indexer/schema                  → schema versioning and migration status diagnostics
+ * GET /indexer/deprecations            → active API deprecations (route, since, sunset, replacement)
  * GET /indexer/failures                → open event-handler failures (skipped events)
  *                                        ?ledger=   restrict to one ledger
  *                                        ?eventId=  look up one RPC event id
@@ -133,6 +134,7 @@ import { redactAddress } from "./redact";
 import { logApiCorsRejected, logApiRequest, logApiRequestError } from "./logger";
 import type { MigrationHealth } from "./db/migrate";
 import { encodeHistoryCursor, parseHistoryCursor } from "./historyCursor";
+import { API_DEPRECATIONS, deprecationHeaders, findDeprecation } from "./apiDeprecation";
 
 // ── Address validation ────────────────────────────────────────────────────────
 //
@@ -656,7 +658,7 @@ export function createApp(options: {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
   app.use(requestTracing);
-  app.use(cors({ ...buildCorsOptions(), exposedHeaders: ["X-Request-ID"] }));
+  app.use(cors({ ...buildCorsOptions(), exposedHeaders: ["X-Request-ID", "Deprecation", "Sunset", "Link"] }));
   app.use(express.json());
 
   // ── Shutdown gate ──────────────────────────────────────────────────────────
@@ -2334,6 +2336,13 @@ export function createApp(options: {
       console.error("[api] Failed to load schema status", err);
       sendError(res, 500, "Failed to load schema status", getErrorMessage(err));
     }
+  });
+
+  // Issue #985: machine-readable sunset signal. External consumers can poll this
+  // to discover deprecated routes, their sunset dates and replacements without
+  // having to hit each route. Shape: { deprecations: ApiDeprecation[] }.
+  app.get("/indexer/deprecations", detailRateLimiter, (_req: Request, res: Response) => {
+    res.json({ deprecations: API_DEPRECATIONS });
   });
 
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
