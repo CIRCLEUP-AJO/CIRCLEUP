@@ -408,6 +408,16 @@ export function validateAddress(
 // ─── Assertion helpers ────────────────────────────────────────────────────────
 
 /**
+ * Alias for {@link isStellarPublicKey}.
+ *
+ * Provided for call-sites that use the more explicit name `isStellarAccountId`
+ * to distinguish account addresses from contract IDs. Both names refer to the
+ * same shape-only G-prefix check; prefer {@link isValidStellarAccount} when a
+ * checksum-verified result is required.
+ */
+export const isStellarAccountId = isStellarPublicKey;
+
+/**
  * Throws a `TypeError` with a descriptive message when `address` is not a
  * valid Stellar public key.
  *
