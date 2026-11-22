@@ -93,6 +93,8 @@ mod token_behavior_fixture; // reusable token behavior fixtures (#888)
 mod member_boundary_tests; // min/max member lifecycle bounds (#889)
 #[cfg(test)]
 mod deadline_boundary_tests; // deadline ledger inclusivity (#890)
+#[cfg(test)]
+mod upgrade_path_tests; // contract upgrade path tests
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
