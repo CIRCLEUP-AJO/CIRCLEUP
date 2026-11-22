@@ -456,3 +456,261 @@ export function assertCanonicalStellarAddress(address: string, label = "address"
     );
   }
 }
+
+// ─── Route-level outcome normalization ────────────────────────────────────────
+//
+// Dynamic routes (`/circles/[address]`, `/reputation/[address]`) receive
+// user-controlled address strings. A request can fail for several distinct
+// reasons that must NOT collapse into a single not-found page:
+//
+//   • the address is malformed            → 400 (client error, retry won't help)
+//   • the entity does not exist           → 404 (definitive, no recovery)
+//   • the indexer hasn't seen it yet      → 404 + "try again shortly" recovery
+//   • a contract read failed              → 502 (upstream returned garbage)
+//   • an upstream service is unavailable  → 503 (temporary, retry later)
+//
+// `RouteOutcome` is a discriminated union carrying a stable `kind`, the HTTP
+// `status` a server component should surface, and a `recovery` descriptor the
+// UI can render as an actionable next step. `routeOutcomeStatus` is the single
+// place that maps an outcome to its status so both routes stay consistent.
+
+/** Stable category for a normalized route outcome. */
+export type RouteOutcomeKind =
+  | "invalid-address"
+  | "not-found"
+  | "indexing-delayed"
+  | "contract-read-failure"
+  | "service-outage";
+
+/** Actionable recovery path shown to the user for a failed route. */
+export interface RouteRecovery {
+  /** Short headline, e.g. "Circle not found". */
+  title: string;
+  /** One-sentence explanation of what happened. */
+  message: string;
+  /** Suggested next step, e.g. "Check the address and try again." */
+  action: string;
+  /** Optional in-app link the user can follow to recover. */
+  href?: string;
+  /** Whether retrying the same request may succeed. */
+  retryable: boolean;
+}
+
+/** Discriminated union of every normalized route outcome. */
+export type RouteOutcome =
+  | { kind: "invalid-address"; status: 400; recovery: RouteRecovery; reason?: AddressValidationReason }
+  | { kind: "not-found"; status: 404; recovery: RouteRecovery }
+  | { kind: "indexing-delayed"; status: 404; recovery: RouteRecovery }
+  | { kind: "contract-read-failure"; status: 502; recovery: RouteRecovery }
+  | { kind: "service-outage"; status: 503; recovery: RouteRecovery };
+
+/** Entity label used to phrase recovery copy ("Circle", "Reputation", …). */
+export type RouteEntity = "circle" | "reputation";
+
+const ENTITY_LABEL: Record<RouteEntity, string> = {
+  circle: "Circle",
+  reputation: "Reputation profile",
+};
+
+/** Build the recovery descriptor for an invalid address. */
+function invalidAddressRecovery(entity: RouteEntity, message?: string): RouteRecovery {
+  return {
+    title: "Invalid address",
+    message: message ?? "The address in this link is not a valid Stellar address.",
+    action: "Check the address for typos, or paste it again from your wallet.",
+    href: "/",
+    retryable: false,
+  };
+}
+
+/** Build the recovery descriptor for a definitively missing entity. */
+function notFoundRecovery(entity: RouteEntity): RouteRecovery {
+  const label = ENTITY_LABEL[entity];
+  return {
+    title: `${label} not found`,
+    message: `No ${label.toLowerCase()} exists at this address.`,
+    action: "Double-check the address, or browse existing circles from the home page.",
+    href: "/",
+    retryable: false,
+  };
+}
+
+/** Build the recovery descriptor for an entity the indexer hasn't seen yet. */
+function indexingDelayedRecovery(entity: RouteEntity): RouteRecovery {
+  const label = ENTITY_LABEL[entity];
+  return {
+    title: `${label} is still being indexed`,
+    message: `This ${label.toLowerCase()} exists on-chain but the indexer hasn't caught up yet.`,
+    action: "Wait a few seconds and refresh the page.",
+    retryable: true,
+  };
+}
+
+/** Build the recovery descriptor for a failed contract read. */
+function contractReadFailureRecovery(entity: RouteEntity): RouteRecovery {
+  const label = ENTITY_LABEL[entity];
+  return {
+    title: `Couldn't load this ${label.toLowerCase()}`,
+    message: "The contract returned an unexpected response while loading this page.",
+    action: "Refresh to try again. If it keeps failing, the contract may be misconfigured.",
+    retryable: true,
+  };
+}
+
+/** Build the recovery descriptor for an upstream service outage. */
+function serviceOutageRecovery(entity: RouteEntity): RouteRecovery {
+  const label = ENTITY_LABEL[entity];
+  return {
+    title: "Service temporarily unavailable",
+    message: `We couldn't reach the service needed to load this ${label.toLowerCase()}.`,
+    action: "This is usually temporary — refresh in a moment.",
+    retryable: true,
+  };
+}
+
+/**
+ * Construct an `invalid-address` outcome.
+ *
+ * Call this *before* any RPC or indexer lookup so malformed input never reaches
+ * a downstream service.
+ */
+export function invalidAddressOutcome(
+  entity: RouteEntity,
+  reason?: AddressValidationReason,
+  message?: string,
+): RouteOutcome {
+  return {
+    kind: "invalid-address",
+    status: 400,
+    recovery: invalidAddressRecovery(entity, message),
+    reason,
+  };
+}
+
+/** Construct a `not-found` outcome for a definitively missing entity. */
+export function notFoundOutcome(entity: RouteEntity): RouteOutcome {
+  return { kind: "not-found", status: 404, recovery: notFoundRecovery(entity) };
+}
+
+/** Construct an `indexing-delayed` outcome for an entity not yet indexed. */
+export function indexingDelayedOutcome(entity: RouteEntity): RouteOutcome {
+  return { kind: "indexing-delayed", status: 404, recovery: indexingDelayedRecovery(entity) };
+}
+
+/** Construct a `contract-read-failure` outcome. */
+export function contractReadFailureOutcome(entity: RouteEntity): RouteOutcome {
+  return {
+    kind: "contract-read-failure",
+    status: 502,
+    recovery: contractReadFailureRecovery(entity),
+  };
+}
+
+/** Construct a `service-outage` outcome. */
+export function serviceOutageOutcome(entity: RouteEntity): RouteOutcome {
+  return { kind: "service-outage", status: 503, recovery: serviceOutageRecovery(entity) };
+}
+
+/**
+ * Validate a route address and return an `invalid-address` outcome when it
+ * fails, or `null` when it is valid.
+ *
+ * Runs synchronously with no network access, so routes can call it as the very
+ * first step of their loader.
+ *
+ * @example
+ * const invalid = validateRouteAddress(params.address, "circle", "C");
+ * if (invalid) return invalid;
+ */
+export function validateRouteAddress(
+  address: unknown,
+  entity: RouteEntity,
+  kind: "G" | "C" | "any" = "any",
+): RouteOutcome | null {
+  const result = validateAddress(address, { kind });
+  if (result.valid) return null;
+  return invalidAddressOutcome(entity, result.reason, result.message);
+}
+
+/**
+ * Error kinds that a `FetchError` (or a contract-read wrapper) may expose.
+ * Kept as a string union so callers don't need to import the fetch layer.
+ */
+export type UpstreamErrorKind =
+  | "network"
+  | "timeout"
+  | "unavailable"
+  | "http"
+  | "parse"
+  | "contract"
+  | "not_found"
+  | "unknown";
+
+/** Minimal shape of an error we can normalize. */
+export interface NormalizableError {
+  kind?: string;
+  status?: number;
+  name?: string;
+  message?: string;
+}
+
+/**
+ * Map an upstream error into a `RouteOutcome`.
+ *
+ * Mapping rules:
+ *   • `not_found` / HTTP 404            → `not-found`
+ *   • `contract` / `parse` / HTTP 5xx   → `contract-read-failure`
+ *   • `network` / `timeout` / `unavailable` / HTTP 502/503 → `service-outage`
+ *   • anything else                     → `service-outage` (safe default)
+ *
+ * Callers that can distinguish "indexer hasn't seen it yet" should return
+ * {@link indexingDelayedOutcome} directly instead of routing through here.
+ */
+export function outcomeFromError(error: unknown, entity: RouteEntity): RouteOutcome {
+  const err = (error ?? {}) as NormalizableError;
+  const kind = typeof err.kind === "string" ? err.kind : undefined;
+  const status = typeof err.status === "number" ? err.status : undefined;
+
+  if (kind === "not_found" || status === 404) {
+    return notFoundOutcome(entity);
+  }
+
+  if (kind === "contract" || kind === "parse") {
+    return contractReadFailureOutcome(entity);
+  }
+
+  if (
+    kind === "network" ||
+    kind === "timeout" ||
+    kind === "unavailable" ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  ) {
+    return serviceOutageOutcome(entity);
+  }
+
+  if (status !== undefined && status >= 500) {
+    return contractReadFailureOutcome(entity);
+  }
+
+  return serviceOutageOutcome(entity);
+}
+
+/**
+ * Return the HTTP status a server component should surface for an outcome.
+ *
+ * This is the single source of truth for status mapping so both dynamic routes
+ * stay consistent. Use it when rendering an error page or building a response.
+ */
+export function routeOutcomeStatus(outcome: RouteOutcome): 400 | 404 | 502 | 503 {
+  return outcome.status;
+}
+
+/**
+ * Returns `true` when the outcome represents a temporary failure the user can
+ * recover from by retrying (indexing delay, contract read failure, outage).
+ */
+export function isRetryableOutcome(outcome: RouteOutcome): boolean {
+  return outcome.recovery.retryable;
+}

@@ -164,7 +164,7 @@ These govern USDC token flows into and out of the circle contract.
 | S6 | `sanitizeTxMetadata` strips secrets and payloads before they appear in logs | `SECRET_KEY_RE` + value-length + stellar-seed pattern checks |
 | S7 | `TxResult` is a discriminated union — callers must check `success` before accessing `txHash` / `ledger` | TypeScript narrowing; `success: true` branch has non-optional `txHash` |
 | S8 | `ReadResult<T>` is a discriminated union — callers must check `ok` before accessing `value` | TypeScript narrowing; `isReadSuccess` / `isReadFailure` type guards |
-| S9 | Wall-clock deadline countdowns are advisory and never authorize a write | Contract ledger checks are authoritative; app gating fails closed on unknown/stale ledger data |
+| S9 | Wall-clock deadline countdowns are advisory and never authorize a write | Contract ledger checks are authoritative; stale snapshots block writes, unknown ledger height blocks `default` while `contribute` remains contract-authoritative. See [`DEADLINE_LEDGER_BOUNDARY.md`](./DEADLINE_LEDGER_BOUNDARY.md) |
 
 ---
 

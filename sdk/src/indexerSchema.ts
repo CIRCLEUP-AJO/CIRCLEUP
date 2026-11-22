@@ -45,6 +45,23 @@ export type IndexerWireType =
   | "array"
   | "record";
 
+/**
+ * Deprecation metadata for a field or endpoint (issue #149).
+ *
+ * A deprecated field stays accepted by `validateIndexerResponse` for the whole
+ * migration window, so old and new response forms both validate. The marker is
+ * documentation plus an observable sunset signal; it never makes a response
+ * invalid on its own.
+ */
+export interface IndexerDeprecation {
+  /** Version (or date) in which the field/endpoint was first deprecated. */
+  since: string;
+  /** Last version (or date) in which the field/endpoint is still served. */
+  sunset: string;
+  /** Field name (or endpoint) that replaces it, when there is one. */
+  replacement?: string;
+}
+
 /** Contract for one field (or array element / record value). */
 export interface IndexerFieldSpec {
   type: IndexerWireType;
@@ -60,10 +77,30 @@ export interface IndexerFieldSpec {
   items?: IndexerFieldSpec;
   /** For `record`: the contract every value must satisfy. */
   values?: IndexerFieldSpec;
+  /** Deprecation window — the field is still accepted while set. */
+  deprecated?: IndexerDeprecation;
+  /**
+   * Legacy wire forms still accepted during a transition (issue #149).
+   *
+   * When present, a value that fails the primary `type` check is retried
+   * against each alternative spec; the field is only a violation when every
+   * form fails. Use this to accept both the old and new encoding of a field
+   * while it is marked `deprecated`.
+   */
+  legacy?: readonly IndexerFieldSpec[];
 }
 
 /** Field contracts for a JSON object, keyed by field name. */
 export type IndexerObjectSchema = Record<string, IndexerFieldSpec>;
+
+/**
+ * An endpoint schema entry: the field contracts plus optional endpoint-level
+ * deprecation metadata (issue #149).
+ */
+export interface IndexerEndpointSchema extends IndexerObjectSchema {
+  /** Deprecation window for the whole endpoint, when it is being retired. */
+  deprecated?: IndexerDeprecation;
+}
 
 /** One mismatch between a response body and its schema. */
 export interface IndexerSchemaViolation {
@@ -363,7 +400,7 @@ export const INDEXER_RESPONSE_SCHEMAS = {
     events: arr(ACTIVITY_EVENT),
     pagination: CURSOR_PAGINATION,
   },
-} satisfies Record<string, IndexerObjectSchema>;
+} satisfies Record<string, IndexerEndpointSchema>;
 
 /** Identifier of a schema in {@link INDEXER_RESPONSE_SCHEMAS}. */
 export type IndexerEndpointName = keyof typeof INDEXER_RESPONSE_SCHEMAS;
@@ -398,6 +435,21 @@ function checkField(
   }
   if (value === null) {
     if (!spec.nullable) out.push({ path, expected: spec.type, actual: "null" });
+    return;
+  }
+
+  // Transition window (issue #149): a deprecated field may still arrive in a
+  // legacy wire form. Accept it when any alternative form validates.
+  if (spec.legacy && spec.legacy.length > 0) {
+    const primary: IndexerSchemaViolation[] = [];
+    checkField({ ...spec, legacy: undefined }, value, path, primary);
+    if (primary.length === 0) return;
+    for (const alt of spec.legacy) {
+      const altOut: IndexerSchemaViolation[] = [];
+      checkField(alt, value, path, altOut);
+      if (altOut.length === 0) return;
+    }
+    out.push(...primary);
     return;
   }
 
@@ -468,6 +520,8 @@ function checkObject(
   out: IndexerSchemaViolation[],
 ): void {
   for (const [key, spec] of Object.entries(schema)) {
+    // Endpoint-level `deprecated` metadata is not a field contract.
+    if (key === "deprecated") continue;
     checkField(spec, value[key], `${path}.${key}`, out);
   }
 }
@@ -510,6 +564,7 @@ export function listUnknownFields(endpoint: IndexerEndpointName, body: unknown):
   const walk = (schema: IndexerObjectSchema, value: unknown, path: string) => {
     if (!isPlainObject(value)) return;
     for (const [key, child] of Object.entries(value)) {
+      if (key === "deprecated") continue;
       const spec = schema[key];
       const childPath = `${path}.${key}`;
       if (!spec) {
@@ -526,5 +581,38 @@ export function listUnknownFields(endpoint: IndexerEndpointName, body: unknown):
     }
   };
   walk(INDEXER_RESPONSE_SCHEMAS[endpoint], body, "$");
+  return out;
+}
+
+/**
+ * List the deprecation markers declared by an endpoint schema (issue #149).
+ *
+ * Returns one entry per deprecated field (with its JSONPath-style location)
+ * plus an entry for the endpoint itself when it is deprecated. Used by the
+ * compatibility tests and by tooling that reports upcoming sunsets.
+ */
+export function listDeprecations(
+  endpoint: IndexerEndpointName,
+): Array<{ path: string; deprecated: IndexerDeprecation }> {
+  const out: Array<{ path: string; deprecated: IndexerDeprecation }> = [];
+  const walk = (schema: IndexerObjectSchema, path: string) => {
+    for (const [key, spec] of Object.entries(schema)) {
+      if (key === "deprecated") {
+        const marker = (schema as IndexerEndpointSchema).deprecated;
+        if (marker) out.push({ path, deprecated: marker });
+        continue;
+      }
+      const childPath = `${path}.${key}`;
+      if (spec.deprecated) out.push({ path: childPath, deprecated: spec.deprecated });
+      if (spec.type === "object" && spec.fields) walk(spec.fields, childPath);
+      if (spec.type === "array" && spec.items) walkSpec(spec.items, `${childPath}[]`);
+    }
+  };
+  const walkSpec = (spec: IndexerFieldSpec, path: string) => {
+    if (spec.deprecated) out.push({ path, deprecated: spec.deprecated });
+    if (spec.type === "object" && spec.fields) walk(spec.fields, path);
+    if (spec.type === "array" && spec.items) walkSpec(spec.items, `${path}[]`);
+  };
+  walk(INDEXER_RESPONSE_SCHEMAS[endpoint], "$");
   return out;
 }

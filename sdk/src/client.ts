@@ -26,6 +26,7 @@ import {
   RpcReadCancelledError,
   optionalRead,
 } from './circleUpClient';
+import { redactSecrets, sanitizeEndpointUrl } from './redact';
 import {
   attachMetadata,
   normalizeNotInitializedError,
@@ -81,6 +82,12 @@ export class FactoryClient extends CircleUpClient {
    *
    * Never throws: a malformed member list or round amount comes back as
    * `result.errorCode === "invalid_argument"`, like every other failure.
+   *
+   * Member order (#873): `members` is sent exactly as given and becomes the
+   * payout rotation — `members[0]` receives round 1's pot, `members[1]`
+   * round 2's, and so on (see {@link payoutSchedule}). Nothing sorts the
+   * list. `creator` signs and pays fees but is **not** added as a member;
+   * include the creator's address in `members` for them to participate.
    */
   async createCircle(
     params: {
@@ -381,6 +388,14 @@ export class CircleClient extends CircleUpClient {
     return result;
   }
 
+  /**
+   * Mark `member` in default for the current round (after its deadline).
+   *
+   * The contract deducts `floor(collateral × PENALTY_BPS / BPS_DENOM)` from
+   * the member's *remaining* collateral — see {@link computeDefaultPenalty}
+   * to preview the amount. A member is charged at most once per round: a
+   * repeat call fails with `AlreadyDefaulted` (code 13) and changes nothing.
+   */
   async markDefault(
     caller: Keypair,
     member: string,
@@ -418,6 +433,20 @@ export class CircleClient extends CircleUpClient {
     return result;
   }
 
+  /**
+   * Settle a terminal (Completed or Cancelled) circle.
+   *
+   * `close` is **global, not per-member**: one successful call by the circle
+   * admin or any configured member releases every member's remaining
+   * collateral (members with zero collateral are skipped), emits one
+   * `collateral_released` event per paid member in member-list order followed
+   * by one `closed` event, and sets the permanent closed flag. Lifecycle
+   * status is unchanged. Every later call fails with `AlreadyClosed`
+   * (close code 1) and pays nothing; a non-member/non-admin caller gets
+   * `Unauthorized` (code 3); Pending/Active circles get `NotTerminalState`
+   * (code 2); a paused circle fails with `CirclePaused` (contract code 7).
+   * Forfeited penalties remain in the contract and are not redistributed.
+   */
   async close(caller: Keypair, options?: WriteOptions): Promise<TxResult> {
     const stale = await this.preflightGuard(
       options?.expected ? { expected: options.expected } : undefined,
@@ -727,7 +756,8 @@ export class CircleClient extends CircleUpClient {
       [scAddress(member)],
       ...optionalRead(read),
     );
-    // i128 on the wire; the contract clamps penalty deductions at zero.
+    // i128 on the wire; penalties floor to 20% of the remaining balance, so
+    // stored collateral is never negative.
     return decodeI128(raw, "getCollateral", { min: 0n });
   }
 
@@ -746,7 +776,7 @@ export class CircleClient extends CircleUpClient {
     }
   }
 
-  async getDefaults(member: string): Promise<number> {
+  async getDefaults(member: string, read?: ReadOptions): Promise<number> {
     const raw = await this.simulateAndReadOrThrow(
       this.circleAddress,
       "get_defaults",
@@ -1189,10 +1219,10 @@ export class IndexerError extends Error {
   readonly retryable: boolean;
 
   constructor(message: string, status: number, url: string, kind?: IndexerErrorKind) {
-    super(message);
+    super(redactSecrets(message));
     this.name = "IndexerError";
     this.status = status;
-    this.url = url;
+    this.url = sanitizeEndpointUrl(url);
     this.kind = kind ?? (status === 0 ? "network" : "http");
     this.retryable =
       this.kind === "network" ||

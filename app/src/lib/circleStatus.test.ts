@@ -9,6 +9,41 @@ import {
   type CircleStatusPresentation,
 } from "./circleStatus";
 
+// ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+/**
+ * Future / unsupported status strings that may cross the versioned deployment
+ * boundary (indexer rows or API payloads) before the client understands them.
+ */
+const FUTURE_STATUS_FIXTURES = [
+  "Paused",
+  "Disputed",
+  "Suspended",
+  "Archived",
+  "PENDING_REVIEW",
+] as const;
+
+/**
+ * Malformed status values that should never crash the UI and must normalize to
+ * the explicit unknown presentation.
+ */
+const MALFORMED_STATUS_FIXTURES: unknown[] = [
+  "",
+  "   ",
+  null,
+  undefined,
+  123,
+  0,
+  NaN,
+  true,
+  false,
+  {},
+  [],
+  { status: "Active" },
+  ["Active"],
+  () => "Active",
+];
+
 // ─── Supported values ─────────────────────────────────────────────────────────
 
 const SUPPORTED: Record<CircleStatus, Partial<CircleStatusPresentation>> = {
@@ -53,6 +88,23 @@ describe("circleStatus — supported values", () => {
     expect(isKnownCircleStatus(undefined)).toBe(false);
     expect(isKnownCircleStatus(123)).toBe(false);
   });
+
+  it("normalizes every known status to itself (case/whitespace-insensitive)", () => {
+    for (const status of ALL_CIRCLE_STATUSES) {
+      expect(normalizeCircleStatus(status)).toBe(status);
+      expect(normalizeCircleStatus(status.toUpperCase())).toBe(status);
+      expect(normalizeCircleStatus(status.toLowerCase())).toBe(status);
+      expect(normalizeCircleStatus(` ${status} `)).toBe(status);
+    }
+  });
+
+  it("enables mutation actions for every known status", () => {
+    for (const status of ALL_CIRCLE_STATUSES) {
+      const meta = getCircleStatusMeta(status);
+      expect(meta.isKnown).toBe(true);
+      expect(meta.actionsEnabled).toBe(true);
+    }
+  });
 });
 
 // ─── Unknown values ───────────────────────────────────────────────────────────
@@ -85,5 +137,71 @@ describe("circleStatus — unknown values (safe fallback)", () => {
   it("never returns a known-status presentation for an unknown value", () => {
     const labels = new Set(ALL_CIRCLE_STATUSES.map((s) => getCircleStatusMeta(s).label));
     expect(labels.has(getCircleStatusMeta("bogus").label)).toBe(false);
+  });
+
+  it.each(FUTURE_STATUS_FIXTURES)(
+    "normalizes future status %s to 'unknown'",
+    (future) => {
+      expect(normalizeCircleStatus(future)).toBe("unknown");
+      expect(isKnownCircleStatus(future)).toBe(false);
+    },
+  );
+
+  it.each(FUTURE_STATUS_FIXTURES)(
+    "renders future status %s with the unsupported presentation",
+    (future) => {
+      const meta = getCircleStatusMeta(future);
+      expect(meta.isKnown).toBe(false);
+      expect(meta.actionsEnabled).toBe(false);
+      expect(meta.chipClasses).toContain("slate");
+      expect(meta.dotClasses).toContain("slate");
+      expect(meta.description).toMatch(/Unrecognized/i);
+      // Raw value is surfaced for diagnostics, not interpolated as HTML.
+      expect(meta.description).toContain(future);
+      expect(meta.description).not.toContain("<");
+      expect(meta.description).not.toContain(">");
+    },
+  );
+
+  it.each(MALFORMED_STATUS_FIXTURES)(
+    "normalizes malformed value %p to 'unknown'",
+    (value) => {
+      expect(normalizeCircleStatus(value)).toBe("unknown");
+      expect(isKnownCircleStatus(value)).toBe(false);
+    },
+  );
+
+  it.each(MALFORMED_STATUS_FIXTURES)(
+    "renders malformed value %p with the unsupported presentation",
+    (value) => {
+      const meta = getCircleStatusMeta(value);
+      expect(meta.isKnown).toBe(false);
+      expect(meta.actionsEnabled).toBe(false);
+      expect(meta.label).toBe("Unknown");
+      expect(meta.chipClasses).toContain("slate");
+      expect(meta.dotClasses).toContain("slate");
+      expect(meta.description).toMatch(/Unrecognized/i);
+    },
+  );
+
+  it("does not interpolate raw HTML from a hostile status string", () => {
+    const hostile = "<img src=x onerror=alert(1)>";
+    const meta = getCircleStatusMeta(hostile);
+    expect(meta.isKnown).toBe(false);
+    expect(meta.actionsEnabled).toBe(false);
+    // The raw value may appear as text, but must not be treated as markup.
+    expect(meta.description).not.toContain("<img");
+    expect(meta.description).not.toContain("onerror");
+  });
+
+  it("disables all mutation actions for every unknown value", () => {
+    const unknowns: unknown[] = [
+      ...FUTURE_STATUS_FIXTURES,
+      ...MALFORMED_STATUS_FIXTURES,
+      "bogus",
+    ];
+    for (const value of unknowns) {
+      expect(getCircleStatusMeta(value).actionsEnabled).toBe(false);
+    }
   });
 });

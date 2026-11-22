@@ -5,7 +5,7 @@ import { useTransition } from "react";
 import clsx from "clsx";
 import type { CircleLifecycleStatus as StatusFilter } from "@/lib/lifecycle";
 import { CIRCLE_STATUS_OPTIONS } from "@/lib/lifecycle";
-import { getCircleStatusMeta } from "@/lib/circleStatus";
+import { getCircleStatusMeta, UNKNOWN_STATUS_META } from "@/lib/circleStatus";
 
 // ─── Label + colour map ───────────────────────────────────────────────────────
 //
@@ -23,6 +23,11 @@ const FILL_CLASSES: Record<StatusFilter, string> = {
   Closed: "bg-slate-500",
 };
 
+/** Sentinel filter value used to surface rows whose status is unrecognized. */
+export const UNKNOWN_STATUS_FILTER = "Unknown" as const;
+
+type FilterKey = StatusFilter | typeof UNKNOWN_STATUS_FILTER | "All";
+
 function statusUi(status: StatusFilter) {
   const meta = getCircleStatusMeta(status);
   const fill = FILL_CLASSES[status];
@@ -34,7 +39,7 @@ function statusUi(status: StatusFilter) {
 }
 
 const STATUS_UI: Record<
-  StatusFilter | "All",
+  FilterKey,
   { label: string; activeClasses: string; dotClasses: string }
 > = {
   All: {
@@ -45,13 +50,22 @@ const STATUS_UI: Record<
   ...Object.fromEntries(
     CIRCLE_STATUS_OPTIONS.map((s) => [s, statusUi(s)]),
   ) as Record<StatusFilter, { label: string; activeClasses: string; dotClasses: string }>,
+  // Explicit presentation for statuses this client version does not understand.
+  [UNKNOWN_STATUS_FILTER]: {
+    label: UNKNOWN_STATUS_META.label,
+    activeClasses: "bg-slate-700 text-white border-slate-700",
+    dotClasses: UNKNOWN_STATUS_META.dotClasses,
+  },
 };
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
 interface CircleStatusFilterProps {
-  /** The currently active status filter, or `undefined` for "All". */
-  activeStatus: StatusFilter | undefined;
+  /**
+   * The currently active status filter, or `undefined` for "All".  May be the
+   * `"Unknown"` sentinel when the URL asks to filter unrecognized statuses.
+   */
+  activeStatus: FilterKey | undefined;
   sort?: string;
   order?: string;
 }
@@ -73,7 +87,7 @@ export function CircleStatusFilter({ activeStatus, sort, order }: CircleStatusFi
   const pathname = usePathname();
   const [isPending, startTransition] = useTransition();
 
-  function handleSelect(status: StatusFilter | undefined) {
+  function handleSelect(status: FilterKey | undefined) {
     startTransition(() => {
       // Preserve sort/order in the URL; reset page/cursor on filter change.
       const params = new URLSearchParams(
@@ -91,7 +105,11 @@ export function CircleStatusFilter({ activeStatus, sort, order }: CircleStatusFi
     });
   }
 
-  const allOptions: Array<StatusFilter | undefined> = [undefined, ...CIRCLE_STATUS_OPTIONS];
+  const allOptions: Array<FilterKey | undefined> = [
+    undefined,
+    ...CIRCLE_STATUS_OPTIONS,
+    UNKNOWN_STATUS_FILTER,
+  ];
 
   return (
     <div

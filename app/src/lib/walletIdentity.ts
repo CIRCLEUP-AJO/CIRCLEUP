@@ -7,6 +7,26 @@ export function invalidateWalletIdentity(): void {
   setDeploymentFacts([]);
   window.dispatchEvent(new Event('circleup:wallet-change'));
 }
+
+/**
+ * Returns true when the injected provider has exposed `addEventListener`,
+ * meaning the app can subscribe to `accountChanged`/`networkChanged` events
+ * and detect identity transitions continuously.
+ *
+ * When this returns false the app cannot receive push notifications from the
+ * wallet. Any write action must perform an explicit identity re-check at the
+ * action boundary — and the UI must not claim that account changes are
+ * monitored continuously.
+ *
+ * SSR-safe: returns false when `window` is not defined.
+ */
+export function providerHasChangeListeners(): boolean {
+  if (typeof window === 'undefined') return false;
+  const w = window as unknown as { freighter?: Provider; freighterApi?: Provider };
+  const provider = w.freighter ?? w.freighterApi;
+  return typeof provider?.addEventListener === 'function';
+}
+
 export function observeWalletChanges(onChange: () => void): () => void {
   const w = window as unknown as { freighter?: Provider; freighterApi?: Provider };
   const provider = w.freighter ?? w.freighterApi;

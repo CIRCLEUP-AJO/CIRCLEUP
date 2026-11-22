@@ -6,6 +6,7 @@ import { shortAddress, NETWORK_PASSPHRASE } from "@/lib/config";
 import {
   detectWalletCapabilities,
   explainUnsupportedAction,
+  explainMonitoringLimitation,
   checkNetworkMismatch,
   describeNetworkMismatch,
   type NetworkMismatchResult,
@@ -27,8 +28,8 @@ type ConnectionState =
   | { status: "idle" }
   | { status: "connecting" }
   | { status: "changing" }
-  | { status: "connected"; address: string; networkMismatch?: NetworkMismatchResult | null; capabilities?: { canSign: boolean; canGetNetwork: boolean } }
-  | { status: "limited"; message: string; address?: string }
+  | { status: "connected"; address: string; networkMismatch?: NetworkMismatchResult | null; capabilities?: { canSign: boolean; canGetNetwork: boolean; canWatchChanges: boolean }; monitoringLimitation?: string | null }
+  | { status: "limited"; message: string; address?: string; monitoringLimitation?: string | null }
   | { status: "not_installed" }
   | { status: "error"; message: string; reason: WalletErrorReason }
 
@@ -123,7 +124,7 @@ export function WalletButton() {
     try { signWarning = caps ? explainUnsupportedAction("sign", caps) : null; } catch { signWarning = null; }
 
     if (signWarning) {
-      if (mountedRef.current && resolution === resolutionRef.current) setState({ status: "limited", message: signWarning, address });
+      if (mountedRef.current && resolution === resolutionRef.current) setState({ status: "limited", message: signWarning, address, monitoringLimitation: caps ? explainMonitoringLimitation(caps) : null });
       return;
     }
 
@@ -135,8 +136,9 @@ export function WalletButton() {
       address,
       networkMismatch,
       capabilities: caps
-        ? { canSign: caps.canSignTransaction, canGetNetwork: caps.canGetNetwork }
+        ? { canSign: caps.canSignTransaction, canGetNetwork: caps.canGetNetwork, canWatchChanges: caps.canWatchChanges }
         : undefined,
+      monitoringLimitation: caps ? explainMonitoringLimitation(caps) : null,
     });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -185,7 +187,7 @@ export function WalletButton() {
 
 
       if (signWarning) {
-        setState({ status: "limited", message: signWarning, address });
+        setState({ status: "limited", message: signWarning, address, monitoringLimitation: caps ? explainMonitoringLimitation(caps) : null });
         return;
       }
 
@@ -197,8 +199,9 @@ export function WalletButton() {
         address,
         networkMismatch,
         capabilities: caps
-          ? { canSign: caps.canSignTransaction, canGetNetwork: caps.canGetNetwork }
+          ? { canSign: caps.canSignTransaction, canGetNetwork: caps.canGetNetwork, canWatchChanges: caps.canWatchChanges }
           : undefined,
+        monitoringLimitation: caps ? explainMonitoringLimitation(caps) : null,
       });
     } catch (err) {
       if (!mountedRef.current || resolution !== resolutionRef.current) return;
@@ -247,6 +250,15 @@ export function WalletButton() {
               role="alert"
             >
               ⚠ {mismatchMessage}
+            </span>
+          )}
+          {!mismatchMessage && state.monitoringLimitation && (
+            <span
+              className="text-xs text-slate-400 max-w-[180px] truncate"
+              title={state.monitoringLimitation}
+              aria-label={`Wallet monitoring note: ${state.monitoringLimitation}`}
+            >
+              ⓘ No live change detection
             </span>
           )}
         </div>

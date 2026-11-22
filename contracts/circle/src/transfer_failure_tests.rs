@@ -10,6 +10,11 @@
 //!    (collateral slot, contribution record, `paid_out`, penalties, `Closed`);
 //! 3. the same call succeeds once the cause is fixed — nothing is left in a
 //!    half-applied state that blocks a retry.
+//!
+//! `mark_default` is deliberately listed separately: it deducts collateral in
+//! storage but performs no token transfer, so an under-funded circle balance
+//! cannot make it fail. The shared token-behavior fixture documents that
+//! distinction in `token_behavior_fixture.rs`.
 
 #![cfg(test)]
 extern crate std;
@@ -177,35 +182,34 @@ fn settle_round_from_underfunded_circle_rolls_back_penalties_and_can_retry() {
 // ── mark_default ────────────────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "USDC transfer failed during collateral penalty")]
-fn mark_default_from_underfunded_circle_panics_with_context() {
-    let t = fixture();
-    t.join_all();
-    t.advance_past_deadline();
-    t.drain_circle(t.token.balance(&t.circle_id));
-    t.circle.mark_default(&t.alice);
-}
-
-#[test]
-fn mark_default_from_underfunded_circle_rolls_back_and_can_retry() {
+fn mark_default_is_bookkeeping_only_and_does_not_move_tokens() {
     let t = fixture();
     t.join_all();
     t.advance_past_deadline();
     let drained = t.token.balance(&t.circle_id);
-    let sink = t.drain_circle(drained);
+    let _sink = t.drain_circle(drained);
 
-    assert!(t.circle.try_mark_default(&t.alice).is_err());
-    assert_eq!(t.circle.get_collateral(&t.alice), COLLATERAL, "collateral must roll back");
-    assert_eq!(t.circle.get_defaults(&t.alice), 0, "defaults counter must roll back");
-
-    t.refund_circle(&sink, drained);
     t.circle.mark_default(&t.alice);
+
     let penalty = COLLATERAL * crate::PENALTY_BPS / crate::BPS_DENOM;
-    assert_eq!(
-        t.circle.get_collateral(&t.alice),
-        COLLATERAL - penalty,
-        "penalty must be applied on retry"
-    );
+    assert_eq!(t.circle.get_collateral(&t.alice), COLLATERAL - penalty);
+    assert_eq!(t.circle.get_defaults(&t.alice), 1);
+    assert_eq!(t.token.balance(&t.circle_id), 0);
+}
+
+#[test]
+fn mark_default_rejects_repeat_flags_even_when_the_circle_is_underfunded() {
+    let t = fixture();
+    t.join_all();
+    t.advance_past_deadline();
+    let drained = t.token.balance(&t.circle_id);
+    let _sink = t.drain_circle(drained);
+
+    t.circle.mark_default(&t.alice);
+    assert!(t.circle.try_mark_default(&t.alice).is_err());
+
+    let penalty = COLLATERAL * crate::PENALTY_BPS / crate::BPS_DENOM;
+    assert_eq!(t.circle.get_collateral(&t.alice), COLLATERAL - penalty);
     assert_eq!(t.circle.get_defaults(&t.alice), 1);
 }
 

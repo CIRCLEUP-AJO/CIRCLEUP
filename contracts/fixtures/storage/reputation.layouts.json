@@ -1,0 +1,48 @@
+{
+  "schema": "circleup.storage-fixtures.v1",
+  "contract": "reputation",
+  "tested_by": "contracts/reputation/tests/storage_compatibility_tests.rs",
+  "candidate": "contract code at the commit under test",
+  "layouts": {
+    "L1": {
+      "introduced_by": "8c7a1df (2026-06-29) initial CircleUp",
+      "instance_keys": ["Admin", "AuthorizedCallers"],
+      "persistent_keys": ["Score(Address)"]
+    },
+    "L2": {
+      "introduced_by": "5d79904 (2026-08-19) permanent revocation",
+      "adds": ["RevokedCallers (instance)"],
+      "notes": "Current layout. Initializing is transient (set and removed within initialize)."
+    }
+  },
+  "fixtures": [
+    {
+      "id": "reputation.L1.pre-revocation",
+      "layout": "L1",
+      "state": "One authorized caller, one scored member, no RevokedCallers key",
+      "expect": "preserved",
+      "assertions": ["score preserved", "get_revoked_callers empty", "increment by authorized caller adds exactly 1", "remove then re-add -> ReputationError::CallerRevoked"]
+    },
+    {
+      "id": "reputation.L2.populated",
+      "layout": "L2",
+      "state": "One authorized and one revoked caller, one scored member",
+      "expect": "preserved + typed_error",
+      "assertions": ["score preserved", "increment by revoked caller -> ReputationError::UnauthorizedCaller", "re-add revoked -> ReputationError::CallerRevoked", "increment by authorized caller adds exactly 1"]
+    },
+    {
+      "id": "reputation.L2.fresh-empty",
+      "layout": "L2",
+      "state": "Initialized, empty allowlists, no scores",
+      "expect": "preserved + typed_error",
+      "assertions": ["score == 0 for any member", "increment -> ReputationError::UnauthorizedCaller"]
+    },
+    {
+      "id": "reputation.uninitialized",
+      "layout": "none",
+      "state": "No storage keys",
+      "expect": "typed_error",
+      "assertions": ["increment -> ReputationError::NotInitialized", "score == 0"]
+    }
+  ]
+}

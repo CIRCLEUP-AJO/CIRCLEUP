@@ -35,12 +35,19 @@
  *   --manifest=<path>  Path to the deployment manifest JSON (from deployment-manifest.ts).
  *                      Required for layers that need contract addresses.
  *   --layers=<list>    Comma-separated subset of layers to check
- *                      (default: all four layers).
+ *                      (default: contracts,sdk,indexer,app,writes).
+ *   --evidence-dir=<p> Directory with CI evidence such as
+ *                      resource-report-<tier>.json (default: artifacts/).
  *   --json             Emit machine-readable JSON report to stdout.
+ *
+ * Missing evidence is a WARNING for testnet release candidates and a FAILURE
+ * for mainnet release candidates. The full matrix and sign-off rules are in
+ * docs/RELEASE_SMOKE_TEST_MATRIX.md.
  */
 
 import fs from "fs";
 import path from "path";
+import { evaluateWriteGate } from "./smoke-write-gate";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -64,7 +71,29 @@ export interface SmokeReport {
   summary: string;
 }
 
-type LayerName = "contracts" | "sdk" | "indexer" | "app";
+/**
+ * `writes` is a pseudo-layer that reports the disposable-testnet write gate
+ * (smoke-write-gate.ts). It never submits anything itself.
+ */
+export type LayerName = "contracts" | "sdk" | "indexer" | "app" | "writes";
+
+export const ALL_LAYERS: LayerName[] = ["contracts", "sdk", "indexer", "app", "writes"];
+
+/** Default directory holding CI-produced release evidence (resource reports…). */
+export const DEFAULT_EVIDENCE_DIR = "artifacts";
+
+/** Missing evidence is a warning for testnet RCs and a failure for mainnet RCs. */
+function missingEvidence(
+  environment: string,
+  layer: string,
+  name: string,
+  message: string,
+  detail?: string,
+): SmokeCheck {
+  return environment === "mainnet"
+    ? smokeFail(layer, name, message, detail)
+    : smokeWarn(layer, name, message, detail);
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -619,12 +648,149 @@ function checkNoCommittedSecrets(): SmokeCheck {
   );
 }
 
+// ── Additional evidence checks (#865, #867, #868) ────────────────────────────
+
+const RESOURCE_TIERS = ["min", "typical", "max"] as const;
+
+interface ResourceReport {
+  schema?: string;
+  tier?: string;
+  toolchain?: { rust?: string; soroban_sdk?: string };
+  workflows?: Array<{ workflow?: string; exceeds_mainnet?: string[]; baseline?: string }>;
+}
+
+/**
+ * Check 1d — Soroban resource budget reports (#868).
+ *
+ * Reads `resource-report-<tier>.json` files produced by
+ * `contracts/circle/tests/resource_budget_tests.rs` in CI. Regressions or
+ * mainnet-limit violations in the min/typical tiers fail; the max tier's
+ * mainnet overruns are reported as warnings (see docs/RESOURCE_BUDGETS.md).
+ */
+export function checkResourceBudgetReports(evidenceDir: string, environment: string): SmokeCheck {
+  const missing: string[] = [];
+  const problems: string[] = [];
+  const warnings: string[] = [];
+
+  for (const tier of RESOURCE_TIERS) {
+    const file = path.join(evidenceDir, `resource-report-${tier}.json`);
+    const report = readJson<ResourceReport>(file);
+    if (!report) {
+      missing.push(path.relative(ROOT, file) || file);
+      continue;
+    }
+    if (report.schema !== "circleup.resource-report.v1") {
+      problems.push(`${tier}: unexpected schema "${report.schema ?? "none"}"`);
+      continue;
+    }
+    for (const wf of report.workflows ?? []) {
+      if (wf.baseline === "regressed") problems.push(`${tier}/${wf.workflow}: regressed beyond tolerance`);
+      if (wf.baseline === "unbaselined") warnings.push(`${tier}/${wf.workflow}: no recorded baseline`);
+      if ((wf.exceeds_mainnet ?? []).length > 0) {
+        const msg = `${tier}/${wf.workflow}: exceeds mainnet limits (${(wf.exceeds_mainnet ?? []).join(", ")})`;
+        if (tier === "max") warnings.push(msg);
+        else problems.push(msg);
+      }
+    }
+  }
+
+  if (missing.length > 0) {
+    return missingEvidence(
+      environment,
+      "contracts",
+      "resource_budget_reports",
+      `${missing.length} resource budget report(s) missing.`,
+      `Expected: ${missing.join(", ")}\nProduce them with CIRCLEUP_RESOURCE_REPORT_DIR=<dir> cargo test -p circle --test resource_budget_tests.`,
+    );
+  }
+  if (problems.length > 0) {
+    return smokeFail("contracts", "resource_budget_reports", `${problems.length} resource budget problem(s).`, problems.join("\n"));
+  }
+  if (warnings.length > 0) {
+    return smokeWarn("contracts", "resource_budget_reports", `${warnings.length} resource budget warning(s).`, warnings.join("\n"));
+  }
+  return smokePass("contracts", "resource_budget_reports", "All tiers within baseline tolerance and mainnet limits.", evidenceDir);
+}
+
+/**
+ * Check 1e — Historical storage fixtures for upgrade compatibility (#867).
+ */
+export function checkStorageCompatibilityFixtures(environment: string): SmokeCheck {
+  const dir = path.join(ROOT, "contracts", "fixtures", "storage");
+  const required = ["circle", "circle_factory", "reputation"];
+  if (!fileExists(dir)) {
+    return missingEvidence(environment, "contracts", "storage_compat_fixtures", "contracts/fixtures/storage is missing.");
+  }
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+  const absent = required.filter((c) => !files.some((f) => f.startsWith(`${c}.`)));
+  if (absent.length > 0) {
+    return missingEvidence(
+      environment,
+      "contracts",
+      "storage_compat_fixtures",
+      `No storage fixtures for: ${absent.join(", ")}.`,
+    );
+  }
+  return smokePass("contracts", "storage_compat_fixtures", `${files.length} storage fixture file(s) present.`, path.relative(ROOT, dir));
+}
+
+/**
+ * Check 2c — SDK transaction/RPC fixtures exist (public API regression evidence).
+ */
+export function checkSdkTransactionFixtures(environment: string): SmokeCheck {
+  const fixture = path.join(ROOT, "sdk", "src", "fixtures", "versionedRpcFixtures.ts");
+  if (!fileExists(fixture)) {
+    return missingEvidence(environment, "sdk", "sdk_transaction_fixtures", "SDK versioned RPC fixtures are missing.");
+  }
+  return smokePass("sdk", "sdk_transaction_fixtures", "SDK versioned RPC fixtures present.", path.relative(ROOT, fixture));
+}
+
+/**
+ * Check 4d — App production build output exists (`next build` → .next/BUILD_ID).
+ */
+export function checkAppProductionBuild(environment: string): SmokeCheck {
+  const buildId = path.join(ROOT, "app", ".next", "BUILD_ID");
+  if (!fileExists(buildId)) {
+    return missingEvidence(
+      environment,
+      "app",
+      "app_production_build",
+      "No app production build found (app/.next/BUILD_ID).",
+      "Run the App CI job (npm run build --workspace=app) for this commit before sign-off.",
+    );
+  }
+  const id = fs.readFileSync(buildId, "utf-8").trim();
+  return smokePass("app", "app_production_build", `App production build present (BUILD_ID ${id}).`, path.relative(ROOT, buildId));
+}
+
+/**
+ * Check 5a — Write-based smoke gate (report only; never submits).
+ */
+export function checkTestnetWriteGate(environment: string, env: Record<string, string | undefined> = process.env): SmokeCheck {
+  const decision = evaluateWriteGate(environment, env);
+  if (decision.allowed) {
+    return smokePass(
+      "writes",
+      "testnet_write_gate",
+      "Disposable testnet write scenarios are permitted (funding is verified before each run).",
+      decision.checks.join(", "),
+    );
+  }
+  return decision.status === "fail"
+    ? smokeFail("writes", "testnet_write_gate", decision.reason)
+    : smokeSkip("writes", "testnet_write_gate", decision.reason);
+}
+
 // ── Aggregate ─────────────────────────────────────────────────────────────────
 
 export interface SmokeOptions {
   environment?: string;
   manifestPath?: string | null;
   layers?: LayerName[];
+  /** Directory with CI evidence (resource reports). Defaults to `<root>/artifacts`. */
+  evidenceDir?: string;
+  /** Environment used for the write gate (defaults to process.env). */
+  env?: Record<string, string | undefined>;
 }
 
 /**
@@ -637,7 +803,8 @@ export interface SmokeOptions {
 export function runSmokeTests(options: SmokeOptions = {}): SmokeReport {
   const environment  = options.environment  ?? "testnet";
   const manifestPath = options.manifestPath ?? null;
-  const layers       = options.layers       ?? ["contracts", "sdk", "indexer", "app"];
+  const layers       = options.layers       ?? ALL_LAYERS;
+  const evidenceDir  = options.evidenceDir  ?? path.join(ROOT, DEFAULT_EVIDENCE_DIR);
 
   const checks: SmokeCheck[] = [];
 
@@ -645,11 +812,14 @@ export function runSmokeTests(options: SmokeOptions = {}): SmokeReport {
     checks.push(checkContractHashes());
     checks.push(checkContractProvenance());
     checks.push(checkManifestContractAlignment(manifestPath));
+    checks.push(checkResourceBudgetReports(evidenceDir, environment));
+    checks.push(checkStorageCompatibilityFixtures(environment));
   }
 
   if (layers.includes("sdk")) {
     checks.push(checkSdkBuild());
     checks.push(checkSdkPackageIntegrity());
+    checks.push(checkSdkTransactionFixtures(environment));
   }
 
   if (layers.includes("indexer")) {
@@ -662,6 +832,11 @@ export function runSmokeTests(options: SmokeOptions = {}): SmokeReport {
     checks.push(checkEnvExamples());
     checks.push(checkDeploymentManifest(manifestPath, environment));
     checks.push(checkNoCommittedSecrets());
+    checks.push(checkAppProductionBuild(environment));
+  }
+
+  if (layers.includes("writes")) {
+    checks.push(checkTestnetWriteGate(environment, options.env ?? process.env));
   }
 
   const failures = checks.filter((c) => c.status === "fail");
@@ -739,27 +914,24 @@ if (require.main === module) {
   const envArg      = args.find((a) => a.startsWith("--env="));
   const manifestArg = args.find((a) => a.startsWith("--manifest="));
   const layersArg   = args.find((a) => a.startsWith("--layers="));
+  const evidenceArg = args.find((a) => a.startsWith("--evidence-dir="));
   const printJson   = args.includes("--json");
 
   const environment  = envArg      ? envArg.replace("--env=", "")      : "testnet";
   const manifestPath = manifestArg ? manifestArg.replace("--manifest=", "") : null;
+  const evidenceDir  = evidenceArg ? path.resolve(evidenceArg.replace("--evidence-dir=", "")) : undefined;
   const layers = layersArg
     ? (layersArg.replace("--layers=", "").split(",") as LayerName[])
-    : (["contracts", "sdk", "indexer", "app"] as LayerName[]);
+    : ALL_LAYERS;
 
-  // Guard: never auto-submit mainnet transactions from this script.
-  // This is a non-mutating check command — mainnet write scenarios require
-  // explicit human sign-off outside this tool.
-  if (environment === "mainnet" && process.env.SMOKE_ALLOW_MAINNET !== "1") {
-    // Read-only checks against mainnet artifacts are safe. But fail fast if
-    // anyone tries to pass environment flags that might trigger write behaviour.
-    // (Currently no writes exist; this guard is forward-looking.)
-    console.log("[smoke-test] Note: running in mainnet read-only mode.");
-    console.log("  No transactions will be submitted.");
-    console.log("  To run testnet write scenarios, use SMOKE_TESTNET=true with a funded account.\n");
+  // This command is non-mutating for every environment: it never deploys,
+  // migrates or submits transactions. Mainnet write scenarios do not exist
+  // and cannot be enabled (see smoke-write-gate.ts — no override flag).
+  if (environment === "mainnet") {
+    console.error("[smoke-test] Mainnet release candidate: read-only checks only. No transactions will be submitted.");
   }
 
-  const report = runSmokeTests({ environment, manifestPath, layers });
+  const report = runSmokeTests({ environment, manifestPath, layers, evidenceDir });
 
   if (printJson) {
     console.log(JSON.stringify(report, null, 2));

@@ -1,7 +1,7 @@
 // --- sdk/src/polling.ts -------------------------------------------------------
 //
 // PollConfig interface, DEFAULT_POLL_CONFIG, STALE_LEDGER_POLLS constant, and
-// validatePollConfig helper — extracted from circleUpClient.ts to reduce that
+// validatePollConfig helper â€” extracted from circleUpClient.ts to reduce that
 // file's LOC.  Re-exported from circleUpClient.ts; the public API is unchanged.
 //
 // These are pure configuration/validation utilities with no RPC or SDK deps.
@@ -68,13 +68,13 @@ export interface PollConfig {
 }
 
 /** Resolved defaults used when the caller omits individual fields. */
-export const DEFAULT_POLL_CONFIG = {
+export const DEFAULT_POLL_CONFIG: Readonly<Required<PollConfig>> = Object.freeze({
   initialIntervalMs: 2_000,
   maxIntervalMs: 10_000,
   backoffFactor: 1.5,
   timeoutMs: 60_000,
   maxConsecutiveErrors: 5,
-} as const satisfies Required<PollConfig>;
+});
 
 /**
  * How many consecutive polls may observe the same RPC ledger before the

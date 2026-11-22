@@ -361,7 +361,9 @@ export interface CircleState {
  *
  * # Invariants
  *
- * - `collateral ≥ 0n` — the contract clamps penalty deductions to 0.
+ * - `collateral ≥ 0n` — each penalty is `floor(collateral / 5)` of the
+ *   remaining balance (see `computeDefaultPenalty`), so it never goes negative
+ *   and positive collateral never reaches 0 through penalties.
  * - `defaults` is the total number of rounds this member has missed across
  *   the circle's lifetime.  It never decreases.
  * - `reputationScore` is the member's global reputation score across all

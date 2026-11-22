@@ -35,6 +35,11 @@ describe("Route Metadata Generation & Guard Tests", () => {
       expect(globalFetch).not.toHaveBeenCalled();
     });
 
+    it("rejects malformed circle addresses before any indexer lookup", async () => {
+      await generateCircleMetadata({ params: { address: MALFORMED_ADDRESS } });
+      expect(globalFetch).not.toHaveBeenCalled();
+    });
+
     it("returns generic fallback metadata when address param is missing or non-string", async () => {
       const meta = await generateCircleMetadata({ params: { address: undefined as any } });
       expect(meta.title).toBe("Circle — CircleUp");
@@ -85,6 +90,30 @@ describe("Route Metadata Generation & Guard Tests", () => {
       expect(meta.title).toBe("Circle Not Found — CircleUp");
       expect(meta.description).toContain("was not found");
     });
+
+    it("returns a stable fallback (not Not Found) when the indexer is unavailable", async () => {
+      globalFetch.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+      globalFetch.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+      const meta = await generateCircleMetadata({ params: { address: VALID_CIRCLE } });
+      expect(meta.title).toBe("Circle — CircleUp");
+      expect(meta.title).not.toBe("Circle Not Found — CircleUp");
+    });
+
+    it("returns a stable fallback when the indexer responds with a server error", async () => {
+      globalFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+      } as Response);
+      globalFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+      } as Response);
+
+      const meta = await generateCircleMetadata({ params: { address: VALID_CIRCLE } });
+      expect(meta.title).toBe("Circle — CircleUp");
+      expect(meta.title).not.toBe("Circle Not Found — CircleUp");
+    });
   });
 
   describe("Reputation Page Metadata (/reputation/[member])", () => {
@@ -95,6 +124,11 @@ describe("Route Metadata Generation & Guard Tests", () => {
       const meta = await generateReputationMetadata({ params: { member: MALFORMED_MEMBER } });
       expect(meta.title).toBe("Reputation — CircleUp");
       expect(meta.description).toBe("On-chain reputation score and contribution history on CircleUp.");
+      expect(globalFetch).not.toHaveBeenCalled();
+    });
+
+    it("rejects malformed member addresses before any indexer lookup", async () => {
+      await generateReputationMetadata({ params: { member: MALFORMED_MEMBER } });
       expect(globalFetch).not.toHaveBeenCalled();
     });
 
@@ -126,6 +160,25 @@ describe("Route Metadata Generation & Guard Tests", () => {
       const meta = await generateReputationMetadata({ params: { member: VALID_MEMBER } });
       expect(meta.title).toBe("Member Not Found — CircleUp");
       expect(meta.description).toContain("has no recorded activity");
+    });
+
+    it("returns a stable fallback (not Member Not Found) when the indexer is unavailable", async () => {
+      globalFetch.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+
+      const meta = await generateReputationMetadata({ params: { member: VALID_MEMBER } });
+      expect(meta.title).toBe("Reputation — CircleUp");
+      expect(meta.title).not.toBe("Member Not Found — CircleUp");
+    });
+
+    it("returns a stable fallback when the indexer responds with a server error", async () => {
+      globalFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+      } as Response);
+
+      const meta = await generateReputationMetadata({ params: { member: VALID_MEMBER } });
+      expect(meta.title).toBe("Reputation — CircleUp");
+      expect(meta.title).not.toBe("Member Not Found — CircleUp");
     });
   });
 });

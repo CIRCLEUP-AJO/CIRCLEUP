@@ -34,6 +34,99 @@ test("detail: pending circle", async ({ page }) => {
   await expect(page).toHaveScreenshot("detail-pending.png", { fullPage: true, animations: "disabled" });
 });
 
+const narrowViewports = [
+  { name: "mobile-320", width: 320, height: 640 },
+  { name: "mobile-375", width: 375, height: 667 },
+  { name: "tablet-768", width: 768, height: 1024 },
+];
+
+for (const viewport of narrowViewports) {
+  test.describe(`detail: active circle at ${viewport.name}`, () => {
+    test.use({ viewport: { width: viewport.width, height: viewport.height } });
+
+    test("long addresses and round table remain readable", async ({ page }) => {
+      await page.goto(`/circles/${activeCircle}`);
+      await expect(page.getByText("Active", { exact: true }).first()).toBeVisible();
+      await expect(page.getByText(member, { exact: false }).first()).toBeVisible();
+      await expect(page.getByRole("table").first()).toBeVisible();
+      await expect(page).toHaveScreenshot(`detail-active-${viewport.name}.png`, {
+        fullPage: true,
+        animations: "disabled",
+      });
+    });
+
+    test("core actions stay reachable without hidden controls", async ({ page }) => {
+      await page.goto(`/circles/${activeCircle}`);
+      await expect(page.getByText("Active", { exact: true }).first()).toBeVisible();
+      const actions = page.getByRole("button");
+      const count = await actions.count();
+      for (let i = 0; i < count; i += 1) {
+        const action = actions.nth(i);
+        if (await action.isVisible()) {
+          await expect(action).toBeInViewport({ ratio: 0 });
+        }
+      }
+      await expect(page).toHaveScreenshot(`detail-active-actions-${viewport.name}.png`, {
+        fullPage: true,
+        animations: "disabled",
+      });
+    });
+  });
+
+  test.describe(`create: form at ${viewport.name}`, () => {
+    test.use({ viewport: { width: viewport.width, height: viewport.height } });
+
+    test("long member addresses and validation remain operable", async ({ page }) => {
+      await page.goto("/create");
+      await page.getByLabel(/Circle name/).fill("Narrow viewport circle");
+      await page.getByLabel("Contribution amount in USDC").fill("123456789.1234567");
+      await page.getByLabel("Round duration in days").fill("30");
+      await page.getByRole("textbox", { name: /Member 1 of/ }).fill(member);
+      await page.getByRole("textbox", { name: /Member 2 of/ }).fill("not-a-stellar-address");
+      await page.locator("form").evaluate((form: HTMLFormElement) => form.requestSubmit());
+      await expect(page.getByText(/must be a G-prefixed 56-character Stellar address/i)).toBeVisible();
+      await expect(page).toHaveScreenshot(`create-validation-${viewport.name}.png`, {
+        fullPage: true,
+        animations: "disabled",
+      });
+    });
+  });
+}
+
+test.describe("detail: active circle at 200% zoom", () => {
+  test.use({ viewport: { width: 640, height: 720 }, deviceScaleFactor: 2 });
+
+  test("long addresses, round table, and actions remain usable", async ({ page }) => {
+    await page.goto(`/circles/${activeCircle}`);
+    await expect(page.getByText("Active", { exact: true }).first()).toBeVisible();
+    await expect(page.getByText(member, { exact: false }).first()).toBeVisible();
+    await expect(page.getByRole("table").first()).toBeVisible();
+    await expect(page).toHaveScreenshot("detail-active-zoom-200.png", {
+      fullPage: true,
+      animations: "disabled",
+    });
+  });
+});
+
+test.describe("create: form at 200% zoom", () => {
+  test.use({ viewport: { width: 640, height: 720 }, deviceScaleFactor: 2 });
+
+  test("long member addresses and validation remain operable", async ({ page }) => {
+    await page.goto("/create");
+    await page.getByLabel(/Circle name/).fill("Zoomed create circle");
+    await page.getByLabel("Contribution amount in USDC").fill("123456789.1234567");
+    await page.getByLabel("Round duration in days").fill("30");
+    await page.getByRole("textbox", { name: /Member 1 of/ }).fill(member);
+    await page.getByRole("textbox", { name: /Member 2 of/ }).fill("not-a-stellar-address");
+    await page.locator("form").evaluate((form: HTMLFormElement) => form.requestSubmit());
+    await expect(page.getByText(/must be a G-prefixed 56-character Stellar address/i)).toBeVisible();
+    await expect(page).toHaveScreenshot("create-validation-zoom-200.png", {
+      fullPage: true,
+      animations: "disabled",
+    });
+  });
+});
+
 test("reputation: indexer unavailable", async ({ page }) => {
   await page.goto(`/reputation/${member}`);
   await expect(page.getByText("Could not load reputation")).toBeVisible();

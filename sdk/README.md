@@ -67,3 +67,13 @@ classifySdkError(err, stage?) maps a TxFailure, WalletFailure, IndexerError, Rpc
 - `message` is written by the SDK and never contains provider text.
 - An unrecognised error is classified as "unknown" and is not retryable.
 - SdkError.from(err) wraps any failure for throwing. The raw value stays on a non-enumerable `cause`, so it is left out of JSON.
+
+## Compatibility and Semantic Versioning Policy
+
+For versioning guarantees, deprecation timelines, release checklists, and migration paths, see [docs/SDK_COMPATIBILITY.md](../docs/SDK_COMPATIBILITY.md).
+
+- **Supported Surface**: Only symbols exported from `@circleup/sdk` root (`sdk/src/index.ts`). Deep imports are unsupported.
+- **Pre-1.0 SemVer**: `0.x.Y` patch releases are backward-compatible. `0.X.0` minor releases introduce major features or breaking/ABI updates.
+- **Deprecations**: Kept for a minimum of 1 minor release with `@deprecated` replacements.
+- **Privacy & State Isolation**: Zero telemetry without opt-in `TxLogger`. Multi-client instances run completely isolated in the same process.
+

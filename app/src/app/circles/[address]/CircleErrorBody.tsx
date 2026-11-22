@@ -9,7 +9,10 @@ export type FetchError =
   | "server"
   | "parse"
   | "misconfigured"
-  | "indexer_outage";
+  | "indexer_outage"
+  | "invalid_address"
+  | "contract_read"
+  | "indexing_delayed";
 
 // ─── Error copy ───────────────────────────────────────────────────────────────
 //
@@ -29,10 +32,22 @@ const ERROR_MESSAGES: Record<FetchError, string> = {
   indexer_outage:
     "The indexer is running but currently degraded. It may be catching up with the chain or experiencing a service disruption. " +
     "Circle details may be incomplete or temporarily unavailable. Try refreshing in a few minutes.",
+  invalid_address:
+    "The circle address in the URL is not a valid address. Check the link and make sure it points to a circle contract address.",
+  contract_read:
+    "The circle contract could not be read. The contract may not exist at this address or the RPC endpoint may be unavailable. Try again in a moment.",
+  indexing_delayed:
+    "This circle exists on-chain but the indexer has not seen it yet. Indexing can take a few minutes after a circle is created. Try refreshing shortly.",
 };
 
 /** Errors a page refresh can sensibly be asked to recover from. */
-const RETRYABLE_ERRORS: FetchError[] = ["network", "server", "parse"];
+const RETRYABLE_ERRORS: FetchError[] = [
+  "network",
+  "server",
+  "parse",
+  "contract_read",
+  "indexing_delayed",
+];
 
 /**
  * Circle detail fetch error, rendered below the header so the circle address

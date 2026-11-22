@@ -278,6 +278,20 @@ export interface DiagnosticsBundle {
      */
     readonly txHash?: string;
   };
+
+  /**
+   * Unrecognised lifecycle status encountered while rendering circle data.
+   *
+   * Present only when an indexer row or API payload carried a status value the
+   * client does not understand (a future status, a malformed value, or a
+   * non-string).  The value is normalised and escaped via
+   * {@link safeUnknownStatusValue}, so it is always safe to display as plain
+   * text and never contains raw HTML.
+   *
+   * Its presence signals that mutation actions were disabled for the affected
+   * circle because the client cannot reason about the state.
+   */
+  readonly unknownStatus?: string;
 }
 
 // ─── Builder input ─────────────────────────────────────────────────────────────
@@ -317,6 +331,16 @@ export interface DiagnosticsBundleInput {
    * Override window-like object for testing (replaces real `window`).
    */
   readonly _win?: { freighter?: unknown; freighterApi?: unknown; navigator?: Partial<Navigator> };
+
+  /**
+   * Raw lifecycle status value that the client did not recognise.
+   *
+   * When provided, it is normalised and escaped via
+   * {@link safeUnknownStatusValue} and surfaced in the bundle's
+   * {@link DiagnosticsBundle.unknownStatus} field.  Callers should only set
+   * this after confirming the value is not a known status.
+   */
+  readonly unknownStatus?: unknown;
 }
 
 // ─── Environment collector ────────────────────────────────────────────────────
@@ -389,6 +413,7 @@ export function buildDiagnosticsBundle(
     stage,
     errorCategory,
     txHash,
+    unknownStatus,
     _nowIso,
     _win,
   } = input;
@@ -457,6 +482,9 @@ export function buildDiagnosticsBundle(
       online,
     },
     ...(errorSection !== undefined ? { error: errorSection } : {}),
+    ...(unknownStatus !== undefined
+      ? { unknownStatus: safeUnknownStatusValue(unknownStatus) }
+      : {}),
   };
 }
 
@@ -486,4 +514,94 @@ function safeEndpoint(raw: string): string {
 }
 function networkLabel(passphrase: string): string {
   return passphrase === 'Public Global Stellar Network ; September 2015' ? 'mainnet' : passphrase === 'Test SDF Network ; September 2015' ? 'testnet' : 'custom';
+}
+
+// ─── Unknown / unsupported status diagnostics ────────────────────────────────
+
+/**
+ * Maximum number of characters retained from an unrecognised status value.
+ * Longer values are truncated so a malformed or hostile payload cannot bloat
+ * the bundle or smuggle a large blob through the diagnostics field.
+ */
+const MAX_STATUS_DIAGNOSTIC_LENGTH = 64;
+
+/**
+ * Escape a string for safe display as plain text.
+ *
+ * The result is intended for React text nodes (which already escape) and for
+ * plain-text diagnostics output.  It never produces markup: `<`, `>`, `&`,
+ * `"`, and `'` are replaced with their HTML entity spellings so that even if
+ * a consumer mistakenly interpolates the value into an HTML sink, it cannot
+ * break out into markup or script.
+ *
+ * This is a defence-in-depth helper — callers must still render the value as
+ * text, never via `dangerouslySetInnerHTML`.
+ */
+export function escapeStatusText(value: unknown): string {
+  const raw = typeof value === "string" ? value : String(value ?? "");
+  return raw
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/**
+ * Normalise an unrecognised lifecycle status value into a safe diagnostic
+ * string.
+ *
+ * - Non-string values (numbers, objects, null, undefined) are coerced to a
+ *   stable textual form rather than being dropped, so reviewers can see what
+ *   actually arrived.
+ * - Control characters are stripped.
+ * - The value is truncated to {@link MAX_STATUS_DIAGNOSTIC_LENGTH} characters.
+ * - The result is escaped via {@link escapeStatusText} so it can be rendered
+ *   as plain text without any risk of raw HTML interpolation.
+ *
+ * The returned string is always safe to display and to include in a
+ * diagnostics bundle.
+ */
+export function safeUnknownStatusValue(value: unknown): string {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else if (value === null) {
+    text = "null";
+  } else if (value === undefined) {
+    text = "undefined";
+  } else if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+    text = String(value);
+  } else {
+    // Objects, arrays, functions, symbols — never serialise their contents.
+    text = `[unrecognised:${typeof value}]`;
+  }
+
+  // Strip control characters (including newlines and NUL) before truncation.
+  // eslint-disable-next-line no-control-regex
+  text = text.replace(/[\u0000-\u001F\u007F]/g, "");
+
+  if (text.length > MAX_STATUS_DIAGNOSTIC_LENGTH) {
+    text = `${text.slice(0, MAX_STATUS_DIAGNOSTIC_LENGTH)}…`;
+  }
+
+  return escapeStatusText(text);
+}
+
+/**
+ * Build the diagnostics fragment describing an unrecognised lifecycle status.
+ *
+ * Returns `undefined` when `value` is a recognised status (per the supplied
+ * predicate) so callers can spread the result conditionally:
+ *
+ * @example
+ * const statusDiagnostics = describeUnknownStatus(rawStatus, isKnownCircleStatus);
+ * const bundle = buildDiagnosticsBundle({ ...input, ...statusDiagnostics });
+ */
+export function describeUnknownStatus(
+  value: unknown,
+  isKnown: (candidate: unknown) => boolean,
+): { readonly unknownStatus?: string } | undefined {
+  if (isKnown(value)) return undefined;
+  return { unknownStatus: safeUnknownStatusValue(value) };
 }

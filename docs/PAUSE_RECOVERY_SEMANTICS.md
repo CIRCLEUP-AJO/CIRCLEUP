@@ -13,8 +13,18 @@ The CircleUp circle contract supports pausing fund-moving operations to enable e
 
 ### Authorization
 
-- **Admin Role**: Only the address stored at initialization (typically the deployer or factory contract) may call `pause()` or `resume()`.
+- **Admin Role**: Only the `Admin` address written once by `initialize` may call `pause()` or `resume()`. There is no setter, no second role, and no upgrade entrypoint; this document does not introduce any.
 - **Authorization Mechanism**: Both functions require `admin.require_auth()`, meaning the admin must sign the transaction.
+- **Check order** (both functions): `Admin` missing → `NotInitialized`; `require_auth`; caller ≠ admin → `Unauthorized`; then the flag check (`AlreadyPaused` / `NotPaused`). A rejected call writes nothing and emits nothing.
+
+#### Who actually holds pause authority (#876)
+
+| Deployment path | Stored `Admin` | Can anyone pause? |
+|---|---|---|
+| `circle_factory.create_circle` (the app's path) | the **factory contract address** | **No.** The factory has no `pause`/`resume` or forwarding entrypoint, and a contract address can only authorize calls it makes itself. Pinned by `contracts/circle_factory/tests/pause_authority_tests.rs`. |
+| Direct `initialize` by an operator | whatever account was passed | Yes — that account (ideally a multisig). |
+
+Giving factory-deployed circles a working pause would mean adding a factory entrypoint and choosing who may call it. That is a **new emergency authority** and needs an explicit governance decision; it is deliberately not part of this change.
 
 ### Pause Entry-Point
 
@@ -200,11 +210,11 @@ This design allows indexers and front-ends to:
 
 ### Does the deadline advance during a pause?
 
-**No.** The deadline ledger (`deadline_ledger` in `RoundState`) is immutable during a pause. It is only advanced when:
-- A round is settled via `settle_round()` (which is blocked while paused).
-- A new round begins after settlement (also blocked while paused).
+**The stored deadline does not move, but time keeps running against it.** `deadline_ledger` is an absolute ledger sequence. Pause does not rewrite it, and the network keeps closing ledgers while the circle is paused.
 
-**Implication**: If a circle is paused with 1 day left in a round, it still has 1 day left when resumed. Members do not lose time.
+**Implication** (corrected for #876): if a circle is paused with 1 day left in a round and stays paused for 2 days, the deadline has **passed** when it resumes. Members cannot contribute (`DeadlinePassed`), and they can be marked in default (`mark_default` / `settle_round`) right after `resume`. Members **do** lose the paused time. Pinned by `ledgers_closed_during_a_pause_count_against_the_deadline` in `contracts/circle/tests/pause_semantics_tests.rs`.
+
+Admins should therefore keep pauses short, or announce that the round will be settled once it resumes. The contract offers no deadline extension, and this document does not add one.
 
 ---
 
@@ -223,11 +233,19 @@ The state machine is simple:
 
 ### Paused Circles and Lifecycle Status
 
-Pause is **orthogonal** to lifecycle status (Pending, Active, Completed, Cancelled):
-- A Pending circle can be paused before all members join.
-- An Active circle can be paused mid-round.
-- A Completed circle **cannot be paused** (close has already finalized it; fund-moving is impossible anyway).
-- A Cancelled circle **cannot be paused** (cancel is blocked while paused, and once cancelled, close must be called to settle collateral).
+Pause is an **overlay** on lifecycle status. `pause` and `resume` never read or write `Status`, `Closed`, rounds, collateral or defaults, and they are accepted in **every** status (corrected for #876; the earlier text claimed Completed and Cancelled circles could not be paused):
+
+| Base state | `pause` | Effect while paused |
+|---|---|---|
+| Pending | Allowed | `join`, `cancel` → `CirclePaused` |
+| Active | Allowed | `contribute`, `payout`, `mark_default`, `settle_round` → `CirclePaused` |
+| Completed (not closed) | Allowed | `close` → `CirclePaused`: **collateral cannot be released until `resume`** |
+| Cancelled (not closed) | Allowed | `close` → `CirclePaused`: same as above |
+| Closed | Allowed | No fund-moving call remains; `close` reports `CirclePaused` instead of `AlreadyClosed` |
+
+While paused, `CirclePaused` (contract error 7) is raised **before** any status check, so a paused circle reports it even where the unpaused circle would give another error. The full matrix is `contracts/circle/src/transition.rs` (`TRANSITION_MATRIX`, `paused_overlay`).
+
+Read availability: every view stays available while paused, including `get_status`, `get_config`, `get_current_round`, `get_collateral`, `get_defaults`, `has_contributed`, `get_pot_amount`, `get_admin`, `get_usdc_token`, `get_protocol_params`, `is_paused` and `is_closed`.
 
 ---
 
@@ -274,9 +292,17 @@ env.events().publish(
 
 ### SDK Responsibility
 
-1. **Check Pause Before Submission**: Call `is_paused()` in the SDK layer before constructing transactions for fund-moving operations.
-2. **Return Contextual Error**: If paused, return a `CircleError::Paused` or similar to the caller (not a low-level Soroban host error).
-3. **Allow Read Methods**: Ensure all read-only views work while paused so status updates are always possible.
+Current behaviour, aligned for #876:
+
+1. **Errors**: `PauseError` codes 1–4 map to SDK diagnostics in `sdk/src/simulationHelpers.ts`: "only the circle admin may pause or resume", "already paused", "not paused", "not initialized". `CirclePaused` (contract code 7) from any fund-moving call maps to "the circle is paused".
+2. **No pause methods**: the SDK does not wrap `pause`/`resume`. Factory-deployed circles cannot be paused, and operators of directly deployed circles invoke them with their own admin key.
+3. **Reads**: all SDK read methods work while paused.
+
+### Indexer projection
+
+- `circle/paused` → `UPDATE circles SET paused = TRUE …`; `circle/resumed` → `… paused = FALSE …`.
+- Neither touches `status`, round data or settlement columns. Lifecycle status is preserved (pinned in `indexer/src/eventSchemas.test.ts`). Reconciliation compares `circles.paused` against on-chain `is_paused()`.
+- The `paused` column is **not yet exposed** by the HTTP API, so the app learns about a pause from the `CirclePaused` transaction error. Exposing it is a follow-up that needs an OpenAPI and HTTP-contract change.
 
 ### Admin Responsibility
 
@@ -313,6 +339,13 @@ All pause/resume semantics are covered by the test suite:
 | `test_334_multiple_pause_resume_cycles_work` | `tests.rs` | Multi-cycle robustness. |
 | `test_334_pause_emits_paused_event` | `tests.rs` | Event emission for pause. |
 | `test_334_resume_emits_resumed_event` | `tests.rs` | Event emission for resume. |
+| `only_the_stored_admin_can_pause_or_resume` | `tests/pause_semantics_tests.rs` | Member, stranger and the circle's own address rejected; no mutation, no event (#876). |
+| `repeated_pause_resume_transitions_are_strictly_alternating` | `tests/pause_semantics_tests.rs` | `AlreadyPaused` / `NotPaused` and event sequence. |
+| `pause_preserves_lifecycle_status_in_every_state` | `tests/pause_semantics_tests.rs` | Pending, Active, Completed, Closed. |
+| `pause_on_cancelled_circle_blocks_close_until_resume` | `tests/pause_semantics_tests.rs` | Terminal interaction. |
+| `every_mutation_is_blocked_while_paused_and_state_is_untouched` | `tests/pause_semantics_tests.rs` | All seven mutations; snapshot unchanged. |
+| `ledgers_closed_during_a_pause_count_against_the_deadline` | `tests/pause_semantics_tests.rs` | Deadline semantics. |
+| `factory_has_no_pause_or_resume_entrypoint` | `circle_factory/tests/pause_authority_tests.rs` | No hidden authority. |
 
 ---
 
@@ -322,7 +355,9 @@ Pause/resume is a transparent emergency control that:
 - **Blocks all fund-moving operations** with a clear error message.
 - **Preserves all state** (collateral, contributions, round progress, deadlines, penalties).
 - **Allows all read-only views** so users and indexers see the pause status.
-- **Does not advance deadlines** so members receive the full contribution window upon resume.
-- **Is fully tested** across lifecycle stages (Pending, Active) and recovery scenarios.
+- **Does not move the stored deadline**, but ledgers keep closing during a pause, so paused time counts against the round.
+- **Is an overlay in every status**, including Completed, Cancelled and Closed. A pause on a terminal circle blocks `close` until `resume`.
+- **Has exactly one authority**, the stored `Admin`. For factory-deployed circles that is the factory contract, which cannot exercise it.
+- **Is tested** across all lifecycle stages and recovery scenarios.
 
 The mechanism is safe for use in production to handle network outages, token unavailability, governance decisions, and emergency holds without data loss or invariant violation.

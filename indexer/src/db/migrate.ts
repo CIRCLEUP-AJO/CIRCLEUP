@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
-import { pool, withPoolCleanup } from "./pool";
+import { pool, withPoolCleanup, connectWithRetry } from "./pool";
 
 const migrationsDir = path.join(__dirname, "migrations");
 
@@ -255,7 +255,22 @@ function logStatus(status: MigrationStatus) {
  * applied — but they produce a prominent warning so operators notice.
  */
 export async function runMigrations(): Promise<MigrationStatus> {
-  const client = await pool.connect();
+  // Wait for Postgres to accept connections before touching the schema.  A
+  // running container is not necessarily ready to serve queries, so retry the
+  // initial connection using the shared DB_CONNECT_MAX_RETRIES /
+  // DB_CONNECT_BASE_DELAY_MS settings.  If the database never becomes ready we
+  // fail loudly rather than running migrations against an unready server.
+  let client: import("pg").PoolClient;
+  try {
+    client = await connectWithRetry();
+  } catch (err) {
+    throw new Error(
+      `[migrate] Database is not ready — could not acquire a connection after retries. ` +
+        `Check that Postgres is running and healthy (e.g. \`docker compose ps\` / ` +
+        `\`docker compose exec db pg_isready -U <user>\`) before running migrations. ` +
+        `Underlying error: ${err}`,
+    );
+  }
   try {
     // ── Base schema ─────────────────────────────────────────────────────────
     const schemaPath = path.join(__dirname, "schema.sql");

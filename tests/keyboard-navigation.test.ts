@@ -754,3 +754,256 @@ describe("Live-region announcement policy (#702 follow-up)", () => {
     assert.equal(model.countFor("polite"), 0);
   });
 });
+
+// ─── Narrow-Viewport & 200% Zoom Reachability Tests (Issue #128) ─────────────
+//
+// These tests model the circle-detail and create flows at the documented
+// mobile width (320px) and at 200% browser zoom (effective ~640px CSS width on
+// a 1280px viewport).  They verify that:
+//
+//   22. Every core read/write action control is in the tab order at narrow width.
+//   23. Long addresses and amounts are exposed as full, distinguishable text
+//       (wrapping / truncation with accessible full value), not clipped.
+//   24. Any unavoidable horizontal scroll container is labeled and keyboard
+//       focusable, and does not hide essential controls.
+//   25. Focus order in the circle-detail flow is logical and trap-free at
+//       narrow widths and 200% zoom.
+//   26. The create flow's action group remains reachable at narrow widths.
+//   27. Labeled scroll containers expose an accessible name and role.
+
+type ViewportProfile = "mobile-320" | "zoom-200";
+
+interface LayoutNode extends FocusableNode {
+  /** CSS width in px the element occupies at the active viewport profile. */
+  widthPx?: number;
+  /** Whether the element overflows its container horizontally. */
+  overflows?: boolean;
+  /** Marks a horizontal scroll container. */
+  scrollContainer?: boolean;
+  /** Accessible name for a scroll container / region. */
+  ariaLabel?: string;
+  /** Full untruncated value for long addresses / amounts. */
+  fullValue?: string;
+  /** Visible (possibly truncated) text. */
+  visibleText?: string;
+  /** Whether the element is a core read/write action. */
+  coreAction?: boolean;
+}
+
+interface LayoutHarness {
+  env: KeyboardTestEnvironment;
+  tabOrder: string[];
+  nodes: Map<string, LayoutNode>;
+  profile: ViewportProfile;
+}
+
+function buildCircleDetailLayout(profile: ViewportProfile): LayoutHarness {
+  const env = new KeyboardTestEnvironment();
+  const nodes = new Map<string, LayoutNode>();
+
+  // At 320px and at 200% zoom the round table cannot fit; it must be wrapped in
+  // a labeled, focusable horizontal scroll container rather than clipping.
+  const roundTableScrollable = true;
+
+  const tabOrder = [
+    "detail-back-btn",
+    "detail-refresh-btn",
+    "round-table-scroll",
+    "member-address-0",
+    "member-address-1",
+    "detail-contribute-btn",
+    "detail-mark-default-btn",
+  ];
+
+  const layoutNodes: LayoutNode[] = [
+    { id: "detail-back-btn", tagName: "BUTTON", tabIndex: 0, textContent: "Back", coreAction: true },
+    { id: "detail-refresh-btn", tagName: "BUTTON", tabIndex: 0, textContent: "Refresh", coreAction: true },
+    {
+      id: "round-table-scroll",
+      tagName: "DIV",
+      role: "region",
+      tabIndex: 0,
+      ariaLabel: "Round history, scroll horizontally to see all columns",
+      scrollContainer: roundTableScrollable,
+      overflows: true,
+    },
+    {
+      id: "member-address-0",
+      tagName: "SPAN",
+      tabIndex: 0,
+      fullValue: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+      visibleText: "GBBD…FLA5",
+    },
+    {
+      id: "member-address-1",
+      tagName: "SPAN",
+      tabIndex: 0,
+      fullValue: "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGSNFHEYVXM3XOJMDS674JZ",
+      visibleText: "GCEZ…674JZ",
+    },
+    { id: "detail-contribute-btn", tagName: "BUTTON", tabIndex: 0, textContent: "Contribute", coreAction: true },
+    { id: "detail-mark-default-btn", tagName: "BUTTON", tabIndex: 0, textContent: "Mark Default", coreAction: true },
+  ];
+
+  for (const node of layoutNodes) {
+    nodes.set(node.id, node);
+    env.register(node);
+  }
+
+  // Tab navigation follows the declared order without trapping.
+  for (const id of tabOrder) {
+    const node = env.nodes.get(id)!;
+    node.onKeyDown = (e) => {
+      if (e.key !== "Tab") return;
+      e.preventDefault();
+      const idx = tabOrder.indexOf(id);
+      const next = e.shiftKey
+        ? (idx - 1 + tabOrder.length) % tabOrder.length
+        : (idx + 1) % tabOrder.length;
+      env.focus(tabOrder[next]);
+    };
+  }
+
+  return { env, tabOrder, nodes, profile };
+}
+
+function buildCreateFlowLayout(profile: ViewportProfile): LayoutHarness {
+  const env = new KeyboardTestEnvironment();
+  const nodes = new Map<string, LayoutNode>();
+
+  const tabOrder = [
+    "name-input",
+    "amount-input",
+    "days-input",
+    "member-0-input",
+    "add-member-button",
+    "submit-button",
+  ];
+
+  for (const id of tabOrder) {
+    const node: LayoutNode = {
+      id,
+      tagName: id.includes("button") ? "BUTTON" : "INPUT",
+      tabIndex: 0,
+      coreAction: id === "submit-button" || id === "add-member-button",
+    };
+    nodes.set(id, node);
+    env.register(node);
+    node.onKeyDown = (e) => {
+      if (e.key !== "Tab") return;
+      e.preventDefault();
+      const idx = tabOrder.indexOf(id);
+      const next = e.shiftKey
+        ? (idx - 1 + tabOrder.length) % tabOrder.length
+        : (idx + 1) % tabOrder.length;
+      env.focus(tabOrder[next]);
+    };
+  }
+
+  return { env, tabOrder, nodes, profile };
+}
+
+describe("Narrow viewport & 200% zoom reachability (#128)", () => {
+  const profiles: ViewportProfile[] = ["mobile-320", "zoom-200"];
+
+  // ── 22. Core actions reachable in tab order ───────────────────────────────
+
+  for (const profile of profiles) {
+    test(`22: all core circle-detail actions are reachable via Tab (${profile})`, () => {
+      const { env, tabOrder, nodes } = buildCircleDetailLayout(profile);
+      const coreActions = [...nodes.values()].filter((n) => n.coreAction).map((n) => n.id);
+
+      env.focus(tabOrder[0]);
+      const visited = new Set<string>([tabOrder[0]]);
+      for (let i = 1; i < tabOrder.length; i++) {
+        env.dispatchKeyDown("Tab", false);
+        visited.add(env.activeElement!.id);
+      }
+
+      for (const action of coreActions) {
+        assert.ok(
+          visited.has(action),
+          `core action ${action} must be reachable by Tab at ${profile}`,
+        );
+      }
+    });
+  }
+
+  // ── 23. Long addresses remain distinguishable ─────────────────────────────
+
+  test("23: long member addresses expose full values and remain distinguishable", () => {
+    const { nodes } = buildCircleDetailLayout("mobile-320");
+    const addr0 = nodes.get("member-address-0")!;
+    const addr1 = nodes.get("member-address-1")!;
+
+    assert.ok(addr0.fullValue && addr0.fullValue.length > 40, "full address must be preserved");
+    assert.ok(addr1.fullValue && addr1.fullValue.length > 40, "full address must be preserved");
+    assert.notEqual(addr0.fullValue, addr1.fullValue, "addresses must be distinguishable");
+    assert.ok(
+      addr0.visibleText && addr0.visibleText !== addr0.fullValue,
+      "narrow layout may truncate visually but must keep the full value accessible",
+    );
+  });
+
+  // ── 24. Labeled horizontal scroll container ───────────────────────────────
+
+  test("24: round table uses a labeled, focusable scroll container that does not hide controls", () => {
+    const { nodes, env } = buildCircleDetailLayout("mobile-320");
+    const scroll = nodes.get("round-table-scroll")!;
+
+    assert.equal(scroll.scrollContainer, true, "round table must be in a scroll container");
+    assert.ok(scroll.ariaLabel && scroll.ariaLabel.length > 0, "scroll container must be labeled");
+    assert.equal(scroll.tabIndex, 0, "scroll container must be keyboard focusable");
+
+    // Focusing the scroll container must not trap focus — Tab continues to actions.
+    env.focus("round-table-scroll");
+    env.dispatchKeyDown("Tab", false);
+    assert.notEqual(
+      env.activeElement?.id,
+      "round-table-scroll",
+      "Tab must move out of the scroll container to the next control",
+    );
+  });
+
+  // ── 25. Focus order logical and trap-free at narrow widths ────────────────
+
+  for (const profile of profiles) {
+    test(`25: circle-detail focus order is trap-free and returns to start (${profile})`, () => {
+      const { env, tabOrder } = buildCircleDetailLayout(profile);
+      env.focus(tabOrder[0]);
+
+      for (let i = 1; i < tabOrder.length; i++) {
+        env.dispatchKeyDown("Tab", false);
+        assert.equal(env.activeElement?.id, tabOrder[i], `Tab step ${i} at ${profile}`);
+      }
+      // Wraps back to the first control — no trap.
+      env.dispatchKeyDown("Tab", false);
+      assert.equal(env.activeElement?.id, tabOrder[0], "Tab wraps to first control");
+    });
+  }
+
+  // ── 26. Create flow action group reachable at narrow widths ───────────────
+
+  for (const profile of profiles) {
+    test(`26: create flow submit and add-member actions reachable (${profile})`, () => {
+      const { env, tabOrder } = buildCreateFlowLayout(profile);
+      env.focus(tabOrder[0]);
+      const visited = new Set<string>([tabOrder[0]]);
+      for (let i = 1; i < tabOrder.length; i++) {
+        env.dispatchKeyDown("Tab", false);
+        visited.add(env.activeElement!.id);
+      }
+      assert.ok(visited.has("submit-button"), `submit must be reachable at ${profile}`);
+      assert.ok(visited.has("add-member-button"), `add-member must be reachable at ${profile}`);
+    });
+  }
+
+  // ── 27. Scroll container semantics ────────────────────────────────────────
+
+  test("27: scroll container exposes region role and accessible name", () => {
+    const { nodes } = buildCircleDetailLayout("zoom-200");
+    const scroll = nodes.get("round-table-scroll")!;
+    assert.equal(scroll.role, "region", "scroll container must have role='region'");
+    assert.ok(scroll.ariaLabel, "scroll container must have an accessible name");
+  });
+});

@@ -327,7 +327,7 @@ const PROTOCOL_GUARANTEES: readonly ProtocolGuarantee[] = [
   {
     emoji: "🛡️",
     title: "Collateral-backed defaults",
-    desc: "Members lock collateral upfront. If anyone defaults on a round, their collateral compensates affected members.",
+    desc: "Members lock collateral upfront. Missing a round forfeits 20% of the remaining collateral (rounded down); the rest is returned when the circle closes.",
   },
   {
     emoji: "⭐",

@@ -177,3 +177,80 @@ describe("getStatusMeta", () => {
     expect(meta.label).toBe("Unknown");
   });
 });
+
+describe("CircleCard — unknown / future status fixtures", () => {
+  const futureStatuses = [
+    "Paused",
+    "Disputed",
+    "Suspended",
+    "Migrating",
+    "ACTIVE_V2",
+    "active:pending",
+  ];
+
+  const malformedStatuses = [
+    "",
+    "   ",
+    "<script>alert(1)</script>",
+    "Active\nPending",
+    "null",
+    "undefined",
+    "0",
+  ];
+
+  it.each(futureStatuses)(
+    "renders explicit unsupported state for future status %s",
+    (status) => {
+      render(<CircleCard circle={{ ...baseCircle, status }} />);
+      const chip = document.querySelector('span[aria-label^="Status:"]');
+      expect(chip).not.toBeNull();
+      expect(chip?.getAttribute("aria-label")).toMatch(/Unrecognized/i);
+      // Must not be presented as a known state
+      expect(chip?.getAttribute("aria-label")).not.toMatch(
+        /Status: (Active|Pending|Completed|Cancelled|Closed)\./
+      );
+    }
+  );
+
+  it.each(malformedStatuses)(
+    "renders explicit unsupported state for malformed status %j",
+    (status) => {
+      render(<CircleCard circle={{ ...baseCircle, status }} />);
+      const chip = document.querySelector('span[aria-label^="Status:"]');
+      expect(chip).not.toBeNull();
+      expect(chip?.getAttribute("aria-label")).toMatch(/Unrecognized/i);
+    }
+  );
+
+  it("does not interpolate raw HTML from status into the DOM", () => {
+    const status = "<img src=x onerror=alert(1)>";
+    render(<CircleCard circle={{ ...baseCircle, status }} />);
+    expect(document.querySelector("img")).toBeNull();
+    const chip = document.querySelector('span[aria-label^="Status:"]');
+    expect(chip?.textContent).toContain(status);
+  });
+
+  it.each([...futureStatuses, ...malformedStatuses])(
+    "enables no mutation actions for unrecognized status %j",
+    (status) => {
+      render(<CircleCard circle={{ ...baseCircle, status }} />);
+      expect(screen.queryByRole("button")).not.toBeInTheDocument();
+      expect(screen.queryByRole("link", { name: /join|leave|start|close|cancel/i })).toBeNull();
+    }
+  );
+
+  it("preserves read-only details for unrecognized status", () => {
+    render(<CircleCard circle={{ ...baseCircle, status: "Paused" }} />);
+    expect(screen.getByText(/\$10\.00 \/ round/)).toBeInTheDocument();
+    expect(screen.getByText("4")).toBeInTheDocument();
+    expect(screen.getByText(/Round 2 of 8/)).toBeInTheDocument();
+  });
+
+  it("getStatusMeta marks unrecognized statuses as unsupported", () => {
+    for (const status of [...futureStatuses, ...malformedStatuses]) {
+      const meta = getStatusMeta(status);
+      expect(meta.description).toMatch(/Unrecognized/i);
+      expect(meta.chipClasses).toMatch(/slate/);
+    }
+  });
+});

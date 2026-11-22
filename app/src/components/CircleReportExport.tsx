@@ -5,6 +5,7 @@ import type { CircleDetailData } from "@/lib/circleTypes";
 import { exportCircleReport, downloadCircleReportHtml, downloadCircleReportText } from "@/lib/circleReport";
 import { ACTIVE_NETWORK_LABEL } from "@/lib/config";
 import { shortAddress } from "@/lib/config";
+import { CopyControl } from "@/components/CopyControl";
 
 export interface CircleReportExportProps {
   /** Circle detail data to export */
@@ -92,6 +93,14 @@ export function CircleReportExport({ data, circleAddress }: CircleReportExportPr
       >
         {exporting ? "Downloading…" : `Download ${format === "html" ? "HTML" : "Text"} Report`}
       </button>
+
+      <CopyControl
+        value={circleAddress}
+        label="Copy circle address"
+        copiedMessage="Circle address copied to clipboard"
+        unavailableMessage="Clipboard unavailable — select the address below to copy manually"
+        failedMessage="Copy failed — select the address below to copy manually"
+      />
 
       <p className="text-xs text-slate-500">
         📄 Reports include members, contribution history, and circle status. 
