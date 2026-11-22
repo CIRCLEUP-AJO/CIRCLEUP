@@ -204,6 +204,20 @@ async function securityHeaders() {
 const nextConfig = {
   reactStrictMode: true,
 
+  // ─── Production container packaging ────────────────────────────────────────
+  //
+  // 'standalone' emits a self-contained server bundle in .next/standalone that
+  // includes only the traced runtime files (plus a minimal node_modules), so
+  // the production image does not need to ship the full source tree or the
+  // development dependencies.  See the container contract docs for the app
+  // image build/run expectations.
+  output: "standalone",
+
+  // Trace from the monorepo root so workspace packages (e.g. shared libs) are
+  // included in the standalone output.  __dirname is app/, so ".." is the repo
+  // root.
+  outputFileTracingRoot: require("path").join(__dirname, ".."),
+
   headers: securityHeaders,
 
   webpack: (config, { isServer }) => {
