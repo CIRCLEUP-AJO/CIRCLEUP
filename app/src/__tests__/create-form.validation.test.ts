@@ -33,6 +33,16 @@ import {
   type CreateFormErrors,
   type ValidatedCreateForm,
 } from "../app/create/CreateClient";
+import {
+  buildFieldErrors,
+  fieldErrorId,
+  fieldInputId,
+  describeField,
+  firstInvalidField,
+  isWalletOrRpcError,
+  FIELD_KEYS,
+  type FieldError,
+} from "../app/create/fieldErrors";
 
 // ─── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -766,6 +776,165 @@ describe("validateCreateForm — membersGeneral reflects the valid-only count (G
     expect(result.errors.membersGeneral).toMatch(/You have 1/);
     // Must NOT say "duplicate" — only one valid address
     expect(result.errors.membersGeneral).not.toMatch(/duplicate/i);
+  });
+});
+
+// ─── Field-level validation summaries (Issue #125) ───────────────────────────
+//
+// These tests pin the structured field-error layer that backs the create
+// form's inline messages and error summary:
+//
+//   buildFieldErrors      — maps CreateFormErrors to stable, keyed FieldErrors
+//   fieldErrorId          — stable, unique DOM id per field error
+//   fieldInputId          — stable DOM id per input
+//   describeField         — aria-describedby wiring (input → message + summary)
+//   firstInvalidField     — focus target for the first problem
+//   isWalletOrRpcError    — keeps contract/RPC failures out of form errors
+
+describe("buildFieldErrors — structured field errors", () => {
+  it("returns no field errors for a valid form", () => {
+    const result = valid();
+    expect(result.ok).toBe(true);
+    expect(buildFieldErrors(result)).toEqual([]);
+  });
+
+  it("emits one entry per invalid field with a stable key", () => {
+    const errors = buildFieldErrors(validateCreateForm("", [A, B], "0", "0"));
+    const keys = errors.map((e) => e.key);
+    expect(keys).toContain(FIELD_KEYS.name);
+    expect(keys).toContain(FIELD_KEYS.amount);
+    expect(keys).toContain(FIELD_KEYS.days);
+  });
+
+  it("emits a distinct key for each invalid member row", () => {
+    const errors = buildFieldErrors(
+      validateCreateForm(VALID.name, [A, "bad", withTypo(B)], VALID.amount, VALID.days),
+    );
+    const memberKeys = errors.filter((e) => e.key.startsWith("member:")).map((e) => e.key);
+    expect(memberKeys).toEqual(["member:1", "member:2"]);
+  });
+
+  it("keeps list-level member problems on a dedicated key", () => {
+    const errors = buildFieldErrors(validateCreateForm(VALID.name, [A, A], VALID.amount, VALID.days));
+    const general = errors.find((e) => e.key === FIELD_KEYS.membersGeneral);
+    expect(general?.message).toMatch(/duplicate/i);
+  });
+
+  it("preserves the original validation copy verbatim", () => {
+    const result = validateCreateForm("", [A, B], VALID.amount, VALID.days);
+    const errors = buildFieldErrors(result);
+    expect(errors[0].message).toMatch(/required/i);
+  });
+
+  it("orders errors by field key for deterministic rendering", () => {
+    const errors = buildFieldErrors(validateCreateForm("", [A, "bad"], "0", "0"));
+    const keys = errors.map((e) => e.key);
+    expect(keys).toEqual([...keys].sort());
+  });
+
+  it("marks every entry as a local input error, never a wallet/RPC failure", () => {
+    const errors = buildFieldErrors(validateCreateForm("", [A, "bad"], "0", "0"));
+    expect(errors.length).toBeGreaterThan(0);
+    errors.forEach((e) => expect(e.source).toBe("input"));
+  });
+});
+
+describe("fieldErrorId / fieldInputId — stable DOM ids", () => {
+  it("produces a stable id for the same field across calls", () => {
+    const a = fieldErrorId(FIELD_KEYS.amount);
+    const b = fieldErrorId(FIELD_KEYS.amount);
+    expect(a).toBe(b);
+  });
+
+  it("produces distinct ids for distinct fields", () => {
+    const ids = new Set([
+      fieldErrorId(FIELD_KEYS.name),
+      fieldErrorId(FIELD_KEYS.amount),
+      fieldErrorId(FIELD_KEYS.days),
+      fieldErrorId("member:0"),
+      fieldErrorId("member:1"),
+    ]);
+    expect(ids.size).toBe(5);
+  });
+
+  it("input and error ids never collide", () => {
+    expect(fieldInputId(FIELD_KEYS.name)).not.toBe(fieldErrorId(FIELD_KEYS.name));
+  });
+
+  it("member row ids are unique per row index", () => {
+    expect(fieldErrorId("member:0")).not.toBe(fieldErrorId("member:1"));
+  });
+});
+
+describe("describeField — aria-describedby wiring", () => {
+  it("returns undefined when the field has no error", () => {
+    expect(describeField(FIELD_KEYS.name, [])).toBeUndefined();
+  });
+
+  it("associates the input with its inline message", () => {
+    const errors: FieldError[] = [
+      { key: FIELD_KEYS.amount, message: "Amount is required", source: "input" },
+    ];
+    const describedBy = describeField(FIELD_KEYS.amount, errors);
+    expect(describedBy).toContain(fieldErrorId(FIELD_KEYS.amount));
+  });
+
+  it("does not associate a field with another field's message", () => {
+    const errors: FieldError[] = [
+      { key: FIELD_KEYS.amount, message: "Amount is required", source: "input" },
+    ];
+    expect(describeField(FIELD_KEYS.days, errors)).toBeUndefined();
+  });
+
+  it("associates a member row only with its own message", () => {
+    const errors: FieldError[] = [
+      { key: "member:1", message: "Member 2: bad address", source: "input" },
+    ];
+    expect(describeField("member:1", errors)).toContain(fieldErrorId("member:1"));
+    expect(describeField("member:0", errors)).toBeUndefined();
+  });
+});
+
+describe("firstInvalidField — focus target for the first problem", () => {
+  it("returns null when there are no errors", () => {
+    expect(firstInvalidField([])).toBeNull();
+  });
+
+  it("returns the first field key in document order", () => {
+    const errors = buildFieldErrors(validateCreateForm("", [A, "bad"], "0", "0"));
+    expect(firstInvalidField(errors)).toBe(FIELD_KEYS.name);
+  });
+
+  it("returns the member row when only a member row is invalid", () => {
+    const errors = buildFieldErrors(
+      validateCreateForm(VALID.name, [A, "bad"], VALID.amount, VALID.days),
+    );
+    expect(firstInvalidField(errors)).toBe("member:1");
+  });
+
+  it("prefers an earlier member row over a later one", () => {
+    const errors = buildFieldErrors(
+      validateCreateForm(VALID.name, ["bad", withTypo(B)], VALID.amount, VALID.days),
+    );
+    expect(firstInvalidField(errors)).toBe("member:0");
+  });
+});
+
+describe("isWalletOrRpcError — wallet/RPC failures stay distinct", () => {
+  it("treats local validation messages as input errors", () => {
+    expect(isWalletOrRpcError("Circle name is required")).toBe(false);
+    expect(isWalletOrRpcError("Amount must be greater than zero")).toBe(false);
+  });
+
+  it("recognises wallet and RPC failure copy", () => {
+    expect(isWalletOrRpcError("Wallet connection failed")).toBe(true);
+    expect(isWalletOrRpcError("RPC request timed out")).toBe(true);
+    expect(isWalletOrRpcError("Transaction submission rejected")).toBe(true);
+  });
+
+  it("never classifies a field error as a wallet failure", () => {
+    const errors = buildFieldErrors(validateCreateForm("", [A, "bad"], "0", "0"));
+    errors.forEach((e) => expect(isWalletOrRpcError(e.message)).toBe(false));
   });
 });
 

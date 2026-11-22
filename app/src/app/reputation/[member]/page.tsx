@@ -3,6 +3,11 @@ import type { Metadata } from "next";
 import { INDEXER_URL, shortAddress } from "@/lib/config";
 import { validateAddress } from "@/lib/address";
 import {
+  getCanonicalUrl,
+  getNetworkLabel,
+  isTestnet,
+} from "@/lib/network";
+import {
   RouteOutcomeError,
   resolveRouteOutcome,
   type RouteOutcome,
@@ -12,13 +17,20 @@ import ReputationClient from "./ReputationClient";
 // ─── Metadata ─────────────────────────────────────────────────────────────────
 //
 // generateMetadata runs server-side; the member address comes from the dynamic
-// route segment.  We validate it with isCanonicalStellarAddress before using
-// it in any metadata string — a malformed or injected URL segment must not
-// appear verbatim in <title> or <meta> attributes.
+// route segment.  We validate it with validateAddress before using it in any
+// metadata string — a malformed or injected URL segment must not appear
+// verbatim in <title> or <meta> attributes.
 //
-// Canonical URL: /reputation/<address>  (normalises the validated address).
-// A malformed segment returns a generic title with no canonical link, which
-// prevents search engines from indexing bogus paths.
+// Canonical URL: <configured origin>/reputation/<address>  (normalises the
+// validated address).  The origin comes from the configured SITE_URL — never
+// from the request Host header, which is attacker-controllable.  A malformed
+// segment returns a generic title with no canonical link, which prevents
+// search engines from indexing bogus paths.
+//
+// Network context: the active network (testnet vs. mainnet) is included in the
+// title/description so copied metadata communicates which network the address
+// belongs to.  A valid address on one network may not identify the same entity
+// on another.
 
 export async function generateMetadata({
   params,
@@ -29,14 +41,17 @@ export async function generateMetadata({
   const validation = validateAddress(memberParam, { kind: "G", requireChecksum: true });
   const safeMember = validation.ok ? validation.address : null;
 
+  const networkLabel = getNetworkLabel();
+  const testnet = isTestnet();
+
   if (!safeMember) {
     return {
-      title: "Reputation — CircleUp",
-      description: "On-chain reputation score and contribution history on CircleUp.",
+      title: `Reputation — CircleUp (${networkLabel})`,
+      description: `On-chain reputation score and contribution history on CircleUp (${networkLabel}).`,
       twitter: {
         card: "summary",
-        title: "Reputation — CircleUp",
-        description: "On-chain reputation score and contribution history on CircleUp.",
+        title: `Reputation — CircleUp (${networkLabel})`,
+        description: `On-chain reputation score and contribution history on CircleUp (${networkLabel}).`,
       },
     };
   }
@@ -46,12 +61,12 @@ export async function generateMetadata({
     // Temporary failure: keep the generic title rather than claiming the
     // member is unknown, and omit the canonical link.
     return {
-      title: "Reputation — CircleUp",
-      description: "On-chain reputation score and contribution history on CircleUp.",
+      title: `Reputation — CircleUp (${networkLabel})`,
+      description: `On-chain reputation score and contribution history on CircleUp (${networkLabel}).`,
       twitter: {
         card: "summary",
-        title: "Reputation — CircleUp",
-        description: "On-chain reputation score and contribution history on CircleUp.",
+        title: `Reputation — CircleUp (${networkLabel})`,
+        description: `On-chain reputation score and contribution history on CircleUp (${networkLabel}).`,
       },
     };
   }
@@ -73,26 +88,33 @@ export async function generateMetadata({
   }
 
   const short = shortAddress(safeMember);
+  const canonicalPath = `/reputation/${safeMember}`;
+  const canonicalUrl = getCanonicalUrl(canonicalPath);
+  const networkNote = testnet
+    ? " This address is on Stellar Testnet — activity here is not mainnet evidence."
+    : "";
+
+  const title = `Reputation: ${short} — CircleUp (${networkLabel})`;
+  const description =
+    `On-chain reputation score and circle participation history for ${safeMember} on CircleUp (${networkLabel}). ` +
+    `View completed rounds, defaults, and contribution records.${networkNote}`;
+
   return {
-    title: `Reputation: ${short} — CircleUp`,
-    description:
-      `On-chain reputation score and circle participation history for ${safeMember} on CircleUp. ` +
-      `View completed rounds, defaults, and contribution records.`,
+    title,
+    description,
     alternates: {
-      canonical: `/reputation/${safeMember}`,
+      canonical: canonicalUrl ?? canonicalPath,
     },
     openGraph: {
-      title: `Reputation: ${short} — CircleUp`,
-      description:
-        `On-chain reputation score and circle participation history for ${safeMember} on CircleUp.`,
-      url: `/reputation/${safeMember}`,
+      title,
+      description,
+      url: canonicalUrl ?? canonicalPath,
       type: "profile",
     },
     twitter: {
       card: "summary",
-      title: `Reputation: ${short} — CircleUp`,
-      description:
-        `On-chain reputation score and circle participation history for ${safeMember} on CircleUp.`,
+      title,
+      description,
     },
   };
 }
