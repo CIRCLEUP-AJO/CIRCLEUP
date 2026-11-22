@@ -2,6 +2,7 @@ import type { TxErrorCode, TxFailure } from './types';
 /** Canonical guidance: never display errorMessage or serialize a failure object. */
 const GUIDANCE: Record<TxErrorCode, string> = {
   invalid_argument: 'Review the input values before trying again.',
+  network_mismatch: 'The app is configured for a different network. Reload before trying again.',
   account_not_found: 'Check the account on the selected network.',
   simulation_failed: 'The action could not be simulated. Refresh state and review eligibility.',
   network_error: 'The network is unavailable. Check the hash before considering another submission.',

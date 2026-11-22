@@ -310,7 +310,7 @@ const USER_MESSAGES: Record<ContractErrorCode, string> = {
   STATE_WRONG_STATUS:
     "This action is not available in the circle's current state.",
   STATE_CIRCLE_PAUSED:
-    "This circle is currently paused. All fund-moving operations are suspended until an admin resumes it.",
+    "This circle is currently paused. All fund-moving operations are suspended until its admin resumes it. Circle data stays readable, and round deadlines keep counting down while paused.",
   STATE_ALREADY_CLOSED:
     "This circle has already been closed and settled.",
   STATE_ROUND_NOT_COMPLETE:

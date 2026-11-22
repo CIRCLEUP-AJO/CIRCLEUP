@@ -465,6 +465,137 @@ describe("validateAddress — kind: 'C' (contracts only)", () => {
   });
 });
 
+// ─── Route guard pre-flight: validation before downstream calls ───────────────
+//
+// The circle and reputation page loaders now run validateAddress with the
+// appropriate kind (and requireChecksum) *before* any RPC or indexer lookup.
+// These tests pin the exact accept/reject decisions the guards rely on so a
+// malformed route segment can never reach a downstream call.
+
+describe("route guard pre-flight — validateAddress({ kind: 'C' })", () => {
+  /** Route segments that must be rejected before any RPC/indexer call. */
+  const malformedSegments = [
+    "",
+    "   ",
+    "not-an-address",
+    "12345",
+    "G-short",
+    "../secret",
+    "%2e%2e%2fsecret",
+    "http://evil.example.com",
+    "<script>alert(1)</script>",
+    "'; DROP TABLE circles; --",
+    REAL_ACCOUNT, // G-key pasted into a circle URL
+    REAL_CONTRACT.slice(0, 55), // truncated contract
+    REAL_CONTRACT + "A", // over-long contract
+    "M" + "A".repeat(55), // muxed
+    "X" + "A".repeat(55), // unsupported prefix
+    "C" + "0".repeat(55), // invalid base32 alphabet
+    SHAPE_ONLY_C, // shape-valid, bad checksum
+    withTypo(REAL_CONTRACT), // single-char typo
+  ];
+
+  it("rejects every malformed segment before downstream calls", () => {
+    malformedSegments.forEach((segment) => {
+      const r = validateAddress(segment, { kind: "C" });
+      expect(r.valid).toBe(false);
+      if (!r.valid) {
+        expect(typeof r.reason).toBe("string");
+        expect(r.message.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  it("accepts a real contract ID so valid routes keep working", () => {
+    const r = validateAddress(REAL_CONTRACT, { kind: "C" });
+    expect(r.valid).toBe(true);
+    if (r.valid) expect(r.kind).toBe("contract");
+  });
+
+  it("rejects shape-only C fakes even with requireChecksum: false only when shape is bad", () => {
+    // With checksum disabled the shape-only fake is accepted (documented
+    // behaviour), but genuinely malformed segments are still rejected.
+    expect(validateAddress(SHAPE_ONLY_C, { kind: "C", requireChecksum: false }).valid).toBe(true);
+    malformedSegments
+      .filter((s) => s !== SHAPE_ONLY_C && s !== withTypo(REAL_CONTRACT))
+      .forEach((segment) => {
+        const r = validateAddress(segment, { kind: "C", requireChecksum: false });
+        expect(r.valid).toBe(false);
+      });
+  });
+});
+
+describe("route guard pre-flight — validateAddress({ kind: 'G' })", () => {
+  /** Route segments that must be rejected before any RPC/indexer call. */
+  const malformedSegments = [
+    "",
+    "   ",
+    "random",
+    "123",
+    "null",
+    "<b>xss</b>",
+    "G-short",
+    "../secret",
+    REAL_CONTRACT, // C-contract is not an account
+    SHAPE_ONLY_C, // contract_not_allowed fires before checksum
+    REAL_ACCOUNT.slice(0, 55), // truncated account
+    REAL_ACCOUNT + "A", // over-long account
+    "M" + "A".repeat(55), // muxed
+    "X" + "A".repeat(55), // unsupported prefix
+    "G" + "0".repeat(55), // invalid base32 alphabet
+    SHAPE_ONLY_G, // shape-valid, bad checksum
+    withTypo(REAL_ACCOUNT), // single-char typo
+  ];
+
+  it("rejects every malformed segment before downstream calls", () => {
+    malformedSegments.forEach((segment) => {
+      const r = validateAddress(segment, { kind: "G" });
+      expect(r.valid).toBe(false);
+      if (!r.valid) {
+        expect(typeof r.reason).toBe("string");
+        expect(r.message.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  it("accepts a real account address so valid routes keep working", () => {
+    const r = validateAddress(REAL_ACCOUNT, { kind: "G" });
+    expect(r.valid).toBe(true);
+    if (r.valid) expect(r.kind).toBe("account");
+  });
+
+  it("accepts SDK-generated accounts", () => {
+    sdkAddresses.forEach((a) => {
+      const r = validateAddress(a, { kind: "G" });
+      expect(r.valid).toBe(true);
+    });
+  });
+});
+
+describe("route guard pre-flight — validateAddress({ kind: 'any' })", () => {
+  it("accepts both real G-keys and real C-contracts", () => {
+    expect(validateAddress(REAL_ACCOUNT).valid).toBe(true);
+    expect(validateAddress(REAL_CONTRACT).valid).toBe(true);
+  });
+
+  it("rejects malformed segments regardless of prefix", () => {
+    [
+      "",
+      "   ",
+      "not-an-address",
+      "../secret",
+      "M" + "A".repeat(55),
+      "X" + "A".repeat(55),
+      SHAPE_ONLY_G,
+      SHAPE_ONLY_C,
+      withTypo(REAL_ACCOUNT),
+      withTypo(REAL_CONTRACT),
+    ].forEach((segment) => {
+      expect(validateAddress(segment).valid).toBe(false);
+    });
+  });
+});
+
 describe("validateAddress — requireChecksum: false", () => {
   it("accepts a shape-only G fake when checksum is disabled", () => {
     const r = validateAddress(SHAPE_ONLY_G, { requireChecksum: false });

@@ -7,6 +7,7 @@ import { redactSecrets } from "./redact";
 import {
   assertAlwaysCreate,
   assertSeedNetwork,
+  buildSeedPreflightReport,
   recordSeedTransaction,
   redactSeedError,
   SeedJournal,
@@ -85,4 +86,105 @@ test("seed failure output redacts RPC URL credentials and query parameters", () 
   );
   assert.doesNotMatch(report, /rpc-user|rpc-pass|api-secret/);
   assert.match(report, /https:\/\/\[REDACTED\]@example\.test\/rpc\?\[REDACTED\]/);
+});
+
+test("preflight allows circle creation on a first run with no prior state", () => {
+  const report = buildSeedPreflightReport({
+    network: "testnet",
+    networkPassphrase: TESTNET_PASSPHRASE,
+    expectedPassphrase: TESTNET_PASSPHRASE,
+    manifest: { network: "testnet", networkPassphrase: TESTNET_PASSPHRASE },
+    journal: undefined,
+    onChainCircle: undefined,
+  });
+  assert.equal(report.network, "testnet");
+  assert.equal(report.createCircle, true);
+  assert.equal(report.unresolved, false);
+  assert.deepEqual(report.steps, []);
+});
+
+test("preflight skips circle creation when a prior run confirmed it", () => {
+  const prior = journal();
+  prior.status = "complete";
+  prior.completedSteps = ["create_circle"];
+  recordSeedTransaction(prior, "create_circle", "hash-1", "confirmed");
+  const report = buildSeedPreflightReport({
+    network: "testnet",
+    networkPassphrase: TESTNET_PASSPHRASE,
+    expectedPassphrase: TESTNET_PASSPHRASE,
+    manifest: { network: "testnet", networkPassphrase: TESTNET_PASSPHRASE },
+    journal: prior,
+    onChainCircle: { id: "circle-1", matchesDemoIdentity: true },
+  });
+  assert.equal(report.createCircle, false);
+  assert.equal(report.unresolved, false);
+  assert.deepEqual(report.steps, [{ step: "create_circle", status: "confirmed", hash: "hash-1" }]);
+});
+
+test("preflight treats a prior timeout as unresolved and skips circle creation", () => {
+  const prior = journal();
+  recordSeedTransaction(prior, "create_circle", "hash-1", "timeout");
+  const report = buildSeedPreflightReport({
+    network: "testnet",
+    networkPassphrase: TESTNET_PASSPHRASE,
+    expectedPassphrase: TESTNET_PASSPHRASE,
+    manifest: { network: "testnet", networkPassphrase: TESTNET_PASSPHRASE },
+    journal: prior,
+    onChainCircle: undefined,
+  });
+  assert.equal(report.createCircle, false);
+  assert.equal(report.unresolved, true);
+  assert.deepEqual(report.steps, [{ step: "create_circle", status: "timeout", hash: "hash-1" }]);
+});
+
+test("preflight reports status per step for incomplete prior setup", () => {
+  const prior = journal();
+  prior.status = "in_progress";
+  prior.completedSteps = ["create_circle"];
+  recordSeedTransaction(prior, "create_circle", "hash-1", "confirmed");
+  recordSeedTransaction(prior, "join:Alice", "hash-2", "submitted");
+  recordSeedTransaction(prior, "join:Bob", "hash-3", "failed");
+  const report = buildSeedPreflightReport({
+    network: "testnet",
+    networkPassphrase: TESTNET_PASSPHRASE,
+    expectedPassphrase: TESTNET_PASSPHRASE,
+    manifest: { network: "testnet", networkPassphrase: TESTNET_PASSPHRASE },
+    journal: prior,
+    onChainCircle: { id: "circle-1", matchesDemoIdentity: true },
+  });
+  assert.equal(report.createCircle, false);
+  assert.equal(report.unresolved, true);
+  assert.deepEqual(report.steps, [
+    { step: "create_circle", status: "confirmed", hash: "hash-1" },
+    { step: "join:Alice", status: "submitted", hash: "hash-2" },
+    { step: "join:Bob", status: "failed", hash: "hash-3" },
+  ]);
+});
+
+test("preflight refuses unsupported networks", () => {
+  assert.throws(() => buildSeedPreflightReport({
+    network: "mainnet",
+    networkPassphrase: TESTNET_PASSPHRASE,
+    expectedPassphrase: TESTNET_PASSPHRASE,
+    manifest: { network: "mainnet", networkPassphrase: TESTNET_PASSPHRASE },
+    journal: undefined,
+    onChainCircle: undefined,
+  }), /only supports testnet/);
+});
+
+test("preflight report never contains secret keys", () => {
+  const secret = `S${"A".repeat(55)}`;
+  const prior = journal();
+  recordSeedTransaction(prior, "create_circle", "hash-1", "timeout");
+  const report = buildSeedPreflightReport({
+    network: "testnet",
+    networkPassphrase: TESTNET_PASSPHRASE,
+    expectedPassphrase: TESTNET_PASSPHRASE,
+    manifest: { network: "testnet", networkPassphrase: TESTNET_PASSPHRASE },
+    journal: prior,
+    onChainCircle: undefined,
+  });
+  const serialized = JSON.stringify(report);
+  assert.doesNotMatch(serialized, new RegExp(secret));
+  assert.doesNotMatch(serialized, /secret/i);
 });

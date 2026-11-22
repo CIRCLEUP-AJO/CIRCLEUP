@@ -10,7 +10,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { scanEnvReads, parseEnvExample, compareEnvParity } from "./check-env-parity";
+import {
+  scanEnvReads,
+  parseEnvExample,
+  compareEnvParity,
+  compareEnvMetadata,
+  type EnvVarMetadata,
+} from "./check-env-parity";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -232,4 +238,169 @@ test("compareEnvParity: never surfaces env values — only name comparison", () 
   // If this function ever started returning values, these assertions about
   // array contents would still pass — the contract is in the type signature
   // (Set<string> of names, not values).
+});
+
+// ── compareEnvMetadata ────────────────────────────────────────────────────────
+
+function meta(overrides: Partial<EnvVarMetadata> & { name: string }): EnvVarMetadata {
+  return {
+    package: "app",
+    required: false,
+    hasDefault: false,
+    ...overrides,
+  };
+}
+
+test("compareEnvMetadata: reports required variables missing from examples", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "DATABASE_URL", required: true }),
+    meta({ name: "PORT", required: false }),
+  ];
+  const examples = new Set(["PORT"]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set());
+
+  assert.deepEqual(result.missingRequired, ["DATABASE_URL"]);
+  assert.deepEqual(result.undocumented, []);
+  assert.deepEqual(result.stale, []);
+});
+
+test("compareEnvMetadata: reports undocumented names (read but not in examples)", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "DATABASE_URL" }),
+    meta({ name: "UNDOCUMENTED_VAR" }),
+  ];
+  const examples = new Set(["DATABASE_URL"]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set());
+
+  assert.deepEqual(result.undocumented, ["UNDOCUMENTED_VAR"]);
+  assert.deepEqual(result.missingRequired, []);
+  assert.deepEqual(result.stale, []);
+});
+
+test("compareEnvMetadata: reports stale example entries", () => {
+  const metadata: EnvVarMetadata[] = [meta({ name: "DATABASE_URL" })];
+  const examples = new Set(["DATABASE_URL", "STALE_VAR"]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set());
+
+  assert.deepEqual(result.stale, ["STALE_VAR"]);
+  assert.deepEqual(result.undocumented, []);
+  assert.deepEqual(result.missingRequired, []);
+});
+
+test("compareEnvMetadata: reports documented defaults that disagree with code", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "PORT", hasDefault: true, defaultValue: "3001" }),
+    meta({ name: "LOG_LEVEL", hasDefault: true, defaultValue: "info" }),
+  ];
+  const examples = new Set(["PORT", "LOG_LEVEL"]);
+  const documentedDefaults = new Map<string, string | undefined>([
+    ["PORT", "3000"], // disagrees with code default "3001"
+    ["LOG_LEVEL", "info"], // matches
+  ]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set(), documentedDefaults);
+
+  assert.deepEqual(result.defaultMismatches, ["PORT"]);
+});
+
+test("compareEnvMetadata: default mismatch when docs claim a default but code has none", () => {
+  const metadata: EnvVarMetadata[] = [meta({ name: "FEATURE_FLAG", hasDefault: false })];
+  const examples = new Set(["FEATURE_FLAG"]);
+  const documentedDefaults = new Map<string, string | undefined>([["FEATURE_FLAG", "true"]]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set(), documentedDefaults);
+
+  assert.deepEqual(result.defaultMismatches, ["FEATURE_FLAG"]);
+});
+
+test("compareEnvMetadata: default mismatch when code has a default but docs omit it", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "PORT", hasDefault: true, defaultValue: "3001" }),
+  ];
+  const examples = new Set(["PORT"]);
+  const documentedDefaults = new Map<string, string | undefined>([["PORT", undefined]]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set(), documentedDefaults);
+
+  assert.deepEqual(result.defaultMismatches, ["PORT"]);
+});
+
+test("compareEnvMetadata: allowlisted variables are excluded from all checks", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "NODE_ENV", required: true }),
+    meta({ name: "CI" }),
+  ];
+  const examples = new Set(["DEPLOY_ARTIFACT"]);
+  const allowlist = new Set(["NODE_ENV", "CI", "DEPLOY_ARTIFACT"]);
+
+  const result = compareEnvMetadata(metadata, examples, allowlist);
+
+  assert.deepEqual(result.missingRequired, []);
+  assert.deepEqual(result.undocumented, []);
+  assert.deepEqual(result.stale, []);
+  assert.deepEqual(result.defaultMismatches, []);
+});
+
+test("compareEnvMetadata: clean result when metadata and examples agree", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "DATABASE_URL", required: true }),
+    meta({ name: "PORT", hasDefault: true, defaultValue: "3001" }),
+  ];
+  const examples = new Set(["DATABASE_URL", "PORT"]);
+  const documentedDefaults = new Map<string, string | undefined>([["PORT", "3001"]]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set(), documentedDefaults);
+
+  assert.deepEqual(result.missingRequired, []);
+  assert.deepEqual(result.undocumented, []);
+  assert.deepEqual(result.stale, []);
+  assert.deepEqual(result.defaultMismatches, []);
+});
+
+test("compareEnvMetadata: results are sorted alphabetically", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "Z_VAR", required: true }),
+    meta({ name: "A_VAR", required: true }),
+    meta({ name: "M_VAR", required: true }),
+  ];
+
+  const result = compareEnvMetadata(metadata, new Set(), new Set());
+
+  assert.deepEqual(result.missingRequired, ["A_VAR", "M_VAR", "Z_VAR"]);
+  assert.deepEqual(result.undocumented, ["A_VAR", "M_VAR", "Z_VAR"]);
+});
+
+test("compareEnvMetadata: output contains names only and never secret values", () => {
+  const metadata: EnvVarMetadata[] = [
+    meta({ name: "API_KEY", required: true, hasDefault: true, defaultValue: "super-secret-default" }),
+    meta({ name: "DB_PASS", required: true }),
+  ];
+  const examples = new Set(["STALE_SECRET=should-not-appear"]);
+  const documentedDefaults = new Map<string, string | undefined>([
+    ["API_KEY", "different-secret-value"],
+  ]);
+
+  const result = compareEnvMetadata(metadata, examples, new Set(), documentedDefaults);
+
+  const allOutput = [
+    ...result.missingRequired,
+    ...result.undocumented,
+    ...result.stale,
+    ...result.defaultMismatches,
+  ];
+
+  for (const entry of allOutput) {
+    assert.ok(
+      !entry.includes("super-secret") &&
+        !entry.includes("should-not-appear") &&
+        !entry.includes("different-secret-value"),
+      `Secret value must not appear in output, got: ${entry}`,
+    );
+  }
+
+  assert.ok(result.missingRequired.includes("API_KEY"));
+  assert.ok(result.missingRequired.includes("DB_PASS"));
 });

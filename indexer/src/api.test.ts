@@ -130,3 +130,56 @@ test("liveness and readiness probe routes are mounted (#934)", async () => {
   assert.match(source, /probe === "liveness"/);
   assert.match(source, /probe === "readiness"/);
 });
+
+test("deprecation policy constants are defined with documented header names (#149)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  // Standard RFC 8594 / RFC 9745 style signalling headers.
+  assert.match(source, /Deprecation/);
+  assert.match(source, /Sunset/);
+  assert.match(source, /deprecated/);
+  // The migration window must be documented in the module header.
+  assert.match(source, /migration window/i);
+});
+
+test("deprecated route emits Deprecation and Sunset headers with documented values (#149)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  // The helper that stamps the headers must be applied to the deprecated route.
+  assert.match(source, /markDeprecated/);
+  assert.match(source, /res\.setHeader\("Deprecation"/);
+  assert.match(source, /res\.setHeader\("Sunset"/);
+  // The deprecated route must still be mounted (legacy shape preserved).
+  assert.match(source, /app\.get\("\/members\/:member\/contributions"/);
+});
+
+test("deprecated response body includes a deprecated marker while keeping legacy fields (#149)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  // The marker is added alongside the legacy payload, not in place of it.
+  assert.match(source, /deprecated:\s*\{/);
+  assert.match(source, /sunsetAt/);
+  assert.match(source, /replacement/);
+  // Legacy fields must remain present during the migration window.
+  assert.match(source, /totalAmount/);
+  assert.match(source, /hasMore/);
+});
+
+test("non-deprecated routes do not emit deprecation headers (#149)", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "api.ts"), "utf8");
+  // Only the explicitly deprecated route should call the helper; count usages.
+  const helperCalls = source.match(/markDeprecated\(/g) ?? [];
+  // One definition + at most one call site for the single deprecated route.
+  assert.ok(
+    helperCalls.length <= 2,
+    `markDeprecated should only be used for deprecated routes, found ${helperCalls.length} usages`,
+  );
+  // Health probes must never be marked deprecated.
+  const liveBlock = source.slice(source.indexOf('app.get("/health/live"'));
+  assert.doesNotMatch(liveBlock.slice(0, 400), /markDeprecated/);
+});

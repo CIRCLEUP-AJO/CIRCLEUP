@@ -11,7 +11,7 @@
 //     empty value is allowed so `npm run dev` still starts without a full
 //     deployment.
 
-import { isSorobanContractId } from "./address";
+import { isSorobanContractId, isStellarAccountId } from "./address";
 
 const REQUIRED_ALWAYS = [
   "NEXT_PUBLIC_STELLAR_RPC_URL",
@@ -166,6 +166,94 @@ export function getNetworkConflicts(
 }
 
 /**
+ * Check whether a hostname is a loopback or local development address.
+ */
+export function isLocalhost(hostname: string): boolean {
+  if (!hostname) return false;
+  const clean = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return (
+    clean === "localhost" ||
+    clean === "127.0.0.1" ||
+    clean === "::1" ||
+    clean === "0.0.0.0" ||
+    clean.endsWith(".localhost") ||
+    clean.endsWith(".local") ||
+    clean.endsWith(".internal") ||
+    clean.endsWith(".test")
+  );
+}
+
+/**
+ * Validate a service URL (RPC or Indexer) against explicit transport policy.
+ * Diagnostic messages omit embedded credentials and query secrets.
+ */
+export function validateAppServiceUrl(
+  url: string,
+  fieldName: string,
+  options: { isProduction?: boolean } = {},
+): string | null {
+  const trimmed = url.trim();
+  if (trimmed === "") return `${fieldName} cannot be empty.`;
+
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    return `${fieldName} is not an absolute URL (missing http:// or https:// scheme).`;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return `${fieldName} is not a valid parseable URL.`;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `${fieldName} uses unsupported scheme "${parsed.protocol}". Only "https:" (and "http:" for local development) are allowed.`;
+  }
+
+  if (parsed.username || parsed.password) {
+    return `${fieldName} cannot contain embedded credentials.`;
+  }
+
+  if (parsed.search || parsed.hash) {
+    return `${fieldName} cannot contain query parameters or fragments.`;
+  }
+
+  const isProd = options.isProduction ?? (process.env.NODE_ENV === "production");
+  if (isProd && parsed.protocol === "http:" && !isLocalhost(parsed.hostname)) {
+    return `${fieldName} must use secure HTTPS in production ("${parsed.origin}" is insecure HTTP).`;
+  }
+
+  return null;
+}
+
+/**
+ * Validate service URLs (Stellar RPC and Indexer) against transport policy.
+ * Exported for unit testing.
+ */
+export function getMalformedServiceUrls(
+  env: Record<string, string | undefined> = process.env as Record<
+    string,
+    string | undefined
+  >,
+  isProduction = process.env.NODE_ENV === "production",
+): string[] {
+  const malformed: string[] = [];
+  const rpc = env["NEXT_PUBLIC_STELLAR_RPC_URL"]?.trim();
+  const indexer = env["NEXT_PUBLIC_INDEXER_URL"]?.trim();
+
+  if (rpc) {
+    const err = validateAppServiceUrl(rpc, "NEXT_PUBLIC_STELLAR_RPC_URL", { isProduction });
+    if (err) malformed.push(err);
+  }
+  if (indexer) {
+    const err = validateAppServiceUrl(indexer, "NEXT_PUBLIC_INDEXER_URL", { isProduction });
+    if (err) malformed.push(err);
+  }
+
+  return malformed;
+}
+
+/**
  * Throw an error listing every missing or malformed variable so the problem is
  * immediately obvious in logs / terminal output.
  * Only runs server-side (typeof window === "undefined").
@@ -175,10 +263,12 @@ function assertEnvVars(): void {
 
   const missing = getMissingEnvVars();
   const malformed = getMalformedContractAddresses();
+  const malformedUrls = getMalformedServiceUrls();
   const conflicts = getNetworkConflicts();
   const problems = [
     ...missing.map((k) => `  • ${k} is missing`),
     ...malformed.map((m) => `  • ${m}`),
+    ...malformedUrls.map((u) => `  • ${u}`),
     ...conflicts.map((c) => `  • ${c}`),
   ];
   if (problems.length === 0) {
@@ -240,9 +330,14 @@ export const INDEXER_TIMEOUT_MS = 10_000;
  * Trailing slashes are stripped so `base + "/circles"` never yields `//circles`.
  * Exported for unit testing.
  */
-export function resolveIndexerBaseUrl(raw: string | undefined | null): string | null {
+export function resolveIndexerBaseUrl(
+  raw: string | undefined | null,
+  options: { isProduction?: boolean } = {},
+): string | null {
   const value = typeof raw === "string" ? raw.trim() : "";
   if (value === "") return null;
+
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(value)) return null;
 
   let parsed: URL;
   try {
@@ -253,6 +348,11 @@ export function resolveIndexerBaseUrl(raw: string | undefined | null): string | 
 
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+
+  const isProd = options.isProduction ?? (process.env.NODE_ENV === "production");
+  if (isProd && parsed.protocol === "http:" && !isLocalhost(parsed.hostname)) {
+    return null;
+  }
 
   return `${parsed.origin}${parsed.pathname.replace(/\/+$/, "")}`;
 }
@@ -356,6 +456,120 @@ export function getExplorerLink(
 
   const segment = EXPLORER_NETWORK_SEGMENT[network];
   return `${EXPLORER_BASE_URL}/${segment}/${type}/${encodeURIComponent(trimmed)}`;
+}
+
+/**
+ * Human-readable label for an explorer link on the given network, so a testnet
+ * page is never presented as mainnet evidence:
+ *
+ *   explorerLinkLabel("testnet", "account") → "View account on Testnet explorer"
+ *   explorerLinkLabel("mainnet", "tx")      → "View transaction on Mainnet explorer"
+ *
+ * Returns `null` when the network is unsupported (custom/unknown), matching
+ * {@link getExplorerLink} — callers render plain text instead of a link.
+ */
+export function explorerLinkLabel(
+  network: string,
+  type: ExplorerEntityType,
+): string | null {
+  if (!isValidNetwork(network)) return null;
+  const networkLabel = network === "mainnet" ? "Mainnet" : "Testnet";
+  const entityLabel =
+    type === "tx" ? "transaction" : type === "account" ? "account" : "contract";
+  return `View ${entityLabel} on ${networkLabel} explorer`;
+}
+
+/**
+ * Build an explorer link for a route-supplied address, validating it first so
+ * an invalid route value can never produce a misleading external link.
+ *
+ * Only `account` and `contract` entity types are supported here — a route
+ * address is never a transaction hash. Returns `null` when the address is not
+ * a well-formed Stellar account (`G…`) or Soroban contract (`C…`) ID, or when
+ * the active network is not a recognised public network.
+ */
+export function getAddressExplorerLink(
+  network: string,
+  type: "account" | "contract",
+  address: string,
+): string | null {
+  if (!isValidNetwork(network)) return null;
+  const trimmed = typeof address === "string" ? address.trim() : "";
+  if (trimmed === "") return null;
+
+  const valid =
+    type === "contract"
+      ? isSorobanContractId(trimmed)
+      : isStellarAccountId(trimmed);
+  if (!valid) return null;
+
+  return getExplorerLink(network, type, trimmed);
+}
+
+/**
+ * Explorer link for a route address on the *active* network, or `null` when the
+ * address is invalid or the active network is custom/unknown.
+ */
+export function getActiveNetworkAddressExplorerLink(
+  type: "account" | "contract",
+  address: string,
+): string | null {
+  return getAddressExplorerLink(ACTIVE_NETWORK, type, address);
+}
+
+// ─── Canonical site URL ───────────────────────────────────────────────────────
+//
+// Canonical metadata (og:url, alternates.canonical, …) must be built from a
+// configured origin — never from the request `Host` header, which is
+// attacker-controlled and would let a crafted request poison cached metadata.
+// `NEXT_PUBLIC_SITE_URL` is the single source of truth; when it is unset or
+// malformed we fall back to the deployment's known origin (localhost in dev)
+// rather than trusting the request.
+
+/** Fallback origin used when NEXT_PUBLIC_SITE_URL is unset or invalid. */
+export const DEFAULT_SITE_URL = "http://localhost:3000";
+
+/**
+ * Normalise a configured site URL to a bare origin (scheme + host + optional
+ * port), or return `null` when it is empty, not absolute, or not http(s).
+ * Paths, queries, fragments, and credentials are stripped/rejected so a
+ * canonical URL can never be built from a partial or unsafe value.
+ * Exported for unit testing.
+ */
+export function resolveSiteUrl(raw: string | undefined | null): string | null {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (value === "") return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+
+  return parsed.origin;
+}
+
+/** The validated canonical site origin, or the localhost fallback. */
+export const SITE_URL: string =
+  resolveSiteUrl(process.env.NEXT_PUBLIC_SITE_URL) ?? DEFAULT_SITE_URL;
+
+/**
+ * Build an absolute canonical URL for an app route from the configured
+ * {@link SITE_URL}. `path` may be given with or without a leading slash; any
+ * query string or fragment is dropped so canonical URLs stay stable. The
+ * request host is never consulted.
+ *
+ *   canonicalUrl("/circle/C…") → "https://circleup.example/circle/C…"
+ */
+export function canonicalUrl(path: string): string {
+  const raw = typeof path === "string" ? path.trim() : "";
+  // Drop query/fragment and normalise to a single leading slash.
+  const pathname = raw.split(/[?#]/, 1)[0].replace(/^\/+/, "");
+  return pathname === "" ? SITE_URL : `${SITE_URL}/${pathname}`;
 }
 
 // ─── USDC / stroops conversion ────────────────────────────────────────────────

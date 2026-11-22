@@ -46,8 +46,18 @@ describe("validateCircleUpConfig", () => {
 
   it("accepts mainnet passphrase", () => {
     expect(() =>
-      validateCircleUpConfig({ ...VALID_CONFIG, networkPassphrase: MAINNET_PASSPHRASE }),
+      validateCircleUpConfig({
+        ...VALID_CONFIG,
+        rpcUrl: "https://soroban-mainnet.stellar.org",
+        networkPassphrase: MAINNET_PASSPHRASE,
+      }),
     ).not.toThrow();
+  });
+
+  it("rejects the public testnet RPC paired with the mainnet passphrase (issue #903)", () => {
+    expect(() =>
+      validateCircleUpConfig({ ...VALID_CONFIG, networkPassphrase: MAINNET_PASSPHRASE }),
+    ).toThrow("config.rpcUrl is the public testnet endpoint");
   });
 
   it("throws for null / non-object input", () => {

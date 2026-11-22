@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { parseReputationResponse } from "@/lib/circleTypes";
 import { getLevel } from "@/components/ReputationBadge";
+import {
+  REPUTATION_SOURCE_LABELS,
+  getReputationFreshness,
+  getReputationScoreState,
+  getReputationHistoryState,
+} from "@/lib/reputationProvenance";
 
 describe("Reputation Data Contract & Parser Tests", () => {
   describe("parseReputationResponse", () => {
@@ -78,6 +84,130 @@ describe("Reputation Data Contract & Parser Tests", () => {
       // Non-object payload
       expect(parseReputationResponse("not an object")).toBeNull();
       expect(parseReputationResponse(null)).toBeNull();
+    });
+  });
+
+  describe("Reputation provenance and freshness states", () => {
+    const member = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    it("distinguishes a new member's verified zero score from a failed read", () => {
+      const payload = {
+        member,
+        found: true,
+        score: 0,
+        contributions: [],
+        defaults: [],
+        updatedAt: "2026-09-29T21:00:00Z",
+      };
+
+      const result = parseReputationResponse(payload);
+      expect(result).not.toBeNull();
+
+      const scoreState = getReputationScoreState(result!);
+      expect(scoreState.kind).toBe("verified-zero");
+      expect(scoreState.label).toBe(REPUTATION_SOURCE_LABELS.onChain);
+      expect(scoreState.value).toBe(0);
+
+      const historyState = getReputationHistoryState(result!);
+      expect(historyState.kind).toBe("empty");
+      expect(historyState.label).toBe(REPUTATION_SOURCE_LABELS.indexer);
+    });
+
+    it("renders score and history provenance with current freshness for a member with history", () => {
+      const payload = {
+        member,
+        found: true,
+        score: 15,
+        contributions: [
+          { circle_address: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", contributions: 3, total_rounds: 5 },
+        ],
+        defaults: [],
+        events: [{ type: "tip_received", delta: 5 }],
+        updatedAt: "2026-09-29T20:00:00Z",
+      };
+
+      const result = parseReputationResponse(payload);
+      expect(result).not.toBeNull();
+
+      const scoreState = getReputationScoreState(result!);
+      expect(scoreState.kind).toBe("verified");
+      expect(scoreState.label).toBe(REPUTATION_SOURCE_LABELS.onChain);
+      expect(scoreState.value).toBe(15);
+
+      const historyState = getReputationHistoryState(result!);
+      expect(historyState.kind).toBe("present");
+      expect(historyState.label).toBe(REPUTATION_SOURCE_LABELS.indexer);
+
+      const freshness = getReputationFreshness(result!, new Date("2026-09-29T20:05:00Z"));
+      expect(freshness.status).toBe("current");
+      expect(freshness.updatedAt).toBe("2026-09-29T20:00:00Z");
+      expect(freshness.label).toBe(REPUTATION_SOURCE_LABELS.indexer);
+    });
+
+    it("marks delayed indexing as stale and notes history may lag chain", () => {
+      const payload = {
+        member,
+        found: true,
+        score: 15,
+        contributions: [],
+        defaults: [],
+        events: [],
+        updatedAt: "2026-09-29T18:00:00Z",
+      };
+
+      const result = parseReputationResponse(payload);
+      expect(result).not.toBeNull();
+
+      const freshness = getReputationFreshness(result!, new Date("2026-09-29T20:00:00Z"));
+      expect(freshness.status).toBe("stale");
+      expect(freshness.mayLagChain).toBe(true);
+      expect(freshness.label).toBe(REPUTATION_SOURCE_LABELS.indexer);
+
+      // Score remains an on-chain read even when the indexer is stale.
+      expect(getReputationScoreState(result!).label).toBe(REPUTATION_SOURCE_LABELS.onChain);
+    });
+
+    it("represents an unavailable history separately from an empty one", () => {
+      const payload = {
+        member,
+        found: false,
+        score: null,
+        detail: "Member has no reputation record in the indexer yet.",
+        contributions: [],
+        defaults: [],
+        updatedAt: null,
+      };
+
+      const result = parseReputationResponse(payload);
+      expect(result).not.toBeNull();
+
+      const historyState = getReputationHistoryState(result!);
+      expect(historyState.kind).toBe("unavailable");
+      expect(historyState.kind).not.toBe("empty");
+
+      const freshness = getReputationFreshness(result!, new Date("2026-09-29T20:00:00Z"));
+      expect(freshness.status).toBe("unavailable");
+      expect(freshness.updatedAt).toBeNull();
+    });
+
+    it("represents an RPC failure distinctly from a verified zero score", () => {
+      const failed = getReputationScoreState(null);
+
+      expect(failed.kind).toBe("unavailable");
+      expect(failed.label).toBe(REPUTATION_SOURCE_LABELS.onChain);
+      expect(failed.value).toBeNull();
+      expect(failed.kind).not.toBe("verified-zero");
+
+      const zero = getReputationScoreState({
+        member,
+        found: true,
+        score: 0,
+        contributions: [],
+        defaults: [],
+        updatedAt: "2026-09-29T21:00:00Z",
+      });
+      expect(zero.kind).toBe("verified-zero");
+      expect(zero.kind).not.toBe(failed.kind);
     });
   });
 

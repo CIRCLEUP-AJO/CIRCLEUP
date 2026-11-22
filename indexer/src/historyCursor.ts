@@ -33,10 +33,50 @@
  * was issued for a different endpoint or filter. A token whose row has since
  * been deleted (e.g. replay after a reorg) is still a valid position — keyset
  * comparison does not need the row to exist.
+ *
+ * Wire contract and deprecation policy (see docs/api-deprecation-policy.md):
+ * the cursor token is a versioned wire format. `HISTORY_CURSOR_VERSION` is the
+ * version of the token layout that this build *emits*, and it is part of the
+ * public API contract exactly like a field name or status value.
+ *
+ *   • The token layout (payload keys, key ordering, value encoding) and each
+ *     endpoint's keyset are frozen for a given version. Any change to them —
+ *     adding/removing/renaming a payload field, reordering keys, changing how
+ *     a key value is encoded, or changing an endpoint's ORDER BY — requires a
+ *     new `HISTORY_CURSOR_VERSION`; the existing version must never be mutated
+ *     in place, because tokens already handed to clients are still in flight.
+ *   • A version bump is a wire-breaking change and follows the API deprecation
+ *     policy: it is announced with a deprecation notice and a migration window
+ *     before tokens of the old version stop being accepted. During the
+ *     transition the parser accepts both the old and the new version (see
+ *     {@link SUPPORTED_CURSOR_VERSIONS}) so a scan started before the rollout
+ *     can finish after it.
+ *   • Minimum support window: a superseded cursor version remains accepted for
+ *     at least {@link CURSOR_VERSION_MIN_SUPPORT_DAYS} days after the new
+ *     version is generally available, and never less than one full release
+ *     cycle. Only after that window may the old version be rejected (HTTP 400
+ *     with {@link INVALID_CURSOR_ERROR}, which already tells clients to restart
+ *     the scan without a cursor).
+ *   • Clients must treat tokens as opaque and must not construct, inspect, or
+ *     persist them across a version change; restarting a scan without a cursor
+ *     is always a valid recovery path.
  */
 
 /** Bumped whenever the token layout or an endpoint's keyset changes. */
 export const HISTORY_CURSOR_VERSION = 1;
+
+/**
+ * Minimum number of days a superseded cursor version stays accepted after the
+ * replacement version is generally available (see the wire contract above).
+ */
+export const CURSOR_VERSION_MIN_SUPPORT_DAYS = 90;
+
+/**
+ * Cursor token versions this build accepts. Contains the current version and,
+ * during a transition, the previous version(s) still inside their support
+ * window. A token whose `v` is not listed here is rejected as invalid.
+ */
+export const SUPPORTED_CURSOR_VERSIONS: readonly number[] = [HISTORY_CURSOR_VERSION];
 
 /** Upper bound on an accepted token, to keep validation cheap. */
 export const MAX_CURSOR_LENGTH = 512;
@@ -145,7 +185,8 @@ export function parseHistoryCursor(
   const p = payload as Partial<CursorPayload>;
   const layout = HISTORY_CURSOR_KEYS[scope];
   if (
-    p.v !== HISTORY_CURSOR_VERSION ||
+    typeof p.v !== "number" ||
+    !SUPPORTED_CURSOR_VERSIONS.includes(p.v) ||
     p.s !== scope ||
     p.f !== filter ||
     !Array.isArray(p.k) ||

@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "cadence": {
+    "cron": "0 6 * * 1",
+    "description": "Weekly, Monday 06:00 UTC, aligned with the Dependabot schedule."
+  },
+  "severityThresholds": {
+    "npm": {
+      "failAt": "high",
+      "warnAt": "moderate"
+    },
+    "cargo": {
+      "failAt": "high",
+      "warnAt": "moderate"
+    }
+  },
+  "exceptionOwner": "@CIRCLEUP-AJO/maintainers",
+  "artifactRetentionDays": 90,
+  "licenseBaseline": "artifacts/licenses-baseline.json",
+  "exceptions": {
+    "advisoryRegistry": ".github/audit-ignore.json",
+    "licenseExceptionsDoc": "docs/LICENSE_EXCEPTIONS.md",
+    "maxReviewIntervalDays": 90
+  },
+  "behavior": {
+    "failOnNewFindings": true,
+    "failOnExpiredExceptions": true,
+    "autoAccept": false,
+    "modifyDependencies": false
+  }
+}

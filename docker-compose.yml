@@ -10,12 +10,20 @@ services:
     ports:
       - "5432:5432"
     volumes:
+      # Named volume holding the local PostgreSQL data directory
+      # (/var/lib/postgresql/data). It persists across `docker compose down`
+      # and container restarts, so test data survives a service restart.
+      # It is only removed by an explicit `docker compose down -v` or by
+      # deleting the named volume directly (see reset instructions below).
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      # Readiness probe: reports healthy only once PostgreSQL accepts
+      # connections, so dependent services never run migrations early.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d circleup"]
       interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 10s
 
   # ── Development container ───────────────────────────────────────────────────
   #
@@ -28,6 +36,22 @@ services:
   #   docker compose exec devcontainer bash
   #   npm test                    # 900+ SDK unit tests
   #   cd contracts && cargo test  # Rust contract tests
+  #
+  # Readiness: this service waits for postgres to report healthy before it
+  # starts, so migrations run only against a database ready to accept them.
+  # Verify readiness with:
+  #   docker compose ps
+  #   docker compose exec postgres pg_isready -U postgres -d circleup
+  #
+  # Restart vs. reset:
+  #   - Restart (keeps data):  docker compose restart postgres
+  #   - Reset (erases data):   docker compose down -v
+  #     `down -v` removes the named `pgdata` volume and is irreversible.
+  #     To target only the local database volume explicitly:
+  #       docker compose stop postgres
+  #       docker volume rm <project>_pgdata
+  #     This deletes only disposable local database data; it does not touch
+  #     other volumes or user data outside this project.
   devcontainer:
     build:
       context: .

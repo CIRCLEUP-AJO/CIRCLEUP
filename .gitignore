@@ -13,6 +13,8 @@ indexer/dist/
 scripts/dist/
 contracts/target/
 artifacts/
+# The reviewed license inventory baseline is committed (Issue #977).
+!artifacts/licenses-baseline.json
 
 # Environment files
 .env

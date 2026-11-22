@@ -40,6 +40,68 @@ import { requestTracing } from "./requestTracing";
  * queryExact<T> (exactly 1 row or throws). The queryOne/queryExact helpers
  * replace the fragile `const [row] = await query(...)` destructuring pattern
  * that silently produced undefined when no row existed (see pool.ts).
+ *
+ * ── API deprecation & versioning policy (issue #149) ────────────────────────
+ *
+ * The routes above are the complete public HTTP surface of the indexer. They
+ * are consumed by the app in this repository, by sdk/src (which mirrors the
+ * response shapes in sdk/src/types.ts and sdk/src/indexerSchema.ts), and by
+ * external tools. The contract below is what those consumers may rely on.
+ *
+ * PUBLIC SURFACE INVENTORY (source of truth — update this block whenever a
+ * route, query parameter, response field, status enum value or numeric
+ * encoding changes):
+ *
+ *   Route                                  Params / filters                         Response fields
+ *   GET /openapi/v1.json                   —                                        OpenAPI document
+ *   GET /health                            ?probe=liveness|readiness                health report
+ *   GET /health/live, /livez               —                                        liveness
+ *   GET /health/ready, /readyz             —                                        readiness
+ *   GET /metrics                           ?format=json|prometheus                  metrics
+ *   GET /circles                           ?status ?sort ?order ?page ?limit        circles[], pagination
+ *   GET /circles/summary                   —                                        total, byStatus
+ *   GET /circles/:address                  —                                        circle, members, latestLedger
+ *   GET /circles/:address/members          —                                        members[], totals, roundDeadlineLedgers
+ *   GET /circles/:address/rounds           —                                        rounds, currentRound, openRounds, pendingDefaults
+ *   GET /circles/:address/history          ?page ?limit                             events[], pagination
+ *   GET /circles/:address/activity         ?page ?limit ?cursor                     events[], pagination
+ *   GET /circles/:address/audit            ?page ?limit                             events[], pagination
+ *   GET /circles/:address/export.csv       —                                        text/csv
+ *   GET /circles/:address/reconciliation   —                                        reconciliation report
+ *   GET /members/:member/circles           ?status ?page ?limit                     circles[], pagination
+ *   GET /members/:member/contributions     ?circle ?page ?limit ?cursor             contributions[], totalAmount, pagination
+ *   GET /reputation/:member                ?circle ?page ?limit                     score, contributions, defaults, pagination
+ *   GET /indexer/state                     —                                        lastLedger, eventCounts, entityCounts
+ *   GET /indexer/health                    —                                        status, running, events, pollCycles
+ *   GET /indexer/failures                  ?ledger ?eventId ?limit                  failures[], count, limit
+ *   GET /indexer/schema                    —                                        migration status
+ *
+ *   Status enums: circle status is Pending|Active|Completed|Cancelled|Closed
+ *   (Closed is indexer-only). Round status is completed|current|cancelled|open.
+ *   Numeric encoding: see docs/INDEXER_NUMERIC_WIRE_FORMAT.md — base-unit
+ *   amounts are decimal strings, persisted BIGINT columns are decimal strings,
+ *   computed counts/ledgers are JSON safe integers.
+ *
+ * DEPRECATION SIGNAL
+ *   A route, query parameter or response field entering its migration window
+ *   is flagged with markDeprecated(res, { since, sunset, replacement }), which
+ *   sets the standard `Deprecation` and `Sunset` response headers and adds a
+ *   `deprecated` marker to the JSON body. The wire shape of the deprecated
+ *   field itself is unchanged during the window, so existing consumers keep
+ *   working while new consumers can migrate.
+ *
+ * SUPPORT WINDOW
+ *   A deprecated field or endpoint remains supported for at least two minor
+ *   releases or 90 days, whichever is longer, before it may be removed. The
+ *   `Sunset` header carries the earliest removal date.
+ *
+ * VERSIONING
+ *   The current unversioned routes are the v1 surface and stay compatible.
+ *   Additive changes (new optional fields, new query params, new routes) do
+ *   not need a version bump. A `/v2` prefix is reserved for non-additive
+ *   changes only — removing or renaming a field, changing a status enum, or
+ *   changing a numeric encoding — and must ship alongside the deprecated v1
+ *   form for the full support window.
  */
 
 import express, { NextFunction, Request, Response } from "express";
@@ -279,6 +341,37 @@ function sendError(res: Response, status: number, message: string, details?: unk
       details: details ?? null,
     },
   });
+}
+
+// ── Deprecation signalling (issue #149) ─────────────────────────────────────
+//
+// See the policy block at the top of this file. markDeprecated() is the only
+// supported way to announce a deprecation: it sets the standard `Deprecation`
+// and `Sunset` headers (RFC 8594 / draft-dalal-deprecation-header) and records
+// the marker on res.locals so the route can include it in its JSON body
+// without changing the shape of the deprecated field itself.
+
+export interface DeprecationInfo {
+  /** Version or date the deprecation was announced, e.g. "1.4.0" or "2024-01-01". */
+  since: string;
+  /** Earliest date the field/endpoint may be removed, e.g. "2024-04-01". */
+  sunset: string;
+  /** Optional pointer to the replacement field, endpoint or doc. */
+  replacement?: string;
+}
+
+/**
+ * Flag the current response as deprecated. Call before sending the body; the
+ * route then includes `deprecated: res.locals.deprecation` in its JSON payload
+ * (or omits it when no deprecation is active).
+ */
+export function markDeprecated(res: Response, info: DeprecationInfo): void {
+  res.setHeader("Deprecation", `version="${info.since}"`);
+  res.setHeader("Sunset", info.sunset);
+  if (info.replacement) {
+    res.setHeader("Link", `<${info.replacement}>; rel="successor-version"`);
+  }
+  res.locals.deprecation = info;
 }
 
 // ── Pagination / query-param constants ───────────────────────────────────────
@@ -557,30 +650,40 @@ interface CircleStatusCountRow {
 }
 
 
-/**
- * Issue #985: emit the observable sunset signal for a deprecated route.
- *
- * `req.route?.path` is only populated once a handler has matched, so this must
- * be called from inside a handler (as its first statement), never from a
- * pre-routing middleware. Deprecated routes are registered in
- * `API_DEPRECATIONS` (see apiDeprecation.ts) and are also published at
- * `GET /indexer/deprecations`.
- */
-export function applyDeprecationHeaders(req: Request, res: Response): void {
-  const routePath = typeof req.route?.path === "string" ? req.route.path : "";
-  const deprecation = findDeprecation(req.method, routePath);
-  if (!deprecation) return;
-  for (const [name, value] of Object.entries(deprecationHeaders(deprecation))) {
-    res.set(name, value);
-  }
-}
-
-export function createApp(options: { cachedMigrationHealth?: MigrationHealth | null } = {}) {
+export function createApp(options: {
+  cachedMigrationHealth?: MigrationHealth | null;
+  /** Returns true once the coordinated shutdown sequence has begun. */
+  isShuttingDown?: () => boolean;
+} = {}) {
   const app = express();
   app.set("trust proxy", TRUST_PROXY_HOPS);
   app.use(requestTracing);
   app.use(cors({ ...buildCorsOptions(), exposedHeaders: ["X-Request-ID", "Deprecation", "Sunset", "Link"] }));
   app.use(express.json());
+
+  // ── Shutdown gate ──────────────────────────────────────────────────────────
+  //
+  // The entrypoint owns the HTTP server and calls server.close() (stop
+  // accepting new connections) followed by closeAllConnections() once the
+  // bounded drain deadline elapses.  This middleware makes the transition
+  // observable to handlers: once shutdown has begun, new requests are refused
+  // with 503 + Connection: close so clients retry elsewhere instead of
+  // starting work that would race the pool being closed.  Requests already
+  // in flight are unaffected — they finish normally (or are cut off by
+  // closeAllConnections at the deadline).
+  //
+  // Handlers in this module are all request-scoped: none of them schedule
+  // timers, spawn background tasks, or hold a connection past the response,
+  // so no additional cleanup is required here beyond refusing new work.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (options.isShuttingDown?.()) {
+      res.setHeader("Connection", "close");
+      res.setHeader("Retry-After", "1");
+      sendError(res, 503, "Server is shutting down");
+      return;
+    }
+    next();
+  });
 
   // Issue 97: Instrument HTTP requests with bounded route and status-code classes
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -791,6 +894,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           total,
           totalPages: Math.ceil(total / limit),
         },
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error("[api] Failed to list circles", err);
@@ -820,7 +925,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         }
       }
 
-      res.json({ total, byStatus });
+      res.json({
+        total,
+        byStatus,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
+      });
     } catch (err) {
       console.error("[api] Failed to list circles", err);
       sendError(res, 500, "Failed to list circles", getErrorMessage(err));
@@ -894,6 +1004,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         },
         members,
         latestLedger,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(`[api] Failed to load circle ${redactAddress(address)}`, err);
@@ -994,6 +1106,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           totalContributions: Number(t.total_contributions),
         },
         roundDeadlineLedgers: circle.round_deadline_ledgers,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(`[api] Failed to load members for circle ${redactAddress(address)}`, err);
@@ -1108,6 +1222,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         // previously invisible to clients).
         openRounds: openRounds.map(annotate),
         pendingDefaults,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(`[api] Failed to load rounds for circle ${redactAddress(address)}`, err);
@@ -1129,7 +1245,13 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         UNION ALL SELECT 'payout', id, ledger, (to_jsonb(p) || jsonb_build_object('amount', p.amount::text, 'ledger', p.ledger::text)) FROM payouts p WHERE circle_address = $1`;
       const events = await query(`SELECT kind, record FROM (${source}) h ORDER BY ledger ASC, kind ASC, id ASC LIMIT $2 OFFSET $3`, [address, paging.limit, paging.offset]);
       const count = await queryExact<{ count: string }>(`SELECT COUNT(*)::text AS count FROM (${source}) h`, [address]);
-      res.json({ circle_address: address, events, pagination: historyMetadata(paging, Number(count.count)) });
+      res.json({
+        circle_address: address,
+        events,
+        pagination: historyMetadata(paging, Number(count.count)),
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
+      });
     } catch (err) { sendError(res, 500, "Failed to load circle history"); }
   });
 
@@ -1279,6 +1401,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           totalPages,
           hasMore: page < totalPages,
         },
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(
@@ -1454,6 +1578,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
             hasMore,
             nextCursor: hasMore ? activityCursor(pageRows[pageRows.length - 1]) : null,
           },
+          // Present only while a deprecation is active for this route/field.
+          ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
         });
         return;
       }
@@ -1487,6 +1613,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           // Lets a page-1 reader continue with the cheaper keyset scan.
           nextCursor: hasMore && events.length > 0 ? activityCursor(events[events.length - 1]) : null,
         },
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(
@@ -1631,6 +1759,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
             hasMore,
             nextCursor: hasMore ? contributionCursor(pageRows[pageRows.length - 1]) : null,
           },
+          // Present only while a deprecation is active for this route/field.
+          ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
         });
         return;
       }
@@ -1673,6 +1803,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
               ? contributionCursor(keyedContributions[keyedContributions.length - 1])
               : null,
         },
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(
@@ -1715,6 +1847,21 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         `SELECT * FROM reputation WHERE member_address = $1`,
         [member],
       );
+
+      // Freshness context: how far the indexer has processed, and when that
+      // state row was last written.  Read from the same indexer_state row the
+      // rest of the API uses (no extra unbounded request).  A missing state
+      // row means the indexer has never recorded progress — history is then
+      // reported as unavailable rather than as "no records".
+      const stateRow = await queryOne<IndexerStateAuditRow>(
+        `SELECT last_ledger, updated_at FROM indexer_state WHERE id = 1`,
+      );
+      const lastProcessedLedger = stateRow
+        ? toSafeInteger(stateRow.last_ledger, "lastProcessedLedger")
+        : null;
+      const lastProcessedAt = stateRow?.updated_at ?? null;
+      const indexerAvailable = stateRow != null;
+
       const scope = `SELECT circle_address FROM contributions WHERE member_address = $1
         UNION SELECT circle_address FROM defaults WHERE member_address = $1`;
       const scopeSql = `SELECT circle_address FROM (${scope}) scope ${circleFilter ? "WHERE circle_address = $2" : ""}`;
@@ -1748,6 +1895,18 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
       // COUNT(*) in PostgreSQL always comes back as a string over the wire;
       // cast to number here so the JSON response shape matches the declared
       // ApiReputationResponse type in sdk/src/types.ts.
+      //
+      // Provenance / freshness (issue #131):
+      //   • `scoreSource` — "indexed" when a reputation row exists (a verified
+      //     read of indexed on-chain reputation events), "none" when the
+      //     member has no record.  Never claims the indexer is the contract's
+      //     authorization source.
+      //   • `historyAvailable` — false only when the indexer has no state row,
+      //     i.e. indexed history cannot be trusted to be complete.  An empty
+      //     history with historyAvailable:true means "no records", not
+      //     "unavailable".
+      //   • `lastProcessedLedger` / `lastProcessedAt` — indexer freshness.
+      const historyAvailable = indexerAvailable;
       res.json({
         member,
         found: row != null,
@@ -1763,6 +1922,12 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
             `reputation/increment event has not been indexed.`
           : undefined,
         score: row?.score ?? 0,
+        // Provenance: the score is an indexed projection of on-chain
+        // reputation events, not a live contract read.
+        scoreSource: row != null ? "indexed" : "none",
+        historyAvailable,
+        lastProcessedLedger,
+        lastProcessedAt,
         contributions: contributions.map((c) => ({
           circle_address: c.circle_address,
           contributions: Number(c.contributions),
@@ -1773,6 +1938,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           count: Number(d.count),
         })),
         updatedAt: row?.updated_at ?? null,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error(`[api] Failed to load reputation for member ${redactAddress(member)}`, err);
@@ -1836,7 +2003,13 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         [address, paging.limit, paging.offset],
       );
       const count = await queryExact<{ count: string }>("SELECT COUNT(*)::text AS count FROM circle_audit_events WHERE circle_address = $1", [address]);
-      res.json({ circle_address: address, events, pagination: historyMetadata(paging, Number(count.count)) });
+      res.json({
+        circle_address: address,
+        events,
+        pagination: historyMetadata(paging, Number(count.count)),
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
+      });
     } catch (err) {
       console.error(`[api] Failed to load audit events for circle ${redactAddress(address)}`, err);
       sendError(res, 500, "Failed to load circle audit events", getErrorMessage(err));
@@ -2041,6 +2214,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           defaults: Number(entityCounts?.defaults ?? 0),
           circlesByStatus,
         },
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error("[api] Failed to load indexer state", err);
@@ -2080,6 +2255,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
           consecutiveFailures: metrics.backoffConsecutiveFailures,
           currentIntervalMs: metrics.backoffCurrentIntervalMs,
         },
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error("[api] Failed to load indexer health", err);
@@ -2120,7 +2297,13 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
 
     try {
       const failures = await listOpenEventFailures({ ledger, eventId, limit: limitResult });
-      res.json({ failures, count: failures.length, limit: limitResult });
+      res.json({
+        failures,
+        count: failures.length,
+        limit: limitResult,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
+      });
     } catch (err) {
       if (isUndefinedTable(err)) {
         sendError(res, 503, "event_failures table is missing — run migrations");
@@ -2146,6 +2329,8 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
         pending: health.status.pending,
         missingOnDisk: health.status.missingOnDisk,
         modified: health.status.modified,
+        // Present only while a deprecation is active for this route/field.
+        ...(res.locals.deprecation ? { deprecated: res.locals.deprecation } : {}),
       });
     } catch (err) {
       console.error("[api] Failed to load schema status", err);
@@ -2174,6 +2359,53 @@ export function createApp(options: { cachedMigrationHealth?: MigrationHealth | n
   });
 
   return app;
+}
+
+/**
+ * Close an HTTP server created from createApp() with a bounded drain period.
+ *
+ * Sequence (matches the coordinated shutdown in the entrypoint):
+ *   1. server.close() — stop accepting new connections; in-flight requests
+ *      are allowed to finish and their sockets close naturally.
+ *   2. If the server has not closed within `drainMs`, force-close every
+ *      remaining socket via closeAllConnections() so a stuck request cannot
+ *      block process replacement indefinitely.
+ *
+ * Resolves with `{ drained: true }` when all connections finished within the
+ * deadline, or `{ drained: false, forced: true }` when the deadline was hit
+ * and remaining connections were terminated.  Never rejects — callers log the
+ * outcome and proceed to close the pool.  Safe to call more than once: a
+ * second call on an already-closed server resolves immediately without
+ * touching sockets again.
+ */
+export async function closeHttpServer(
+  server: import("node:http").Server,
+  drainMs: number,
+): Promise<{ drained: boolean; forced: boolean }> {
+  if (!server.listening) {
+    return { drained: true, forced: false };
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  const closed = new Promise<{ drained: boolean; forced: boolean }>((resolve) => {
+    server.close(() => resolve({ drained: true, forced: false }));
+    timer = setTimeout(() => {
+      // Deadline exceeded: terminate remaining sockets.  server.close()'s
+      // callback still fires once the sockets are gone, but we resolve now so
+      // the caller is not held up by a socket that refuses to close.
+      try {
+        server.closeAllConnections();
+      } catch {
+        // Older Node versions without closeAllConnections — nothing to do.
+      }
+      resolve({ drained: false, forced: true });
+    }, drainMs);
+    if (typeof timer.unref === "function") timer.unref();
+  });
+
+  const result = await closed;
+  if (timer) clearTimeout(timer);
+  return result;
 }
 
 function parseHistoryPage(req: Request, res: Response): { page: number; limit: number; offset: number } | null {

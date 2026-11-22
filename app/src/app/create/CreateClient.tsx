@@ -4,6 +4,7 @@ import { parseContractError, userMessageForError, type ContractAppError } from "
 import { observeWalletChanges } from "@/lib/walletIdentity";
 import { useAnnouncer, ANNOUNCEMENTS } from "@/lib/useAnnouncer";
 import { useDeploymentVerified, deploymentVerified } from "@/lib/deploymentState";
+import { CopyControl } from "@/components/CopyControl";
 import { useState, useId, useRef, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import {
@@ -18,7 +19,7 @@ import {
 } from "@/lib/config";
 import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
-import { Address, nativeToScVal, xdr } from "@stellar/stellar-sdk";
+import { buildCreateCircleArgs } from "@/lib/createCircleArgs";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -65,6 +66,62 @@ export interface CreateFormErrors {
   members?: (string | undefined)[];
   /** List-level member error (count, duplicates). */
   membersGeneral?: string;
+}
+
+/**
+ * Stable identifiers for every field that can carry a validation message.
+ *
+ * Member rows are keyed by their row index (`member:0`, `member:1`, …) so a
+ * message can be tied to exactly one input and cleared independently when that
+ * row is corrected. `members` is the list-level key (count/duplicates) and
+ * `wallet` is deliberately *not* a form field: wallet and RPC failures live in
+ * a separate channel so they are never mislabeled as local input errors.
+ */
+export type FieldKey =
+  | "name"
+  | "amount"
+  | "days"
+  | "members"
+  | `member:${number}`;
+
+/** A single structured validation issue tied to a field key. */
+export interface FieldError {
+  key: FieldKey;
+  message: string;
+}
+
+/** DOM id for the inline error message belonging to a field key. */
+export function fieldErrorId(formId: string, key: FieldKey): string {
+  return `${formId}-${key.replace(":", "-")}-err`;
+}
+
+/**
+ * Flatten a CreateFormErrors object into an ordered list of structured issues.
+ *
+ * Order matches the visual order of the form (name → amount → duration →
+ * member rows → member list), which is also the order the error summary lists
+ * them and the order focus moves through them.
+ */
+export function toFieldErrorList(errors: CreateFormErrors): FieldError[] {
+  const list: FieldError[] = [];
+  if (errors.name) list.push({ key: "name", message: errors.name });
+  if (errors.amount) list.push({ key: "amount", message: errors.amount });
+  if (errors.days) list.push({ key: "days", message: errors.days });
+  errors.members?.forEach((message, i) => {
+    if (message) list.push({ key: `member:${i}`, message });
+  });
+  if (errors.membersGeneral) list.push({ key: "members", message: errors.membersGeneral });
+  return list;
+}
+
+/** Human-readable label for a field key, used in the error summary. */
+export function fieldLabel(key: FieldKey): string {
+  if (key === "name") return "Circle name";
+  if (key === "amount") return "Contribution amount";
+  if (key === "days") return "Round duration";
+  if (key === "members") return "Members";
+  const idx = Number(key.slice("member:".length));
+  return `Member ${idx + 1}`;
 }
 
 /** The normalised values returned when validation passes. */
@@ -409,12 +466,18 @@ export default function CreateClient() {
 
   // ── Submission state ───────────────────────────────────────────────────────
   const [loading, setLoading] = useState(false);
+  // Wallet / RPC / contract failures. Kept separate from `fieldErrors` so a
+  // wallet or network problem is never rendered as a local input error.
   const [submitError, setSubmitError] = useState("");
   const [supportError, setSupportError] = useState<ContractAppError | null>(null);
   const [fieldErrors, setFieldErrors] = useState<CreateFormErrors>({});
   const [txHash, setTxHash] = useState("");
   const [confirmed, setConfirmed] = useState(false);
-  const [copied, setCopied] = useState(false);
+  // Verified circle address derived from the factory event / transaction
+  // result. Only set when the data is trustworthy; never guessed.
+  const [circleAddress, setCircleAddress] = useState("");
+  // Whether the user has opted to stay on the receipt instead of navigating.
+  const [stayOnReceipt, setStayOnReceipt] = useState(false);
 
   // Whether validation has been attempted — controls when inline errors appear.
   // Before first submit, per-field errors are hidden so the form isn't
@@ -423,6 +486,20 @@ export default function CreateClient() {
 
   // Guards against concurrent submissions (rapid double-click, etc.)
   const submittingRef = useRef(false);
+
+  // Owned timer for the post-success redirect. Stored in a ref so it can be
+  // cleared on unmount, on user navigation, or when the user chooses to stay.
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearRedirectTimer = useCallback(() => {
+    if (redirectTimerRef.current !== null) {
+      clearTimeout(redirectTimerRef.current);
+      redirectTimerRef.current = null;
+    }
+  }, []);
+
+  // Always clear any pending redirect when the component unmounts.
+  useEffect(() => clearRedirectTimer, [clearRedirectTimer]);
 
   // ── Stable IDs ─────────────────────────────────────────────────────────────
   const formId        = useId();
@@ -433,10 +510,12 @@ export default function CreateClient() {
   const membersHintId = useId();
   const submitErrId   = useId();
   const successId     = useId();
+  const summaryId     = useId();
 
   // ── Focus management ────────────────────────────────────────────────────────
   const submitErrorRef = useRef<HTMLDivElement>(null);
   const successRef     = useRef<HTMLDivElement>(null);
+  const summaryRef     = useRef<HTMLDivElement>(null);
   // One ref per member row for focusing the first invalid field
   const memberRefs     = useRef<(HTMLInputElement | null)[]>([]);
   const nameRef        = useRef<HTMLInputElement>(null);
@@ -450,6 +529,19 @@ export default function CreateClient() {
   useEffect(() => {
     if (txHash && successRef.current) successRef.current.focus();
   }, [txHash]);
+
+  // Lifecycle-aware success redirect: only schedule when the transaction is
+  // confirmed AND a verified circle address exists. The timer is owned by this
+  // effect and cleared on cleanup (unmount, dependency change, or user opting
+  // to stay), so it can never fire against an unmounted or navigated page.
+  useEffect(() => {
+    if (!confirmed || !circleAddress || stayOnReceipt) return;
+    redirectTimerRef.current = setTimeout(() => {
+      redirectTimerRef.current = null;
+      router.push(`/circles/${circleAddress}`);
+    }, 5000);
+    return () => clearRedirectTimer();
+  }, [confirmed, circleAddress, stayOnReceipt, router, clearRedirectTimer]);
 
   // ── Derived values ──────────────────────────────────────────────────────────
   // Distinct filled addresses only: blank rows and repeated addresses never
@@ -473,12 +565,18 @@ export default function CreateClient() {
   const potDisplay = formatPot(roundStroops, filledCount);
   const memberAmountDisplay = formatUsdc(roundStroops);
 
-  // Live-validate after first submit attempt so errors update as user types
+  // Live-validate after first submit attempt so errors update as user types.
+  // Only the fields that actually changed are re-evaluated, so correcting one
+  // input clears its own message without touching unrelated ones.
   useEffect(() => {
     if (!validated) return;
     const result = validateCreateForm(name, members, roundUSDC, roundDays);
     setFieldErrors(result.ok ? {} : result.errors);
   }, [validated, name, members, roundUSDC, roundDays]);
+
+  // Structured, ordered list of issues for the summary and focus management.
+  const fieldErrorList = toFieldErrorList(fieldErrors);
+  const hasFieldErrors = fieldErrorList.length > 0;
 
   // ── Member helpers ──────────────────────────────────────────────────────────
 
@@ -497,31 +595,58 @@ export default function CreateClient() {
     memberRefs.current = memberRefs.current.filter((_, idx) => idx !== i);
   }
 
-  // ── Copy helper ─────────────────────────────────────────────────────────────
-  async function copyTxHash() {
-    const hash = txHash;
-    if (!hash) return;
-    try {
-      await navigator.clipboard.writeText(hash);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // clipboard API unavailable — silently skip
+
+  // ── Focus first error ────────────────────────────────────────────────────────
+  //
+  // Moves focus to the first invalid input (in visual order). When the only
+  // issue is list-level (member count/duplicates) there is no single offending
+  // input, so focus the error summary instead — it is focusable and links to
+  // each affected field.
+  function focusFirstError(errors: CreateFormErrors) {
+    const first = toFieldErrorList(errors)[0];
+    if (!first) return;
+    switch (first.key) {
+      case "name":
+        nameRef.current?.focus();
+        return;
+      case "amount":
+        amountRef.current?.focus();
+        return;
+      case "days":
+        daysRef.current?.focus();
+        return;
+      case "members":
+        summaryRef.current?.focus();
+        return;
+      default: {
+        const idx = Number(first.key.slice("member:".length));
+        memberRefs.current[idx]?.focus();
+        return;
+      }
     }
   }
 
-  // ── Focus first error ────────────────────────────────────────────────────────
-  function focusFirstError(errors: CreateFormErrors) {
-    if (errors.name) { nameRef.current?.focus(); return; }
-    if (errors.amount) { amountRef.current?.focus(); return; }
-    if (errors.days) { daysRef.current?.focus(); return; }
-    if (errors.members) {
-      const firstIdx = errors.members.findIndex((e) => e !== undefined);
-      if (firstIdx !== -1) { memberRefs.current[firstIdx]?.focus(); return; }
+  /** Move focus to the input (or summary) for a field key from the summary. */
+  function focusField(key: FieldKey) {
+    switch (key) {
+      case "name":
+        nameRef.current?.focus();
+        return;
+      case "amount":
+        amountRef.current?.focus();
+        return;
+      case "days":
+        daysRef.current?.focus();
+        return;
+      case "members":
+        membersHintId && document.getElementById(membersHintId)?.focus();
+        return;
+      default: {
+        const idx = Number(key.slice("member:".length));
+        memberRefs.current[idx]?.focus();
+        return;
+      }
     }
-    // membersGeneral — focus the first empty member slot if it exists
-    const firstEmpty = members.findIndex((m) => m.trim() === "");
-    if (firstEmpty !== -1) { memberRefs.current[firstEmpty]?.focus(); }
   }
 
   // ── Submit ──────────────────────────────────────────────────────────────────
@@ -539,11 +664,13 @@ export default function CreateClient() {
     actionAbortRef.current = actionCtrl;
 
     try {
+      clearRedirectTimer();
       setSubmitError("");
       setSupportError(null);
       setTxHash("");
       setConfirmed(false);
-      setCopied(false);
+      setCircleAddress("");
+      setStayOnReceipt(false);
       setValidated(true);
 
       // ── Step 1: field validation ──────────────────────────────────────────
@@ -554,8 +681,11 @@ export default function CreateClient() {
         return; // never reach wallet
       }
       setFieldErrors({});
+      // Local input is valid — clear any stale wallet/RPC message so it is not
+      // mistaken for a form error on this attempt.
+      setSubmitError("");
 
-      const { name: circleName, validMembers, amountStroops, roundDays: days } = validation.values;
+      const { validMembers, amountStroops, roundDays: days } = validation.values;
 
       // ── Step 2: wallet check ──────────────────────────────────────────────
       let walletAddress: string | null;
@@ -585,15 +715,10 @@ export default function CreateClient() {
         return;
       }
 
-      // Self-address check — creator must not be in the member list
-      const creatorLower = walletAddress.toLowerCase();
-      if (validMembers.some((m) => m.toLowerCase() === creatorLower)) {
-        setSubmitError(
-          "Your wallet address cannot be included in the member list. " +
-            "The circle creator is automatically a member.",
-        );
-        return;
-      }
+      // Creator participation (#873): the factory never adds the creator as a
+      // member. A creator who wants to take part lists their own address, in
+      // the rotation slot they want; omitting it creates a circle they only
+      // organise.
 
       // ── Step 3: factory address guard ─────────────────────────────────────
       if (!CIRCLE_FACTORY_ADDRESS) {
@@ -604,20 +729,19 @@ export default function CreateClient() {
       // ── Step 4: submit ────────────────────────────────────────────────────
       setLoading(true);
       announce(ANNOUNCEMENTS.txSubmitting.message, ANNOUNCEMENTS.txSubmitting.politeness);
-      const membersVec = xdr.ScVal.scvVec(
-        validMembers.map((m) => new Address(m).toScVal()),
-      );
-
+      // Exactly the factory's `create_circle(creator, members, round_amount,
+      // round_deadline_ledgers)`. Members keep the order shown in the form —
+      // that order is the payout rotation. The circle name is display-only
+      // and is not an on-chain argument.
       const result = await invokeContract(
         CIRCLE_FACTORY_ADDRESS,
         "create_circle",
-        [
-          new Address(walletAddress).toScVal(),
-          nativeToScVal(circleName, { type: "string" }),
-          membersVec,
-          nativeToScVal(amountStroops, { type: "i128" }),
-          nativeToScVal(daysToLedgers(days), { type: "u32" }),
-        ],
+        buildCreateCircleArgs({
+          creator: walletAddress,
+          members: validMembers,
+          amountStroops,
+          deadlineLedgers: daysToLedgers(days),
+        }),
         walletAddress,
         actionCtrl.signal,
       );
@@ -635,8 +759,11 @@ export default function CreateClient() {
 
       setConfirmed(true);
       setTxHash(result.txHash ?? "");
+      // Only trust a circle address that the factory/transaction result
+      // actually returned. If it is absent, the receipt is shown without a
+      // detail link and no redirect is scheduled.
+      setCircleAddress(result.circleAddress ?? "");
       announce(ANNOUNCEMENTS.circleCreated.message, ANNOUNCEMENTS.circleCreated.politeness);
-      setTimeout(() => router.push("/"), 5000);
     } catch (err: unknown) {
       if (actionCtrl.signal.aborted) return;
       const safeError = parseContractError(err instanceof Error ? err.message : "");
@@ -676,9 +803,11 @@ export default function CreateClient() {
         Create a Circle
       </h1>
       <p className="text-slate-500 text-sm mb-8">
-        Set up the members, contribution amount, and schedule. The rotation order
-        is the same as the member list — members contribute in the order listed,
-        top to bottom.
+        Set up the members, contribution amount, and schedule. Every member
+        contributes every round; the payout rotation follows the member list
+        exactly as entered — the first address receives round 1&apos;s pot, the
+        second round 2&apos;s, and so on. Addresses are not sorted. You are not
+        added automatically: include your own address if you want to take part.
       </p>
 
       <form
@@ -688,6 +817,38 @@ export default function CreateClient() {
         aria-describedby={submitDescribedBy}
         noValidate
       >
+
+        {/* ── Error summary ────────────────────────────────────────────────────
+            Rendered only for local input errors. Wallet/RPC failures use the
+            separate submit-level region below and never appear here. */}
+        {hasFieldErrors && (
+          <div
+            id={summaryId}
+            ref={summaryRef}
+            role="alert"
+            tabIndex={-1}
+            aria-labelledby={`${summaryId}-title`}
+            className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 focus:outline-none focus:ring-2 focus:ring-red-400"
+          >
+            <p id={`${summaryId}-title`} className="font-semibold mb-1">
+              Please fix {fieldErrorList.length} issue
+              {fieldErrorList.length === 1 ? "" : "s"} before creating the circle:
+            </p>
+            <ul className="list-disc pl-5 space-y-0.5">
+              {fieldErrorList.map((err) => (
+                <li key={err.key}>
+                  <button
+                    type="button"
+                    onClick={() => focusField(err.key)}
+                    className="underline text-left hover:text-red-900"
+                  >
+                    {fieldLabel(err.key)}: {err.message}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {/* ── Circle name ──────────────────────────────────────────────────── */}
         <div>
@@ -710,10 +871,15 @@ export default function CreateClient() {
             }`}
             aria-required="true"
             aria-invalid={fieldErrors.name ? "true" : undefined}
-            aria-describedby={fieldErrors.name ? `${nameId}-err` : undefined}
+            aria-describedby={
+              fieldErrors.name ? fieldErrorId(formId, "name") : undefined
+            }
             autoComplete="off"
           />
-          <FieldError id={`${nameId}-err`} message={fieldErrors.name} />
+          <FieldError
+            id={fieldErrorId(formId, "name")}
+            message={fieldErrors.name}
+          />
           <p className="mt-1 text-xs text-slate-400">
             {name.trim().length}/{MAX_NAME_LENGTH} characters
           </p>
@@ -747,7 +913,7 @@ export default function CreateClient() {
                 aria-invalid={fieldErrors.amount ? "true" : undefined}
                 aria-describedby={[
                   amountHintId,
-                  fieldErrors.amount ? `${amountId}-err` : null,
+                  fieldErrors.amount ? fieldErrorId(formId, "amount") : null,
                 ].filter(Boolean).join(" ")}
                 aria-label="Contribution amount in USDC"
               />
@@ -758,7 +924,10 @@ export default function CreateClient() {
               {filledCount > 0 ? filledCount : "…"} member
               {filledCount !== 1 ? "s" : ""} = ${potDisplay}
             </p>
-            <FieldError id={`${amountId}-err`} message={fieldErrors.amount} />
+            <FieldError
+              id={fieldErrorId(formId, "amount")}
+              message={fieldErrors.amount}
+            />
           </div>
 
           <div>
@@ -783,10 +952,15 @@ export default function CreateClient() {
               }`}
               aria-required="true"
               aria-invalid={fieldErrors.days ? "true" : undefined}
-              aria-describedby={fieldErrors.days ? `${daysId}-err` : undefined}
+              aria-describedby={
+                fieldErrors.days ? fieldErrorId(formId, "days") : undefined
+              }
               aria-label="Round duration in days"
             />
-            <FieldError id={`${daysId}-err`} message={fieldErrors.days} />
+            <FieldError
+              id={fieldErrorId(formId, "days")}
+              message={fieldErrors.days}
+            />
           </div>
         </div>
 
@@ -816,7 +990,7 @@ export default function CreateClient() {
             {members.map((m, i) => {
               const fieldErr = fieldErrors.members?.[i];
               const inputId  = `member-${i}`;
-              const errId    = `member-${i}-err`;
+              const errId    = fieldErrorId(formId, `member:${i}`);
               const atMin    = members.length <= MIN_MEMBERS;
               return (
                 <li key={i} className="flex flex-col gap-0.5">
@@ -883,6 +1057,7 @@ export default function CreateClient() {
           {/* List-level member error (count, duplicates) */}
           {fieldErrors.membersGeneral && (
             <p
+              id={fieldErrorId(formId, "members")}
               role="alert"
               className="mt-2 text-xs text-red-600 flex items-center gap-1"
             >
@@ -910,7 +1085,8 @@ export default function CreateClient() {
           {/* Live count status, so the bounds are visible before the first submit. */}
           <p
             id={membersHintId}
-            className={`text-xs mt-1 ${
+            tabIndex={-1}
+            className={`text-xs mt-1 focus:outline-none focus:ring-2 focus:ring-brand-500 rounded ${
               memberSummary.status === "ok" ? "text-slate-400" : "text-amber-700"
             }`}
             aria-live="polite"
@@ -956,7 +1132,9 @@ export default function CreateClient() {
           </ul>
         </div>
 
-        {/* ── Submit-level error ────────────────────────────────────────────── */}
+        {/* ── Submit-level error (wallet / RPC / contract) ─────────────────────
+            Separate channel from field errors: these are never local input
+            problems, so they are not listed in the error summary above. */}
         {submitError && (
           <div
             id={submitErrId}
@@ -980,10 +1158,10 @@ export default function CreateClient() {
             tabIndex={-1}
             className="bg-brand-50 border border-brand-200 rounded-lg p-4 text-sm text-brand-700 space-y-3 focus:outline-none"
           >
-            <p className="font-semibold text-brand-800 flex items-center gap-1.5">
+            <p className="font-semibold text-brand-800 flex items-center gap-1.5 break-words">
               <span aria-hidden="true">{confirmed ? "✅" : "ℹ"}</span> {confirmed ? "Circle created successfully!" : "Transaction receipt — check status before another write"}
             </p>
-            <a href="/transactions" className="underline">Reopen transaction status</a>
+            <a href="/transactions" className="underline break-words">Reopen transaction status</a>
             <div>
               <p
                 className="text-xs text-brand-600 mb-1 font-medium"
@@ -991,36 +1169,56 @@ export default function CreateClient() {
               >
                 Transaction hash
               </p>
-              <div className="flex items-center gap-2 bg-white border border-brand-200 rounded-lg px-3 py-2">
-                <span
-                  className="font-mono text-xs text-slate-700 flex-1 break-all select-all min-w-0"
-                  aria-labelledby={`${successId}-hash-label`}
-                >
-                  {txHash}
-                </span>
-                <button
-                  type="button"
-                  onClick={copyTxHash}
-                  className="text-brand-600 hover:text-brand-800 text-xs font-medium shrink-0 min-h-[44px] px-2"
-                  aria-label={copied ? "Transaction hash copied" : "Copy transaction hash"}
-                  aria-pressed={copied}
-                >
-                  {copied ? "✓ Copied" : "Copy"}
-                </button>
-              </div>
+              <CopyControl
+                value={txHash}
+                label="Transaction hash"
+                labelledBy={`${successId}-hash-label`}
+                className="bg-white border border-brand-200 rounded-lg px-3 py-2"
+              />
             </div>
             {explorerTxUrl && (
               <a
                 href={explorerTxUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900"
+                className="inline-flex items-center gap-1 text-xs font-medium text-brand-700 underline hover:text-brand-900 break-all"
               >
                 View on Stellar Expert ↗
               </a>
             )}
-            <p className="text-xs text-slate-500" aria-live="polite" aria-atomic="true">
-              {confirmed ? "Redirecting to circles list in a few seconds…" : "Confirmation was not established. Open Recent transactions to check this hash."}
+            {/* Explicit navigation actions — the user stays in control. */}
+            <div className="flex flex-wrap items-center gap-2">
+              {confirmed && circleAddress && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    clearRedirectTimer();
+                    router.push(`/circles/${circleAddress}`);
+                  }}
+                  className="inline-flex items-center justify-center bg-brand-600 text-white text-xs font-semibold px-3 py-2 rounded-lg hover:bg-brand-700 min-h-[44px]"
+                >
+                  View circle
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  clearRedirectTimer();
+                  setStayOnReceipt(true);
+                }}
+                className="inline-flex items-center justify-center border border-brand-300 text-brand-700 text-xs font-semibold px-3 py-2 rounded-lg hover:bg-brand-100 min-h-[44px]"
+              >
+                Stay on receipt
+              </button>
+            </div>
+            <p className="text-xs text-slate-500 break-words" aria-live="polite" aria-atomic="true">
+              {confirmed && circleAddress && !stayOnReceipt
+                ? "Redirecting to your new circle in a few seconds…"
+                : confirmed && circleAddress
+                ? "You chose to stay on this receipt. Use View circle when ready."
+                : confirmed
+                ? "Circle created. The circle address was not returned, so no detail link is available — keep this transaction hash."
+                : "Confirmation was not established. Open Recent transactions to check this hash."}
             </p>
           </div>
         )}
@@ -1039,7 +1237,7 @@ export default function CreateClient() {
           disabled={submitBlocked}
           aria-busy={loading}
           aria-describedby={submitDescribedBy}
-          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg min-h-[48px]"
+          className="w-full bg-brand-600 text-white py-3 rounded-xl font-semibold hover:bg-brand-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed text-lg min-h-[48px] break-words"
         >
           {loading ? "Creating circle…" : "Create Circle"}
         </button>

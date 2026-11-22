@@ -32,7 +32,12 @@ import {
   type CircleUpConfig,
   type NetworkConfig,
   type StateSnapshot,
+  // Deprecated symbol verification (issue #909 — planned removal in 0.4.0)
+  type CircleDetailResponse,
 } from "@circleup/sdk";
+
+/** Verified import of deprecated alias — removed in 0.4.0. */
+export type PublicApiDeprecatedAliasCheck = CircleDetailResponse;
 
 /** Construct the top-level client from the documented config shape. */
 export function makeClient(): CircleUpClient {
@@ -143,3 +148,114 @@ export async function recover(
   const lookup = await client.lookupTransaction(hash);
   return lookup.ok ? lookup.value.status : "lookup_failed";
 }
+
+// ─── API deprecation policy (issue #149) ─────────────────────────────────────
+
+import {
+  readDeprecations,
+  isDeprecated,
+  type Deprecation,
+  type DeprecationHeaders,
+} from "@circleup/sdk";
+
+/**
+ * Observe a deprecation before it breaks anything.
+ *
+ * Deprecated fields and endpoints keep working for the full migration window
+ * (see docs/api-deprecation-policy.md). The indexer advertises each pending
+ * change in the response body's `deprecations` array and mirrors it in the
+ * `Deprecation` / `Sunset` response headers, so a consumer can warn and migrate
+ * without parsing logs. `Sunset` is the RFC 8594 date after which the old form
+ * may be removed; nothing is removed before it.
+ */
+export function pendingDeprecations(
+  headers: DeprecationHeaders,
+  body: { deprecations?: Deprecation[] },
+): { warnings: string[]; sunsetAt: Date | null } {
+  // Headers are the observable signal; the body array carries the detail.
+  const deprecations = readDeprecations(headers, body);
+  const warnings = deprecations.map(
+    (d) => `${d.field} is deprecated in favor of ${d.replacement}; removed after ${d.sunset}`,
+  );
+  const sunsetAt = deprecations.length
+    ? new Date(Math.min(...deprecations.map((d) => Date.parse(d.sunset))))
+    : null;
+  return { warnings, sunsetAt };
+}
+
+/**
+ * Migrate a read model to the replacement field while the old one still works.
+ *
+ * Read the replacement when present and fall back to the deprecated field only
+ * during the window; after `sunset` the fallback can be deleted. `isDeprecated`
+ * lets a consumer assert it is no longer relying on a field slated for removal.
+ */
+export function circleName(row: { name?: string; title?: string }): string {
+  if (isDeprecated("name")) {
+    // Transitional: prefer the replacement, fall back to the old field.
+    return row.title ?? row.name ?? "";
+  }
+  return row.title ?? "";
+}
+
+// ─── Network identity, error taxonomy, and lifecycle (issues #900–#903) ──────
+
+import {
+  resolveNetworkIdentity,
+  classifySdkError,
+  txLifecycleFromResult,
+  txLifecycleFromLookup,
+  RETRY_POLICY,
+  type NetworkIdentity,
+  type SdkErrorInfo,
+  type TxLifecycle,
+} from "@circleup/sdk";
+
+/** A custom (standalone) network needs its name, URL, and passphrase together. */
+export function standaloneIdentity(): NetworkIdentity {
+  return resolveNetworkIdentity({
+    network: "custom",
+    rpcUrl: "http://localhost:8000/soroban/rpc",
+    networkPassphrase: "Standalone Network ; February 2017",
+  });
+}
+
+/** Branch on the stable error code — never on message text. */
+export function errorBanner(err: unknown): { text: string; info: SdkErrorInfo } {
+  const info = classifySdkError(err);
+  switch (info.code) {
+    case "wallet_rejected":
+      return { text: "You declined the signature.", info };
+    case "network_mismatch":
+      return { text: "Switch your wallet to the configured network.", info };
+    case "send_ambiguous":
+    case "poll_timeout":
+      return { text: `Checking transaction ${info.txHash ?? ""}…`, info };
+    default:
+      return { text: info.message, info };
+  }
+}
+
+/**
+ * Settle a write without resubmitting: a local polling timeout is `pending`,
+ * so resume by hash instead of sending a second transaction.
+ */
+export async function settle(client: CircleUpClient, result: TxResult): Promise<TxLifecycle> {
+  let state = txLifecycleFromResult(result);
+  if (state.state === "pending" || state.state === "submitted" || state.state === "unavailable") {
+    if (!state.txHash) return state;
+    const validUntil = isTxFailure(result) ? result.diagnostics?.validUntil : undefined;
+    // Resume polling after the original budget ran out (no new signature).
+    state = txLifecycleFromResult(await client.waitForTransaction(state.txHash, { validUntil }));
+    if (state.state === "unavailable" && state.txHash) {
+      state = txLifecycleFromLookup(await client.lookupTransaction(state.txHash), {
+        txHash: state.txHash,
+        validUntil,
+      });
+    }
+  }
+  return state;
+}
+
+/** Writes never resend a new transaction automatically; reads retry a bounded number of times. */
+export const sendRetries = RETRY_POLICY.submission.retries; // "same_envelope"

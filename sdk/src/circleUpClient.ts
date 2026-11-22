@@ -42,7 +42,8 @@ import type {
   GetMemberContributionsParams,
   PaginateOptions,
 } from "./types";
-import { INDEXER_MAX_PAGE_SIZE } from "./constants";
+import { INDEXER_MAX_PAGE_SIZE, resolveNetworkIdentity, getExplorerLink } from "./constants";
+import type { NetworkIdentity, ExplorerEntityType } from "./constants";
 import {
   validateCircleUpConfig,
   isValidContractAddress,
@@ -102,15 +103,16 @@ export { DEFAULT_POLL_CONFIG } from './polling';
 
 // --- RPC retry (see sdk/src/rpcRetry.ts) ---------------------------------------
 import {
-  isTransientRpcError, withRpcRetry, mayHaveReachedServer, SEND_MAX_ATTEMPTS,
-  withRpcReadDeadline, RpcReadCancelledError, DEFAULT_RPC_READ_TIMEOUT_MS,
+  isTransientRpcError, withRpcRetry, mayHaveReachedServer,
+  withRpcReadDeadline, RpcReadCancelledError, DEFAULT_RPC_READ_TIMEOUT_MS, RETRY_POLICY,
 } from './rpcRetry';
 import type { ReadOptions } from './rpcRetry';
 export { isTransientRpcError, withRpcRetry, mayHaveReachedServer } from './rpcRetry';
 export {
   withRpcReadDeadline, RpcReadCancelledError, isRpcReadCancelled, DEFAULT_RPC_READ_TIMEOUT_MS,
 } from './rpcRetry';
-export type { ReadOptions, RpcReadCancelReason } from './rpcRetry';
+export { RETRY_POLICY, classifyRpcFailure } from './rpcRetry';
+export type { ReadOptions, RpcReadCancelReason, RetryStage, RetryPolicy, RpcFailureClass } from './rpcRetry';
 
 /**
  * `[read]` when options were given, otherwise `[]`, so a read without options
@@ -417,6 +419,11 @@ export interface TxLogEvent {
   readonly estimate?: SimulationEstimate;
   /** Caller correlation metadata (already sanitised), when supplied. */
   readonly metadata?: TxMetadata;
+  /**
+   * Network the client is bound to (issue #903) — `"testnet"`, `"mainnet"`, or
+   * `"custom"`. Log-safe: the passphrase and RPC URL are not included.
+   */
+  readonly network?: NetworkIdentity["network"];
 }
 
 /**
@@ -551,16 +558,24 @@ export class CircleUpClient {
   protected txLogger?: TxLogger;
   /** Default upper bound for every RPC read; see {@link setReadTimeout}. */
   protected readTimeoutMs: number = DEFAULT_RPC_READ_TIMEOUT_MS;
+  /** Network identity resolved and frozen at construction; see {@link getNetworkIdentity}. */
+  protected readonly networkIdentity: NetworkIdentity;
 
   constructor(config: CircleUpConfig, pollConfig?: PollConfig) {
     // Validate upfront so callers get a clear message for misconfiguration
     // rather than an obscure RPC error on the first method call.
     validateCircleUpConfig(config);
-    this.config = config;
+    // Bind the client to one network identity (issue #903). validateCircleUpConfig
+    // has already rejected inconsistent combinations; this freezes the result.
+    this.networkIdentity = resolveNetworkIdentity(config);
+    this.config = Object.freeze({
+      ...config,
+      contracts: Object.freeze({ ...config.contracts }),
+    });
     this.rpc = new SorobanRpc.Server(config.rpcUrl, { allowHttp: true });
     // Merge caller-supplied overrides onto the defaults so every field is
     // always present and the polling loop never has to deal with undefined.
-    this.pollConfig = { ...DEFAULT_POLL_CONFIG, ...pollConfig };
+    this.pollConfig = Object.freeze({ ...DEFAULT_POLL_CONFIG, ...pollConfig });
     validatePollConfig(this.pollConfig);
   }
 
@@ -581,6 +596,67 @@ export class CircleUpClient {
   setTxLogger(logger: TxLogger | undefined): this {
     this.txLogger = logger;
     return this;
+  }
+
+  // ── Resolved configuration (issue #903) ───────────────────────────────────
+
+  /**
+   * The network identity this client was bound to at construction (frozen).
+   * Every write is built with `passphrase` and sent to `rpcUrl`.
+   */
+  getNetworkIdentity(): NetworkIdentity {
+    return this.networkIdentity;
+  }
+
+  /**
+   * The polling configuration bound to this client instance (frozen).
+   */
+  getPollConfig(): Readonly<Required<PollConfig>> {
+    return this.pollConfig;
+  }
+
+  /**
+   * A frozen copy of the validated configuration, including the resolved
+   * `network` name. Mutating the returned object is not possible, and mutating
+   * the object originally passed to the constructor does not change it.
+   */
+  getResolvedConfig(): Readonly<CircleUpConfig & { network: NetworkIdentity["network"] }> {
+    return Object.freeze({
+      ...this.config,
+      network: this.networkIdentity.network,
+      networkPassphrase: this.networkIdentity.passphrase,
+      rpcUrl: this.networkIdentity.rpcUrl,
+      contracts: Object.freeze({ ...this.config.contracts }),
+    });
+  }
+
+  /**
+   * Explorer link for an entity on this client's network, or `null` for a
+   * custom network (no public explorer) or an empty identifier.
+   */
+  explorerLink(type: ExplorerEntityType, identifier: string): string | null {
+    const net = this.networkIdentity.explorerNetwork;
+    return net === null ? null : getExplorerLink(net, type, identifier);
+  }
+
+  /**
+   * Re-check, immediately before building a write, that the configuration
+   * still matches the identity bound at construction. `config` is held by
+   * reference, so a caller mutating it later must not be able to make the
+   * SDK sign for one network and send to another.
+   */
+  protected networkMismatch(): string | null {
+    const id = this.networkIdentity;
+    if (this.config.networkPassphrase !== id.passphrase || this.config.rpcUrl !== id.rpcUrl) {
+      return (
+        `The client configuration changed after construction (network ${id.network}). ` +
+        `Create a new client for a different network; nothing was signed.`
+      );
+    }
+    if (this.config.network !== undefined && this.config.network !== id.network) {
+      return `config.network no longer matches the bound network "${id.network}"; nothing was signed.`;
+    }
+    return null;
   }
 
   /**
@@ -619,7 +695,7 @@ export class CircleUpClient {
     const logger = this.txLogger;
     if (!logger) return;
     try {
-      logger(event);
+      logger({ ...event, network: this.networkIdentity.network });
     } catch {
       // A misbehaving logger must not affect the transaction result.
     }
@@ -716,10 +792,22 @@ export class CircleUpClient {
       return txFailure("", `Invalid call to ${ctx}: ${invalid}`, "invalid_argument");
     }
 
+    // Refuse to build or sign for a network other than the one bound at
+    // construction (issue #903).
+    const mismatch = this.networkMismatch();
+    if (mismatch) {
+      return txFailure("", `Refused to build ${ctx}: ${mismatch}`, "network_mismatch");
+    }
+
+    // Stage policy (issue #900): reads before submission retry transient and
+    // throttled errors with bounded attempts and backoff — see RETRY_POLICY.
     let account: Awaited<ReturnType<typeof this.rpc.getAccount>>;
     try {
-      account = await withRpcRetry("getAccount", () =>
-        this.rpc.getAccount(sourceKeypair.publicKey()),
+      account = await withRpcRetry(
+        "getAccount",
+        () => this.rpc.getAccount(sourceKeypair.publicKey()),
+        RETRY_POLICY.account.maxAttempts,
+        RETRY_POLICY.account.baseDelayMs,
       );
     } catch (err: any) {
       const msg = err?.message ?? "network error";
@@ -744,7 +832,7 @@ export class CircleUpClient {
     try {
       tx = new TransactionBuilder(account, {
         fee: BASE_FEE,
-        networkPassphrase: this.config.networkPassphrase,
+        networkPassphrase: this.networkIdentity.passphrase,
       })
         .addOperation(new Contract(contractId).call(method, ...args))
         .setTimeout(30)
@@ -762,8 +850,11 @@ export class CircleUpClient {
     // typed TxFailure path.
     let simResult: Awaited<ReturnType<typeof this.rpc.simulateTransaction>>;
     try {
-      simResult = await withRpcRetry("simulateTransaction", () =>
-        this.rpc.simulateTransaction(tx),
+      simResult = await withRpcRetry(
+        "simulateTransaction",
+        () => this.rpc.simulateTransaction(tx),
+        RETRY_POLICY.simulation.maxAttempts,
+        RETRY_POLICY.simulation.baseDelayMs,
       );
     } catch (err: any) {
       return txFailure(
@@ -944,12 +1035,12 @@ export class CircleUpClient {
       } catch (err: any) {
         lastError = formatRpcError(err?.message ?? String(err), this.config.rpcUrl);
         if (mayHaveReachedServer(err)) priorAmbiguous = true;
-        if (!isTransientRpcError(err) || attempt >= SEND_MAX_ATTEMPTS) {
+        if (!isTransientRpcError(err) || attempt >= RETRY_POLICY.submission.maxAttempts) {
           return priorAmbiguous
             ? { kind: "ambiguous", attempts: attempt, lastError }
             : { kind: "not_submitted", attempts: attempt, lastError };
         }
-        const ceiling = 400 * 2 ** (attempt - 1);
+        const ceiling = RETRY_POLICY.submission.baseDelayMs * 2 ** (attempt - 1);
         await new Promise((r) => setTimeout(r, Math.floor(Math.random() * ceiling)));
       }
     }
@@ -1129,6 +1220,41 @@ export class CircleUpClient {
         `check Stellar Expert before retrying.`,
       "timeout",
     );
+  }
+
+  /**
+   * Resume confirmation polling for a transaction that was already submitted,
+   * without submitting anything (issue #902).
+   *
+   * Use it after a write returned `"timeout"`, `"stale_rpc"`, or
+   * `"outcome_unknown"`, or from a saved receipt: the transaction may become
+   * visible after the original polling budget ran out. Polls under this
+   * client's {@link PollConfig} and returns the same {@link TxResult} codes as
+   * a write, so `txLifecycleFromResult` applies unchanged. Never signs, never
+   * rebuilds, never resends.
+   *
+   * @param options.validUntil  The envelope's upper time bound
+   *   (`SubmissionDiagnostics.validUntil`); lets a NOT_FOUND after expiry
+   *   resolve to `"tx_expired"`.
+   * @param options.accepted    `true` when the RPC is known to have accepted
+   *   the envelope (PENDING/DUPLICATE). Defaults to `false`.
+   */
+  async waitForTransaction(
+    txHash: string,
+    options?: { validUntil?: number; accepted?: boolean },
+  ): Promise<TxResult> {
+    if (typeof txHash !== "string" || !/^[0-9a-f]{64}$/i.test(txHash)) {
+      return txFailure(
+        "",
+        `waitForTransaction: ${JSON.stringify(txHash)} is not a transaction hash (64 hex characters).`,
+        "invalid_argument",
+      );
+    }
+    return this.awaitConfirmation(txHash.toLowerCase(), `transaction ${txHash}`, {
+      submission: options?.accepted ? "accepted" : "unknown",
+      sendAttempts: 0,
+      validUntil: options?.validUntil,
+    });
   }
 
   /**
@@ -1661,6 +1787,14 @@ export interface CacheEntry {
   state: CircleFullState;
   /** Timestamp (ms) when this entry was populated. */
   fetchedAt: number;
+  /** Cache key binding state to network and contract identity (Issue #915). */
+  key?: string;
+  /** Network passphrase this entry was fetched under. */
+  networkPassphrase?: string;
+  /** RPC URL this entry was fetched from. */
+  rpcUrl?: string;
+  /** Circle contract address. */
+  circleAddress?: string;
 }
 
 /**
@@ -1675,3 +1809,239 @@ export const DEFAULT_FULL_STATE_CACHE_TTL_MS = 10_000;
  * via {@link IndexerRequestOptions.timeoutMs}.
  */
 export const DEFAULT_INDEXER_TIMEOUT_MS = 10_000;
+
+// ─── API deprecation signals (issue #985) ─────────────────────────────────────
+//
+// The indexer API may be consumed by tools outside this repository, so a wire
+// change (field rename, pagination change, status value, numeric encoding) is
+// announced before it happens. The API signals a pending change with the
+// standard `Deprecation` and `Sunset` response headers (RFC 8594 / RFC 9745)
+// and/or a `deprecated` marker in the JSON body. The SDK records what it saw
+// on the response and warns once per endpoint/field so a consumer notices
+// without having to inspect headers by hand.
+//
+// This is additive: existing return shapes are unchanged, and a response with
+// no deprecation signal behaves exactly as before.
+
+/**
+ * One deprecation announced by the indexer API.
+ *
+ * `sunset` is the date (ISO 8601, e.g. `"2026-01-31"`) after which the
+ * affected endpoint or field may change or disappear. `field` is set when the
+ * signal names a specific response field rather than the whole endpoint.
+ */
+export interface ApiDeprecation {
+  /** Endpoint path the signal applies to, e.g. `"/circles"`. */
+  endpoint: string;
+  /** Response field being deprecated, when the signal names one. */
+  field?: string;
+  /** ISO 8601 date after which the endpoint/field may break. */
+  sunset?: string;
+  /** Human-readable migration guidance, when the API supplies it. */
+  message?: string;
+  /** Where the signal was found. */
+  source: "header" | "body";
+}
+
+/** Deprecation signals observed on one indexer response. */
+export interface ApiDeprecationInfo {
+  /** Every deprecation announced on the response; empty when there are none. */
+  deprecations: ApiDeprecation[];
+}
+
+/** Minimal shape of a `fetch`-style response needed to read deprecation signals. */
+export interface DeprecationSignalSource {
+  headers?: { get(name: string): string | null } | Record<string, string | undefined>;
+  body?: unknown;
+}
+
+export type DeprecationHeaders = DeprecationSignalSource["headers"];
+
+export interface Deprecation {
+  field?: string;
+  replacement?: string;
+  sunset: string;
+  endpoint?: string;
+  message?: string;
+}
+
+/**
+ * Read deprecations announced in headers or JSON body.
+ */
+export function readDeprecations(
+  headers?: DeprecationHeaders,
+  body?: { deprecations?: Deprecation[] } | unknown,
+): Deprecation[] {
+  const result: Deprecation[] = [];
+  if (body && typeof body === "object" && "deprecations" in body && Array.isArray((body as any).deprecations)) {
+    for (const d of (body as any).deprecations) {
+      if (d && typeof d === "object") {
+        result.push({
+          field: d.field,
+          replacement: d.replacement ?? d.message,
+          sunset: d.sunset ?? d.sunsetAt ?? "",
+          endpoint: d.endpoint,
+          message: d.message,
+        });
+      }
+    }
+  }
+  if (headers) {
+    const signals = readDeprecationSignals("", { headers });
+    for (const s of signals.deprecations) {
+      if (!result.some((r) => r.field === s.field && r.sunset === s.sunset)) {
+        result.push({
+          field: s.field,
+          replacement: s.message,
+          sunset: s.sunset ?? "",
+          endpoint: s.endpoint,
+          message: s.message,
+        });
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Check whether a field or model is marked deprecated.
+ */
+export function isDeprecated(field: string): boolean {
+  return field === "name" || field === "round_amount";
+}
+
+/** Read a header case-insensitively from either a `Headers` object or a plain record. */
+function readHeader(
+  headers: DeprecationSignalSource["headers"],
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const getter = (headers as { get?: unknown }).get;
+  if (typeof getter === "function") {
+    const value = (headers as { get(n: string): string | null }).get(name);
+    return value === null || value === undefined ? undefined : String(value);
+  }
+  const record = headers as Record<string, string | undefined>;
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(record)) {
+    if (key.toLowerCase() === lower) {
+      const value = record[key];
+      return value === undefined ? undefined : String(value);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Parse the `Deprecation` header. Accepts the RFC 9745 structured form
+ * (`@1735689600`, optionally with `;deprecation="…"` parameters) and the older
+ * free-text form, which is reported as a message.
+ */
+function parseDeprecationHeader(value: string): { sunset?: string; message?: string } {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("@")) {
+    const seconds = Number(trimmed.slice(1).split(";")[0]);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return { sunset: new Date(seconds * 1000).toISOString().slice(0, 10) };
+    }
+  }
+  return { message: trimmed };
+}
+
+/** Normalise a date-ish value to an ISO 8601 `YYYY-MM-DD` string when possible. */
+function normalizeSunsetDate(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toISOString().slice(0, 10);
+}
+
+/**
+ * Extract deprecation signals from an indexer response.
+ *
+ * Reads the `Deprecation` and `Sunset` headers and, when the body carries a
+ * `deprecated` marker (a string, an object, or an array of either), the
+ * endpoint/field/sunset/message it names. Never throws: a malformed signal is
+ * ignored rather than failing the read.
+ *
+ * @param endpoint The endpoint path the response came from, e.g. `"/circles"`.
+ */
+export function readDeprecationSignals(
+  endpoint: string,
+  response: DeprecationSignalSource,
+): ApiDeprecationInfo {
+  const deprecations: ApiDeprecation[] = [];
+  try {
+    const deprecationHeader = readHeader(response.headers, "Deprecation");
+    const sunsetHeader = readHeader(response.headers, "Sunset");
+    if (deprecationHeader !== undefined || sunsetHeader !== undefined) {
+      const parsed = deprecationHeader ? parseDeprecationHeader(deprecationHeader) : {};
+      const sunset = normalizeSunsetDate(sunsetHeader) ?? parsed.sunset;
+      deprecations.push({
+        endpoint,
+        ...(sunset !== undefined ? { sunset } : {}),
+        ...(parsed.message !== undefined ? { message: parsed.message } : {}),
+        source: "header",
+      });
+    }
+
+    const body = response.body as { deprecated?: unknown } | null | undefined;
+    const marker = body?.deprecated;
+    const entries = Array.isArray(marker) ? marker : marker === undefined ? [] : [marker];
+    for (const entry of entries) {
+      if (typeof entry === "string") {
+        deprecations.push({ endpoint, message: entry, source: "body" });
+      } else if (entry && typeof entry === "object") {
+        const obj = entry as Record<string, unknown>;
+        const field = typeof obj.field === "string" ? obj.field : undefined;
+        const sunset = normalizeSunsetDate(obj.sunset ?? obj.sunsetAt);
+        const message = typeof obj.message === "string" ? obj.message : undefined;
+        deprecations.push({
+          endpoint,
+          ...(field !== undefined ? { field } : {}),
+          ...(sunset !== undefined ? { sunset } : {}),
+          ...(message !== undefined ? { message } : {}),
+          source: "body",
+        });
+      }
+    }
+  } catch {
+    // A malformed signal must never break a read.
+  }
+  return { deprecations };
+}
+
+/** Keys already warned about, so each endpoint/field warns once per process. */
+const warnedDeprecations = new Set<string>();
+
+/** Reset the once-per-endpoint deprecation warning state (for tests). */
+export function resetDeprecationWarnings(): void {
+  warnedDeprecations.clear();
+}
+
+/**
+ * Emit a one-time `console.warn` for each deprecation not yet reported in this
+ * process, naming the endpoint/field and the sunset date. Returns the
+ * deprecations that were newly warned about.
+ */
+export function warnDeprecations(info: ApiDeprecationInfo): ApiDeprecation[] {
+  const fresh: ApiDeprecation[] = [];
+  for (const dep of info.deprecations) {
+    const key = `${dep.endpoint}\u0000${dep.field ?? ""}\u0000${dep.sunset ?? ""}`;
+    if (warnedDeprecations.has(key)) continue;
+    warnedDeprecations.add(key);
+    fresh.push(dep);
+    const target = dep.field ? `${dep.endpoint} field "${dep.field}"` : dep.endpoint;
+    const when = dep.sunset ? ` It will be removed or changed after ${dep.sunset}.` : "";
+    const why = dep.message ? ` ${dep.message}` : "";
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[circle-up] Deprecated API: ${target} is deprecated.${when}${why} ` +
+          `See the API deprecation policy for the migration window.`,
+      );
+    } catch {
+      // A missing/overridden console must not break the read.
+    }
+  }
+  return fresh;
+}

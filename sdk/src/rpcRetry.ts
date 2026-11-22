@@ -264,6 +264,86 @@ export async function withRpcReadDeadline<T>(
 /** Attempts (first try + resends of the identical envelope) for sendTransaction. */
 export const SEND_MAX_ATTEMPTS = 3;
 
+// ─── Stage-by-stage retry policy (issue #900) ─────────────────────────────────
+//
+// | Stage        | RPC call            | Kind  | Automatic retry                                         |
+// |--------------|---------------------|-------|---------------------------------------------------------|
+// | `account`    | getAccount          | read  | Transient / throttled errors, bounded, backoff.         |
+// | `simulation` | simulateTransaction | read  | Transient / throttled errors, bounded, backoff.         |
+// | `wallet`     | (wallet signature)  | —     | Never. A rejection is the user's decision; a re-prompt  |
+// |              |                     |       | is only ever started by the caller.                     |
+// | `submission` | sendTransaction     | write | Only the identical signed envelope, and only after a    |
+// |              |                     |       | transient error. Never rebuilt or re-signed. After an   |
+// |              |                     |       | ambiguous send the SDK looks the hash up instead.       |
+// | `polling`    | getTransaction      | read  | Keep polling within PollConfig (timeoutMs,              |
+// |              |                     |       | maxConsecutiveErrors). A local timeout is reported as   |
+// |              |                     |       | "timeout"/"outcome_unknown" with the hash — not failure.|
+// | `lookup`     | getTransaction      | read  | Transient / throttled errors within ReadOptions deadline.|
+// | `read`       | simulateTransaction | read  | Same as lookup.                                         |
+//
+// The SDK never automatically resubmits a *new* transaction. A caller may
+// rebuild a write only when `isRetryable(failure)` is true — i.e. the SDK has
+// evidence the original was never applied (never reached the RPC, refused,
+// rejected, or expired unincluded).
+
+/** A stage of an SDK operation that talks to the RPC or wallet. */
+export type RetryStage = "account" | "simulation" | "wallet" | "submission" | "polling" | "lookup" | "read";
+
+/** How the SDK retries one {@link RetryStage}. */
+export interface RetryPolicy {
+  /**
+   * `"read"` stages never change chain state; `"write"` stages may; `"user"`
+   * stages wait on a person (wallet prompt) and are never retried by the SDK.
+   */
+  readonly kind: "read" | "write" | "user";
+  /** Total attempts (first try included). `1` means no automatic retry. */
+  readonly maxAttempts: number;
+  /** Base delay for capped exponential backoff with full jitter, in ms. */
+  readonly baseDelayMs: number;
+  /**
+   * What is retried: `"same_request"` repeats the identical read,
+   * `"same_envelope"` resends the identical signed transaction (never a new
+   * one), `"poll_budget"` keeps polling within {@link PollConfig}, `"none"`
+   * never retries.
+   */
+  readonly retries: "same_request" | "same_envelope" | "poll_budget" | "none";
+}
+
+/** The SDK's retry policy for every stage. See the table above. */
+export const RETRY_POLICY: Readonly<Record<RetryStage, RetryPolicy>> = Object.freeze({
+  account: Object.freeze({ kind: "read", maxAttempts: 3, baseDelayMs: 400, retries: "same_request" }),
+  simulation: Object.freeze({ kind: "read", maxAttempts: 3, baseDelayMs: 400, retries: "same_request" }),
+  wallet: Object.freeze({ kind: "user", maxAttempts: 1, baseDelayMs: 0, retries: "none" }),
+  submission: Object.freeze({ kind: "write", maxAttempts: SEND_MAX_ATTEMPTS, baseDelayMs: 400, retries: "same_envelope" }),
+  polling: Object.freeze({ kind: "read", maxAttempts: Infinity, baseDelayMs: 0, retries: "poll_budget" }),
+  lookup: Object.freeze({ kind: "read", maxAttempts: 3, baseDelayMs: 400, retries: "same_request" }),
+  read: Object.freeze({ kind: "read", maxAttempts: 3, baseDelayMs: 400, retries: "same_request" }),
+} satisfies Record<RetryStage, RetryPolicy>);
+
+/**
+ * Coarse class of an RPC/provider failure, used to decide retries:
+ *
+ * - `"throttled"` — rate limited (HTTP 429, "too many requests"). Retry with backoff.
+ * - `"transient"` — network blip, gateway error, timeout. Retry with backoff.
+ * - `"cancelled"` — stopped locally by a deadline or AbortSignal. Do not retry.
+ * - `"permanent"` — anything else (bad request, auth, unrecognised). Do not retry.
+ */
+export type RpcFailureClass = "throttled" | "transient" | "cancelled" | "permanent";
+
+/** Classify a thrown RPC/provider error. Never inspects or returns its text beyond matching. */
+export function classifyRpcFailure(err: unknown): RpcFailureClass {
+  if (err instanceof RpcReadCancelledError) return "cancelled";
+  const status =
+    typeof err === "object" && err !== null && "status" in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  const lower = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
+  if (status === 429 || lower.includes("rate limit") || lower.includes("too many requests")) {
+    return "throttled";
+  }
+  return isTransientRpcError(err) ? "transient" : "permanent";
+}
+
 /**
  * Return `false` only when `err` proves the request never reached the RPC, so
  * the transaction cannot have been accepted. Returns `true` whenever that

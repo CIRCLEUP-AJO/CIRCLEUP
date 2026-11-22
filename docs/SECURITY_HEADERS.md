@@ -112,24 +112,96 @@ should be reviewed before Phase 2 enforcement; Next.js 14+ supports
 [nonce-based CSP](https://nextjs.org/docs/app/building-your-application/configuring/content-security-policy)
 which eliminates the need for `unsafe-inline`.
 
-### Phase 1 — observation (current)
+### Staged rollout overview
+
+The CSP moves through three explicit stages.  Enforcement is **never** enabled
+until the report-only inventory has been collected, grouped, and reviewed.
+
+| Stage | Header | `NEXT_PUBLIC_CSP_ENFORCE` | Purpose |
+|-------|--------|---------------------------|---------|
+| 0 — off | none | unset | Local debugging only |
+| 1 — report-only | `Content-Security-Policy-Report-Only` | unset / `false` | Collect and triage violations |
+| 2 — enforced | `Content-Security-Policy` | `true` | Block and report violations |
+
+### Phase 1 — report-only collection (current)
 
 1. Set `NEXT_PUBLIC_CSP_REPORT_URI` to a URI that can receive violation
    reports (e.g. a simple logging endpoint, or a service such as
    [report-uri.com](https://report-uri.com)).
 2. Deploy.  The header is `Content-Security-Policy-Report-Only`; nothing is
    blocked.
-3. Collect violation reports for at least one full release cycle (recommended:
-   2–4 weeks in production, or until no new violation types appear).
-4. For each violation type, decide:
-   - **Expected** (e.g. Freighter extension content-script): document and
-     adjust the policy if needed.
-   - **Unexpected** (e.g. an undocumented third-party script): investigate
-     before proceeding to enforcement.
+3. Capture violations in a controlled environment first (staging or a
+   dedicated test deployment), then in production for at least one full
+   release cycle (recommended: 2–4 weeks, or until no new violation types
+   appear).
+4. Group every report by `violated-directive` (or `effective-directive`) and
+   `blocked-uri` / `source-file` origin.  Only the directive and the origin
+   are needed for triage — see the privacy rules below.
+
+### Privacy-safe violation reporting
+
+Violation reports must not become a side channel for user data.  Before
+enabling `NEXT_PUBLIC_CSP_REPORT_URI`:
+
+- **Strip query strings and fragments** from `document-uri` and
+  `blocked-uri` at the collector.  CircleUp URLs can contain wallet
+  addresses, circle contract addresses, or member identifiers in the path.
+- **Never log request bodies, form data, or transaction payloads.**  CSP
+  reports do not include them, but the collector must not be configured to
+  capture them either.
+- **Do not store full `document-uri` paths** for authenticated routes; keep
+  only the origin plus a coarse route bucket (e.g. `/app/*`).
+- **Retain reports for a bounded window** (e.g. 30 days) and restrict access
+  to the security maintainers.
+- If a third-party reporting service is used, confirm in writing that it
+  does not retain or resell report contents and that its retention matches
+  the window above.
+
+If any of these cannot be guaranteed, leave `NEXT_PUBLIC_CSP_REPORT_URI`
+unset and triage using browser devtools in a controlled environment instead.
+
+### Violation triage and reviewed allowlist
+
+For each grouped violation type, record a decision in the table below and
+keep it in this document.  Enforcement may only proceed when every entry is
+**Expected** or **Resolved**.
+
+| Directive | Blocked origin / source | Classification | Decision |
+|-----------|-------------------------|----------------|----------|
+| `script-src` | `'unsafe-inline'` (Next.js dev HMR) | Expected (dev only) | Nonce-based CSP before enforcement |
+| `script-src` | Freighter content-script injection | Expected | Verify in wallet test path; no wildcard |
+| `connect-src` | Soroban RPC origin | Expected | Already in allowlist |
+| `connect-src` | Indexer origin | Expected | Already in allowlist |
+
+Rules for the allowlist:
+
+- Add **exact origins only**.  Do **not** add broad wildcards
+  (`https:`, `*`, `*.example.com`) to silence reports — a wildcard defeats
+  the purpose of the policy and hides real regressions.
+- Every relaxed directive (e.g. keeping `'unsafe-inline'` in `style-src`)
+  must have a documented reason in this file.
+- Any new origin goes through `EXTRA_CONNECT_SRC` and the
+  [External origins inventory](#external-origins-inventory) table.
+
+### Integration test path (wallet and explorer)
+
+Before flipping to enforcement, verify the following in a staging
+deployment with the **enforced** header active:
+
+1. **App assets** — load every top-level route and confirm no `script-src`,
+   `style-src`, `font-src`, or `img-src` violations in the console.
+2. **Freighter connect** — connect, sign, and submit a transaction; confirm
+   the wallet prompt appears and no `script-src` violation is reported.
+3. **Explorer links** — open a transaction and an account link to the
+   Stellar explorer; confirm `frame-src 'none'` and `connect-src` do not
+   block the navigation.
+4. **Indexer reads** — load a circle and member list; confirm
+   `connect-src` allows the indexer origin.
+5. Record the test run (date, build SHA, result) alongside the triage table.
 
 ### Phase 2 — enforcement
 
-Once the violation report is clean:
+Once the violation report is clean and the integration test path passes:
 
 1. In your production environment, set:
    ```
@@ -138,8 +210,30 @@ Once the violation report is clean:
 2. Redeploy.  The header switches to `Content-Security-Policy`; any request
    not covered by the policy will be blocked and reported.
 3. Monitor error rates and violation reports for 24–48 hours after the rollout.
-4. If wallet interaction breaks, add `'unsafe-inline'` to `script-src` (see
-   the Freighter note above) and re-deploy.
+4. If wallet interaction breaks, follow the rollback procedure below rather
+   than adding `'unsafe-inline'` to `script-src` in production.
+
+### Rollback criteria and procedure
+
+Roll back to report-only if **any** of the following occurs after
+enforcement:
+
+- Freighter connect, sign, or submit fails for any user.
+- A required app asset (script, style, font, image) fails to load.
+- Explorer or indexer navigation is blocked.
+- A new, unexplained violation type appears in reports.
+
+To disable enforcement safely:
+
+1. Unset `NEXT_PUBLIC_CSP_ENFORCE` (or set it to `false`) in the
+   environment configuration.
+2. Redeploy.  The header reverts to `Content-Security-Policy-Report-Only`;
+   nothing is blocked and reporting continues.
+3. File an issue with the grouped violation data (privacy-safe fields only)
+   and update the triage table before attempting enforcement again.
+
+Do not "fix" a rollback by widening the policy with wildcards; fix the
+underlying requirement or the allowlist entry instead.
 
 ### Freighter wallet compatibility
 
@@ -190,3 +284,5 @@ origin:
 3. Verify the header is present and correct with `curl` (see above).
 4. Submit the change for review — CSP changes should be peer-reviewed even
    when the app is in Report-Only mode.
+5. Update the [violation triage table](#violation-triage-and-reviewed-allowlist)
+   with the reason for any relaxed directive.

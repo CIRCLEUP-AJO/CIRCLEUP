@@ -71,3 +71,11 @@ npx ts-node scripts/src/check-token-assumptions.ts --profile testnet
 npx ts-node scripts/src/check-token-assumptions.ts --profile production --strict
 ```
 
+---
+
+## 5. Test doubles are not deployment evidence
+
+The Rust contract suites use the real Stellar Asset Contract as a token test double and drive four named outcomes through the shared [`token_behavior_fixture.rs`](../contracts/circle/src/token_behavior_fixture.rs): success, insufficient funds, authorization rejection and explicit transfer failure. Those tests prove only that CircleUp handles standard SEP-41 success and failure results without leaving partial state.
+
+They do **not** prove anything about the deployed USDC issuer identity, reserve backing, clawback flags, or the correctness of the configured mainnet contract address. Those properties are covered exclusively by the on-chain verification and operator assertions in sections 2–4 above, and by the trust boundary summary in [`CONTRACT_TRUST_BOUNDARIES.md`](./CONTRACT_TRUST_BOUNDARIES.md).
+

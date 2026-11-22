@@ -16,7 +16,14 @@
 //   Wallets        WalletAdapter, signWithWalletAdapter — optional provider
 //                  boundary for SDK-assisted signing (no browser globals)
 //   Recovery       isRetryable, CircleUpClient.lookupTransaction,
-//                  SubmissionDiagnostics, TxLookup
+//                  CircleUpClient.waitForTransaction, SubmissionDiagnostics,
+//                  TxLookup, RETRY_POLICY (stage-by-stage retry rules)
+//   Lifecycle      txLifecycleFromResult, txLifecycleFromLookup, TxLifecycle —
+//                  submitted / pending / confirmed / failed / unavailable
+//   Error taxonomy SdkError, classifySdkError, classifyTxFailure,
+//                  classifyWalletFailure, SdkErrorCode, SdkErrorStage
+//   Network        resolveNetworkIdentity, NetworkIdentity,
+//                  CircleUpClient.getNetworkIdentity / getResolvedConfig
 //   Config & types CircleUpConfig, NetworkConfig, NetworkName, CircleStatus,
 //                  CircleConfig, RoundState, CircleFullState, and the indexer
 //                  response types (ApiCircleRow, ApiCircleDetailResponse, …)
@@ -49,6 +56,8 @@ export * from "./constants"; // network URLs/passphrases, getNetworkConfig, unit
 export * from "./types";     // CircleUpConfig, CircleStatus, CircleConfig, RoundState, decoders, indexer read models, …
 export * from "./utils";     // usdcToStroops, stroopsToUsdc, formatUsdc, shortAddress, …
 export * from "./gating";    // StateSnapshot, GateResult, computeActionEligibility, buildSnapshot, …
+export * from "./penalty";   // computeDefaultPenalty, projectCollateralAfterDefaults, PENALTY_ROUNDING (#874)
+export * from "./rotation";  // payoutSchedule, recipientForRound, payoutSlotOf (#873)
 
 export {
   // Base client (from circleUpClient.ts)
@@ -63,18 +72,30 @@ export {
   // Read deadlines & cancellation (issue #899)
   RpcReadCancelledError,
   isRpcReadCancelled,
+  // Stage-by-stage retry policy (issue #900)
+  RETRY_POLICY,
+  classifyRpcFailure,
   // Low-level ScVal encoders
   scAddress,
   scU32,
   scI128,
   scBool,
   scAddressVec,
+  // API deprecation signals (issue #985 & #80)
+  readDeprecationSignals,
+  readDeprecations,
+  isDeprecated,
+  resetDeprecationWarnings,
+  warnDeprecations,
 } from "./circleUpClient";
 
 export type {
   PollConfig,
   ReadOptions,
   RpcReadCancelReason,
+  RetryStage,
+  RetryPolicy,
+  RpcFailureClass,
   WriteOptions,
   TxLogPhase,
   TxLogEvent,
@@ -85,6 +106,11 @@ export type {
   DeploymentCheckStatus,
   DeploymentVerification,
   VerifyDeploymentOptions,
+  ApiDeprecation,
+  ApiDeprecationInfo,
+  DeprecationSignalSource,
+  Deprecation,
+  DeprecationHeaders,
 } from "./circleUpClient";
 
 export {
@@ -119,5 +145,63 @@ export type {
   SignWithWalletOptions,
 } from "./walletAdapter";
 
+// bigint serialization helpers (Issue #908)
+export {
+  bigintToDecimalString,
+  decimalStringToBigInt,
+  bigintReplacer,
+  bigintReviver,
+  serializeWithBigInt,
+  deserializeWithBigInt,
+} from "./serialization";
+export type { BigIntWireString } from "./serialization";
+
 export { transactionSupport } from "./support";
 export type { SupportSummary } from "./support";
+
+// Stable error taxonomy (issue #901).
+export {
+  SdkError,
+  isSdkError,
+  classifySdkError,
+  classifyTxFailure,
+  classifyWalletFailure,
+} from "./errors";
+export type { SdkErrorCode, SdkErrorStage, SdkErrorInfo, SdkRetryAdvice } from "./errors";
+
+// Transaction lifecycle and finality (issue #902).
+export { txLifecycleFromResult, txLifecycleFromLookup, isTxLifecycleSettled } from "./lifecycle";
+export type {
+  TxLifecycle,
+  TxLifecycleState,
+  TxNotApplied,
+  TxSubmitted,
+  TxPending,
+  TxConfirmed,
+  TxChainFailed,
+  TxUnavailable,
+} from "./lifecycle";
+
+// Privacy-safe diagnostics and redaction (issue #912).
+export {
+  redactSecrets,
+  redactAddresses,
+  sanitizeEndpointUrl,
+  isSafeTxHash,
+  sanitizeDiagnosticsRecord,
+  ALLOWLISTED_DIAGNOSTIC_FIELDS,
+  MAX_SAFE_DIAGNOSTIC_LENGTH,
+} from "./redact";
+export type { AllowlistedDiagnosticField } from "./redact";
+
+// Transport policy and URL validation (issue #914 / #78).
+export {
+  validateServiceUrl,
+  isLocalhost,
+  sanitizeUrlForDiagnostic,
+} from "./transportPolicy";
+export type { TransportPolicyOptions, UrlValidationResult } from "./transportPolicy";
+
+// ── Deprecated — planned removal in 0.4.0 (issue #909) ───────────────────────
+export type { CircleDetailResponse } from "./types";
+

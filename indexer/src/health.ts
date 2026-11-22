@@ -70,6 +70,45 @@ export interface ReadinessReport {
   reason?: string;
 }
 
+/**
+ * Container probe contract for the production indexer image.
+ *
+ * The production image's Dockerfile HEALTHCHECK and any orchestrator probe
+ * (Kubernetes livenessProbe/readinessProbe, ECS healthCheck, etc.) must agree
+ * with the readiness semantics implemented by checkReadiness() below:
+ *
+ *   - Liveness  → GET /health/live   (HTTP 200 while the process is running;
+ *                                     no external dependencies touched)
+ *   - Readiness → GET /health/ready  (HTTP 200 when ready === true, i.e. DB
+ *                                     reachable and schema safe; HTTP 503 when
+ *                                     DB is down, schema is drifted/
+ *                                     uninitialized, or the process is
+ *                                     shutting down.  RPC down is reported as
+ *                                     "degraded" but still ready: true / 200)
+ *
+ * The port is taken from the PORT env var (default 3001) — the same value the
+ * HTTP server binds to — so the probe always targets the port the container
+ * actually exposes.  Keep this in sync with the image's EXPOSE and the
+ * documented health command.
+ */
+export const HEALTH_PORT = parseInt(process.env.PORT || "3001", 10);
+
+/** Path served by the liveness probe (process-only, no dependencies). */
+export const LIVENESS_PATH = "/health/live";
+
+/** Path served by the readiness probe (DB + schema + RPC semantics). */
+export const READINESS_PATH = "/health/ready";
+
+/**
+ * Documented health command for the production image.  The Dockerfile
+ * HEALTHCHECK should invoke this exact URL so the container probe matches the
+ * service readiness contract.  Uses only Node built-ins so it works in the
+ * distroless/slim runtime image without curl or wget installed.
+ */
+export const HEALTHCHECK_COMMAND =
+  `node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'${READINESS_PATH}')` +
+  `.then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"`;
+
 export interface HealthReport {
   status: "ok" | "degraded";
   serviceStatus: "healthy" | "degraded" | "unavailable";
@@ -792,6 +831,9 @@ export async function checkReadiness(options: {
     };
   }
 
+  // Run the three readiness dependencies in parallel.  Each is individually
+  // timeout-bounded (HEALTH_TIMEOUT_MS) so a hung DB/RPC cannot stall the
+  // container probe past its own timeout.
   const [db, schema, rpcCheck] = await Promise.all([
     checkDbConnectivity(),
     checkSchemaHealth(options.cachedMigrationHealth),
@@ -852,4 +894,14 @@ export async function checkReadiness(options: {
     degradedDependencies: degradedDeps,
     reason: degradedDeps.length > 0 ? `degraded dependencies: ${degradedDeps.join(", ")}` : undefined,
   };
+}
+
+/**
+ * Map a ReadinessReport to the HTTP status code the /health/ready endpoint
+ * must return.  Kept next to checkReadiness() so the container probe contract
+ * (200 = ready, 503 = not ready) is defined in exactly one place and cannot
+ * drift from the readiness semantics.
+ */
+export function readinessHttpStatus(report: ReadinessReport): 200 | 503 {
+  return report.ready ? 200 : 503;
 }

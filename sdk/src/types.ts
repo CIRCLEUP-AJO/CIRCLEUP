@@ -1,5 +1,6 @@
 // ─── SDK Types ────────────────────────────────────────────────────────────────
 import type { CircleStatus } from './validators';
+import type { ConfiguredNetworkName } from './constants';
 //
 // Public API invariants for every type and helper in this module are documented
 // in docs/API_INVARIANTS.md (section 9 — SDK type-safety invariants).
@@ -10,9 +11,23 @@ export type NetworkPassphrase =
   | "Public Global Stellar Network ; September 2015";
 
 export interface CircleUpConfig {
-  /** Stellar RPC endpoint */
+  /**
+   * Stellar RPC endpoint. Where requests are sent — never used to infer which
+   * network the client is on (see `resolveNetworkIdentity`).
+   */
   rpcUrl: string;
-  networkPassphrase: NetworkPassphrase;
+  /**
+   * Explicit network name (issue #903). Optional for the presets: when omitted
+   * the network is resolved from `networkPassphrase`. When set, the passphrase
+   * must match the preset. Use `"custom"` (with a non-preset passphrase and an
+   * `rpcUrl`) for a standalone or private network.
+   */
+  network?: ConfiguredNetworkName;
+  /**
+   * Passphrase every transaction commits to. A preset passphrase, or any
+   * passphrase when `network` is `"custom"`.
+   */
+  networkPassphrase: NetworkPassphrase | (string & {});
   /** Deployed contract addresses */
   contracts: {
     circleFactory: string;
@@ -377,6 +392,7 @@ export interface TxSuccess {
  * | Code | When it fires | Safe to retry? |
  * |------|---------------|----------------|
  * | `"invalid_argument"` | The call was rejected by SDK-side validation before any network I/O. | No — fix the inputs. |
+ * | `"network_mismatch"` | The client configuration no longer matches the network it was bound to; nothing was built or signed. | No — create a client for the intended network. |
  * | `"account_not_found"` | The source account does not exist on the network. | No — fund the account first. |
  * | `"simulation_failed"` | The Soroban simulation rejected the invocation (contract panic / validation). | No — the state or inputs are wrong. |
  * | `"network_error"` | A network-level fetch failure before or during submission. | Yes. |
@@ -403,6 +419,7 @@ export interface TxSuccess {
  */
 export type TxErrorCode =
   | "invalid_argument"
+  | "network_mismatch"
   | "account_not_found"
   | "simulation_failed"
   | "network_error"
@@ -621,6 +638,7 @@ export function isRetryable(result: TxFailure): boolean {
     case "stale_rpc":
     case "outcome_unknown":
     case "invalid_argument":
+    case "network_mismatch":
     case "account_not_found":
     case "simulation_failed":
     case "tx_failed":
@@ -920,6 +938,14 @@ export interface ApiCircleDetailResponse {
   /** Latest ledger processed by the indexer; used for deadline countdown math. */
   latestLedger: number | null;
 }
+
+/**
+ * Legacy alias for {@link ApiCircleDetailResponse}.
+ *
+ * @deprecated since 0.2.0 — use {@link ApiCircleDetailResponse} instead.
+ * Will be removed in 0.4.0.
+ */
+export type CircleDetailResponse = ApiCircleDetailResponse;
 
 /** Response body for GET /circles/:address/members */
 export interface ApiMembersResponse {
@@ -1331,7 +1357,8 @@ export interface AuditEvent {
   /**
    * Address that triggered the transition.
    * - For `"cancelled"`: the member who called `cancel()`.
-   * - For `"closed"`: the member who called `close()`.
+   * - For `"closed"`: the member or admin who called `close()`. Close is
+   *   global — this one call settled every member's collateral.
    * `null` if the event payload did not include a caller field.
    */
   triggered_by: string | null;
@@ -1354,8 +1381,12 @@ export interface AuditEvent {
    */
   total_released: string | null;
   /**
-   * What total_released would have been with zero penalties (string).
-   * Used to compute forfeited collateral: `total_expected - total_released`.
+   * `round_amount × COLLATERAL_MULTIPLIER × member_count` (string) — counts
+   * every configured member, whether or not they joined.
+   * For a circle closed from **Completed**, `total_expected - total_released`
+   * is the collateral forfeited to penalties. For a circle closed from
+   * **Cancelled** it also includes deposits that were never made by members
+   * who did not join, so it is not a forfeiture figure there.
    * `null` for `"cancelled"` rows and when the event payload omitted the field.
    */
   total_expected_collateral: string | null;

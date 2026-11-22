@@ -44,6 +44,11 @@ import { useState, useId, useCallback, useRef } from "react";
 import { buildAndSerialise, type DiagnosticsBundleInput } from "@/lib/diagnostics";
 import type { ContractAppError } from "@/lib/contractErrors";
 import type { TxStage, TxErrorCategory } from "@/lib/telemetry";
+import {
+  describeStatusSafely,
+  isKnownCircleStatus,
+  type CircleStatusLike,
+} from "@/lib/circleStatus";
 
 // ─── Prop types ───────────────────────────────────────────────────────────────
 
@@ -57,6 +62,12 @@ export interface DiagnosticsPanelProps {
   stage?: TxStage;
   /** TxErrorCategory — included as error.category in the bundle. */
   errorCategory?: TxErrorCategory;
+  /**
+   * Raw lifecycle status value observed from the indexer or API payload.
+   * May be a known status, a future status string, or a malformed value.
+   * Rendered as plain text only — never interpolated as HTML.
+   */
+  status?: CircleStatusLike;
 }
 
 // ─── Copy / download state ────────────────────────────────────────────────────
@@ -98,6 +109,7 @@ export function DiagnosticsPanel({
   txHash,
   stage,
   errorCategory,
+  status,
 }: DiagnosticsPanelProps) {
   const [isExpanded,    setIsExpanded]    = useState(false);
   const [copyState,     setCopyState]     = useState<ActionState>("idle");
@@ -183,6 +195,15 @@ export function DiagnosticsPanel({
     downloadState === "success" ? "Downloaded!" :
     downloadState === "error"   ? "Download failed" :
     "Download as JSON";
+
+  // ── Status diagnostics ─────────────────────────────────────────────────────
+  //
+  // Unknown / future / malformed status values are surfaced here as plain
+  // text so they can be reported without ever being treated as a known
+  // lifecycle state (and without being interpolated as raw HTML).
+  const hasStatus = status !== undefined && status !== null;
+  const statusIsKnown = hasStatus && isKnownCircleStatus(status);
+  const statusDescription = hasStatus ? describeStatusSafely(status) : null;
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -288,6 +309,28 @@ export function DiagnosticsPanel({
               </div>
             </details>
           </div>
+
+          {/* ── Unrecognized status ───────────────────────────────────── */}
+          {hasStatus && !statusIsKnown && (
+            <div
+              role="note"
+              aria-label="Unrecognized status"
+              className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 space-y-1"
+            >
+              <p className="font-semibold flex items-center gap-1">
+                <span aria-hidden="true">⚠</span>
+                Unrecognized status
+              </p>
+              <p className="leading-relaxed">
+                The app received a lifecycle status it does not understand.
+                Mutation actions are disabled for this state. The raw value is
+                shown below as plain text for diagnostics only.
+              </p>
+              <p className="font-mono break-all text-amber-900">
+                {statusDescription}
+              </p>
+            </div>
+          )}
 
           {/* ── Action buttons ─────────────────────────────────────────── */}
           <div className="flex flex-wrap gap-2" role="group" aria-label="Diagnostics bundle actions">

@@ -308,6 +308,28 @@ export function explainUnsupportedAction(
 }
 
 /**
+ * Returns a user-facing advisory when the provider cannot notify the app of
+ * account or network changes, or `null` when continuous monitoring is active.
+ *
+ * When this returns a non-null string the app cannot rely on push events to
+ * detect wallet identity transitions. It will perform an explicit identity
+ * re-check immediately before every signing prompt. Read-only actions remain
+ * fully available; only write actions require this extra step.
+ *
+ * The returned message is advisory — it describes a limitation, not an error.
+ * Display it as an informational note, not a blocking error panel.
+ */
+export function explainMonitoringLimitation(caps: WalletCapabilities): string | null {
+  if (!caps.installed) return null; // no wallet — a different message covers this
+  if (caps.canWatchChanges) return null; // continuous monitoring is active
+  return (
+    "Your wallet cannot notify this page when accounts or networks change. " +
+    "Account identity will be verified immediately before each transaction. " +
+    "Read-only browsing is unaffected."
+  );
+}
+
+/**
  * Build a human-readable description of a {@link NetworkMismatchResult} for
  * display in a UI warning banner or tooltip.
  *

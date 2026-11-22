@@ -16,6 +16,9 @@ import {
   usdcToStroops,
   stroopsToUsdc,
   isConfigAbsent,
+  validateAppServiceUrl,
+  getMalformedServiceUrls,
+  isLocalhost,
 } from "../lib/config";
 
 const VALID_FACTORY = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
@@ -243,5 +246,59 @@ describe("stroopsToUsdc", () => {
 
   it("returns '0' for invalid input", () => {
     expect(stroopsToUsdc("not-a-number")).toBe("0");
+  });
+});
+
+// ─── Transport Policy (Issue #914 / Issue 78) ────────────────────────────────
+
+describe("validateAppServiceUrl and transport policy", () => {
+  it("accepts valid HTTPS URLs", () => {
+    expect(
+      validateAppServiceUrl("https://soroban-testnet.stellar.org", "RPC_URL"),
+    ).toBeNull();
+  });
+
+  it("accepts localhost HTTP in development", () => {
+    expect(
+      validateAppServiceUrl("http://localhost:3001", "INDEXER_URL", {
+        isProduction: false,
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects remote HTTP URLs in production", () => {
+    const err = validateAppServiceUrl("http://insecure.example.com", "RPC_URL", {
+      isProduction: true,
+    });
+    expect(err).toMatch(/must use secure HTTPS in production/);
+  });
+
+  it("rejects URLs with embedded credentials without echoing them", () => {
+    const err = validateAppServiceUrl("http://user:Pass123@localhost:3001", "RPC_URL");
+    expect(err).toBe("RPC_URL cannot contain embedded credentials.");
+    expect(err).not.toContain("Pass123");
+  });
+
+  it("rejects URLs with query parameters without echoing query values", () => {
+    const err = validateAppServiceUrl("http://localhost:3001?secret=ABC", "INDEXER_URL");
+    expect(err).toBe("INDEXER_URL cannot contain query parameters or fragments.");
+    expect(err).not.toContain("ABC");
+  });
+
+  it("rejects non-HTTP protocols", () => {
+    const err = validateAppServiceUrl("ftp://stellar.org", "RPC_URL");
+    expect(err).toMatch(/uses unsupported scheme "ftp:"/);
+  });
+
+  it("flags malformed service URLs in getMalformedServiceUrls", () => {
+    const env = {
+      NEXT_PUBLIC_STELLAR_RPC_URL: "http://bot:secret@soroban.org",
+      NEXT_PUBLIC_INDEXER_URL: "http://remote-indexer.example.com",
+    };
+    const errors = getMalformedServiceUrls(env, true);
+    expect(errors.length).toBe(2);
+    expect(errors[0]).toContain("cannot contain embedded credentials");
+    expect(errors[0]).not.toContain("secret");
+    expect(errors[1]).toContain("must use secure HTTPS in production");
   });
 });

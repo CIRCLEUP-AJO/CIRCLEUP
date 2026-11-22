@@ -78,6 +78,46 @@ is reviewed, tested, and approved.
   user-controlled input in Server Components without validation. Risk is real but reduced.
   Upgrade in a dedicated PR after verifying all routes and CI checks.
 
+## Scheduled dependency audit and license evidence
+
+The repository runs a policy-driven dependency audit in
+[`.github/workflows/dependency-audit.yml`](../.github/workflows/dependency-audit.yml).
+
+**Cadence:** weekly (Monday 06:00 UTC) via `schedule`, plus on any push or pull
+request that touches `package.json`, `package-lock.json`, `contracts/Cargo.lock`,
+`contracts/deny.toml`, `scripts/license-inventory.sh`, `LICENSE_EXCEPTIONS.md`, or
+the workflow itself. Manual runs are available via `workflow_dispatch`.
+
+**Permissions:** `contents: read` only. The workflow never runs `npm audit fix`,
+never runs `npm install`, never commits, and never publishes dependencies. It
+audits the committed dependency graph exactly as checked in.
+
+**What it produces (reviewable artifacts):**
+
+| Artifact | Contents | Retention |
+|----------|----------|-----------|
+| `npm-audit-json` | `npm audit --workspaces --json` output | 90 days |
+| `npm-audit-summary` | Human-readable `npm audit --workspaces` report | 90 days |
+| `license-inventory` | `scripts/license-inventory.sh` output across all workspaces | 90 days |
+| `audit-policy-result` | Policy evaluation summary (pass/fail, findings, exceptions applied) | 90 days |
+
+**Severity threshold:** the workflow fails on any `high` or `critical` advisory
+that is not covered by a documented, time-bounded exception. `moderate` and `low`
+advisories are reported in the artifacts but do not fail the run.
+
+**Exceptions:** every exception must be recorded in
+[LICENSE_EXCEPTIONS.md](./LICENSE_EXCEPTIONS.md) (licenses) or the deferred
+findings table above (advisories) with package, advisory/license, scope, owner,
+reviewer, and an explicit `review-by` date. The workflow parses these entries and
+fails if any exception is missing an owner or a review date, or if the review
+date has passed. Expired exceptions are treated as new findings. No finding is
+ever auto-suppressed: adding an exception requires a reviewed PR.
+
+**Failure policy:** a new high/critical advisory, an unknown or disallowed
+license, a missing inventory tool, or an expired/malformed exception fails the
+workflow. The failure output lists each finding and the policy rule it violates
+so a reviewer can act on it.
+
 ## Running audits locally
 
 ```bash
@@ -105,3 +145,14 @@ Before adding any new dependency:
 2. Check its license: `npm run license:check --workspace=<pkg>`.
 3. Prefer pinned devDependencies for tooling (linters, formatters, test runners).
 4. Avoid adding transitive dependencies directly — fix the root package instead.
+
+## Reviewing scheduled audit results
+
+When the scheduled workflow fails:
+
+1. Download the `audit-policy-result` and `npm-audit-summary` artifacts from the run.
+2. For each new finding, assess reachability, affected versions, available fixes,
+   and production versus development exposure (see the deferral rationale above).
+3. Either open a focused upgrade PR, or add a time-bounded exception with owner and
+   `review-by` date in a reviewed PR. Do not edit the workflow to silence a finding.
+4. Re-run the workflow via `workflow_dispatch` to confirm the evidence is green.

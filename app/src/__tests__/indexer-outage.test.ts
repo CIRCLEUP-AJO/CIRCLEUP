@@ -12,6 +12,7 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { fetchCircleData } from "../app/circles/[address]/CircleDetailClient";
+import { fetchWithTimeout } from "../lib/fetchWithTimeout";
 
 const CONTRACT = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
 
@@ -80,6 +81,66 @@ describe("fetchCircleData — indexer outage detection", () => {
   });
 });
 
+// ─── Service outage outcome mapping ──────────────────────────────────────────
+//
+// The route-level outcome for an indexer 503 must be "service_outage" — a
+// distinct category from "contract_read_failure" (RPC/contract read errors)
+// and "not_found" (unknown entity). These tests pin that mapping so the
+// outage recovery path cannot silently regress into a generic error page.
+
+describe("route outcome mapping — indexer 503 is a service outage", () => {
+  it("maps a 503 indexer response to 'service_outage'", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    const outcome = classifyRouteOutcome({ kind: "http", status: 503 });
+    expect(outcome).toBe("service_outage");
+  });
+
+  it("does not collapse a 503 into 'not_found' or 'contract_read_failure'", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    const outcome = classifyRouteOutcome({ kind: "http", status: 503 });
+    expect(outcome).not.toBe("not_found");
+    expect(outcome).not.toBe("contract_read_failure");
+  });
+
+  it("keeps 404 as 'not_found' and contract read errors as 'contract_read_failure'", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    expect(classifyRouteOutcome({ kind: "http", status: 404 })).toBe("not_found");
+    expect(classifyRouteOutcome({ kind: "contract_read" })).toBe("contract_read_failure");
+  });
+
+  it("maps an unreachable indexer to 'service_outage' as well", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    expect(classifyRouteOutcome({ kind: "network" })).toBe("service_outage");
+  });
+
+  it("assigns HTTP 503 to the service outage outcome", async () => {
+    const { httpStatusForOutcome } = await import("../lib/routeOutcome");
+    expect(httpStatusForOutcome("service_outage")).toBe(503);
+    expect(httpStatusForOutcome("not_found")).toBe(404);
+    expect(httpStatusForOutcome("invalid_address")).toBe(400);
+  });
+});
+
+describe("outage recovery path rendering", () => {
+  it("renders the outage recovery guidance for the service_outage outcome", async () => {
+    const { renderRouteOutcome } = await import("../lib/routeOutcome");
+    const html = renderRouteOutcome("service_outage");
+    expect(html).toContain("temporarily unavailable");
+    expect(html).toContain("Retry");
+    // Must not render the not-found copy for an outage.
+    expect(html).not.toContain("not found");
+  });
+
+  it("renders distinct copy for not_found and contract_read_failure", async () => {
+    const { renderRouteOutcome } = await import("../lib/routeOutcome");
+    const notFound = renderRouteOutcome("not_found");
+    const readFailure = renderRouteOutcome("contract_read_failure");
+    expect(notFound).not.toBe(readFailure);
+    expect(notFound).toContain("not found");
+    expect(readFailure).toContain("could not be read");
+  });
+});
+
 // ─── Error message map completeness ──────────────────────────────────────────
 //
 // Verifies that every error kind that can be surfaced has a corresponding
@@ -123,5 +184,147 @@ describe("error kind distinguishability", () => {
     // These must be distinct so the UI can show different recovery guidance.
     const kinds = new Set(["network", "parse", "server", "misconfigured", "indexer_outage"]);
     expect(kinds.size).toBe(5);
+  });
+});
+
+// ─── Server-rendered indexer reads: bounded timeout + retry ───────────────────
+//
+// The homepage performs a server-side GET to the indexer. A connection that
+// stays pending must not hang the render: the request has a finite deadline,
+// at most one bounded retry for safe GETs, and any timeout/cancellation/upstream
+// error must reach the existing fallback rather than an empty successful list.
+
+describe("fetchWithTimeout — deadline, abort, and bounded retry", () => {
+  it("aborts a slow response that exceeds the deadline and reports a timeout", async () => {
+    // fetch never resolves on its own; it only settles when the abort signal fires.
+    global.fetch = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("timeout");
+    // A timeout must never be reported as a successful (empty) list.
+    expect(result.error).not.toBe("network");
+  });
+
+  it("passes an abort signal to fetch and surfaces cancellation as a timeout", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    global.fetch = vi.fn((_url: string, init?: RequestInit) => {
+      receivedSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 0,
+    });
+
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("timeout");
+  });
+
+  it("retries exactly once after a timeout, then gives up", async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(new DOMException("The operation was aborted.", "AbortError"));
+        });
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("timeout");
+    // Initial attempt + exactly one bounded retry.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers successfully when the retry returns a valid response", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce((_url: string, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          });
+        });
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: [] }),
+      } as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 1,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry non-retryable upstream errors (e.g. 503 outage)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({}),
+    } as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await fetchWithTimeout("https://indexer.example/api", {
+      timeoutMs: 20,
+      retries: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toBe("indexer_outage");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares a single bounded request across parallel Suspense consumers", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: [] }),
+    } as Response);
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const [a, b, c] = await Promise.all([
+      fetchWithTimeout("https://indexer.example/api", { timeoutMs: 50, retries: 1 }),
+      fetchWithTimeout("https://indexer.example/api", { timeoutMs: 50, retries: 1 }),
+      fetchWithTimeout("https://indexer.example/api", { timeoutMs: 50, retries: 1 }),
+    ]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    expect(c.ok).toBe(true);
+    // Deduplicated: parallel consumers must not multiply upstream requests.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

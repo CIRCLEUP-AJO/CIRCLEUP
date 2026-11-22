@@ -345,3 +345,125 @@ export const CIRCLE_ACTIVITY_CURSOR_FIXTURE = {
   events: CIRCLE_ACTIVITY_FIXTURE.events.slice(2),
   pagination: { limit: 2, hasMore: false, nextCursor: null },
 };
+
+// ── Legacy (pre-deprecation) response forms — issue #149 ─────────────────────
+//
+// During a deprecation window the indexer serves both the legacy and the
+// current form of a changed field/endpoint. The fixtures below capture the
+// legacy wire shape so the compatibility tests can assert that both forms
+// parse. Each legacy fixture carries the deprecation metadata documented in
+// docs/INDEXER_API_COMPATIBILITY.md (since / sunset / replacement) and is
+// removed once its sunset date has passed.
+
+/** Deprecation metadata attached to every legacy fixture. */
+export interface LegacyFixtureDeprecation {
+  /** ISO-8601 date the legacy form was first marked deprecated. */
+  since: string;
+  /** ISO-8601 date after which the legacy form may be removed. */
+  sunset: string;
+  /** The current field/endpoint that replaces the legacy form. */
+  replacement: string;
+}
+
+/** A legacy fixture plus the deprecation metadata describing its window. */
+export interface LegacyFixture<T> {
+  deprecation: LegacyFixtureDeprecation;
+  body: T;
+}
+
+/**
+ * GET /circles — legacy form.
+ *
+ * Before the pagination envelope was standardised, `GET /circles` returned a
+ * bare array of circle rows and used `page`/`per_page` query parameters.
+ * The current form wraps the rows in `{ circles, pagination }`.
+ */
+export const CIRCLES_LIST_LEGACY_FIXTURE: LegacyFixture<{
+  circles: (typeof CIRCLE_LIST_ROW)[];
+}> = {
+  deprecation: {
+    since: "2026-01-01",
+    sunset: "2026-07-01",
+    replacement: "GET /circles with { circles, pagination } envelope",
+  },
+  body: {
+    circles: [CIRCLE_LIST_ROW],
+  },
+};
+
+/**
+ * GET /circles/:address/members — legacy form.
+ *
+ * The legacy response exposed the member list under `data` and reported the
+ * round deadline as a JS number (`roundDeadlineLedgers`) rather than the
+ * decimal string used for BIGINT columns today.
+ */
+export const MEMBERS_LEGACY_FIXTURE: LegacyFixture<{
+  data: (typeof MEMBERS_FIXTURE.members)[];
+  totals: typeof MEMBERS_FIXTURE.totals;
+  roundDeadlineLedgers: number;
+}> = {
+  deprecation: {
+    since: "2026-01-01",
+    sunset: "2026-07-01",
+    replacement: "GET /circles/:address/members with `members` and string roundDeadlineLedgers",
+  },
+  body: {
+    data: MEMBERS_FIXTURE.members,
+    totals: MEMBERS_FIXTURE.totals,
+    roundDeadlineLedgers: 120_960,
+  },
+};
+
+/**
+ * GET /members/:member/contributions — legacy offset pagination.
+ *
+ * Before keyset pagination (issue #898) the endpoint always returned the
+ * page/total envelope; cursor pages add `nextCursor` and drop `page`/`total`.
+ * The legacy form remains valid when no `cursor` parameter is supplied.
+ */
+export const MEMBER_CONTRIBUTIONS_LEGACY_FIXTURE: LegacyFixture<
+  typeof MEMBER_CONTRIBUTIONS_FIXTURE
+> = {
+  deprecation: {
+    since: "2026-01-01",
+    sunset: "2026-07-01",
+    replacement: "GET /members/:member/contributions?cursor=<token> keyset pagination",
+  },
+  body: MEMBER_CONTRIBUTIONS_FIXTURE,
+};
+
+/**
+ * GET /reputation/:member — legacy form.
+ *
+ * The legacy response used `reputationScore` instead of `score` and omitted
+ * `found`; unknown members were reported with a 404 rather than `found: false`.
+ */
+export const REPUTATION_LEGACY_FIXTURE: LegacyFixture<{
+  member: string;
+  reputationScore: number;
+  contributions: typeof REPUTATION_FIXTURE.contributions;
+  defaults: typeof REPUTATION_FIXTURE.defaults;
+  updatedAt: string | null;
+}> = {
+  deprecation: {
+    since: "2026-01-01",
+    sunset: "2026-07-01",
+    replacement: "GET /reputation/:member with `score` and `found`",
+  },
+  body: {
+    member: MEMBER_A,
+    reputationScore: 3,
+    contributions: REPUTATION_FIXTURE.contributions,
+    defaults: REPUTATION_FIXTURE.defaults,
+    updatedAt: REPUTATION_FIXTURE.updatedAt,
+  },
+};
+
+/** All legacy fixtures, keyed by the endpoint they describe. */
+export const LEGACY_FIXTURES = {
+  circlesList: CIRCLES_LIST_LEGACY_FIXTURE,
+  members: MEMBERS_LEGACY_FIXTURE,
+  memberContributions: MEMBER_CONTRIBUTIONS_LEGACY_FIXTURE,
+  reputation: REPUTATION_LEGACY_FIXTURE,
+} as const;

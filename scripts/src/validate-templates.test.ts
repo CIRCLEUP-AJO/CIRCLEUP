@@ -604,6 +604,202 @@ describe("real repo templates — feature_request and PR integrity", () => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Package-impact / verification traceability section check
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// The traceability convention (docs/TRACEABILITY.md) asks contributors to add a
+// compact "Package impact & verification" section to issues and PRs.  It maps
+// each acceptance criterion to the affected packages and the verification
+// commands that provide evidence.  The check below is advisory: a missing
+// section produces a warning, never a hard failure, so unrelated work is not
+// blocked.
+
+const TRACEABILITY_HEADING_RE = /^#{1,6}\s+package impact\s*(?:&|and)\s*verification\b/im;
+
+// Package names that a traceability row may reference.
+const TRACEABILITY_PACKAGES = [
+  "contracts",
+  "sdk",
+  "indexer",
+  "app",
+  "deployment",
+];
+
+// The three worked examples the convention must document.
+const TRACEABILITY_EXAMPLE_KINDS = [
+  "contract event change",
+  "indexer schema change",
+  "app-only behavior change",
+];
+
+interface TraceabilityResult {
+  /** True when the section heading is present. */
+  hasSection: boolean;
+  /** Package names referenced anywhere in the section body. */
+  packages: string[];
+  /** True when at least one verification command is referenced. */
+  hasVerification: boolean;
+  /** Advisory warnings; empty means the section looks complete. */
+  warnings: string[];
+}
+
+function extractTraceabilitySection(content: string): string | null {
+  const lines = content.split("\n");
+  const startIdx = lines.findIndex((l) => TRACEABILITY_HEADING_RE.test(l));
+  if (startIdx === -1) return null;
+
+  const headingLevel = (lines[startIdx].match(/^#+/) ?? ["#"])[0].length;
+  const body: string[] = [];
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const nextHeading = lines[i].match(/^(#+)\s/);
+    if (nextHeading && nextHeading[1].length <= headingLevel) break;
+    body.push(lines[i]);
+  }
+  return body.join("\n");
+}
+
+function checkTraceabilitySection(content: string): TraceabilityResult {
+  const section = extractTraceabilitySection(content);
+  if (section === null) {
+    return {
+      hasSection: false,
+      packages: [],
+      hasVerification: false,
+      warnings: ["missing 'Package impact & verification' section"],
+    };
+  }
+
+  const lower = section.toLowerCase();
+  const packages = TRACEABILITY_PACKAGES.filter((pkg) => lower.includes(pkg));
+  const hasVerification = /`[^`]+`/.test(section) || /\b(npm|pnpm|yarn|cargo|make|node)\b/.test(lower);
+
+  const warnings: string[] = [];
+  if (packages.length === 0) {
+    warnings.push("no affected package named (contracts/sdk/indexer/app/deployment)");
+  }
+  if (!hasVerification) {
+    warnings.push("no verification command referenced");
+  }
+
+  return { hasSection: true, packages, hasVerification, warnings };
+}
+
+// Advisory gate: returns warnings but never throws / blocks.
+function traceabilityGate(content: string): { blocking: boolean; warnings: string[] } {
+  const result = checkTraceabilitySection(content);
+  return { blocking: false, warnings: result.warnings };
+}
+
+const FULL_TRACEABILITY_SECTION = `
+## Package impact & verification
+
+| Acceptance criterion | Packages | Verification |
+|---|---|---|
+| Event is emitted on transfer | contracts, indexer | \`cargo test -p circle\`, \`npm test -w indexer\` |
+| UI shows new event | app | \`npm test -w app\` |
+`.trim();
+
+describe("checkTraceabilitySection", () => {
+  test("template with the section passes with no warnings", () => {
+    const result = checkTraceabilitySection(FULL_TRACEABILITY_SECTION);
+    assert.equal(result.hasSection, true);
+    assert.deepEqual(result.warnings, []);
+    assert.ok(result.hasVerification);
+  });
+
+  test("template missing the section is flagged", () => {
+    const result = checkTraceabilitySection("## Summary\n\nJust a summary.");
+    assert.equal(result.hasSection, false);
+    assert.ok(result.warnings.some((w) => w.includes("missing")));
+  });
+
+  test("section without any package is flagged", () => {
+    const content = "## Package impact & verification\n\n| AC | Verification |\n|---|---|\n| x | `npm test` |";
+    const result = checkTraceabilitySection(content);
+    assert.equal(result.hasSection, true);
+    assert.deepEqual(result.packages, []);
+    assert.ok(result.warnings.some((w) => w.includes("package")));
+  });
+
+  test("section without a verification command is flagged", () => {
+    const content = "## Package impact & verification\n\nAffects contracts and indexer.";
+    const result = checkTraceabilitySection(content);
+    assert.equal(result.hasSection, true);
+    assert.ok(result.packages.includes("contracts"));
+    assert.ok(result.packages.includes("indexer"));
+    assert.equal(result.hasVerification, false);
+    assert.ok(result.warnings.some((w) => w.includes("verification")));
+  });
+
+  test("heading is matched case-insensitively and with 'and'", () => {
+    const content = "## PACKAGE IMPACT AND VERIFICATION\n\ncontracts — `cargo test`";
+    const result = checkTraceabilitySection(content);
+    assert.equal(result.hasSection, true);
+  });
+
+  test("section body stops at the next same-level heading", () => {
+    const content = [
+      "## Package impact & verification",
+      "",
+      "contracts — `cargo test`",
+      "",
+      "## Checklist",
+      "",
+      "indexer app deployment",
+    ].join("\n");
+    const result = checkTraceabilitySection(content);
+    assert.deepEqual(result.packages, ["contracts"]);
+  });
+});
+
+describe("traceabilityGate (advisory, non-blocking)", () => {
+  test("never blocks even when the section is missing", () => {
+    const gate = traceabilityGate("## Summary\n\nNo traceability here.");
+    assert.equal(gate.blocking, false);
+    assert.ok(gate.warnings.length > 0);
+  });
+
+  test("reports no warnings for a complete section", () => {
+    const gate = traceabilityGate(FULL_TRACEABILITY_SECTION);
+    assert.equal(gate.blocking, false);
+    assert.deepEqual(gate.warnings, []);
+  });
+});
+
+describe("traceability worked examples", () => {
+  const REPO_ROOT = path.resolve(__dirname, "..", "..");
+  const TRACEABILITY_DOC = path.join(REPO_ROOT, "docs", "TRACEABILITY.md");
+
+  test("docs/TRACEABILITY.md exists", () => {
+    assert.ok(
+      fs.existsSync(TRACEABILITY_DOC),
+      "docs/TRACEABILITY.md must document the convention",
+    );
+  });
+
+  test("documents all three worked examples", () => {
+    if (!fs.existsSync(TRACEABILITY_DOC)) return;
+    const lower = fs.readFileSync(TRACEABILITY_DOC, "utf8").toLowerCase();
+    for (const kind of TRACEABILITY_EXAMPLE_KINDS) {
+      assert.ok(
+        lower.includes(kind),
+        `TRACEABILITY.md must include the '${kind}' example`,
+      );
+    }
+  });
+
+  test("convention is linked from contribution guidance", () => {
+    const contributing = path.join(REPO_ROOT, "CONTRIBUTING.md");
+    if (!fs.existsSync(contributing)) return;
+    const content = fs.readFileSync(contributing, "utf8");
+    assert.ok(
+      /TRACEABILITY\.md/.test(content),
+      "CONTRIBUTING.md must link to docs/TRACEABILITY.md",
+    );
+  });
+});
+
 // Re-export for inline use in the describe blocks above
 // (mirrors the pattern already in this file)
 function extractRelativeLinks(
@@ -639,3 +835,340 @@ function extractRelativeLinks(
 
   return results;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Documentation validator (docs-check) — inline re-implementation
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Mirrors scripts/src/validate-docs.ts so the checker's behaviour can be
+// exercised without spawning a process.  The validator:
+//   - extracts repository-relative Markdown links, ignoring external URLs,
+//     anchor-only links, mailto:, and links inside fenced/inline code spans
+//   - resolves each link against the source file's directory
+//   - verifies referenced npm scripts exist in the owning package.json
+//   - honours a suppression marker for intentional nonstandard references
+//   - reports the source file and 1-based line for every failure
+
+const DOCS_LINK_RE = /\[([^\]]*)\]\(([^)]+)\)/g;
+const SUPPRESSION_MARKER = "docs-check-ignore";
+
+interface DocLink {
+  line: number;
+  rawLink: string;
+  resolvedPath: string;
+}
+
+interface DocIssue {
+  file: string;
+  line: number;
+  message: string;
+}
+
+/** Strip fenced code blocks and inline code spans so they are not scanned. */
+function stripCodeSpans(content: string): string[] {
+  const lines = content.split("\n");
+  const out: string[] = [];
+  let inFence = false;
+  for (const lineText of lines) {
+    if (/^\s*(```|~~~)/.test(lineText)) {
+      inFence = !inFence;
+      out.push("");
+      continue;
+    }
+    if (inFence) {
+      out.push("");
+      continue;
+    }
+    // Blank out inline code spans, preserving line structure.
+    out.push(lineText.replace(/`[^`]*`/g, ""));
+  }
+  return out;
+}
+
+function extractDocLinks(content: string, fileDir: string): DocLink[] {
+  const lines = stripCodeSpans(content);
+  const results: DocLink[] = [];
+  lines.forEach((lineText, idx) => {
+    let match: RegExpExecArray | null;
+    DOCS_LINK_RE.lastIndex = 0;
+    while ((match = DOCS_LINK_RE.exec(lineText)) !== null) {
+      const rawLink = match[2].trim();
+      if (
+        rawLink.startsWith("http://") ||
+        rawLink.startsWith("https://") ||
+        rawLink.startsWith("#") ||
+        rawLink.startsWith("mailto:")
+      ) {
+        continue;
+      }
+      const linkWithoutFragment = rawLink.split("#")[0];
+      if (!linkWithoutFragment) continue;
+      results.push({
+        line: idx + 1,
+        rawLink,
+        resolvedPath: path.resolve(fileDir, linkWithoutFragment),
+      });
+    }
+  });
+  return results;
+}
+
+function isSuppressed(content: string, line: number): boolean {
+  const lines = content.split("\n");
+  const current = lines[line - 1] ?? "";
+  const previous = lines[line - 2] ?? "";
+  return current.includes(SUPPRESSION_MARKER) || previous.includes(SUPPRESSION_MARKER);
+}
+
+function checkDocLinks(
+  filePath: string,
+  content: string,
+): DocIssue[] {
+  const fileDir = path.dirname(filePath);
+  const issues: DocIssue[] = [];
+  for (const link of extractDocLinks(content, fileDir)) {
+    if (isSuppressed(content, link.line)) continue;
+    if (!fs.existsSync(link.resolvedPath)) {
+      issues.push({
+        file: filePath,
+        line: link.line,
+        message: `broken local link: ${link.rawLink}`,
+      });
+    }
+  }
+  return issues;
+}
+
+interface PackageScripts {
+  [pkgJsonPath: string]: Set<string>;
+}
+
+function loadPackageScripts(repoRoot: string): PackageScripts {
+  const result: PackageScripts = {};
+  const candidates = [
+    path.join(repoRoot, "package.json"),
+    path.join(repoRoot, "scripts", "package.json"),
+    path.join(repoRoot, "app", "package.json"),
+    path.join(repoRoot, "indexer", "package.json"),
+  ];
+  for (const pkgPath of candidates) {
+    if (!fs.existsSync(pkgPath)) continue;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
+        scripts?: Record<string, string>;
+      };
+      result[pkgPath] = new Set(Object.keys(parsed.scripts ?? {}));
+    } catch {
+      result[pkgPath] = new Set();
+    }
+  }
+  return result;
+}
+
+const NPM_RUN_RE = /npm\s+run\s+([A-Za-z0-9:_-]+)/g;
+
+function checkNpmScripts(
+  filePath: string,
+  content: string,
+  repoRoot: string,
+  scripts: PackageScripts,
+): DocIssue[] {
+  const issues: DocIssue[] = [];
+  const lines = stripCodeSpans(content);
+  // Determine which package.json governs this doc by walking up to repo root.
+  const rel = path.relative(repoRoot, filePath);
+  let governingPkg = path.join(repoRoot, "package.json");
+  if (rel.startsWith("scripts" + path.sep)) {
+    governingPkg = path.join(repoRoot, "scripts", "package.json");
+  } else if (rel.startsWith("app" + path.sep)) {
+    governingPkg = path.join(repoRoot, "app", "package.json");
+  } else if (rel.startsWith("indexer" + path.sep)) {
+    governingPkg = path.join(repoRoot, "indexer", "package.json");
+  }
+  const available = scripts[governingPkg];
+  if (!available) return issues;
+
+  lines.forEach((lineText, idx) => {
+    let match: RegExpExecArray | null;
+    NPM_RUN_RE.lastIndex = 0;
+    while ((match = NPM_RUN_RE.exec(lineText)) !== null) {
+      const scriptName = match[1];
+      if (isSuppressed(content, idx + 1)) continue;
+      if (!available.has(scriptName)) {
+        issues.push({
+          file: filePath,
+          line: idx + 1,
+          message: `unknown npm script: ${scriptName}`,
+        });
+      }
+    }
+  });
+  return issues;
+}
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+function makeRepoFixture(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "cu-docs-"));
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ scripts: { build: "tsc", test: "node --test" } }),
+    "utf8",
+  );
+  fs.mkdirSync(path.join(root, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(root, "docs", "EXISTS.md"), "# Exists\n", "utf8");
+  fs.mkdirSync(path.join(root, "scripts"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "scripts", "package.json"),
+    JSON.stringify({ scripts: { "validate-templates": "tsx src/validate-templates.ts" } }),
+    "utf8",
+  );
+  return root;
+}
+
+describe("docs validator — link extraction", () => {
+  test("ignores external https:// links (no network dependency)", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "[GitHub](https://github.com/CIRCLEUP-AJO/CIRCLEUP)";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("ignores anchor-only links", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    assert.deepEqual(checkDocLinks(file, "[top](#overview)"), []);
+  });
+
+  test("ignores mailto: links", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    assert.deepEqual(checkDocLinks(file, "[mail](mailto:team@example.com)"), []);
+  });
+
+  test("ignores links inside fenced code blocks", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = ["```md", "[Phantom](./PHANTOM.md)", "```"].join("\n");
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("ignores links inside inline code spans", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "Use `[Phantom](./PHANTOM.md)` as an example.";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("resolves a valid relative link with fragment", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "[Exists](./EXISTS.md#section)";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+});
+
+describe("docs validator — broken local links", () => {
+  test("reports broken link with source file and line", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = ["# Title", "", "[Phantom](./PHANTOM.md)"].join("\n");
+    const issues = checkDocLinks(file, content);
+    assert.equal(issues.length, 1);
+    assert.equal(issues[0].file, file);
+    assert.equal(issues[0].line, 3);
+    assert.match(issues[0].message, /broken local link/);
+  });
+
+  test("reports each broken link on its own line", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = ["[A](./A.md)", "[B](./B.md)"].join("\n");
+    const issues = checkDocLinks(file, content);
+    assert.deepEqual(issues.map((i) => i.line), [1, 2]);
+  });
+
+  test("suppression marker on the same line silences the issue", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = "[Phantom](./PHANTOM.md) <!-- docs-check-ignore -->";
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("suppression marker on the previous line silences the issue", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = [
+      "<!-- docs-check-ignore -->",
+      "[Phantom](./PHANTOM.md)",
+    ].join("\n");
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+
+  test("intentional generated link is suppressed and not reported", () => {
+    const root = makeRepoFixture();
+    const file = path.join(root, "docs", "README.md");
+    const content = [
+      "<!-- docs-check-ignore: generated by build -->",
+      "[Generated](./generated/OUTPUT.md)",
+    ].join("\n");
+    assert.deepEqual(checkDocLinks(file, content), []);
+  });
+});
+
+describe("docs validator — npm scripts", () => {
+  test("valid npm script passes", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = "Run `npm run build` to compile.";
+    assert.deepEqual(checkNpmScripts(file, content, root, scripts), []);
+  });
+
+  test("missing npm script is reported with file and line", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = ["# Build", "", "Run `npm run nonexistent`"].join("\n");
+    const issues = checkNpmScripts(file, content, root, scripts);
+    assert.equal(issues.length, 1);
+    assert.equal(issues[0].file, file);
+    assert.equal(issues[0].line, 3);
+    assert.match(issues[0].message, /unknown npm script: nonexistent/);
+  });
+
+  test("package-specific script resolves against its own package.json", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "scripts", "README.md");
+    const content = "Run `npm run validate-templates`.";
+    assert.deepEqual(checkNpmScripts(file, content, root, scripts), []);
+  });
+
+  test("script from another package is not accepted", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "scripts", "README.md");
+    const content = "Run `npm run build`.";
+    const issues = checkNpmScripts(file, content, root, scripts);
+    assert.equal(issues.length, 1);
+    assert.match(issues[0].message, /unknown npm script: build/);
+  });
+
+  test("npm script inside a code span is still checked", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = "Run `npm run missing-script`.";
+    const issues = checkNpmScripts(file, content, root, scripts);
+    assert.equal(issues.length, 1);
+  });
+
+  test("suppression marker silences an unknown npm script", () => {
+    const root = makeRepoFixture();
+    const scripts = loadPackageScripts(root);
+    const file = path.join(root, "README.md");
+    const content = "Run `npm run legacy` <!-- docs-check-ignore -->";
+    assert.deepEqual(checkNpmScripts(file, content, root, scripts), []);
+  });
+});

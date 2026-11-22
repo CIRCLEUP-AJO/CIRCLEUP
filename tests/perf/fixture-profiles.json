@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Deterministic offline fixture profiles for the performance budget suite. No live Stellar RPC, no PostgreSQL, no production data. NOTE: these are perf fixture profiles, distinct from profiles/*.env deployment environment profiles.",
+  "version": "1.0.0",
+  "updatedAt": "2026-11-20",
+  "maxMembers": 256,
+  "maxMembersComment": "Mirrors the protocol MAX_MEMBERS constant (contracts/circle).",
+  "profiles": {
+    "small": {
+      "circleListCount": 10,
+      "circleDetailMembers": 10,
+      "contributionCount": 10
+    },
+    "typical": {
+      "circleListCount": 50,
+      "circleDetailMembers": 32,
+      "contributionCount": 50
+    },
+    "highWater": {
+      "circleListCount": 100,
+      "circleDetailMembers": 256,
+      "contributionCount": 100
+    }
+  }
+}

@@ -20,8 +20,12 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Prerequisites](#prerequisites)
   - [Step-by-Step](#step-by-step)
 - [Environment Variables Reference](#environment-variables-reference)
+  - [Inventory and CI Parity Check](#inventory-and-ci-parity-check)
   - [Indexer (`indexer/.env`)](#indexer-indexerenv)
   - [App (`app/.env.local`)](#app-appenvlocal)
+  - [SDK (`sdk/`)](#sdk-sdk)
+  - [Scripts (`scripts/.env`)](#scripts-scriptsenv)
+  - [Deployment Profiles (`deploy/profiles/`)](#deployment-profiles-deployprofiles)
 - [Deployment](#deployment)
   - [Contract Deployment Order](#contract-deployment-order)
   - [Post-Deployment Configuration](#post-deployment-configuration)
@@ -80,6 +84,10 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Contract Mutation Guards (Rust)](#contract-mutation-guards-rust)
   - [App Gating Mutation Tests (TypeScript)](#app-gating-mutation-tests-typescript)
   - [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations)
+- [Issue-to-Test Traceability](#issue-to-test-traceability)
+  - [Package Impact and Verification Section](#package-impact-and-verification-section)
+  - [Examples](#examples)
+  - [Review Guidance](#review-guidance)
 - [Development Best Practices](#development-best-practices)
 
 ---
@@ -246,8 +254,40 @@ User navigates to /reputation/[address]
   ΓåÆ ReputationPage (Server Component) passes address to ReputationClient
   ΓåÆ ReputationClient (Client Component) fetches:
       GET /reputation/:member ΓåÆ score + per-circle contributions + defaults
+      GET /indexer/state      ΓåÆ indexer freshness (lastLedger, updatedAt)
+  ΓåÆ Reads the reputation contract score directly via RPC (on-chain read)
   ΓåÆ Renders score card, participation table, defaults table
 ```
+
+The reputation page mixes two data sources, and the UI labels each one so a
+user can tell them apart:
+
+| Section | Source | Provenance label |
+|---|---|---|
+| Score | Reputation contract `score` view via Soroban RPC | On-chain read |
+| Participation / defaults history | Indexer REST API (derived from events) | Indexed projection |
+| Freshness | `GET /indexer/state` (`lastLedger`, `updatedAt`) | Indexer cursor |
+
+The indexer is a derived read-model. It is **not** the contract's authorization
+source: the reputation contract's allowlist and revocation list decide who may
+call `increment`, and the indexer only records the resulting events. The page
+must not imply otherwise.
+
+The page renders four distinct states rather than collapsing them into one
+empty view:
+
+| State | Meaning | Rendering |
+|---|---|---|
+| Verified zero | Contract read succeeded and returned `0` | Score shown as `0` with an "On-chain read" label |
+| Score unavailable | Contract read failed (RPC error/timeout) | Score replaced by "Score unavailable" with the RPC error; never shown as `0` |
+| Empty history | Indexer responded and has no records for this member | "No indexed activity yet" with the indexer freshness timestamp |
+| History unavailable | Indexer unreachable or returned an error | "History unavailable" with a retry hint; never shown as "no activity" |
+
+Freshness is displayed next to the history section as the indexer's
+`updatedAt` and `lastLedger`. When the cursor is behind the current chain
+ledger, the history is labelled as possibly stale rather than complete. These
+fields come from the existing `/indexer/state` response, so the page adds no
+extra unbounded RPC or database requests.
 
 ---
 
@@ -274,6 +314,96 @@ Run `npm run check:node` to validate the Node/npm pair. After Rust and the WASM
 target are installed, run `npm run check:toolchain` to validate the complete
 pinned build tuple before compiling contracts.
 
+### Supported Runtime Policy
+
+The supported runtimes are declared in package metadata and enforced by CI. A
+runtime is "supported" only if at least one CI job builds and tests it; the
+`engines` field must never claim a range that CI does not exercise.
+
+| Runtime | Declared support | CI coverage | Notes |
+|---|---|---|---|
+| Node.js 18.18+ / npm 9 | Minimum supported boundary | `node-18` matrix leg (sdk, indexer, app) | Lower boundary of `engines.node`; keep until EOL |
+| Node.js 22.x / npm 10 | Supported | `node-22` matrix leg (sdk, indexer, app) | Current LTS |
+| Node.js 24.x / npm 11 | Supported | `node-24` matrix leg (sdk, indexer, app) | Newest tested runtime |
+| Rust 1.81.0 | Pinned, single version | `contracts` job only | `contracts/rust-toolchain.toml` is authoritative |
+
+Node/npm pairs are validated by `npm run check:node`, which fails with the
+expected and actual versions when the pair is not one of the tuples above.
+
+**Package-specific exclusions from the Node matrix:**
+
+- `contracts/` is not part of the Node matrix. Contract artifacts must be
+  reproducible, so they are built only on the pinned Rust toolchain declared in
+  `contracts/rust-toolchain.toml`; duplicating the contracts job across Node
+  versions would add cost without coverage.
+- `scripts/` runs only on the primary Node leg. It is an operator tool that
+  deploys and seeds testnet, not a published package, so it is not part of the
+  support claim.
+- The `app` matrix leg runs `lint` and `tsc --noEmit` only; the full Next.js
+  production build runs once on the primary Node leg to keep CI time bounded.
+
+When a runtime reaches end of life, remove it from the matrix and narrow
+`engines` in the same change. Never widen `engines` without adding a matrix leg.
+
+### Rust Toolchain Policy
+
+`contracts/rust-toolchain.toml` is the single source of truth for the compiler
+version, the required targets, and the required components. CI does not select
+a Rust version independently: it installs the toolchain declared in that file
+and fails early if the active compiler differs.
+
+```toml
+# contracts/rust-toolchain.toml (abridged)
+[toolchain]
+channel = "1.81.0"
+targets = ["wasm32-unknown-unknown"]
+components = ["rustfmt", "clippy"]
+```
+
+`.cargo/config.toml` must not override the toolchain channel. If a local
+`rustup override` or a different default toolchain is active, `rustup` resolves
+the pin from `rust-toolchain.toml` whenever a cargo command runs inside
+`contracts/`.
+
+**Verification step.** Both CI and local setup run the same check before
+compiling:
+
+```bash
+npm run check:toolchain
+# Prints the active rustc/cargo versions, the pinned channel, and the
+# installed targets/components, then exits non-zero on any mismatch:
+#   expected rustc 1.81.0 (from contracts/rust-toolchain.toml)
+#   actual   rustc 1.83.0
+```
+
+The same version data is written into the contract artifact report so a WASM
+hash difference can be traced to a compiler difference rather than guessed at.
+
+### Local Setup from a Clean Environment
+
+The following sequence works from a machine with no Rust or Node toolchain
+installed and produces the same compiler and target as CI:
+
+```bash
+# 1. Install the pinned Rust toolchain, target, and components
+rustup toolchain install 1.81.0 --profile minimal \
+  --target wasm32-unknown-unknown --component rustfmt --component clippy
+
+# 2. Confirm the pin resolves inside contracts/ (rustup reads the file)
+cd contracts && rustup show active-toolchain
+# Expected: 1.81.0-<host> (overridden by 'contracts/rust-toolchain.toml')
+
+# 3. Verify the full build tuple before compiling anything
+cd .. && npm run check:toolchain
+
+# 4. Build the contracts on the pinned toolchain
+cd contracts && cargo build --target wasm32-unknown-unknown --release
+```
+
+If step 3 reports a mismatch, do not continue: fix the toolchain first. A
+mismatch that surfaces later appears as an opaque WASM artifact hash
+difference, not as a compiler error.
+
 ### Step-by-Step
 
 **1. Clone and install**
@@ -290,6 +420,74 @@ npm install
 docker compose up -d
 # Wait for the healthcheck: docker compose ps should show "healthy"
 ```
+
+The compose file defines a PostgreSQL readiness probe (`pg_isready`). A running
+container is not the same as a database ready to accept connections, so always
+wait for `healthy` before running migrations or starting the indexer:
+
+```bash
+# Block until the healthcheck reports healthy (or fail after the timeout)
+docker compose ps postgres
+docker compose exec -T postgres pg_isready -U postgres -d circleup
+# Expected: "postgres:5432 - accepting connections"
+```
+
+Startup order is **start → readiness → migrate → indexer**. Running
+`npm run migrate` against a container that is still initializing fails with a
+connection error; re-run it only after `pg_isready` reports accepting
+connections.
+
+**Local data persistence (named volume)**
+
+Local Postgres data lives in the named Docker volume `circleup_pgdata`
+(declared in `docker-compose.yml`). It contains the entire local database
+cluster: the `circleup` database, all indexer tables (`circles`,
+`circle_members`, `contributions`, `payouts`, `ingested_events`,
+`indexer_state`, `ledger_checkpoints`, `schema_migrations`), and the
+`circleup_restore` database if you ran a restore drill. It does **not** contain
+contract state, which lives on-chain.
+
+Because the volume is named, it survives container recreation:
+
+| Operation | Command | Data in `circleup_pgdata` |
+|---|---|---|
+| Restart the service | `docker compose restart postgres` | Preserved |
+| Stop the service | `docker compose stop postgres` | Preserved |
+| Recreate the container | `docker compose up -d --force-recreate postgres` | Preserved |
+| Rebuild the image | `docker compose up -d --build postgres` | Preserved |
+| **Reset local data** | see below | **Destroyed** |
+
+A restart is not a reset. If the indexer reports stale or inconsistent data,
+prefer `npm run replay` or the restore drill over deleting the volume.
+
+**Resetting local disposable data (irreversible)**
+
+Only do this when you intend to throw away the local database and start from a
+fresh schema. This deletes the named volume and everything in it — there is no
+undo, and it cannot be recovered from the container.
+
+```bash
+# 1. Stop the indexer and the database
+npm run stop:indexer   # or kill the indexer process
+docker compose stop postgres
+
+# 2. Remove ONLY the named local database volume
+docker volume rm circleup_pgdata
+
+# 3. Start fresh, wait for readiness, then migrate
+docker compose up -d postgres
+docker compose exec -T postgres pg_isready -U postgres -d circleup
+npm run migrate
+```
+
+Do not use `docker compose down -v`, `docker volume prune`, or
+`docker system prune --volumes` for this: those commands delete every volume
+on the host, including volumes belonging to other projects and any user data
+you did not intend to touch. Target the single named volume explicitly.
+
+After a reset, the indexer has no cursor and will re-ingest from
+`START_LEDGER`; set it to your deployment ledger to avoid scanning testnet
+genesis (see [Re-indexing from a Given Ledger](#re-indexing-from-a-given-ledger)).
 
 **3. Configure the indexer**
 
@@ -352,38 +550,114 @@ npm run dev
 
 ## Environment Variables Reference
 
+This section is the human-readable view of the environment-variable inventory. The
+machine-readable source of truth lives in `config/env-inventory.json`; the CI parity
+checker (`npm run check:env`) compares that inventory against the `.env.example`
+files, the runtime validators in each package, and the tables below. If a variable
+is renamed, gains a default, or becomes required in code, update the inventory and
+this section in the same change.
+
+### Inventory and CI Parity Check
+
+```bash
+npm run check:env
+# Exits 0 when inventory, examples, validators, and this runbook agree.
+# Exits non-zero and prints a name-only report for:
+#   - missing:      inventory entry with no matching .env.example or doc row
+#   - stale:        .env.example or doc row with no matching inventory entry
+#   - undocumented: process.env read or validator key absent from the inventory
+#   - drift:        requiredness or default differs between inventory and code
+```
+
+The checker reports variable **names** and the kind of mismatch only. It never
+prints configured values, so it is safe to run against a populated environment
+and in CI logs. Secret-bearing variables are listed by name and marked
+`secret` in the inventory; their values are never read by the checker.
+
+Each table row below follows a fixed column order so the checker can parse it:
+
+`| Variable | Package | Required | Default | Description |`
+
+- **Package** is the owning workspace: `indexer`, `app`, `sdk`, `scripts`, or `deploy`.
+- **Required** is `Yes`, `No`, or `Prod` (required only when `NODE_ENV=production`).
+- **Default** is the literal default, `—` when there is none, or `(empty)` when the
+  variable is defined but intentionally blank.
+
 ### Indexer (`indexer/.env`)
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DATABASE_URL` | Yes | ΓÇö | Postgres connection string, e.g. `postgresql://postgres:password@localhost:5432/circleup` |
-| `STELLAR_RPC_URL` | Yes | ΓÇö | Soroban RPC endpoint, e.g. `https://soroban-testnet.stellar.org` |
-| `CIRCLE_FACTORY_ADDRESS` | Yes | ΓÇö | Deployed factory contract ID (`C...`) |
-| `REPUTATION_ADDRESS` | Yes | ΓÇö | Deployed reputation contract ID (`C...`) |
-| `USDC_ADDRESS` | Yes | ΓÇö | USDC token contract ID (`C...`) |
-| `NETWORK_PASSPHRASE` | No | `Test SDF Network ; September 2015` | Stellar network passphrase |
-| `PORT` | No | `3001` | API server port |
-| `START_LEDGER` | No | `0` | Ledger to start indexing from. Set to your deployment ledger to skip testnet genesis |
-| `POLL_INTERVAL_MS` | No | `5000` | How often to poll the RPC for new events (milliseconds) |
-| `EVENTS_LIMIT` | No | `100` | Max events per `getEvents()` call. Soroban RPC caps at 10 000 |
-| `ALLOWED_ORIGINS` | No | *(all origins)* | Comma-separated CORS allow-list, e.g. `https://app.circleup.xyz`. Leave blank for local dev. Required in production |
-| `RATE_LIMIT_WINDOW_MS` | No | `60000` | Rate-limit window in milliseconds |
-| `RATE_LIMIT_MAX` | No | `100` | Max requests per IP per window |
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `DATABASE_URL` | `indexer` | Yes | — | Postgres connection string, e.g. `postgresql://postgres:password@localhost:5432/circleup`. Secret. |
+| `STELLAR_RPC_URL` | `indexer` | Yes | — | Soroban RPC endpoint, e.g. `https://soroban-testnet.stellar.org` |
+| `CIRCLE_FACTORY_ADDRESS` | `indexer` | Yes | — | Deployed factory contract ID (`C...`) |
+| `REPUTATION_ADDRESS` | `indexer` | Yes | — | Deployed reputation contract ID (`C...`) |
+| `USDC_ADDRESS` | `indexer` | Yes | — | USDC token contract ID (`C...`) |
+| `NETWORK_PASSPHRASE` | `indexer` | No | `Test SDF Network ; September 2015` | Stellar network passphrase |
+| `PORT` | `indexer` | No | `3001` | API server port |
+| `START_LEDGER` | `indexer` | No | `0` | Ledger to start indexing from. Set to your deployment ledger to skip testnet genesis |
+| `POLL_INTERVAL_MS` | `indexer` | No | `5000` | How often to poll the RPC for new events (milliseconds) |
+| `EVENTS_LIMIT` | `indexer` | No | `100` | Max events per `getEvents()` call. Soroban RPC caps at 10 000 |
+| `ALLOWED_ORIGINS` | `indexer` | No | `(empty)` | Comma-separated CORS allow-list, e.g. `https://app.circleup.xyz`. Leave blank for local dev. Required in production |
+| `RATE_LIMIT_WINDOW_MS` | `indexer` | No | `60000` | Rate-limit window in milliseconds |
+| `RATE_LIMIT_MAX` | `indexer` | No | `100` | Max requests per IP per window |
 
 All required variables are validated at boot time. The indexer will exit with a clear error message listing every missing key if any are absent or blank.
 
 ### App (`app/.env.local`)
 
-| Variable | Required in production | Default | Description |
-|---|---|---|---|
-| `NEXT_PUBLIC_STELLAR_RPC_URL` | Yes | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
-| `NEXT_PUBLIC_NETWORK_PASSPHRASE` | Yes | `Test SDF Network ; September 2015` | Network passphrase |
-| `NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS` | Yes (prod) | *(empty)* | Factory contract ID |
-| `NEXT_PUBLIC_REPUTATION_ADDRESS` | Yes (prod) | *(empty)* | Reputation contract ID |
-| `NEXT_PUBLIC_USDC_ADDRESS` | Yes (prod) | *(empty)* | USDC token contract ID |
-| `NEXT_PUBLIC_INDEXER_URL` | Yes | `http://localhost:3001` | Indexer base URL |
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `NEXT_PUBLIC_STELLAR_RPC_URL` | `app` | No | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
+| `NEXT_PUBLIC_NETWORK_PASSPHRASE` | `app` | No | `Test SDF Network ; September 2015` | Network passphrase |
+| `NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS` | `app` | Prod | `(empty)` | Factory contract ID |
+| `NEXT_PUBLIC_REPUTATION_ADDRESS` | `app` | Prod | `(empty)` | Reputation contract ID |
+| `NEXT_PUBLIC_USDC_ADDRESS` | `app` | Prod | `(empty)` | USDC token contract ID |
+| `NEXT_PUBLIC_INDEXER_URL` | `app` | No | `http://localhost:3001` | Indexer base URL |
 
 In development, the contract address variables may be left blank ΓÇö the app will start but contract interactions will fail gracefully. In production (`NODE_ENV=production`) they are required and the server will throw at boot time if they are missing.
+
+### SDK (`sdk/`)
+
+The SDK does not read `process.env` directly. `getNetworkConfig` accepts an explicit
+network name and resolves RPC URL and passphrase from the built-in network table.
+The variables below are read only by the SDK's test harness and are not part of any
+deployed runtime.
+
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `SDK_TEST_RPC_URL` | `sdk` | No | `https://soroban-testnet.stellar.org` | RPC endpoint used by SDK integration tests |
+| `SDK_TEST_NETWORK_PASSPHRASE` | `sdk` | No | `Test SDF Network ; September 2015` | Passphrase used by SDK integration tests |
+
+### Scripts (`scripts/.env`)
+
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `NETWORK` | `scripts` | Yes | — | Target network name (`testnet` or `mainnet`) |
+| `NETWORK_PASSPHRASE` | `scripts` | Yes | — | Passphrase for the target network |
+| `RPC_URL` | `scripts` | Yes | — | Soroban RPC endpoint used for deployment |
+| `DEPLOYER_IDENTITY` | `scripts` | Yes | `deployer` | stellar-cli identity name. The private key stays in the CLI keystore, never in `.env` |
+| `STELLAR_SECRET_KEY` | `scripts` | No | `(empty)` | CI-only injection path. Secret. Never commit or echo |
+| `HORIZON_URL` | `scripts` | No | `https://horizon-testnet.stellar.org` | Horizon endpoint used for funding checks |
+
+The deploy script validates `NETWORK`, `NETWORK_PASSPHRASE`, and `RPC_URL` before any write transaction. Run `npm run validate-env --workspace=scripts` to check the profile independently.
+
+### Deployment Profiles (`deploy/profiles/`)
+
+Profile files are JSON, not `.env` files. The inventory records the same
+requiredness and default metadata so the parity checker can compare them with the
+runtime validators that consume them.
+
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `PROFILE` | `deploy` | Yes | — | Profile name (`development`, `staging`, `production`) |
+| `RPC_URL` | `deploy` | Yes | — | RPC endpoint for the profile. Must be HTTPS and non-testnet for `production` |
+| `NETWORK_PASSPHRASE` | `deploy` | Yes | — | Passphrase for the profile network |
+| `HORIZON_URL` | `deploy` | Yes | — | Horizon endpoint used by the mainnet readiness gate |
+| `CIRCLE_FACTORY_ADDRESS` | `deploy` | Yes | — | Factory contract ID for the profile |
+| `REPUTATION_ADDRESS` | `deploy` | Yes | — | Reputation contract ID for the profile |
+| `USDC_ADDRESS` | `deploy` | Yes | — | USDC token contract ID for the profile |
+| `ADMIN_PUBLIC_KEY` | `deploy` | Yes | — | Public key of the deployment admin. Public value only; never a secret |
+| `DEPLOYMENT_MANIFEST` | `deploy` | No | `scripts/deployed-manifest.json` | Path to the deployment manifest checked by the readiness gate |
 
 ---
 
@@ -515,6 +789,14 @@ npm run migrate:check    # verify schema is clean before restarting
 ## Database Operations
 
 ### Running Migrations
+
+Migrations require a ready database. Verify readiness first (see
+[Step-by-Step](#step-by-step)):
+
+```bash
+docker compose exec -T postgres pg_isready -U postgres -d circleup
+# Expected: "postgres:5432 - accepting connections"
+```
 
 ```bash
 # Development (uses ts-node, does not require a build)
@@ -1018,17 +1300,28 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 
 ### Reputation page shows no data
 
-**Symptom:** `/reputation/[address]` shows "No reputation record found."
+**Symptom:** `/reputation/[address]` shows "No indexed activity yet", "History unavailable", or "Score unavailable".
 
-**Cause:** This is not an error. It means the address has no `reputation/score_updated` events in the indexer database. The member has not yet completed a full payout round in any circle.
+**Diagnosis:** These are three different states and must not be treated as one.
 
-**If reputation should exist:**
-1. Check `REPUTATION_ADDRESS` in `indexer/.env` matches the deployed contract.
-2. Check the `reputation` table in Postgres directly:
+| Message | Meaning | Action |
+|---|---|---|
+| Score shown as `0` with "On-chain read" | Verified zero: the contract read succeeded | None ΓÇö the member has no completed rounds |
+| "Score unavailable" | The reputation contract read failed (RPC error or timeout) | Check `NEXT_PUBLIC_STELLAR_RPC_URL` and RPC reachability; retry |
+| "No indexed activity yet" | The indexer responded and has no `reputation/score_updated` events for this member | Expected for a new member; check freshness below |
+| "History unavailable" | The indexer could not be reached or returned an error | Check `curl http://localhost:3001/health` and `NEXT_PUBLIC_INDEXER_URL` |
+
+**If history should exist:**
+1. Check the freshness label on the page ΓÇö compare `lastLedger` with the current chain ledger. A lagging cursor means the history is delayed, not absent.
+2. Check `REPUTATION_ADDRESS` in `indexer/.env` matches the deployed contract.
+3. Check the `reputation` table in Postgres directly:
    ```sql
    SELECT * FROM reputation WHERE member_address = '<address>';
    ```
-3. If the row is missing but you know a payout occurred, replay from the payout ledger.
+4. If the row is missing but you know a payout occurred, replay from the payout ledger.
+
+The indexer is a derived read-model and is not the contract's authorization
+source; a missing indexer row never means the on-chain score is wrong.
 
 ---
 
@@ -1054,6 +1347,26 @@ GROUP BY c.address, c.current_round, c.total_rounds;
 | `round contribution` | Member's balance dropped below `round_amount` since joining | Same as above |
 | `round payout` | Circle contract's USDC balance is insufficient (should not happen normally) | Check for missing contributions ΓÇö call `get_current_round` to verify `contributions_received` |
 | `collateral release` | Token frozen, deauthorized, or missing trustline | Check the member's USDC trustline on stellar.expert |
+
+---
+
+### Indexer fails to connect to Postgres on startup
+
+**Symptom:** The indexer or `npm run migrate` exits with a connection error
+(`ECONNREFUSED`, `the database system is starting up`, or
+`database "circleup" does not exist`).
+
+**Cause:** The Postgres container is running but not yet ready, or the named
+volume was removed and the database has not been re-initialized.
+
+**Resolution:**
+1. Check container health: `docker compose ps postgres` — wait for `healthy`.
+2. Probe readiness directly:
+   `docker compose exec -T postgres pg_isready -U postgres -d circleup`.
+3. Only once it reports accepting connections, run `npm run migrate` and then
+   start the indexer.
+4. If the volume was intentionally reset, the database is recreated empty on
+   the next `docker compose up -d postgres`; migrations must be re-applied.
 
 ---
 
@@ -1589,8 +1902,19 @@ Any future change to a guard listed in either test file requires updating the co
 - Integration tests gated on `DATABASE_URL` are skipped automatically in CI environments without Postgres ΓÇö run them locally before landing schema changes.
 - When modifying a financial guard in `contracts/circle/src/lib.rs` or `app/src/lib/gating.ts`, update the corresponding mutation guard test in `mutation_guards.rs` or `gating.mutation.test.ts`. If the guard is intentionally excluded from mutation testing, add a rationale to the [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations) table.
 
+**Documentation checks**
+- CI validates repository-relative Markdown links and referenced npm scripts/workspace paths. Broken local links and unknown commands fail with the source file and line.
+- External links are not fetched in CI, so builds never depend on network availability. External URLs are only checked by the optional, manually triggered link job.
+- Anchors, fenced code blocks, inline code spans, and generated links are handled by the checker's fixtures so they do not produce false positives.
+- To suppress a valid nonstandard reference, add a comment on the line above it:
+  ```markdown
+  <!-- docs-check-ignore: path is generated at deploy time -->
+  [deployment manifest](./generated/deployed-manifest.json)
+  ```
+  Suppressions must state a reason. Blanket file-level suppression is not supported.
+
 **Branching and commits**
 - Follow [Conventional Commits](https://www.conventionalcommits.org/): `feat(scope): description`, `fix(scope): description`, etc.
 - One feature or fix per PR. Keep PRs focused to make review tractable.
 - Update `CHANGELOG.md` under `[Unreleased]` with every user-visible change.
-- CI runs on every PR: TypeScript build (`tsc --noEmit`), Rust WASM compile (`cargo build --target wasm32-unknown-unknown`), and ESLint. All checks must pass before merging.
+- CI runs on every PR: TypeScript build (`tsc --noEmit`), Rust WASM compile (`cargo build --target wasm32-unknown-unknown`) on the pinned toolchain, ESLint, the Node runtime matrix, and the documentation link/command check. All checks must pass before merging.

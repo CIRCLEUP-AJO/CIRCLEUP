@@ -340,6 +340,165 @@ export function isValidNetwork(value: string): value is NetworkName {
   return value === "testnet" || value === "mainnet";
 }
 
+// ─── Network identity (issue #903) ────────────────────────────────────────────
+//
+// A client's network identity is the pair (network name, passphrase). The
+// passphrase is what a signature commits to, so it is the only thing that
+// decides which network a transaction belongs to; the RPC URL is merely where
+// requests are sent.
+//
+// Validation rule:
+//
+// | `network`               | `networkPassphrase` must be             | Notes |
+// |-------------------------|-----------------------------------------|-------|
+// | omitted                 | a preset passphrase (testnet / mainnet) | Name is resolved from the passphrase — never from the URL. |
+// | `"testnet"`/`"mainnet"` | exactly that preset's passphrase        | A mismatch is rejected. |
+// | `"custom"`              | a non-empty, non-preset passphrase      | Custom networks need the URL and passphrase supplied together. |
+//
+// In every case `rpcUrl` is required. An RPC URL that exactly matches a
+// *different* preset's public endpoint is rejected as inconsistent, but a URL
+// is never accepted as proof of identity on its own: an unknown URL is allowed
+// for any network, and identity still comes from the passphrase.
+//
+// Explorer links are only produced for preset networks; a custom network has
+// `explorerNetwork: null`, so `getExplorerLink` callers render plain text.
+
+/** Network name accepted in `CircleUpConfig.network`. `"custom"` opts into a non-preset passphrase. */
+export type ConfiguredNetworkName = NetworkName | "custom";
+
+/** The validated, read-only network identity a client is bound to. */
+export interface NetworkIdentity {
+  /** Preset name, or `"custom"` for an explicitly configured network. */
+  readonly network: ConfiguredNetworkName;
+  /** Passphrase every transaction built by the client commits to. */
+  readonly passphrase: string;
+  /** RPC endpoint requests are sent to. Not part of the identity proof. */
+  readonly rpcUrl: string;
+  /** `true` when `network` is one of the named presets. */
+  readonly preset: boolean;
+  /** Network to pass to {@link getExplorerLink}; `null` for custom networks (no public explorer). */
+  readonly explorerNetwork: NetworkName | null;
+}
+
+/** The subset of `CircleUpConfig` that determines network identity. */
+export interface NetworkIdentityInput {
+  network?: unknown;
+  networkPassphrase?: unknown;
+  rpcUrl?: unknown;
+}
+
+function presetForPassphrase(passphrase: string): NetworkName | undefined {
+  return (Object.keys(NETWORK_CONFIGS) as NetworkName[]).find(
+    (name) => NETWORK_CONFIGS[name].passphrase === passphrase,
+  );
+}
+
+function presetForRpcUrl(rpcUrl: string): NetworkName | undefined {
+  const normalised = rpcUrl.trim().replace(/\/+$/, "").toLowerCase();
+  return (Object.keys(NETWORK_CONFIGS) as NetworkName[]).find(
+    (name) => NETWORK_CONFIGS[name].rpcUrl.toLowerCase() === normalised,
+  );
+}
+
+/**
+ * Check a network name / passphrase / RPC URL combination against the rule
+ * above and return every problem found (empty when consistent). Does not
+ * check URL syntax — `validateCircleUpConfig` does that.
+ */
+export function networkIdentityErrors(input: NetworkIdentityInput): string[] {
+  const errors: string[] = [];
+  const { network, networkPassphrase, rpcUrl } = input;
+
+  if (network !== undefined && network !== "testnet" && network !== "mainnet" && network !== "custom") {
+    errors.push(
+      `config.network ${JSON.stringify(network)} is not supported. Use "testnet", "mainnet", or "custom".`,
+    );
+    return errors;
+  }
+  if (typeof networkPassphrase !== "string" || networkPassphrase.trim() === "") {
+    // Reported by validateCircleUpConfig with its own message.
+    return errors;
+  }
+
+  const passphrasePreset = presetForPassphrase(networkPassphrase);
+  if (network === "custom") {
+    if (passphrasePreset) {
+      errors.push(
+        `config.network is "custom" but config.networkPassphrase is the ${passphrasePreset} passphrase. ` +
+          `Use network: "${passphrasePreset}" for the preset network.`,
+      );
+    }
+    if (typeof rpcUrl !== "string" || rpcUrl.trim() === "") {
+      errors.push('config.network "custom" requires config.rpcUrl and config.networkPassphrase to be supplied together.');
+    }
+  } else if (network === "testnet" || network === "mainnet") {
+    if (networkPassphrase !== NETWORK_CONFIGS[network].passphrase) {
+      errors.push(
+        `config.networkPassphrase does not match config.network "${network}". ` +
+          `Expected ${JSON.stringify(NETWORK_CONFIGS[network].passphrase)}.`,
+      );
+    }
+  } else if (!passphrasePreset) {
+    errors.push(
+      `config.networkPassphrase ${JSON.stringify(networkPassphrase)} is not recognised. ` +
+        `Expected one of: ${(Object.keys(NETWORK_CONFIGS) as NetworkName[])
+          .map((n) => JSON.stringify(NETWORK_CONFIGS[n].passphrase))
+          .join(", ")}, or set config.network to "custom" for a custom network.`,
+    );
+  }
+
+  // A preset's public endpoint paired with another network's passphrase would
+  // build for one network and send to another.
+  const resolved = network === "custom" ? undefined : (network as NetworkName | undefined) ?? passphrasePreset;
+  const urlPreset = typeof rpcUrl === "string" ? presetForRpcUrl(rpcUrl) : undefined;
+  if (urlPreset && (network === "custom" || (resolved !== undefined && urlPreset !== resolved))) {
+    errors.push(
+      `config.rpcUrl is the public ${urlPreset} endpoint but the configured network is ` +
+        `${network === "custom" ? "custom" : resolved}. Use a matching RPC URL and passphrase.`,
+    );
+  }
+  return errors;
+}
+
+/**
+ * Resolve and validate a client's network identity.
+ *
+ * Identity always comes from the explicit `network` name and the passphrase,
+ * never from the RPC URL. The result is frozen.
+ *
+ * @throws `Error` listing every inconsistency (see the rule table above).
+ *
+ * @example
+ * resolveNetworkIdentity({ rpcUrl: TESTNET_RPC_URL, networkPassphrase: TESTNET_PASSPHRASE });
+ *   // → { network: "testnet", preset: true, explorerNetwork: "testnet", … }
+ * resolveNetworkIdentity({ network: "custom", rpcUrl: "http://localhost:8000/rpc",
+ *   networkPassphrase: "Standalone Network ; February 2017" });
+ *   // → { network: "custom", preset: false, explorerNetwork: null, … }
+ */
+export function resolveNetworkIdentity(input: NetworkIdentityInput): NetworkIdentity {
+  const errors = networkIdentityErrors(input);
+  if (typeof input.networkPassphrase !== "string" || input.networkPassphrase.trim() === "") {
+    errors.push("config.networkPassphrase is required.");
+  }
+  if (typeof input.rpcUrl !== "string" || input.rpcUrl.trim() === "") {
+    if (!errors.some((e) => e.includes("config.rpcUrl"))) errors.push("config.rpcUrl is required.");
+  }
+  if (errors.length > 0) {
+    throw new Error(`Inconsistent network configuration:\n${errors.map((e) => `  • ${e}`).join("\n")}`);
+  }
+  const passphrase = input.networkPassphrase as string;
+  const network: ConfiguredNetworkName =
+    input.network === "custom" ? "custom" : ((input.network as NetworkName | undefined) ?? presetForPassphrase(passphrase)!);
+  const preset = network !== "custom";
+  return Object.freeze({
+    network,
+    passphrase,
+    rpcUrl: input.rpcUrl as string,
+    preset,
+    explorerNetwork: preset ? network : null,
+  });
+}
+
 // ─── Block explorer links ─────────────────────────────────────────────────────
 
 /** Host prefix shared by every Stellar Expert explorer URL. */

@@ -40,6 +40,44 @@ describe("published v1 HTTP contract", () => {
       expect(createHash("sha256").update(normalized).digest("hex"), file).toBe(digest);
     }
   });
+  it("documents a deprecation status for every published route", () => {
+    const policy = doc["x-deprecation-policy"];
+    expect(policy, "x-deprecation-policy").toBeTruthy();
+    expect(policy.warningWindowDays).toBeGreaterThan(0);
+    expect(policy.sunsetHeader).toBe("Sunset");
+    expect(policy.deprecationHeader).toBe("Deprecation");
+    for (const [path, item] of Object.entries<any>(doc.paths)) {
+      for (const [method, op] of Object.entries<any>(item)) {
+        expect(["active", "deprecated"], `${method.toUpperCase()} ${path}`).toContain(op["x-deprecation-status"]);
+        if (op["x-deprecation-status"] === "deprecated") {
+          expect(op.deprecated, `${method.toUpperCase()} ${path} deprecated`).toBe(true);
+          expect(Number.isFinite(Date.parse(op["x-sunset"])), `${method.toUpperCase()} ${path} x-sunset`).toBe(true);
+        }
+      }
+    }
+  });
+  it("marks deprecated fields with deprecated: true and an x-sunset date", () => {
+    const walk = (schema: any, where: string) => {
+      if (!schema || typeof schema !== "object") return;
+      if (schema.deprecated === true) expect(Number.isFinite(Date.parse(schema["x-sunset"])), where).toBe(true);
+      if (schema["x-sunset"] !== undefined) expect(schema.deprecated, where).toBe(true);
+      for (const [k, v] of Object.entries<any>(schema.properties || {})) walk(v, `${where}.${k}`);
+      if (schema.items) walk(schema.items, `${where}[]`);
+      for (const key of ["anyOf", "oneOf", "allOf"]) (schema[key] || []).forEach((s: any, i: number) => walk(s, `${where}.${key}[${i}]`));
+    };
+    for (const [name, schema] of Object.entries<any>(doc.components.schemas)) walk(schema, name);
+  });
+  it("fails source-hash review when a wire source changes without a deprecation entry", () => {
+    const changed = Object.keys(doc["x-source-sha256"])[0];
+    const normalized = readFileSync(resolve(root, changed), "utf8").replace(/\r\n/g, "\n");
+    const drifted = { ...doc, "x-source-sha256": { ...doc["x-source-sha256"], [changed]: createHash("sha256").update(normalized + "\n").digest("hex") } };
+    const review = (d: any) => Object.entries(d["x-source-sha256"]).every(([file, digest]) =>
+      createHash("sha256").update(readFileSync(resolve(root, file), "utf8").replace(/\r\n/g, "\n")).digest("hex") === digest);
+    expect(review(doc)).toBe(true);
+    expect(review(drifted)).toBe(false);
+    const hasDeprecationEntry = Object.values<any>(doc.paths).some(item => Object.values<any>(item).some(op => op["x-deprecation-status"] === "deprecated"));
+    expect(review(drifted) || hasDeprecationEntry).toBe(false);
+  });
   it("accepts representative published SDK endpoint fixtures", () => {
     const cases: Record<string, unknown> = {
       circlesList: fixtures.CIRCLES_LIST_FIXTURE, circleDetail: fixtures.CIRCLE_DETAIL_FIXTURE,
