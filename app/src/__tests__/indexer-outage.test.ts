@@ -80,6 +80,66 @@ describe("fetchCircleData — indexer outage detection", () => {
   });
 });
 
+// ─── Service outage outcome mapping ──────────────────────────────────────────
+//
+// The route-level outcome for an indexer 503 must be "service_outage" — a
+// distinct category from "contract_read_failure" (RPC/contract read errors)
+// and "not_found" (unknown entity). These tests pin that mapping so the
+// outage recovery path cannot silently regress into a generic error page.
+
+describe("route outcome mapping — indexer 503 is a service outage", () => {
+  it("maps a 503 indexer response to 'service_outage'", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    const outcome = classifyRouteOutcome({ kind: "http", status: 503 });
+    expect(outcome).toBe("service_outage");
+  });
+
+  it("does not collapse a 503 into 'not_found' or 'contract_read_failure'", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    const outcome = classifyRouteOutcome({ kind: "http", status: 503 });
+    expect(outcome).not.toBe("not_found");
+    expect(outcome).not.toBe("contract_read_failure");
+  });
+
+  it("keeps 404 as 'not_found' and contract read errors as 'contract_read_failure'", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    expect(classifyRouteOutcome({ kind: "http", status: 404 })).toBe("not_found");
+    expect(classifyRouteOutcome({ kind: "contract_read" })).toBe("contract_read_failure");
+  });
+
+  it("maps an unreachable indexer to 'service_outage' as well", async () => {
+    const { classifyRouteOutcome } = await import("../lib/routeOutcome");
+    expect(classifyRouteOutcome({ kind: "network" })).toBe("service_outage");
+  });
+
+  it("assigns HTTP 503 to the service outage outcome", async () => {
+    const { httpStatusForOutcome } = await import("../lib/routeOutcome");
+    expect(httpStatusForOutcome("service_outage")).toBe(503);
+    expect(httpStatusForOutcome("not_found")).toBe(404);
+    expect(httpStatusForOutcome("invalid_address")).toBe(400);
+  });
+});
+
+describe("outage recovery path rendering", () => {
+  it("renders the outage recovery guidance for the service_outage outcome", async () => {
+    const { renderRouteOutcome } = await import("../lib/routeOutcome");
+    const html = renderRouteOutcome("service_outage");
+    expect(html).toContain("temporarily unavailable");
+    expect(html).toContain("Retry");
+    // Must not render the not-found copy for an outage.
+    expect(html).not.toContain("not found");
+  });
+
+  it("renders distinct copy for not_found and contract_read_failure", async () => {
+    const { renderRouteOutcome } = await import("../lib/routeOutcome");
+    const notFound = renderRouteOutcome("not_found");
+    const readFailure = renderRouteOutcome("contract_read_failure");
+    expect(notFound).not.toBe(readFailure);
+    expect(notFound).toContain("not found");
+    expect(readFailure).toContain("could not be read");
+  });
+});
+
 // ─── Error message map completeness ──────────────────────────────────────────
 //
 // Verifies that every error kind that can be surfaced has a corresponding

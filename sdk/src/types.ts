@@ -939,6 +939,14 @@ export interface ApiCircleDetailResponse {
   latestLedger: number | null;
 }
 
+/**
+ * Legacy alias for {@link ApiCircleDetailResponse}.
+ *
+ * @deprecated since 0.2.0 — use {@link ApiCircleDetailResponse} instead.
+ * Will be removed in 0.4.0.
+ */
+export type CircleDetailResponse = ApiCircleDetailResponse;
+
 /** Response body for GET /circles/:address/members */
 export interface ApiMembersResponse {
   totals?: { memberCount: number; totalCollateral: string; totalContributions: number };
@@ -1349,7 +1357,8 @@ export interface AuditEvent {
   /**
    * Address that triggered the transition.
    * - For `"cancelled"`: the member who called `cancel()`.
-   * - For `"closed"`: the member who called `close()`.
+   * - For `"closed"`: the member or admin who called `close()`. Close is
+   *   global — this one call settled every member's collateral.
    * `null` if the event payload did not include a caller field.
    */
   triggered_by: string | null;
@@ -1372,8 +1381,12 @@ export interface AuditEvent {
    */
   total_released: string | null;
   /**
-   * What total_released would have been with zero penalties (string).
-   * Used to compute forfeited collateral: `total_expected - total_released`.
+   * `round_amount × COLLATERAL_MULTIPLIER × member_count` (string) — counts
+   * every configured member, whether or not they joined.
+   * For a circle closed from **Completed**, `total_expected - total_released`
+   * is the collateral forfeited to penalties. For a circle closed from
+   * **Cancelled** it also includes deposits that were never made by members
+   * who did not join, so it is not a forfeiture figure there.
    * `null` for `"cancelled"` rows and when the event payload omitted the field.
    */
   total_expected_collateral: string | null;

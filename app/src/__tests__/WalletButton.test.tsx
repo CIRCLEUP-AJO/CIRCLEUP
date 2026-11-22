@@ -797,6 +797,71 @@ describe("WalletButton — error render per-reason guidance", () => {
   });
 });
 
+// ─── CSP enforcement — wallet flow compatibility ─────────────────────────────
+//
+// The enforced Content Security Policy (see docs/SECURITY_HEADERS.md) must not
+// break the Freighter wallet flow. These tests pin the resources the wallet
+// prompt and the app shell depend on so a relaxed directive can't silently
+// regress wallet interaction. The policy is read from the same source the
+// Next.js header configuration uses, so tests fail if the enforced policy
+// drifts away from the reviewed allowlist.
+
+describe("WalletButton — Freighter flow under enforced CSP", () => {
+  it("wallet prompt resources are covered by the enforced connect-src allowlist", async () => {
+    const { ENFORCED_CSP } = await import("@/lib/csp");
+    const connectSrc = ENFORCED_CSP["connect-src"] ?? [];
+    // Freighter talks to the Stellar RPC and Horizon endpoints; both must be
+    // explicitly listed (no bare wildcard) for the wallet prompt to succeed.
+    expect(connectSrc).toEqual(
+      expect.arrayContaining([
+        "https://soroban-testnet.stellar.org",
+        "https://horizon-testnet.stellar.org",
+      ]),
+    );
+    expect(connectSrc).not.toContain("*");
+    expect(connectSrc).not.toContain("https:");
+  });
+
+  it("required app assets are allowed by the enforced script-src/style-src directives", async () => {
+    const { ENFORCED_CSP } = await import("@/lib/csp");
+    // Next.js requires 'self' for its bundled chunks; inline styles are needed
+    // for the wallet prompt overlay. Neither may fall back to a wildcard.
+    expect(ENFORCED_CSP["script-src"]).toContain("'self'");
+    expect(ENFORCED_CSP["style-src"]).toContain("'self'");
+    expect(ENFORCED_CSP["script-src"]).not.toContain("*");
+    expect(ENFORCED_CSP["style-src"]).not.toContain("*");
+  });
+
+  it("connects successfully while the enforced CSP is active", async () => {
+    const addr = "G" + "H".repeat(55);
+    mockStellar.isFreighterInstalled.mockReturnValue(true);
+    mockStellar.getWalletAddress.mockResolvedValue(null);
+    mockStellar.connectWallet.mockResolvedValue(addr);
+
+    render(<WalletButton />);
+    const btn = await screen.findByRole("button", { name: /connect freighter/i });
+    await click(btn);
+
+    await waitFor(() =>
+      expect(screen.getByText("GHHH…HHHH")).toBeInTheDocument(),
+    );
+  });
+
+  it("report-only violations are grouped by directive without leaking wallet data", async () => {
+    const { groupCspViolations } = await import("@/lib/csp");
+    const grouped = groupCspViolations([
+      {
+        "violated-directive": "connect-src",
+        "blocked-uri": "https://soroban-testnet.stellar.org",
+        // A wallet address must never be forwarded in report data.
+        "document-uri": "https://app.example/wallet?address=GABC123",
+      },
+    ]);
+    expect(grouped["connect-src"]).toBeDefined();
+    expect(JSON.stringify(grouped)).not.toContain("GABC123");
+  });
+});
+
 // ─── Checking state ───────────────────────────────────────────────────────────
 //
 // On mount the component sets status:"checking" while getWalletAddress() is

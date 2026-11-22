@@ -50,6 +50,16 @@ const WASM_DIR      = path.join(CONTRACTS, 'target', 'wasm32-unknown-unknown', '
 const HASHES_FILE   = path.join(CONTRACTS, 'expected-hashes.json');
 const PROVENANCE_FILE = path.join(CONTRACTS, 'provenance.json');
 const TOOLCHAIN_FILE = path.join(CONTRACTS, 'rust-toolchain.toml');
+const CARGO_TOML    = path.join(CONTRACTS, 'Cargo.toml');
+
+/** Build flags used for every reproducible WASM artifact build. */
+export const BUILD_TARGET = 'wasm32-unknown-unknown';
+export const BUILD_PROFILE = 'release';
+export const BUILD_FLAGS = [
+  '--release',
+  '--target wasm32-unknown-unknown',
+  '--locked',
+] as const;
 
 export const WASM_NAMES = ['reputation.wasm', 'circle_factory.wasm', 'circle.wasm'] as const;
 export type WasmName = typeof WASM_NAMES[number];
@@ -63,6 +73,12 @@ export interface ExpectedHashes {
   toolchain: string;
   target: string;
   profile: string;
+  /** Exact compiler version the hashes were generated with (e.g. "rustc 1.81.0 ..."). */
+  rustc?: string;
+  /** Soroban SDK version resolved from contracts/Cargo.toml. */
+  sdk?: string;
+  /** Build flags used to produce the artifacts. */
+  buildFlags?: string[];
   artifacts: Record<WasmName, string>;
 }
 
@@ -87,6 +103,8 @@ export interface ProvenanceMetadata {
     cargo: string;
     target: string;
     profile: string;
+    sdk: string;
+    buildFlags: string[];
   };
   artifacts: Record<WasmName, ArtifactProvenance>;
 }
@@ -113,6 +131,20 @@ export function readPinnedToolchain(): string {
   const content = fs.readFileSync(TOOLCHAIN_FILE, 'utf8');
   const match = content.match(/channel\s*=\s*"([^"]+)"/);
   return match ? match[1] : 'unknown (channel not found)';
+}
+
+/** Read the Soroban SDK version declared in contracts/Cargo.toml. */
+export function readSdkVersion(): string {
+  if (!fs.existsSync(CARGO_TOML)) {
+    return 'unknown (contracts/Cargo.toml not found)';
+  }
+  const content = fs.readFileSync(CARGO_TOML, 'utf8');
+  // Match `soroban-sdk = "..."`, `soroban-sdk = { version = "..." }`, etc.
+  const match = content.match(/soroban-sdk\s*=\s*(?:\{[^}]*version\s*=\s*"([^"]+)"|"([^"]+)")/);
+  if (!match) {
+    return 'unknown (soroban-sdk not found)';
+  }
+  return match[1] ?? match[2] ?? 'unknown';
 }
 
 /** Run a shell command safely, returning trimmed stdout or fallback on error. */
@@ -164,7 +196,7 @@ function run(cmd: string, label: string): string {
 
 export function buildContracts(): void {
   run(
-    `cargo build --release --target wasm32-unknown-unknown --manifest-path ${CONTRACTS}/Cargo.toml`,
+    `cargo build ${BUILD_FLAGS.join(' ')} --manifest-path ${CONTRACTS}/Cargo.toml`,
     'Building all contracts',
   );
 }
@@ -208,8 +240,10 @@ export function generateProvenance(): ProvenanceMetadata {
       active: activeToolchain(),
       rustc: rustcVersion(),
       cargo: cargoVersion(),
-      target: 'wasm32-unknown-unknown',
-      profile: 'release',
+      target: BUILD_TARGET,
+      profile: BUILD_PROFILE,
+      sdk: readSdkVersion(),
+      buildFlags: [...BUILD_FLAGS],
     },
     artifacts,
   };
@@ -243,8 +277,11 @@ export function updateHashes(): void {
     _comment2: 'Regenerate with: npm run hash-artifacts --workspace=scripts',
     _comment3: 'Commit this file together with contracts/rust-toolchain.toml whenever contracts change.',
     toolchain: pinned,
-    target:    'wasm32-unknown-unknown',
-    profile:   'release',
+    target:    BUILD_TARGET,
+    profile:   BUILD_PROFILE,
+    rustc:     rustcVersion(),
+    sdk:       readSdkVersion(),
+    buildFlags: [...BUILD_FLAGS],
     artifacts: hashes,
   };
 
@@ -277,6 +314,10 @@ export function writeProvenance(outputPath?: string): void {
   console.log(`  Git commit       : ${provenance.git.commit} (${provenance.git.branch}${provenance.git.isDirty ? ' [dirty]' : ''})`);
   console.log(`  Rust toolchain   : ${provenance.toolchain.pinned} (active: ${provenance.toolchain.active})`);
   console.log(`  Compiler version : ${provenance.toolchain.rustc}`);
+  console.log(`  Cargo version    : ${provenance.toolchain.cargo}`);
+  console.log(`  Soroban SDK      : ${provenance.toolchain.sdk}`);
+  console.log(`  Target / profile : ${provenance.toolchain.target} / ${provenance.toolchain.profile}`);
+  console.log(`  Build flags      : ${provenance.toolchain.buildFlags.join(' ')}`);
   console.log('\n  Artifacts provenance:');
   for (const [name, data] of Object.entries(provenance.artifacts)) {
     console.log(`    ${name.padEnd(22)}: ${data.sha256} (${data.sizeBytes} bytes)`);
@@ -292,6 +333,9 @@ export function printHashes(): void {
   console.log(`  Pinned toolchain : ${readPinnedToolchain()}`);
   console.log(`  Rustc version    : ${rustcVersion()}`);
   console.log(`  Cargo version    : ${cargoVersion()}`);
+  console.log(`  Soroban SDK      : ${readSdkVersion()}`);
+  console.log(`  Target / profile : ${BUILD_TARGET} / ${BUILD_PROFILE}`);
+  console.log(`  Build flags      : ${BUILD_FLAGS.join(' ')}`);
   console.log(`  WASM directory   : ${WASM_DIR}\n`);
 
   try {
@@ -331,7 +375,55 @@ export function verifyHashes(): void {
   console.log(`  Active toolchain : ${active}`);
 
   const toolchainOk = active.includes(pinned);
-  console.log(`  Toolchain match  : ${toolchainOk ? '✅' : '⚠  (mismatch — artifacts may differ)'}`);
+  console.log(`  Toolchain match  : ${toolchainOk ? '✅' : '✗  (mismatch — artifacts will differ)'}`);
+
+  // 2b. Fail hard when the active toolchain does not match the pinned toolchain.
+  if (!toolchainOk) {
+    console.error(
+      `\n  ✗ Active toolchain (${active}) does not match pinned toolchain (${pinned}).\n` +
+      `     Run: rustup override set ${pinned}\n` +
+      '     Refusing to verify hashes with an unpinned toolchain.',
+    );
+    process.exit(1);
+  }
+
+  // 2c. Verify recorded compiler / SDK / target / flags match the current environment.
+  const currentRustc = rustcVersion();
+  const currentSdk = readSdkVersion();
+  const currentFlags = [...BUILD_FLAGS];
+
+  const drift: string[] = [];
+
+  if (expected.rustc && expected.rustc !== currentRustc) {
+    drift.push(`rustc: expected "${expected.rustc}" but active is "${currentRustc}"`);
+  }
+  if (expected.sdk && expected.sdk !== currentSdk) {
+    drift.push(`soroban-sdk: expected "${expected.sdk}" but resolved "${currentSdk}"`);
+  }
+  if (expected.target && expected.target !== BUILD_TARGET) {
+    drift.push(`target: expected "${expected.target}" but build uses "${BUILD_TARGET}"`);
+  }
+  if (expected.profile && expected.profile !== BUILD_PROFILE) {
+    drift.push(`profile: expected "${expected.profile}" but build uses "${BUILD_PROFILE}"`);
+  }
+  if (expected.buildFlags && expected.buildFlags.join(' ') !== currentFlags.join(' ')) {
+    drift.push(
+      `build flags: expected "${expected.buildFlags.join(' ')}" but build uses "${currentFlags.join(' ')}"`,
+    );
+  }
+
+  if (drift.length > 0) {
+    console.error(
+      '\n  ✗ Toolchain / SDK / build-flag drift detected against expected-hashes.json:\n' +
+      drift.map((d) => `     • ${d}`).join('\n') + '\n\n' +
+      '  A compiler, SDK, target, or build-flag change must be reviewed together with\n' +
+      '  the expected artifact hash changes. If the change is intentional, regenerate:\n' +
+      '    npx ts-node src/check-artifact-hashes.ts --update\n' +
+      '  and commit contracts/expected-hashes.json, contracts/provenance.json, and\n' +
+      '  contracts/rust-toolchain.toml in the same reviewed change.',
+    );
+    process.exit(1);
+  }
 
   // 3. Verify that all expected artifacts are populated (no empty strings)
   const unpopulated = Object.entries(expected.artifacts)
@@ -385,10 +477,12 @@ export function verifyHashes(): void {
       '  One or more artifacts do not match expected hashes.\n' +
       '  Possible causes:\n' +
       '    • Toolchain version differs from contracts/rust-toolchain.toml\n' +
+      '    • Soroban SDK version changed in contracts/Cargo.toml\n' +
       '    • Contract source was modified without updating expected-hashes.json\n' +
       '    • Build environment differs (OS, linker, optimization flags)\n\n' +
       '  To update expected hashes after an intentional change:\n' +
-      '    npx ts-node src/check-artifact-hashes.ts --update',
+      '    npx ts-node src/check-artifact-hashes.ts --update\n' +
+      '  and commit the updated hashes, provenance, and toolchain together.',
     );
     process.exit(1);
   }

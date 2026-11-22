@@ -50,7 +50,7 @@ CircleUp brings Rotating Savings & Credit Associations (ROSCAs) — known as **A
 | 3     | $400   | Carol     |
 | 4     | $400   | Dave      |
 
-Each member contributes $400 total, receives $400 once. Zero interest. Zero trust required.
+Each member contributes $400 total, receives $400 once. Zero interest. No organizer custody risk — but deployment identity, token value, admin key custody, upgrades and network choice remain assumptions. See [`docs/CONTRACT_TRUST_BOUNDARIES.md`](./docs/CONTRACT_TRUST_BOUNDARIES.md) for the full trust boundary.
 
 ---
 
@@ -527,6 +527,8 @@ formatPot("10000000", 4);      // → "4.00"
 ## Contracts Reference
 
 > **Full reference:** [`docs/CONTRACT_REFERENCE.md`](./docs/CONTRACT_REFERENCE.md) — canonical entry-point signatures, error codes, authorization rules, and links to event payload tables for all three contracts.
+>
+> **Trust boundaries:** [`docs/CONTRACT_TRUST_BOUNDARIES.md`](./docs/CONTRACT_TRUST_BOUNDARIES.md) — which guarantees come from code, which from tooling, and which remain operator or user assumptions.
 
 ### `circle_factory`
 
@@ -622,9 +624,15 @@ Pending ──(cancel)──────▶ Cancelled
 
 **Deadline invariant:**
 
-- `contribute` is accepted only while `ledger.sequence <= round.deadline_ledger`.
-- `mark_default` is accepted only while `ledger.sequence > round.deadline_ledger`.
-- The boundary is strict on both sides — the deadline ledger itself rejects contributions and also rejects defaults (only `> deadline_ledger` triggers the default window).
+The contract uses one strict comparison: `ledger.sequence > round.deadline_ledger`.
+
+| Ledger | `contribute` | `mark_default` / `settle_round` |
+|--------|--------------|---------------------------------|
+| `deadline_ledger - 1` | accepted | rejected |
+| `deadline_ledger` | accepted (last valid ledger) | rejected |
+| `deadline_ledger + 1` | rejected | accepted |
+
+`payout` is not time-gated. The deadline ledger is the last on-time contribution ledger, not the first default-eligible ledger. See [`docs/DEADLINE_LEDGER_BOUNDARY.md`](./docs/DEADLINE_LEDGER_BOUNDARY.md) for the full convention, client gating rules and boundary-test evidence.
 
 **Reentrancy / initialization guard:**
 

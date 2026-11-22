@@ -364,3 +364,82 @@ test(
     assert.equal(status, 400);
   }),
 );
+
+// ── Deprecated query parameters — migration window contract ───────────────────
+//
+// Legacy request-side parameters remain accepted for the documented migration
+// window. While accepted, responses must carry the observable sunset signal
+// (`Deprecation` and `Sunset` headers) so external consumers can detect and
+// migrate before the parameter is removed. Unknown or invalid values for those
+// parameters must still be rejected with 400.
+
+function requestWithHeaders(
+  server: http.Server,
+  path: string,
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Record<string, unknown> }> {
+  return new Promise((resolve, reject) => {
+    const addr = server.address() as { port: number };
+    http.get(`http://127.0.0.1:${addr.port}${path}`, (res) => {
+      let raw = "";
+      res.on("data", (c) => (raw += c));
+      res.on("end", () => {
+        let body: Record<string, unknown> = {};
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          body = {};
+        }
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body });
+      });
+    }).on("error", reject);
+  });
+}
+
+test(
+  "GET /circles: deprecated ?page_size= is accepted and signals Deprecation/Sunset",
+  withServer(async (s) => {
+    const { status, headers, body } = await requestWithHeaders(s, "/circles?page_size=10");
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body.circles), "circles must be an array");
+    assert.ok(headers.deprecation, "Deprecation header must be present");
+    assert.ok(headers.sunset, "Sunset header must be present");
+  }),
+);
+
+test(
+  "GET /circles: deprecated ?sort_by= is accepted and signals Deprecation/Sunset",
+  withServer(async (s) => {
+    const { status, headers } = await requestWithHeaders(s, "/circles?sort_by=created_ledger");
+    assert.equal(status, 200);
+    assert.ok(headers.deprecation, "Deprecation header must be present");
+    assert.ok(headers.sunset, "Sunset header must be present");
+  }),
+);
+
+test(
+  "GET /circles: deprecated ?page_size= with invalid value still returns 400",
+  withServer(async (s) => {
+    const { status, body } = await request(s, "/circles?page_size=abc");
+    assert.equal(status, 400);
+    assert.match(String(body.error), /page_size/);
+  }),
+);
+
+test(
+  "GET /circles: deprecated ?sort_by= with unknown field still returns 400",
+  withServer(async (s) => {
+    const { status, body } = await request(s, "/circles?sort_by=injected_col");
+    assert.equal(status, 400);
+    assert.match(String(body.error), /sort_by/);
+  }),
+);
+
+test(
+  "GET /circles: non-deprecated request carries no Deprecation header",
+  withServer(async (s) => {
+    const { status, headers } = await requestWithHeaders(s, "/circles?limit=10");
+    assert.equal(status, 200);
+    assert.equal(headers.deprecation, undefined);
+    assert.equal(headers.sunset, undefined);
+  }),
+);

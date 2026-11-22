@@ -240,6 +240,17 @@ test("projection: circle/initialized v2 writes config and one member row per rot
   assert.equal(rest.length, 0);
 });
 
+// Issue #873: the event's member vector IS the payout rotation. The projection
+// must map array position → payout_order (0-based) and must never re-sort the
+// addresses; API reads then order by payout_order.
+test("projection: circle/initialized v2 keeps event order as payout_order (no sorting)", async () => {
+  const [, members] = await project("circle/initialized v2");
+  assert.match(members.text, /\(m\.ord - 1\)::int/);
+  assert.doesNotMatch(members.text, /ORDER BY|array_sort|sort\(/i);
+  const passed = members.values[1] as string[];
+  assert.deepEqual(passed, [FIXTURE_ALICE, FIXTURE_BOB, FIXTURE_CAROL], "addresses passed in event order");
+});
+
 test("projection: circle/initialized v1 writes config only (no rotation to project)", async () => {
   const calls = await project("circle/initialized v1 (historical)");
   assert.equal(calls.length, 1);
@@ -335,6 +346,20 @@ test("projection: circle/paused and circle/resumed toggle the paused flag", asyn
   const [resumed] = await project("circle/resumed");
   assert.match(resumed.text, /paused = FALSE/);
   assert.deepEqual(resumed.values, [FIXTURE_CIRCLE]);
+});
+
+// Issue #876: pause is an overlay. The projection must only toggle the
+// `paused` column and must never rewrite the lifecycle `status` (Pending /
+// Active / Completed / Cancelled / Closed) or any round/collateral data.
+test("projection: circle/paused and circle/resumed never touch lifecycle status", async () => {
+  for (const id of ["circle/paused", "circle/resumed"]) {
+    const calls = await project(id);
+    assert.equal(calls.length, 1, `${id} must issue exactly one statement`);
+    const sql = calls[0].text;
+    assert.match(sql, /^\s*UPDATE circles SET paused = (TRUE|FALSE), updated_at = NOW\(\) WHERE address = \$1\s*$/);
+    assert.doesNotMatch(sql, /\bstatus\b/, `${id} must not modify status`);
+    assert.doesNotMatch(sql, /current_round|collateral|closed/i, `${id} must not modify round or settlement data`);
+  }
 });
 
 test("projection: reputation/score_updated upserts the member's score", async () => {

@@ -5,7 +5,8 @@ import path from "path";
 
 const ROOT = path.resolve(__dirname, "..", "..");
 const TOOLCHAIN_PATH = path.join(ROOT, "contracts", "rust-toolchain.toml");
-const EXPECTED_SOROBAN_SDK = "21.7.7";
+const EXPECTED_RUST = "1.81.0";
+const EXPECTED_SOROBAN_SDK = "29.0.1";
 
 interface ToolchainPin {
   channel: string;

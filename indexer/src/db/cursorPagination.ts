@@ -27,6 +27,46 @@
  *   const nextCursor = rows.length ? encodeCursor(rows[rows.length-1]) : null;
  */
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Wire-format contract (Issue #985 / Issue 149)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The encoded cursor string is part of the PUBLIC HTTP API wire format. It is
+// returned to clients in pagination links (`nextCursor` / `prevCursor`) and
+// accepted back as the `cursor` query parameter, so external tools may persist
+// and replay it across releases. Treat the cursor as a versioned read-model
+// contract, not an internal implementation detail:
+//
+//   - The set of fields encoded into a cursor, their names, and their value
+//     encoding (e.g. bigint-as-string) are observable by consumers. Changing
+//     any of these is a WIRE-BREAKING change.
+//   - Wire-breaking cursor changes MUST follow the versioned deprecation policy
+//     documented in the API reference (see docs/api deprecation policy): bump
+//     the cursor version, keep decoding the previous version for the documented
+//     migration window, and emit an observable sunset signal (deprecation
+//     warning header / field) before the old form is removed.
+//   - Additive changes are the ONLY compatible change: adding a new optional
+//     field to the encoded cursor object is allowed, because decoders ignore
+//     unknown fields and existing cursors remain valid. Removing or renaming a
+//     cursor field, or changing its encoding, is not additive and requires a
+//     version bump.
+//   - Release review must identify affected app, SDK, and external-consumer
+//     contracts whenever cursor fields or pagination semantics change.
+//
+// The current cursor version is CURSOR_VERSION below. It is encoded into the
+// cursor payload so that a future decoder can distinguish old and new forms
+// during a transition.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Version of the cursor wire format.
+ *
+ * Bump this only for wire-breaking changes to the encoded cursor payload, and
+ * only together with a deprecation window for the previous version. Additive
+ * fields do not require a version bump.
+ */
+export const CURSOR_VERSION = 1;
+
 import { query } from "../db/pool";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,6 +76,12 @@ import { query } from "../db/pool";
 /**
  * Encode a row's cursor fields to a URL-safe string.
  * Uses JSON + base64 to be encoding-agnostic.
+ *
+ * WIRE FORMAT: the returned string is exposed to API consumers. The encoded
+ * field set and value encoding are part of the versioned read-model contract
+ * (see the wire-format contract note above). Additive fields are compatible;
+ * removing/renaming fields or changing encoding requires a CURSOR_VERSION bump
+ * and a deprecation window.
  */
 export function encodeCursor(row: Record<string, unknown>, fields: string[]): string {
   const cursorObj: Record<string, string> = {};
@@ -54,6 +100,11 @@ export function encodeCursor(row: Record<string, unknown>, fields: string[]): st
 /**
  * Decode a cursor string back to an object.
  * Returns null if the cursor is malformed.
+ *
+ * WIRE FORMAT: accepts cursors previously emitted by this API. During a
+ * versioned transition this must continue to accept the previous cursor
+ * version for the documented migration window (see the wire-format contract
+ * note above). Unknown fields are ignored so additive changes stay compatible.
  */
 export function decodeCursor(cursor: string): Record<string, string> | null {
   try {
@@ -124,6 +175,12 @@ export interface CursorQueryResult<T> {
  *   - Stable: new inserts don't cause duplicates/skips
  *   - Efficient: no row counting or scanning
  *   - Deterministic: unique tie-breaker ensures order
+ *
+ * CONTRACT: `cursorFields` defines the public cursor wire format for the
+ * endpoint. Changing the cursor field set, order, or value encoding is a
+ * wire-breaking change and must follow the versioned deprecation policy
+ * (CURSOR_VERSION bump + documented migration window + sunset signal).
+ * Adding optional fields is the only compatible change.
  *
  * @param options Query configuration
  * @returns Paginated rows with cursors
@@ -270,6 +327,10 @@ export async function queryWithCursor<T extends Record<string, unknown>>(
 /**
  * Query circles with stable cursor pagination.
  * Uses (created_ledger, id) as cursor for uniqueness.
+ *
+ * CONTRACT: the (created_ledger, id) cursor shape is part of the public
+ * read-model wire format. Changing it is wire-breaking and must follow the
+ * versioned deprecation policy (see the wire-format contract note above).
  */
 export async function queryCirclesWithCursor(
   cursor: string | undefined,
@@ -311,6 +372,10 @@ export async function queryCirclesWithCursor(
 /**
  * Query contributions with stable cursor pagination.
  * Uses (ledger, id) as cursor for uniqueness.
+ *
+ * CONTRACT: the (ledger, id) cursor shape is part of the public read-model
+ * wire format. Changing it is wire-breaking and must follow the versioned
+ * deprecation policy (see the wire-format contract note above).
  */
 export async function queryContributionsWithCursor(
   memberAddress: string,

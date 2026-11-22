@@ -55,6 +55,7 @@ vi.mock("next/link", () => ({
 
 import CreateClient from "@/app/create/CreateClient";
 import { CircleCard, type Circle } from "@/components/CircleCard";
+import CircleDetailClient from "@/app/circle/[address]/CircleDetailClient";
 
 const baseCircle: Circle = {
   address: "CCIRCLE111111111111111111111111111111111111111111111111111",
@@ -107,6 +108,85 @@ describe("viewport — create form", () => {
     const submit = screen.getByRole("button", { name: /create circle/i });
     expect(submit).not.toHaveAttribute("disabled");
     expect(submit).toHaveClass("min-h-[48px]");
+  });
+
+  it.each([
+    ["mobile", MOBILE_WIDTH],
+    ["200% zoom", ZOOM_200_WIDTH],
+  ])("keeps the create flow operable at %s width", (_label, width) => {
+    setViewport(width);
+    render(<CreateClient />);
+    const submit = screen.getByRole("button", { name: /create circle/i });
+    expect(submit).toBeEnabled();
+    expect(submit).toHaveClass("min-h-[48px]");
+    const member1 = screen.getByRole("textbox", { name: /member 1 of/i });
+    expect(member1).toBeEnabled();
+    setViewport(1024);
+  });
+});
+
+/**
+ * Documented supported mobile width (px) and the effective CSS viewport at
+ * 200% browser zoom on a 1280px-wide desktop (1280 / 2 = 640px).
+ */
+const MOBILE_WIDTH = 375;
+const ZOOM_200_WIDTH = 640;
+
+function setViewport(width: number) {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    writable: true,
+    value: width,
+  });
+  window.dispatchEvent(new Event("resize"));
+}
+
+const detailCircle: Circle = {
+  address: "CDETAIL111111111111111111111111111111111111111111111111111",
+  creator: "GCREATOR11111111111111111111111111111111111111111111111111",
+  round_amount: "1234567890",
+  member_count: 3,
+  status: "Active",
+  current_round: 1,
+  total_rounds: 3,
+  created_ledger: 1000,
+};
+
+describe.each([
+  ["mobile", MOBILE_WIDTH],
+  ["200% zoom", ZOOM_200_WIDTH],
+])("viewport — circle detail at %s width", (_label, width) => {
+  beforeEach(() => setViewport(width));
+  afterEach(() => setViewport(1024));
+
+  it("renders long addresses with wrapping and full value available", () => {
+    render(<CircleDetailClient circle={detailCircle} />);
+    const addresses = screen.getAllByText(/CDETAIL|GCREATOR/);
+    expect(addresses.length).toBeGreaterThan(0);
+    for (const el of addresses) {
+      expect(el.className).toMatch(/break-all|break-words|truncate/);
+    }
+  });
+
+  it("labels any horizontal scroll container so it is announced", () => {
+    render(<CircleDetailClient circle={detailCircle} />);
+    const scrollers = document.querySelectorAll<HTMLElement>("[data-scroll-container]");
+    for (const el of scrollers) {
+      const label =
+        el.getAttribute("aria-label") ??
+        el.getAttribute("aria-labelledby") ??
+        el.getAttribute("role");
+      expect(label).toBeTruthy();
+    }
+  });
+
+  it("keeps core read and write actions reachable and focusable", () => {
+    render(<CircleDetailClient circle={detailCircle} />);
+    const contribute = screen.getByRole("button", { name: /contribute/i });
+    expect(contribute).toBeEnabled();
+    expect(contribute).toHaveClass("min-h-[48px]");
+    const back = screen.getByRole("link", { name: /back|all circles/i });
+    expect(back).toHaveAttribute("href");
   });
 });
 

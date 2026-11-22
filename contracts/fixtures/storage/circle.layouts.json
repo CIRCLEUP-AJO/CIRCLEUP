@@ -1,0 +1,67 @@
+{
+  "schema": "circleup.storage-fixtures.v1",
+  "contract": "circle",
+  "tested_by": "contracts/circle/tests/storage_compatibility_tests.rs",
+  "candidate": "contract code at the commit under test",
+  "layouts": {
+    "L1": {
+      "introduced_by": "8c7a1df (2026-06-29) initial CircleUp",
+      "instance_keys": ["Config", "Status", "CurrentRound", "RoundsCompleted"],
+      "persistent_keys": ["Collateral(Address)", "Contributed(Address,u32)", "Defaults(Address)"],
+      "notes": "Initializing (bf8c3db) and Defaulted (602ca71) are transient/additive and omitted here."
+    },
+    "L2": {
+      "introduced_by": "32e78d3 (2026-08-19) close() strict settlement (#166)",
+      "adds": ["Closed (instance)"]
+    },
+    "L3": {
+      "introduced_by": "a072026 / 2a3ad2d (2026-08-26) pause controls (#334), token identity (#335)",
+      "adds": ["Admin (instance)", "Paused (instance)", "UsdcToken (instance)"],
+      "notes": "Current layout."
+    }
+  },
+  "fixtures": [
+    {
+      "id": "circle.L1.pending-no-joins",
+      "layout": "L1",
+      "state": "Pending, no members joined (empty Collateral/Contributed/Defaults collections)",
+      "expect": "preserved",
+      "assertions": ["get_status == Pending", "get_collateral == 0", "has_contributed == false", "get_defaults == 0", "is_closed == false", "is_paused == false"]
+    },
+    {
+      "id": "circle.L1.active-mid-round",
+      "layout": "L1",
+      "state": "Active round 0, one contribution, one prior default",
+      "expect": "preserved + typed_error",
+      "assertions": ["Config/RoundState fields preserved", "get_admin -> ContractError::NotInitialized", "get_usdc_token -> ContractError::NotInitialized", "pause -> PauseError::NotInitialized"]
+    },
+    {
+      "id": "circle.L2.completed-unclosed",
+      "layout": "L2",
+      "state": "Completed, collateral still locked, no Admin key",
+      "expect": "deterministic_panic",
+      "assertions": ["is_closed == false", "close panics: 'circle: Admin missing — storage inconsistency' (untyped; known gap)"]
+    },
+    {
+      "id": "circle.L3.active-paused",
+      "layout": "L3",
+      "state": "Active and paused",
+      "expect": "preserved",
+      "assertions": ["is_paused == true", "get_admin/get_usdc_token preserved", "resume(admin) succeeds"]
+    },
+    {
+      "id": "circle.L3.completed-rounds-mismatch",
+      "layout": "L3",
+      "state": "Completed but RoundsCompleted < member count",
+      "expect": "typed_error",
+      "assertions": ["close -> CloseError::RoundsIncomplete"]
+    },
+    {
+      "id": "circle.L3.closed",
+      "layout": "L3",
+      "state": "Completed and already closed",
+      "expect": "typed_error",
+      "assertions": ["is_closed == true", "close -> CloseError::AlreadyClosed"]
+    }
+  ]
+}

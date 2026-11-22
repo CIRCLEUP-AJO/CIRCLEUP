@@ -1,8 +1,12 @@
 import { indexerFetch } from "@/lib/indexerFetch";
 import type { Metadata } from "next";
-import { notFound } from "next/navigation";
 import { INDEXER_URL, shortAddress } from "@/lib/config";
-import { isCanonicalStellarAddress } from "@/lib/address";
+import { validateAddress } from "@/lib/address";
+import {
+  RouteOutcomeError,
+  resolveRouteOutcome,
+  type RouteOutcome,
+} from "@/lib/routeOutcome";
 import ReputationClient from "./ReputationClient";
 
 // ─── Metadata ─────────────────────────────────────────────────────────────────
@@ -22,7 +26,8 @@ export async function generateMetadata({
   params: { member: string };
 }): Promise<Metadata> {
   const memberParam = typeof params?.member === "string" ? params.member.trim() : "";
-  const safeMember = isCanonicalStellarAddress(memberParam) ? memberParam : null;
+  const validation = validateAddress(memberParam, { kind: "G", requireChecksum: true });
+  const safeMember = validation.ok ? validation.address : null;
 
   if (!safeMember) {
     return {
@@ -37,15 +42,33 @@ export async function generateMetadata({
   }
 
   const lookup = await lookupReputationMember(safeMember);
-  if (lookup.ok && !lookup.known) {
+  if (!lookup.ok) {
+    // Temporary failure: keep the generic title rather than claiming the
+    // member is unknown, and omit the canonical link.
     return {
-      title: "Member Not Found — CircleUp",
-      description: "The requested member address has no recorded activity on CircleUp.",
+      title: "Reputation — CircleUp",
+      description: "On-chain reputation score and contribution history on CircleUp.",
       twitter: {
         card: "summary",
-        title: "Member Not Found — CircleUp",
-        description: "The requested member address has no recorded activity on CircleUp.",
+        title: "Reputation — CircleUp",
+        description: "On-chain reputation score and contribution history on CircleUp.",
       },
+    };
+  }
+
+  if (lookup.outcome.kind === "unknown" || lookup.outcome.kind === "indexing-delayed") {
+    const title =
+      lookup.outcome.kind === "indexing-delayed"
+        ? "Member Indexing Delayed — CircleUp"
+        : "Member Not Found — CircleUp";
+    const description =
+      lookup.outcome.kind === "indexing-delayed"
+        ? "This member has not been indexed yet. Please check back shortly."
+        : "The requested member address has no recorded activity on CircleUp.";
+    return {
+      title,
+      description,
+      twitter: { card: "summary", title, description },
     };
   }
 
@@ -99,10 +122,11 @@ function isValidUrl(url: string): boolean {
 // contribution/default counters let us tell "real, explicitly-tracked zero
 // score" apart from "no record at all".
 //
-// `known` becomes true when the member has an on-chain presence: a reputation
-// row, or recorded contributions/defaults in any circle.
+// The lookup resolves to a route outcome so the page can distinguish a
+// genuinely unknown member (404) from a delayed index (404 + delayed copy),
+// a contract read failure (502), and a service outage (503).
 type MemberLookup =
-  | { ok: true; known: boolean }
+  | { ok: true; outcome: RouteOutcome }
   | { ok: false };
 
 /**
@@ -127,19 +151,27 @@ async function lookupReputationMember(member: string): Promise<MemberLookup> {
     return { ok: false };
   }
 
-  if (res.status === 404) return { ok: true, known: false };
-  if (!res.ok) return { ok: false };
+  if (res.status === 404) {
+    return { ok: true, outcome: { kind: "unknown" } };
+  }
+  if (!res.ok) {
+    return { ok: false };
+  }
 
   try {
     const data = (await res.json()) as {
       found?: unknown;
       contributions?: unknown;
       defaults?: unknown;
+      indexing?: unknown;
     };
-    return {
-      ok: true,
-      known: typeof data === "object" && data !== null,
-    };
+    if (typeof data !== "object" || data === null) {
+      return { ok: false };
+    }
+    if (data.indexing === "pending" || data.indexing === "delayed") {
+      return { ok: true, outcome: { kind: "indexing-delayed" } };
+    }
+    return { ok: true, outcome: { kind: "ok" } };
   } catch {
     return { ok: false };
   }
@@ -158,21 +190,31 @@ export default async function ReputationPage({
 }: {
   params: { member: string };
 }) {
-  // Invalid address segments produce a proper 404 rather than an empty screen
-  // that looks identical to "no activity yet" (Issue #385).
-  if (!isCanonicalStellarAddress(params.member)) {
-    notFound();
+  // Validation runs before any RPC or indexer lookup so malformed segments
+  // never reach downstream services (Issue #385 / #968).
+  const validation = validateAddress(params.member, {
+    kind: "G",
+    requireChecksum: true,
+  });
+  if (!validation.ok) {
+    resolveRouteOutcome({ kind: "invalid-address" });
   }
+  const member = validation.address;
 
   // Issue #486: a well-formed address with no recorded on-chain presence
   // (no reputation row, no contributions, no defaults) has no reputation page.
   // Serving a real 404 — instead of a 200 page that reads like "nothing yet" —
   // gives users and search engines an unambiguous signal that the member is
   // unknown, while the not-found page guides them on what to check next.
-  const lookup = await lookupReputationMember(params.member);
-  if (lookup.ok && !lookup.known) {
-    notFound();
+  const lookup = await lookupReputationMember(member);
+  if (!lookup.ok) {
+    // Temporary failure: let the client surface its outage / retry states.
+    return <ReputationClient member={member} />;
   }
 
-  return <ReputationClient member={params.member} />;
+  if (lookup.outcome.kind !== "ok") {
+    resolveRouteOutcome(lookup.outcome);
+  }
+
+  return <ReputationClient member={member} />;
 }

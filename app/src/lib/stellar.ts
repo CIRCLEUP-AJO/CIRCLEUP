@@ -35,7 +35,7 @@ import {
 } from "@stellar/freighter-api";
 import { STELLAR_RPC_URL, NETWORK_PASSPHRASE, REPUTATION_ADDRESS } from "./config";
 import { rememberTransaction, boundedRead, type TransactionStatus } from './transactionStatus';
-import { walletRevision } from './walletIdentity';
+import { walletRevision, providerHasChangeListeners } from './walletIdentity';
 import { deploymentVerified, setDeploymentFacts, type DeploymentFact } from './deploymentState';
 import { CIRCLE_FACTORY_ADDRESS, USDC_ADDRESS } from './config';
 import { startTx, emit, categorizeError } from "./telemetry";
@@ -770,6 +770,24 @@ export async function submitContractTx(
   signal?.throwIfAborted();
   const identityRevision = walletRevision();
   const assertIdentity = async () => {
+    // When the injected Freighter provider lacks change-event listeners, the
+    // revision counter will never increment from a silent account switch — so
+    // we do an explicit live address lookup immediately before signing to catch
+    // the change.  This path only applies to the Freighter adapter: for custom
+    // adapters the adapter itself is authoritative about its current address
+    // and the address-equality check below covers the mismatch.
+    if (wallet === freighterAdapter && !providerHasChangeListeners()) {
+      const liveAddress = await currentWalletAddress(wallet);
+      if (liveAddress !== accountToSign) {
+        throw new Error(
+          'Your wallet account changed since this action was prepared. ' +
+          'Review and re-submit the action to sign with the current account.',
+        );
+      }
+    }
+    // Revision counter guard: catches account/network changes on providers that
+    // do fire events, and also catches programmatic invalidations (e.g. from
+    // observeWalletChanges subscribers).
     const address = await currentWalletAddress(wallet);
     if (identityRevision !== walletRevision() || address !== accountToSign) throw new Error('Wallet account changed. Review the action again.');
     if (!deploymentVerified()) throw new Error('Verify the configured deployment before submitting.');

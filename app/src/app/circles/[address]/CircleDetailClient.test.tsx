@@ -1161,3 +1161,302 @@ describe("CircleDetailClient — AnnouncerPortal present in DOM", () => {
     });
   });
 });
+
+// ─── Issue #130 — unknown lifecycle statuses ─────────────────────────────────
+//
+// A future or malformed status string must never crash the page, must never be
+// rendered as a false pending/active state, and must never enable a mutation.
+// Read-only details stay visible when their fields validate.
+
+describe("Issue #130 — unknown lifecycle status handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (stellarMock.getWalletAddress as any).mockResolvedValue(MEMBER_A);
+  });
+
+  function makeUnknownStatusData(status: string): CircleDetailData {
+    return makeReadyData({
+      circle: {
+        status: status as unknown as CircleDetailData["circle"]["status"],
+        current_round: 0,
+        total_rounds: 4,
+        round_amount: "10000000",
+        member_count: 2,
+        deadline_ledger: 5000,
+      },
+    });
+  }
+
+  test("a future status string renders an explicit unsupported state", async () => {
+    render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeUnknownStatusData("Paused")} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/unsupported/i)).toBeInTheDocument();
+    });
+  });
+
+  test("unknown status is not presented as Pending or Active", async () => {
+    const { container } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeUnknownStatusData("Paused")} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/unsupported/i)).toBeInTheDocument();
+    });
+
+    // The status badge must not claim a known state
+    const badgeText = container.textContent ?? "";
+    expect(badgeText).not.toMatch(/status:\s*pending/i);
+    expect(badgeText).not.toMatch(/status:\s*active/i);
+  });
+
+  test("unknown status disables every mutation action", async () => {
+    render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeUnknownStatusData("Paused")} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/unsupported/i)).toBeInTheDocument();
+    });
+
+    const mutationNames = [/contribute round/i, /trigger payout/i, /join circle/i];
+    for (const name of mutationNames) {
+      const btn = screen.queryByRole("button", { name });
+      if (btn) expect(btn).toBeDisabled();
+    }
+  });
+
+  test("unknown status keeps read-only details visible", async () => {
+    render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeUnknownStatusData("Paused")} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/unsupported/i)).toBeInTheDocument();
+    });
+
+    // Member addresses remain readable
+    expect(screen.getByText(MEMBER_A)).toBeInTheDocument();
+    expect(screen.getByText(MEMBER_B)).toBeInTheDocument();
+  });
+
+  test("malformed status value does not crash the render", () => {
+    expect(() =>
+      render(
+        <CircleDetailClient
+          circleAddress={CONTRACT}
+          circleData={makeUnknownStatusData("<script>alert(1)</script>")}
+        />,
+      ),
+    ).not.toThrow();
+  });
+
+  test("malformed status value is not interpolated as raw HTML", async () => {
+    const { container } = render(
+      <CircleDetailClient
+        circleAddress={CONTRACT}
+        circleData={makeUnknownStatusData("<img src=x onerror=alert(1)>")}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(/unsupported/i)).toBeInTheDocument();
+    });
+
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("script")).toBeNull();
+  });
+});
+
+// ─── Issue #127 — clipboard fallback ────────────────────────────────────────
+//
+// Copy actions must report success only when the clipboard write actually
+// completed. When the API is missing or permission is denied, the content must
+// stay selectable for manual copying and the status text must say so.
+
+describe("Issue #127 — clipboard fallback for invite link", () => {
+  const originalClipboard = (navigator as any).clipboard;
+  const originalExecCommand = (document as any).execCommand;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (stellarMock.getWalletAddress as any).mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    if (originalClipboard === undefined) {
+      delete (navigator as any).clipboard;
+    } else {
+      (navigator as any).clipboard = originalClipboard;
+    }
+    (document as any).execCommand = originalExecCommand;
+  });
+
+  test("successful copy announces a copied state", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />);
+
+    const copyBtn = await screen.findByRole("button", { name: /copy invite link/i });
+    await waitFor(() => expect(copyBtn).not.toBeDisabled());
+
+    fireEvent.click(copyBtn);
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(/copied/i)).toBeInTheDocument();
+    });
+  });
+
+  test("permission denial shows a manual-copy fallback and never claims success", async () => {
+    const writeText = vi.fn().mockRejectedValue(new DOMException("denied", "NotAllowedError"));
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />);
+
+    const copyBtn = await screen.findByRole("button", { name: /copy invite link/i });
+    await waitFor(() => expect(copyBtn).not.toBeDisabled());
+
+    fireEvent.click(copyBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not copy/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/^copied/i)).toBeNull();
+  });
+
+  test("missing clipboard API shows the manual-copy fallback", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: undefined,
+      configurable: true,
+    });
+
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />);
+
+    const copyBtn = await screen.findByRole("button", { name: /copy invite link/i });
+    await waitFor(() => expect(copyBtn).not.toBeDisabled());
+
+    fireEvent.click(copyBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not copy/i)).toBeInTheDocument();
+    });
+  });
+
+  test("on failure the invite link stays available for manual selection", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+      configurable: true,
+    });
+
+    const { container } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />,
+    );
+
+    const copyBtn = await screen.findByRole("button", { name: /copy invite link/i });
+    await waitFor(() => expect(copyBtn).not.toBeDisabled());
+    fireEvent.click(copyBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not copy/i)).toBeInTheDocument();
+    });
+
+    const input = container.querySelector<HTMLInputElement>(
+      'input[aria-label="Invite link for this circle"]',
+    );
+    expect(input).toBeInTheDocument();
+    expect(input!.value).toContain(`/circles/${CONTRACT}`);
+  });
+
+  test("repeated copy attempts keep reporting the true outcome", async () => {
+    const writeText = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("denied"))
+      .mockResolvedValueOnce(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />);
+
+    const copyBtn = await screen.findByRole("button", { name: /copy invite link/i });
+    await waitFor(() => expect(copyBtn).not.toBeDisabled());
+
+    fireEvent.click(copyBtn);
+    await waitFor(() => expect(screen.getByText(/could not copy/i)).toBeInTheDocument());
+
+    fireEvent.click(copyBtn);
+    await waitFor(() => expect(screen.getByText(/copied/i)).toBeInTheDocument());
+    expect(writeText).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── Issue #128 — narrow viewport / high zoom usability ─────────────────────
+//
+// jsdom has no layout engine, so these tests assert the structural guarantees
+// that make narrow layouts usable: long values wrap, unavoidable horizontal
+// scrolling lives in a labelled container, and action controls stay reachable.
+
+describe("Issue #128 — narrow viewport and 200% zoom structure", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (stellarMock.getWalletAddress as any).mockResolvedValue(MEMBER_A);
+  });
+
+  test("long member addresses are rendered in wrappable elements", async () => {
+    const { container } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(MEMBER_A)).toBeInTheDocument();
+    });
+
+    const addressEl = screen.getByText(MEMBER_A);
+    // Address must not be forced onto a single unwrappable line
+    expect(addressEl.className).toMatch(/break-all|break-words|truncate/);
+    expect(container.querySelector("[style*='white-space: nowrap']")).toBeNull();
+  });
+
+  test("any horizontally scrollable region is labelled for assistive tech", async () => {
+    const { container } = render(
+      <CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText(MEMBER_A)).toBeInTheDocument();
+    });
+
+    const scrollers = container.querySelectorAll<HTMLElement>("[class*='overflow-x-auto']");
+    scrollers.forEach((el) => {
+      const labelled =
+        el.getAttribute("aria-label") ||
+        el.getAttribute("aria-labelledby") ||
+        el.getAttribute("role") === "region";
+      expect(labelled).toBeTruthy();
+    });
+  });
+
+  test("action controls remain in the DOM and reachable at narrow widths", async () => {
+    render(<CircleDetailClient circleAddress={CONTRACT} circleData={makeReadyData()} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /contribute round/i })).toBeInTheDocument();
+    });
+
+    const actions = screen.getAllByRole("button");
+    expect(actions.length).toBeGreaterThan(0);
+    // No action control is hidden from the accessibility tree
+    actions.forEach((btn) => expect(btn).not.toHaveAttribute("aria-hidden", "true"));
+  });
+});

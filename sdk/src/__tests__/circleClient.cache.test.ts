@@ -210,3 +210,119 @@ describe("CircleClient.invalidateCache", () => {
     }).not.toThrow();
   });
 });
+
+// ─── Network and Account Cache Isolation (Issue #915 / Issue 79) ─────────────
+
+describe("Network and Account Cache Isolation (Issue #915)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not return cached state if network passphrase changes on client reuse", async () => {
+    const { client, getConfigSpy } = makeClient(60_000);
+    await client.getFullState();
+    expect(getConfigSpy).toHaveBeenCalledTimes(1);
+
+    // Switch network configuration on the client instance
+    (client as any).config = {
+      ...(client as any).config,
+      networkPassphrase: "Public Global Stellar Network ; September 2015",
+    };
+
+    // Cache must miss because network key does not match
+    expect(client.getCachedState()).toBeNull();
+    expect(client.isCacheStale()).toBe(true);
+
+    // Calling getFullState must trigger a fresh fetch
+    await client.getFullState();
+    expect(getConfigSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not return cached state if rpcUrl changes on client reuse", async () => {
+    const { client, getConfigSpy } = makeClient(60_000);
+    await client.getFullState();
+    expect(getConfigSpy).toHaveBeenCalledTimes(1);
+
+    // Switch RPC URL on the client instance
+    (client as any).config = {
+      ...(client as any).config,
+      rpcUrl: "https://soroban-mainnet.stellar.org",
+    };
+
+    expect(client.getCachedState()).toBeNull();
+    await client.getFullState();
+    expect(getConfigSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps public circle data cached across account changes", async () => {
+    const { client, getConfigSpy } = makeClient(60_000);
+
+    // Account A evaluates gating
+    const resA = await client.gateAction("contribute", {
+      memberAddress: MEMBER_A_ADDR,
+      hasContributedCurrentRound: false,
+    });
+    expect(resA.allowed).toBe(true);
+    expect(getConfigSpy).toHaveBeenCalledTimes(1);
+
+    // Account B evaluates gating - public circle state is reused (account-independent)
+    const resB = await client.gateAction("contribute", {
+      memberAddress: MEMBER_B_ADDR,
+      hasContributedCurrentRound: true,
+    });
+    expect(resB.allowed).toBe(false); // already contributed
+    // No new public state fetch: public circle state is reused
+    expect(getConfigSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not leak member-specific eligibility across account changes", async () => {
+    const { client } = makeClient(60_000);
+
+    // Account A has already contributed
+    const gateA = await client.gateAction("contribute", {
+      memberAddress: MEMBER_A_ADDR,
+      hasContributedCurrentRound: true,
+    });
+    expect(gateA.allowed).toBe(false);
+
+    // Account B has not contributed
+    const gateB = await client.gateAction("contribute", {
+      memberAddress: MEMBER_B_ADDR,
+      hasContributedCurrentRound: false,
+    });
+    // Account B gets its own fresh evaluation, not Account A's blocked result
+    expect(gateB.allowed).toBe(true);
+  });
+
+  it("scoped invalidateCache({ account }) only invalidates that account's eligibility", async () => {
+    const { client, getConfigSpy } = makeClient(60_000);
+
+    await client.gateAction("contribute", {
+      memberAddress: MEMBER_A_ADDR,
+      hasContributedCurrentRound: false,
+    });
+    await client.gateAction("contribute", {
+      memberAddress: MEMBER_B_ADDR,
+      hasContributedCurrentRound: false,
+    });
+    expect(getConfigSpy).toHaveBeenCalledTimes(1);
+
+    // Invalidate only Account A
+    client.invalidateCache({ account: MEMBER_A_ADDR });
+
+    // Public state is still valid and not null
+    expect(client.getCachedState()).not.toBeNull();
+
+    // Invalidate context for Account B
+    client.invalidateContext({ memberAddress: MEMBER_B_ADDR });
+    expect(client.getCachedState()).not.toBeNull();
+
+    // Invalidate context for network switch invalidates all
+    client.invalidateContext({ network: true });
+    expect(client.getCachedState()).toBeNull();
+  });
+});

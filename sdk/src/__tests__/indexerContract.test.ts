@@ -18,6 +18,12 @@ import {
   type IndexerEndpointName,
 } from "../indexerSchema";
 import {
+  DEPRECATION_POLICY,
+  findDeprecation,
+  isPastSunset,
+  type DeprecationNotice,
+} from "../deprecationPolicy";
+import {
   AUDIT_EVENTS_FIXTURE,
   CIRCLE_ACTIVITY_CURSOR_FIXTURE,
   CIRCLE_ACTIVITY_EMPTY_FIXTURE,
@@ -206,5 +212,77 @@ describe("incompatible wire drift is reported", () => {
     (body.contributions[0] as Record<string, unknown>).amount = "secret-looking-value";
     const violations = validateIndexerResponse("memberContributions", body);
     expect(JSON.stringify(violations)).not.toContain("secret-looking-value");
+  });
+});
+
+// ─── Deprecation transition window (issue #149) ───────────────────────────────
+
+/**
+ * A representative deprecation notice used to exercise the transition window.
+ * It mirrors the shape of entries in `DEPRECATION_POLICY` without depending on
+ * any particular live notice, so the tests stay meaningful as the policy grows.
+ */
+const TRANSITION_NOTICE: DeprecationNotice = {
+  endpoint: "circlesList",
+  field: "$.circles[0].round_amount",
+  replacement: "$.circles[0].roundAmount",
+  deprecatedIn: "2026-01-01",
+  sunset: "2026-07-01",
+  note: "round_amount is renamed to roundAmount; both are served during the window.",
+};
+
+describe("deprecation transition window", () => {
+  it("keeps the policy additive-only: every notice has a replacement and a sunset", () => {
+    for (const notice of DEPRECATION_POLICY) {
+      expect(notice.replacement, `${notice.field} has no replacement`).toBeTruthy();
+      expect(notice.sunset, `${notice.field} has no sunset`).toBeTruthy();
+      expect(notice.sunset >= notice.deprecatedIn, `${notice.field} sunsets before deprecation`).toBe(true);
+    }
+  });
+
+  it("serves legacy and new response forms side by side during the window", () => {
+    // Legacy form: the deprecated field is still present.
+    const legacy = clone(CIRCLES_LIST_FIXTURE);
+    expect(validateIndexerResponse("circlesList", legacy)).toEqual([]);
+
+    // New form: the replacement field is present alongside the deprecated one.
+    const transitional = clone(CIRCLES_LIST_FIXTURE);
+    const row = transitional.circles[0] as Record<string, unknown>;
+    row.roundAmount = row.round_amount;
+    expect(validateIndexerResponse("circlesList", transitional)).toEqual([]);
+    expect(listUnknownFields("circlesList", transitional)).toEqual(["$.circles[0].roundAmount"]);
+  });
+
+  it("still parses a deprecated field while it is inside its window", () => {
+    const body = clone(CIRCLES_LIST_FIXTURE);
+    const row = body.circles[0] as Record<string, unknown>;
+    expect(row.round_amount).toBeDefined();
+    expect(validateIndexerResponse("circlesList", body)).toEqual([]);
+    expect(isPastSunset(TRANSITION_NOTICE, "2026-03-01")).toBe(false);
+  });
+
+  it("reports removal of a deprecated field before its sunset as a violation", () => {
+    const body = clone(CIRCLES_LIST_FIXTURE);
+    const row = body.circles[0] as Record<string, unknown>;
+    delete row.round_amount;
+    // Even with the replacement present, dropping the deprecated field early
+    // breaks consumers that have not migrated yet.
+    row.roundAmount = "1000000";
+    expect(validateIndexerResponse("circlesList", body)).toContainEqual({
+      path: "$.circles[0].round_amount",
+      expected: "stroops",
+      actual: "missing",
+    });
+    expect(isPastSunset(TRANSITION_NOTICE, "2026-03-01")).toBe(false);
+  });
+
+  it("allows removal only after the sunset date", () => {
+    expect(isPastSunset(TRANSITION_NOTICE, "2026-07-01")).toBe(true);
+    expect(isPastSunset(TRANSITION_NOTICE, "2026-08-15")).toBe(true);
+  });
+
+  it("resolves a notice for a deprecated field", () => {
+    expect(findDeprecation("circlesList", "$.circles[0].round_amount")).toEqual(TRANSITION_NOTICE);
+    expect(findDeprecation("circlesList", "$.circles[0].roundAmount")).toBeUndefined();
   });
 });

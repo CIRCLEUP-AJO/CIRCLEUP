@@ -423,6 +423,146 @@ test(
 );
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Issue #985 — deprecation policy: pagination transition compatibility
+//
+// The documented policy (docs/api-deprecation-policy.md) allows a transition
+// window during which both the legacy page-based pagination envelope and the
+// cursor-based form must parse. Deprecated inputs must still work and must be
+// announced with `Deprecation` / `Sunset` response headers.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type HttpResultWithHeaders = HttpResult & { headers: http.IncomingHttpHeaders };
+
+function getWithHeaders(server: http.Server, path: string): Promise<HttpResultWithHeaders> {
+  return new Promise((resolve, reject) => {
+    const addr = server.address() as { port: number };
+    http
+      .get(`http://127.0.0.1:${addr.port}${path}`, (res) => {
+        let raw = "";
+        res.on("data", (chunk: string) => (raw += chunk));
+        res.on("end", () => {
+          let body: Record<string, unknown> = {};
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            body = {};
+          }
+          resolve({ status: res.statusCode ?? 0, body, headers: res.headers });
+        });
+      })
+      .on("error", reject);
+  });
+}
+
+/** Assert the pagination envelope keeps its documented wire types. */
+function assertPaginationWireTypes(
+  pagination: Record<string, unknown>,
+  label: string,
+): void {
+  assert.equal(typeof pagination.page, "number", `${label}: page must be a number`);
+  assert.equal(typeof pagination.limit, "number", `${label}: limit must be a number`);
+  assert.equal(typeof pagination.total, "number", `${label}: total must be a number`);
+  assert.equal(typeof pagination.totalPages, "number", `${label}: totalPages must be a number`);
+  assert.equal(typeof pagination.hasMore, "boolean", `${label}: hasMore must be a boolean`);
+  assert.ok(Number.isInteger(pagination.page), `${label}: page must be an integer`);
+  assert.ok(Number.isInteger(pagination.limit), `${label}: limit must be an integer`);
+  assert.ok(Number.isInteger(pagination.total), `${label}: total must be an integer`);
+  assert.ok(Number.isInteger(pagination.totalPages), `${label}: totalPages must be an integer`);
+}
+
+test(
+  "#985 legacy page-based pagination envelope keeps documented wire types",
+  withServer(async (s) => {
+    const { status, body } = await get(
+      s,
+      `/members/${VALID_G}/contributions?page=1&limit=2`,
+    );
+    assert.equal(status, 200, "legacy page-based request must still succeed");
+    const pagination = body.pagination as Record<string, unknown>;
+    assert.ok(pagination, "legacy response must include the pagination envelope");
+    assertPaginationWireTypes(pagination, "legacy contributions");
+  }),
+);
+
+test(
+  "#985 cursor-based pagination form parses during the transition",
+  withServer(
+    async (s) => {
+      const { status, body } = await get(
+        s,
+        `/members/${VALID_G}/contributions?limit=2&cursor=0`,
+      );
+      assert.equal(status, 200, "cursor-based request must be accepted");
+      // The cursor form must still expose the documented envelope fields so
+      // consumers can migrate incrementally.
+      const pagination = body.pagination as Record<string, unknown>;
+      assert.ok(pagination, "cursor response must include the pagination envelope");
+      assertPaginationWireTypes(pagination, "cursor contributions");
+      // A cursor response must advertise the next cursor (null on last page).
+      assert.ok(
+        "nextCursor" in pagination,
+        "cursor response must include nextCursor (null when exhausted)",
+      );
+    },
+    {
+      queryOne: async () => ({ count: "3", total_amount: "0" }),
+    },
+  ),
+);
+
+test(
+  "#985 deprecated pagination parameter still works and is announced via headers",
+  withServer(
+    async (s) => {
+      const { status, body, headers } = await getWithHeaders(
+        s,
+        `/circles/${VALID_C}/history?page=1&limit=2`,
+      );
+      assert.equal(status, 200, "deprecated page parameter must still be honoured");
+
+      // The deprecation must be observable on the wire.
+      assert.ok(
+        headers["deprecation"] !== undefined,
+        "deprecated pagination must send a Deprecation header",
+      );
+      assert.ok(
+        headers["sunset"] !== undefined,
+        "deprecated pagination must send a Sunset header",
+      );
+
+      // The legacy envelope must remain intact during the window.
+      const pagination = body.pagination as Record<string, unknown>;
+      assert.ok(pagination, "deprecated response must still include pagination");
+      assertPaginationWireTypes(pagination, "deprecated history");
+    },
+    {
+      queryOne: async () => ({ address: VALID_C }),
+      queryExact: async () => ({ count: "5" }),
+    },
+  ),
+);
+
+test(
+  "#985 /circles/:address/history envelope keeps documented wire types",
+  withServer(
+    async (s) => {
+      const { status, body } = await get(
+        s,
+        `/circles/${VALID_C}/history?page=2&limit=3`,
+      );
+      assert.equal(status, 200);
+      const pagination = body.pagination as Record<string, unknown>;
+      assert.ok(pagination, "history response must include the pagination envelope");
+      assertPaginationWireTypes(pagination, "history");
+    },
+    {
+      queryOne: async () => ({ address: VALID_C }),
+      queryExact: async () => ({ count: "5" }),
+    },
+  ),
+);
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Cross-endpoint: all 400 validation responses include an error key
 // ═══════════════════════════════════════════════════════════════════════════════
 

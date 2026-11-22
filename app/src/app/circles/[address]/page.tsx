@@ -25,7 +25,7 @@ import CircleErrorBody from "./CircleErrorBody";
 // in generateMetadata only, and extends the guard to the page render path so
 // a malformed address never reaches the indexer, CircleHeader, or
 // CircleDetailClient.
-import { isSorobanContractId } from "@/lib/address";
+import { isSorobanContractId, validateAddress } from "@/lib/address";
 
 export async function generateMetadata({
   params,
@@ -343,11 +343,29 @@ export default async function CircleDetailPage({
   // getMalformedContractAddresses in config.ts.  A 404 is the correct HTTP
   // signal ΓÇö it matches what the indexer would return for an unknown address,
   // and it keeps the not-found.tsx error UI consistent.
-  if (!isSorobanContractId(params.address)) {
-    notFound();
+  // Issue #132: run the shared validator before any indexer or RPC lookup and
+  // map each failure category to a distinct route outcome:
+  //   invalid address   -> 400 (shared invalid-address UI, not a 404)
+  //   unknown entity    -> 404 via notFound()
+  //   indexing delayed  -> 404 with delayed-indexing copy
+  //   contract read fail-> 502
+  //   service outage    -> 503
+  const validation = validateAddress(params.address, {
+    kind: "C",
+    requireChecksum: true,
+  });
+  if (!validation.ok) {
+    return (
+      <div>
+        <CircleHeader address={params.address} circle={null} />
+        <CircleErrorBody error="invalid_address" />
+      </div>
+    );
   }
 
-  const result = await getCircleDetail(params.address);
+  const address = validation.address;
+
+  const result = await getCircleDetail(address);
 
   if (!result.ok) {
     if (result.error === "not_found") {
@@ -356,7 +374,7 @@ export default async function CircleDetailPage({
     // At this point result.error is narrowed to FetchError (never "not_found")
     return (
       <div>
-        <CircleHeader address={params.address} circle={null} />
+        <CircleHeader address={address} circle={null} />
         <CircleErrorBody error={result.error} />
       </div>
     );
@@ -366,10 +384,10 @@ export default async function CircleDetailPage({
 
   return (
     <div>
-      <CircleHeader address={params.address} circle={data.circle} />
+      <CircleHeader address={address} circle={data.circle} />
 
       <CircleDetailClient
-        circleAddress={params.address}
+        circleAddress={address}
         circleData={data}
       />
     </div>

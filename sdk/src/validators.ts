@@ -7,6 +7,7 @@
 // Re-exported from sdk/src/index.ts via types.ts for backward compatibility.
 
 import { networkIdentityErrors } from './constants';
+import { validateServiceUrl } from './transportPolicy';
 import type {
   CircleUpConfig,
   TxMetadata,
@@ -60,8 +61,13 @@ export function validateCircleUpConfig(config: unknown): asserts config is Circl
   // rpcUrl
   if (!cfg.rpcUrl || typeof cfg.rpcUrl !== "string") {
     errors.push('config.rpcUrl is required and must be a string (e.g. "https://soroban-testnet.stellar.org").');
-  } else if (!/^https?:\/\/.+/.test(cfg.rpcUrl)) {
-    errors.push(`config.rpcUrl "${cfg.rpcUrl}" does not look like a valid URL.`);
+  } else {
+    const rpcValidation = validateServiceUrl(cfg.rpcUrl, "config.rpcUrl", {
+      network: typeof cfg.network === "string" ? cfg.network : undefined,
+    });
+    if (!rpcValidation.valid && rpcValidation.error) {
+      errors.push(rpcValidation.error);
+    }
   }
 
   // networkPassphrase + network identity (issue #903): the passphrase decides
@@ -96,10 +102,13 @@ export function validateCircleUpConfig(config: unknown): asserts config is Circl
       errors.push(
         `config.indexerUrl must be a string URL (e.g. "http://localhost:3001"), got ${typeof cfg.indexerUrl}.`,
       );
-    } else if (cfg.indexerUrl.trim() !== "" && !/^https?:\/\/.+/.test(cfg.indexerUrl.trim())) {
-      errors.push(
-        `config.indexerUrl "${cfg.indexerUrl}" does not look like a valid HTTP(S) URL.`,
-      );
+    } else if (cfg.indexerUrl.trim() !== "") {
+      const indexerValidation = validateServiceUrl(cfg.indexerUrl, "config.indexerUrl", {
+        network: typeof cfg.network === "string" ? cfg.network : undefined,
+      });
+      if (!indexerValidation.valid && indexerValidation.error) {
+        errors.push(indexerValidation.error);
+      }
     }
   }
 
@@ -361,7 +370,9 @@ export interface CircleState {
  *
  * # Invariants
  *
- * - `collateral ≥ 0n` — the contract clamps penalty deductions to 0.
+ * - `collateral ≥ 0n` — each penalty is `floor(collateral / 5)` of the
+ *   remaining balance (see `computeDefaultPenalty`), so it never goes negative
+ *   and positive collateral never reaches 0 through penalties.
  * - `defaults` is the total number of rounds this member has missed across
  *   the circle's lifetime.  It never decreases.
  * - `reputationScore` is the member's global reputation score across all
