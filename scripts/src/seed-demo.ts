@@ -42,6 +42,12 @@ import {
   SeedJournal,
   writeSeedJournal,
 } from "./seed-demo-policy";
+import {
+  buildDemoIdentity,
+  runSeedPreflight,
+  printPreflightReport,
+  PreflightReport,
+} from "./seed-demo-preflight";
 
 // Load from scripts/.env if present, otherwise fall back to root .env
 dotenv.config({ path: path.join(__dirname, "../.env") });
@@ -173,7 +179,11 @@ async function readContract<T>(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  assertAlwaysCreate(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const dryRun = argv.includes("--dry-run");
+  if (!dryRun) {
+    assertAlwaysCreate(argv);
+  }
 
   const manifestPath = path.join(__dirname, "../deployed-manifest.json");
   const validation = validateManifest(manifestPath, NETWORK);
@@ -185,6 +195,48 @@ async function main() {
   const deployed = validation.manifest;
   const rpcNetwork = await rpc.getNetwork();
   assertSeedNetwork(NETWORK, NETWORK_PASSPHRASE, rpcNetwork.passphrase, deployed);
+
+  // ── Preflight (#147) — detect prior seed state before any write ──────────
+
+  const identity = buildDemoIdentity(NETWORK, deployed);
+  console.log("[seed] Running preflight status lookup...");
+  let preflight: PreflightReport;
+  try {
+    preflight = await runSeedPreflight({
+      rpc,
+      identity,
+      journalPath: seedOutPath,
+      readCircleAddresses: () =>
+        readContract<string[]>(
+          deployed.contracts.circleFactory.contractId,
+          "get_circles",
+          [],
+        ),
+    });
+  } catch (err) {
+    throw new Error(
+      `[seed] Preflight failed; refusing to write without a known state: ${redactSeedError(String((err as Error).message))}`,
+    );
+  }
+  printPreflightReport(preflight);
+
+  if (dryRun) {
+    console.log("\n[seed] --dry-run specified; no funding or contract writes performed.");
+    return;
+  }
+
+  if (preflight.decision === "skip-create") {
+    console.log(
+      "\n[seed] Prior demo state detected for this deployment. Skipping circle creation to avoid duplicates.",
+    );
+    if (preflight.unresolved) {
+      console.log(
+        "[seed] A previous create_circle is UNRESOLVED (timeout). It may still confirm; do not retry blindly.",
+      );
+    }
+    console.log("[seed] Re-run with a fresh deployment manifest to create a new demo circle.");
+    return;
+  }
 
   console.log("🔄 CircleUp Demo Seed Script");
   console.log("===========================");
@@ -262,29 +314,36 @@ async function main() {
   console.log("\n💵 Note: In a real demo, fund each account with testnet USDC.");
   console.log("   Skipping USDC mint step — use stellar-cli to mint test USDC.");
 
-  // Create circle via factory
-  console.log("\n🏗️  Creating 4-member $100/round circle...");
-  const membersVec = xdr.ScVal.scvVec(
-    members.map((kp) => new Address(kp.publicKey()).toScVal()),
-  );
+  // Create circle via factory (only when preflight found no prior state)
+  let circleAddress: string;
+  if (preflight.decision === "create") {
+    console.log("\n🏗️  Creating 4-member $100/round circle...");
+    const membersVec = xdr.ScVal.scvVec(
+      members.map((kp) => new Address(kp.publicKey()).toScVal()),
+    );
 
-  activeJournal.currentStep = "create_circle";
-  persistJournal();
-  const createHash = await buildAndSend(alice, deployed.contracts.circleFactory.contractId, "create_circle", [
-    new Address(alice.publicKey()).toScVal(),
-    membersVec,
-    nativeToScVal(ROUND_AMOUNT, { type: "i128" }),
-    nativeToScVal(ROUND_DEADLINE_LEDGERS, { type: "u32" }),
-  ], "create_circle");
-  console.log(`  ✅ Circle created. Tx: ${createHash}`);
+    activeJournal.currentStep = "create_circle";
+    persistJournal();
+    const createHash = await buildAndSend(alice, deployed.contracts.circleFactory.contractId, "create_circle", [
+      new Address(alice.publicKey()).toScVal(),
+      membersVec,
+      nativeToScVal(ROUND_AMOUNT, { type: "i128" }),
+      nativeToScVal(ROUND_DEADLINE_LEDGERS, { type: "u32" }),
+    ], "create_circle");
+    console.log(`  ✅ Circle created. Tx: ${createHash}`);
 
-  // Get circle address from factory
-  const circleAddresses = await readContract<string[]>(
-    deployed.contracts.circleFactory.contractId,
-    "get_circles",
-    [],
-  );
-  const circleAddress = circleAddresses[circleAddresses.length - 1];
+    // Get circle address from factory
+    const circleAddresses = await readContract<string[]>(
+      deployed.contracts.circleFactory.contractId,
+      "get_circles",
+      [],
+    );
+    circleAddress = circleAddresses[circleAddresses.length - 1];
+  } else {
+    // Reuse the circle identified by the preflight status lookup.
+    circleAddress = preflight.circleAddress!;
+    console.log(`\n♻️  Reusing existing demo circle from prior run: ${circleAddress}`);
+  }
   activeJournal.circleAddress = circleAddress;
   persistJournal();
   console.log(`  Circle address: ${circleAddress}`);

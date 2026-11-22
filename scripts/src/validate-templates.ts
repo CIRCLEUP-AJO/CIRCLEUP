@@ -222,6 +222,47 @@ export function checkPrTemplateIntegrity(filePath: string): string[] {
   );
 }
 
+// ── Package-impact & verification convention check ────────────────────────────
+
+/**
+ * Tokens that must appear in the issue and PR templates to confirm they carry
+ * the compact package-impact / verification section described in
+ * docs/TRACEABILITY.md.
+ *
+ * The convention is deliberately checkbox-free: contributors map each
+ * acceptance criterion to the affected packages and the commands that verify
+ * the behavior, without duplicating a full test plan.
+ *
+ * What each token represents:
+ *   "package impact"    → the section heading exists
+ *   "verification"      → contributors state how the change is verified
+ *   "acceptance"        → criteria are mapped, not just listed
+ *   "contracts"         → at least one package boundary is named
+ *   "indexer"           → indexer boundary is named
+ *   "app"               → app boundary is named
+ *   "TRACEABILITY.md"   → the convention doc is linked for guidance
+ */
+const REQUIRED_TRACEABILITY_TOKENS: string[] = [
+  "package impact",
+  "verification",
+  "acceptance",
+  "contracts",
+  "indexer",
+  "app",
+  "TRACEABILITY.md",
+];
+
+/**
+ * Returns the list of missing traceability tokens for a template file.
+ * An empty array means all tokens are present.
+ */
+export function checkTraceabilitySection(filePath: string): string[] {
+  const content = fs.readFileSync(filePath, "utf8").toLowerCase();
+  return REQUIRED_TRACEABILITY_TOKENS.filter(
+    (token) => !content.includes(token.toLowerCase()),
+  );
+}
+
 // ── Diagnosis & reporting ─────────────────────────────────────────────────────
 
 interface Failure {
@@ -333,6 +374,26 @@ function run(): void {
         message:
           `missing required PR template section — expected "${token}" ` +
           `to be present so reviewers can verify security and traceability.`,
+      });
+    }
+  }
+
+  // ── 5. Package-impact & verification convention (issue + PR templates) ────
+  //
+  // Both the feature-request template and the PR template must carry the
+  // compact package-impact / verification section so cross-package changes
+  // (contract → indexer → app → deployment) surface missing evidence at
+  // review time.  See docs/TRACEABILITY.md for the convention and examples.
+  for (const filePath of [featureRequestPath, prTemplatePath]) {
+    if (!fs.existsSync(filePath)) continue; // already reported above
+    const missingTrace = checkTraceabilitySection(filePath);
+    for (const token of missingTrace) {
+      failures.push({
+        location: relPath(filePath),
+        message:
+          `missing package-impact/verification content — expected "${token}" ` +
+          `so each acceptance criterion maps to affected packages and ` +
+          `verification commands (see docs/TRACEABILITY.md).`,
       });
     }
   }

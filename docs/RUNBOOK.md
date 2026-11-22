@@ -20,8 +20,12 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Prerequisites](#prerequisites)
   - [Step-by-Step](#step-by-step)
 - [Environment Variables Reference](#environment-variables-reference)
+  - [Inventory and CI Parity Check](#inventory-and-ci-parity-check)
   - [Indexer (`indexer/.env`)](#indexer-indexerenv)
   - [App (`app/.env.local`)](#app-appenvlocal)
+  - [SDK (`sdk/`)](#sdk-sdk)
+  - [Scripts (`scripts/.env`)](#scripts-scriptsenv)
+  - [Deployment Profiles (`deploy/profiles/`)](#deployment-profiles-deployprofiles)
 - [Deployment](#deployment)
   - [Contract Deployment Order](#contract-deployment-order)
   - [Post-Deployment Configuration](#post-deployment-configuration)
@@ -80,6 +84,10 @@ For the SDK API reference and contract invariants see [README.md](../README.md).
   - [Contract Mutation Guards (Rust)](#contract-mutation-guards-rust)
   - [App Gating Mutation Tests (TypeScript)](#app-gating-mutation-tests-typescript)
   - [CI Budget and Excluded Mutations](#ci-budget-and-excluded-mutations)
+- [Issue-to-Test Traceability](#issue-to-test-traceability)
+  - [Package Impact and Verification Section](#package-impact-and-verification-section)
+  - [Examples](#examples)
+  - [Review Guidance](#review-guidance)
 - [Development Best Practices](#development-best-practices)
 
 ---
@@ -420,38 +428,114 @@ npm run dev
 
 ## Environment Variables Reference
 
+This section is the human-readable view of the environment-variable inventory. The
+machine-readable source of truth lives in `config/env-inventory.json`; the CI parity
+checker (`npm run check:env`) compares that inventory against the `.env.example`
+files, the runtime validators in each package, and the tables below. If a variable
+is renamed, gains a default, or becomes required in code, update the inventory and
+this section in the same change.
+
+### Inventory and CI Parity Check
+
+```bash
+npm run check:env
+# Exits 0 when inventory, examples, validators, and this runbook agree.
+# Exits non-zero and prints a name-only report for:
+#   - missing:      inventory entry with no matching .env.example or doc row
+#   - stale:        .env.example or doc row with no matching inventory entry
+#   - undocumented: process.env read or validator key absent from the inventory
+#   - drift:        requiredness or default differs between inventory and code
+```
+
+The checker reports variable **names** and the kind of mismatch only. It never
+prints configured values, so it is safe to run against a populated environment
+and in CI logs. Secret-bearing variables are listed by name and marked
+`secret` in the inventory; their values are never read by the checker.
+
+Each table row below follows a fixed column order so the checker can parse it:
+
+`| Variable | Package | Required | Default | Description |`
+
+- **Package** is the owning workspace: `indexer`, `app`, `sdk`, `scripts`, or `deploy`.
+- **Required** is `Yes`, `No`, or `Prod` (required only when `NODE_ENV=production`).
+- **Default** is the literal default, `—` when there is none, or `(empty)` when the
+  variable is defined but intentionally blank.
+
 ### Indexer (`indexer/.env`)
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DATABASE_URL` | Yes | ΓÇö | Postgres connection string, e.g. `postgresql://postgres:password@localhost:5432/circleup` |
-| `STELLAR_RPC_URL` | Yes | ΓÇö | Soroban RPC endpoint, e.g. `https://soroban-testnet.stellar.org` |
-| `CIRCLE_FACTORY_ADDRESS` | Yes | ΓÇö | Deployed factory contract ID (`C...`) |
-| `REPUTATION_ADDRESS` | Yes | ΓÇö | Deployed reputation contract ID (`C...`) |
-| `USDC_ADDRESS` | Yes | ΓÇö | USDC token contract ID (`C...`) |
-| `NETWORK_PASSPHRASE` | No | `Test SDF Network ; September 2015` | Stellar network passphrase |
-| `PORT` | No | `3001` | API server port |
-| `START_LEDGER` | No | `0` | Ledger to start indexing from. Set to your deployment ledger to skip testnet genesis |
-| `POLL_INTERVAL_MS` | No | `5000` | How often to poll the RPC for new events (milliseconds) |
-| `EVENTS_LIMIT` | No | `100` | Max events per `getEvents()` call. Soroban RPC caps at 10 000 |
-| `ALLOWED_ORIGINS` | No | *(all origins)* | Comma-separated CORS allow-list, e.g. `https://app.circleup.xyz`. Leave blank for local dev. Required in production |
-| `RATE_LIMIT_WINDOW_MS` | No | `60000` | Rate-limit window in milliseconds |
-| `RATE_LIMIT_MAX` | No | `100` | Max requests per IP per window |
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `DATABASE_URL` | `indexer` | Yes | — | Postgres connection string, e.g. `postgresql://postgres:password@localhost:5432/circleup`. Secret. |
+| `STELLAR_RPC_URL` | `indexer` | Yes | — | Soroban RPC endpoint, e.g. `https://soroban-testnet.stellar.org` |
+| `CIRCLE_FACTORY_ADDRESS` | `indexer` | Yes | — | Deployed factory contract ID (`C...`) |
+| `REPUTATION_ADDRESS` | `indexer` | Yes | — | Deployed reputation contract ID (`C...`) |
+| `USDC_ADDRESS` | `indexer` | Yes | — | USDC token contract ID (`C...`) |
+| `NETWORK_PASSPHRASE` | `indexer` | No | `Test SDF Network ; September 2015` | Stellar network passphrase |
+| `PORT` | `indexer` | No | `3001` | API server port |
+| `START_LEDGER` | `indexer` | No | `0` | Ledger to start indexing from. Set to your deployment ledger to skip testnet genesis |
+| `POLL_INTERVAL_MS` | `indexer` | No | `5000` | How often to poll the RPC for new events (milliseconds) |
+| `EVENTS_LIMIT` | `indexer` | No | `100` | Max events per `getEvents()` call. Soroban RPC caps at 10 000 |
+| `ALLOWED_ORIGINS` | `indexer` | No | `(empty)` | Comma-separated CORS allow-list, e.g. `https://app.circleup.xyz`. Leave blank for local dev. Required in production |
+| `RATE_LIMIT_WINDOW_MS` | `indexer` | No | `60000` | Rate-limit window in milliseconds |
+| `RATE_LIMIT_MAX` | `indexer` | No | `100` | Max requests per IP per window |
 
 All required variables are validated at boot time. The indexer will exit with a clear error message listing every missing key if any are absent or blank.
 
 ### App (`app/.env.local`)
 
-| Variable | Required in production | Default | Description |
-|---|---|---|---|
-| `NEXT_PUBLIC_STELLAR_RPC_URL` | Yes | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
-| `NEXT_PUBLIC_NETWORK_PASSPHRASE` | Yes | `Test SDF Network ; September 2015` | Network passphrase |
-| `NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS` | Yes (prod) | *(empty)* | Factory contract ID |
-| `NEXT_PUBLIC_REPUTATION_ADDRESS` | Yes (prod) | *(empty)* | Reputation contract ID |
-| `NEXT_PUBLIC_USDC_ADDRESS` | Yes (prod) | *(empty)* | USDC token contract ID |
-| `NEXT_PUBLIC_INDEXER_URL` | Yes | `http://localhost:3001` | Indexer base URL |
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `NEXT_PUBLIC_STELLAR_RPC_URL` | `app` | No | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint |
+| `NEXT_PUBLIC_NETWORK_PASSPHRASE` | `app` | No | `Test SDF Network ; September 2015` | Network passphrase |
+| `NEXT_PUBLIC_CIRCLE_FACTORY_ADDRESS` | `app` | Prod | `(empty)` | Factory contract ID |
+| `NEXT_PUBLIC_REPUTATION_ADDRESS` | `app` | Prod | `(empty)` | Reputation contract ID |
+| `NEXT_PUBLIC_USDC_ADDRESS` | `app` | Prod | `(empty)` | USDC token contract ID |
+| `NEXT_PUBLIC_INDEXER_URL` | `app` | No | `http://localhost:3001` | Indexer base URL |
 
 In development, the contract address variables may be left blank ΓÇö the app will start but contract interactions will fail gracefully. In production (`NODE_ENV=production`) they are required and the server will throw at boot time if they are missing.
+
+### SDK (`sdk/`)
+
+The SDK does not read `process.env` directly. `getNetworkConfig` accepts an explicit
+network name and resolves RPC URL and passphrase from the built-in network table.
+The variables below are read only by the SDK's test harness and are not part of any
+deployed runtime.
+
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `SDK_TEST_RPC_URL` | `sdk` | No | `https://soroban-testnet.stellar.org` | RPC endpoint used by SDK integration tests |
+| `SDK_TEST_NETWORK_PASSPHRASE` | `sdk` | No | `Test SDF Network ; September 2015` | Passphrase used by SDK integration tests |
+
+### Scripts (`scripts/.env`)
+
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `NETWORK` | `scripts` | Yes | — | Target network name (`testnet` or `mainnet`) |
+| `NETWORK_PASSPHRASE` | `scripts` | Yes | — | Passphrase for the target network |
+| `RPC_URL` | `scripts` | Yes | — | Soroban RPC endpoint used for deployment |
+| `DEPLOYER_IDENTITY` | `scripts` | Yes | `deployer` | stellar-cli identity name. The private key stays in the CLI keystore, never in `.env` |
+| `STELLAR_SECRET_KEY` | `scripts` | No | `(empty)` | CI-only injection path. Secret. Never commit or echo |
+| `HORIZON_URL` | `scripts` | No | `https://horizon-testnet.stellar.org` | Horizon endpoint used for funding checks |
+
+The deploy script validates `NETWORK`, `NETWORK_PASSPHRASE`, and `RPC_URL` before any write transaction. Run `npm run validate-env --workspace=scripts` to check the profile independently.
+
+### Deployment Profiles (`deploy/profiles/`)
+
+Profile files are JSON, not `.env` files. The inventory records the same
+requiredness and default metadata so the parity checker can compare them with the
+runtime validators that consume them.
+
+| Variable | Package | Required | Default | Description |
+|---|---|---|---|---|
+| `PROFILE` | `deploy` | Yes | — | Profile name (`development`, `staging`, `production`) |
+| `RPC_URL` | `deploy` | Yes | — | RPC endpoint for the profile. Must be HTTPS and non-testnet for `production` |
+| `NETWORK_PASSPHRASE` | `deploy` | Yes | — | Passphrase for the profile network |
+| `HORIZON_URL` | `deploy` | Yes | — | Horizon endpoint used by the mainnet readiness gate |
+| `CIRCLE_FACTORY_ADDRESS` | `deploy` | Yes | — | Factory contract ID for the profile |
+| `REPUTATION_ADDRESS` | `deploy` | Yes | — | Reputation contract ID for the profile |
+| `USDC_ADDRESS` | `deploy` | Yes | — | USDC token contract ID for the profile |
+| `ADMIN_PUBLIC_KEY` | `deploy` | Yes | — | Public key of the deployment admin. Public value only; never a secret |
+| `DEPLOYMENT_MANIFEST` | `deploy` | No | `scripts/deployed-manifest.json` | Path to the deployment manifest checked by the readiness gate |
 
 ---
 

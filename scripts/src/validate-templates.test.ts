@@ -604,6 +604,202 @@ describe("real repo templates — feature_request and PR integrity", () => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// Package-impact / verification traceability section check
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// The traceability convention (docs/TRACEABILITY.md) asks contributors to add a
+// compact "Package impact & verification" section to issues and PRs.  It maps
+// each acceptance criterion to the affected packages and the verification
+// commands that provide evidence.  The check below is advisory: a missing
+// section produces a warning, never a hard failure, so unrelated work is not
+// blocked.
+
+const TRACEABILITY_HEADING_RE = /^#{1,6}\s+package impact\s*(?:&|and)\s*verification\b/im;
+
+// Package names that a traceability row may reference.
+const TRACEABILITY_PACKAGES = [
+  "contracts",
+  "sdk",
+  "indexer",
+  "app",
+  "deployment",
+];
+
+// The three worked examples the convention must document.
+const TRACEABILITY_EXAMPLE_KINDS = [
+  "contract event change",
+  "indexer schema change",
+  "app-only behavior change",
+];
+
+interface TraceabilityResult {
+  /** True when the section heading is present. */
+  hasSection: boolean;
+  /** Package names referenced anywhere in the section body. */
+  packages: string[];
+  /** True when at least one verification command is referenced. */
+  hasVerification: boolean;
+  /** Advisory warnings; empty means the section looks complete. */
+  warnings: string[];
+}
+
+function extractTraceabilitySection(content: string): string | null {
+  const lines = content.split("\n");
+  const startIdx = lines.findIndex((l) => TRACEABILITY_HEADING_RE.test(l));
+  if (startIdx === -1) return null;
+
+  const headingLevel = (lines[startIdx].match(/^#+/) ?? ["#"])[0].length;
+  const body: string[] = [];
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const nextHeading = lines[i].match(/^(#+)\s/);
+    if (nextHeading && nextHeading[1].length <= headingLevel) break;
+    body.push(lines[i]);
+  }
+  return body.join("\n");
+}
+
+function checkTraceabilitySection(content: string): TraceabilityResult {
+  const section = extractTraceabilitySection(content);
+  if (section === null) {
+    return {
+      hasSection: false,
+      packages: [],
+      hasVerification: false,
+      warnings: ["missing 'Package impact & verification' section"],
+    };
+  }
+
+  const lower = section.toLowerCase();
+  const packages = TRACEABILITY_PACKAGES.filter((pkg) => lower.includes(pkg));
+  const hasVerification = /`[^`]+`/.test(section) || /\b(npm|pnpm|yarn|cargo|make|node)\b/.test(lower);
+
+  const warnings: string[] = [];
+  if (packages.length === 0) {
+    warnings.push("no affected package named (contracts/sdk/indexer/app/deployment)");
+  }
+  if (!hasVerification) {
+    warnings.push("no verification command referenced");
+  }
+
+  return { hasSection: true, packages, hasVerification, warnings };
+}
+
+// Advisory gate: returns warnings but never throws / blocks.
+function traceabilityGate(content: string): { blocking: boolean; warnings: string[] } {
+  const result = checkTraceabilitySection(content);
+  return { blocking: false, warnings: result.warnings };
+}
+
+const FULL_TRACEABILITY_SECTION = `
+## Package impact & verification
+
+| Acceptance criterion | Packages | Verification |
+|---|---|---|
+| Event is emitted on transfer | contracts, indexer | \`cargo test -p circle\`, \`npm test -w indexer\` |
+| UI shows new event | app | \`npm test -w app\` |
+`.trim();
+
+describe("checkTraceabilitySection", () => {
+  test("template with the section passes with no warnings", () => {
+    const result = checkTraceabilitySection(FULL_TRACEABILITY_SECTION);
+    assert.equal(result.hasSection, true);
+    assert.deepEqual(result.warnings, []);
+    assert.ok(result.hasVerification);
+  });
+
+  test("template missing the section is flagged", () => {
+    const result = checkTraceabilitySection("## Summary\n\nJust a summary.");
+    assert.equal(result.hasSection, false);
+    assert.ok(result.warnings.some((w) => w.includes("missing")));
+  });
+
+  test("section without any package is flagged", () => {
+    const content = "## Package impact & verification\n\n| AC | Verification |\n|---|---|\n| x | `npm test` |";
+    const result = checkTraceabilitySection(content);
+    assert.equal(result.hasSection, true);
+    assert.deepEqual(result.packages, []);
+    assert.ok(result.warnings.some((w) => w.includes("package")));
+  });
+
+  test("section without a verification command is flagged", () => {
+    const content = "## Package impact & verification\n\nAffects contracts and indexer.";
+    const result = checkTraceabilitySection(content);
+    assert.equal(result.hasSection, true);
+    assert.ok(result.packages.includes("contracts"));
+    assert.ok(result.packages.includes("indexer"));
+    assert.equal(result.hasVerification, false);
+    assert.ok(result.warnings.some((w) => w.includes("verification")));
+  });
+
+  test("heading is matched case-insensitively and with 'and'", () => {
+    const content = "## PACKAGE IMPACT AND VERIFICATION\n\ncontracts — `cargo test`";
+    const result = checkTraceabilitySection(content);
+    assert.equal(result.hasSection, true);
+  });
+
+  test("section body stops at the next same-level heading", () => {
+    const content = [
+      "## Package impact & verification",
+      "",
+      "contracts — `cargo test`",
+      "",
+      "## Checklist",
+      "",
+      "indexer app deployment",
+    ].join("\n");
+    const result = checkTraceabilitySection(content);
+    assert.deepEqual(result.packages, ["contracts"]);
+  });
+});
+
+describe("traceabilityGate (advisory, non-blocking)", () => {
+  test("never blocks even when the section is missing", () => {
+    const gate = traceabilityGate("## Summary\n\nNo traceability here.");
+    assert.equal(gate.blocking, false);
+    assert.ok(gate.warnings.length > 0);
+  });
+
+  test("reports no warnings for a complete section", () => {
+    const gate = traceabilityGate(FULL_TRACEABILITY_SECTION);
+    assert.equal(gate.blocking, false);
+    assert.deepEqual(gate.warnings, []);
+  });
+});
+
+describe("traceability worked examples", () => {
+  const REPO_ROOT = path.resolve(__dirname, "..", "..");
+  const TRACEABILITY_DOC = path.join(REPO_ROOT, "docs", "TRACEABILITY.md");
+
+  test("docs/TRACEABILITY.md exists", () => {
+    assert.ok(
+      fs.existsSync(TRACEABILITY_DOC),
+      "docs/TRACEABILITY.md must document the convention",
+    );
+  });
+
+  test("documents all three worked examples", () => {
+    if (!fs.existsSync(TRACEABILITY_DOC)) return;
+    const lower = fs.readFileSync(TRACEABILITY_DOC, "utf8").toLowerCase();
+    for (const kind of TRACEABILITY_EXAMPLE_KINDS) {
+      assert.ok(
+        lower.includes(kind),
+        `TRACEABILITY.md must include the '${kind}' example`,
+      );
+    }
+  });
+
+  test("convention is linked from contribution guidance", () => {
+    const contributing = path.join(REPO_ROOT, "CONTRIBUTING.md");
+    if (!fs.existsSync(contributing)) return;
+    const content = fs.readFileSync(contributing, "utf8");
+    assert.ok(
+      /TRACEABILITY\.md/.test(content),
+      "CONTRIBUTING.md must link to docs/TRACEABILITY.md",
+    );
+  });
+});
+
 // Re-export for inline use in the describe blocks above
 // (mirrors the pattern already in this file)
 function extractRelativeLinks(
