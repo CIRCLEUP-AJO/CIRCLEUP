@@ -20,6 +20,7 @@ import {
 import { isStellarPublicKey, isValidStellarAccount } from "@/lib/address";
 import { getWalletAddress, invokeContract, WalletError } from "@/lib/stellar";
 import { buildCreateCircleArgs } from "@/lib/createCircleArgs";
+import { rememberTransaction } from "@/lib/transactionStatus";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -294,32 +295,41 @@ export function validateCreateForm(
   }
 
   // ── Amount ────────────────────────────────────────────────────────────────
+  //
+  // Amount is validated purely as a string — no Number() or parseFloat().
+  // Only a plain decimal matching /^\d+(\.\d+)?$/ is accepted; exponent
+  // notation, trailing characters, and negative signs are all rejected before
+  // the value reaches usdcToStroops.  This ensures the displayed pot and the
+  // value sent to the contract are derived from exactly the same integer.
   const amountStr = roundUSDC.trim();
   let amountStroops: bigint | undefined;
 
   if (amountStr === "" || amountStr === ".") {
     errors.amount = "Contribution amount is required.";
+  } else if (!/^\d+(\.\d+)?$/.test(amountStr)) {
+    // Catches exponent notation (1e7), leading minus (-1), trailing chars (1a),
+    // multiple dots (1.2.3), and anything else that is not a plain decimal.
+    errors.amount = "Enter a valid amount using digits and an optional decimal point (e.g. \"10\" or \"9.50\").";
   } else {
-    const amountNum = Number(amountStr);
-    if (!Number.isFinite(amountNum) || amountNum < 0) {
-      errors.amount = "Enter a valid positive amount.";
-    } else if (amountNum === 0) {
-      errors.amount = "Contribution amount must be greater than zero.";
-    } else if (amountNum > MAX_ROUND_USDC) {
-      errors.amount =
-        `Round amount of $${amountNum.toLocaleString()} exceeds the maximum of ` +
-        `$${MAX_ROUND_USDC.toLocaleString()} USDC.`;
-    } else if (countDecimalPlaces(amountStr) > MAX_USDC_DECIMALS) {
+    // Plain decimal: safe to pass to usdcToStroops which works in bigint only.
+    if (countDecimalPlaces(amountStr) > MAX_USDC_DECIMALS) {
       errors.amount =
         `USDC supports at most ${MAX_USDC_DECIMALS} decimal places. ` +
         `"${amountStr}" has ${countDecimalPlaces(amountStr)}.`;
     } else {
-      // usdcToStroops is safe here — we've already checked the decimal count
       try {
         amountStroops = usdcToStroops(amountStr);
         if (amountStroops <= 0n) {
           errors.amount = "Contribution amount must be greater than zero.";
           amountStroops = undefined;
+        } else {
+          // Check the max using bigint arithmetic so the comparison is exact.
+          const maxStroops = usdcToStroops(String(MAX_ROUND_USDC));
+          if (amountStroops > maxStroops) {
+            errors.amount =
+              `Round amount exceeds the maximum of $${MAX_ROUND_USDC.toLocaleString()} USDC.`;
+            amountStroops = undefined;
+          }
         }
       } catch (err) {
         errors.amount = err instanceof Error ? err.message : "Invalid amount.";
@@ -749,7 +759,12 @@ export default function CreateClient() {
 
       if (!result.success) {
         setSupportError(result.typedError ?? parseContractError(result.error));
-        if (result.txHash) setTxHash(result.txHash);
+        if (result.txHash) {
+          setTxHash(result.txHash);
+          // Even a failed/timed-out submission gets a receipt so the user can
+          // check its status on the transactions page without resubmitting.
+          rememberTransaction(result.txHash, false);
+        }
         const errMsg = userMessageForError(result.typedError ?? parseContractError(result.error));
         setSubmitError(errMsg);
         const fa = ANNOUNCEMENTS.circleCreateFailed(errMsg);
@@ -759,6 +774,10 @@ export default function CreateClient() {
 
       setConfirmed(true);
       setTxHash(result.txHash ?? "");
+      // Persist the receipt so the user can reopen it on /transactions after
+      // navigating away, refreshing, or losing the page.  Only the hash and
+      // acceptance flag are stored — no XDR, no keys, no private data.
+      if (result.txHash) rememberTransaction(result.txHash, true);
       // Only trust a circle address that the factory/transaction result
       // actually returned. If it is absent, the receipt is shown without a
       // detail link and no redirect is scheduled.
