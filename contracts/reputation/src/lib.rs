@@ -456,6 +456,12 @@ impl ReputationContract {
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod overflow_tests;
+
+#[cfg(test)]
+mod authorization_invariants_tests;
+
+#[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
