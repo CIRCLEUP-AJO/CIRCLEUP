@@ -46,6 +46,7 @@ import {
   TransactionBuilder,
   Networks,
 } from "@stellar/stellar-sdk";
+import type { QueryResultRow } from "pg";
 import { query, pool, withPoolCleanup } from "./pool";
 import { rpc } from "../indexer";
 import { REPUTATION_ADDRESS } from "../config";
@@ -90,7 +91,19 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 // ── Canonical contract reads ──────────────────────────────────────────────────
 
-type SimResult<T> = { ok: true; value: T } | { ok: false; error: string };
+export type SimResult<T> = { ok: true; value: T } | { ok: false; error: string };
+
+export type QueryFn = <T extends QueryResultRow = QueryResultRow>(
+  sql: string,
+  params?: unknown[],
+) => Promise<T[]>;
+
+export type SimulateReadFn = (
+  sourceAddress: string,
+  contractId: string,
+  method: string,
+  args?: xdr.ScVal[],
+) => Promise<SimResult<unknown>>;
 
 /**
  * Read-only contract call via `simulateTransaction`. Never submits a
@@ -142,11 +155,12 @@ interface CanonicalCircleState {
 
 async function readCanonicalCircleState(
   circleAddress: string,
+  simFn: SimulateReadFn = simulateContractRead,
 ): Promise<SimResult<CanonicalCircleState>> {
   const [statusResult, configResult, roundResult] = await Promise.all([
-    simulateContractRead(circleAddress, circleAddress, "get_status"),
-    simulateContractRead(circleAddress, circleAddress, "get_config"),
-    simulateContractRead(circleAddress, circleAddress, "get_current_round"),
+    simFn(circleAddress, circleAddress, "get_status"),
+    simFn(circleAddress, circleAddress, "get_config"),
+    simFn(circleAddress, circleAddress, "get_current_round"),
   ]);
 
   if (!statusResult.ok) return { ok: false, error: `get_status: ${statusResult.error}` };
@@ -227,6 +241,8 @@ export interface ReconciliationOptions {
   /** Restrict the scan to a single circle address. */
   circleAddress?: string;
   log?: (msg: string) => void;
+  queryFn?: QueryFn;
+  simulateRead?: SimulateReadFn;
 }
 
 // ── Report mode (read-only) ───────────────────────────────────────────────────
@@ -262,6 +278,8 @@ export async function runReconciliationReport(
   const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
   const graceMs = options.graceMs ?? DEFAULT_GRACE_MS;
   const log = options.log ?? (() => {});
+  const queryExec = options.queryFn ?? query;
+  const simFn = options.simulateRead ?? simulateContractRead;
   const graceCutoff = Date.now() - graceMs;
 
   const differences: Difference[] = [];
@@ -276,14 +294,14 @@ export async function runReconciliationReport(
 
   for (;;) {
     const rows = options.circleAddress
-      ? await query<DbCircleRow>(
+      ? await queryExec<DbCircleRow>(
           `SELECT address, status, current_round, total_rounds, member_count,
                   round_amount, updated_at
            FROM circles WHERE address = $1
            ORDER BY address LIMIT $2 OFFSET $3`,
           [options.circleAddress, pageSize, offset],
         )
-      : await query<DbCircleRow>(
+      : await queryExec<DbCircleRow>(
           `SELECT address, status, current_round, total_rounds, member_count,
                   round_amount, updated_at
            FROM circles ORDER BY address LIMIT $1 OFFSET $2`,
@@ -299,7 +317,7 @@ export async function runReconciliationReport(
       }
       circlesScanned++;
 
-      const canonical = await readCanonicalCircleState(row.address);
+      const canonical = await readCanonicalCircleState(row.address, simFn);
       if (!canonical.ok) {
         unreadable.push({ entity: "circle", key: row.address, error: canonical.error });
         continue;
@@ -342,7 +360,7 @@ export async function runReconciliationReport(
         );
       }
 
-      const members = await query<DbCircleMemberRow>(
+      const members = await queryExec<DbCircleMemberRow>(
         `SELECT member_address, collateral, defaults FROM circle_members WHERE circle_address = $1`,
         [row.address],
       );
@@ -353,8 +371,8 @@ export async function runReconciliationReport(
         const memberScVal = new Address(m.member_address).toScVal();
 
         const [collateralResult, defaultsResult] = await Promise.all([
-          simulateContractRead(row.address, row.address, "get_collateral", [memberScVal]),
-          simulateContractRead(row.address, row.address, "get_defaults", [memberScVal]),
+          simFn(row.address, row.address, "get_collateral", [memberScVal]),
+          simFn(row.address, row.address, "get_defaults", [memberScVal]),
         ]);
 
         if (!collateralResult.ok) {
@@ -394,14 +412,14 @@ export async function runReconciliationReport(
         if (reputationSeen.has(m.member_address)) continue;
         reputationSeen.add(m.member_address);
 
-        const [repRow] = await query<DbReputationRow>(
+        const [repRow] = await queryExec<DbReputationRow>(
           `SELECT score, updated_at FROM reputation WHERE member_address = $1`,
           [m.member_address],
         );
         if (!repRow || new Date(repRow.updated_at).getTime() > graceCutoff) continue;
 
         reputationScanned++;
-        const scoreResult = await simulateContractRead(
+        const scoreResult = await simFn(
           REPUTATION_ADDRESS,
           REPUTATION_ADDRESS,
           "score",
@@ -457,6 +475,49 @@ export interface RepairOptions {
   log?: (msg: string) => void;
 }
 
+export interface PlannedRepair {
+  entity: Difference["entity"];
+  /** circle address, or "circleAddress:memberAddress" for circle_member */
+  key: string;
+  field: string;
+  indexed: string;
+  canonical: string;
+  supported: boolean;
+  sqlPreview?: string;
+}
+
+export interface RepairPlan {
+  generatedAt: string;
+  dryRun: true;
+  totalDifferences: number;
+  capped: boolean;
+  maxRepairs: number;
+  skippedGrace: number;
+  unreadable: UnreadableEntity[];
+  plannedRepairs: PlannedRepair[];
+  summary: {
+    circlesScanned: number;
+    circlesSkippedGrace: number;
+    membersScanned: number;
+    reputationScanned: number;
+    differencesFound: number;
+    plannedRepairs: number;
+    unsupportedFields: number;
+    unreadableCount: number;
+  };
+}
+
+export interface PlanOptions {
+  /** Maximum number of differences to include in the plan (default 500). */
+  maxRepairs?: number;
+}
+
+export interface ApplyPlanOptions extends RepairOptions {
+  /** Explicit confirmation required to mutate database. If false or omitted, mutation is rejected. */
+  confirm?: boolean;
+  queryFn?: QueryFn;
+}
+
 const CIRCLE_FIELD_SQL: Record<string, { column: string; cast: string }> = {
   status: { column: "status", cast: "text" },
   current_round: { column: "current_round", cast: "integer" },
@@ -471,6 +532,101 @@ const CIRCLE_MEMBER_FIELD_SQL: Record<string, { column: string; cast: string }> 
 };
 
 /**
+ * Check whether a field difference is supported by the automated repair mapping.
+ */
+export function isFieldSupported(entity: Difference["entity"], field: string): boolean {
+  if (entity === "circle") return field in CIRCLE_FIELD_SQL;
+  if (entity === "circle_member") return field in CIRCLE_MEMBER_FIELD_SQL;
+  if (entity === "reputation") return field === "score";
+  return false;
+}
+
+/**
+ * Generates an SQL statement preview for human review in a dry-run plan.
+ */
+export function formatSqlPreview(diff: Difference): string | undefined {
+  if (diff.entity === "circle") {
+    const spec = CIRCLE_FIELD_SQL[diff.field];
+    if (!spec) return undefined;
+    return `UPDATE circles SET ${spec.column} = $1::${spec.cast}, updated_at = NOW() WHERE address = $2 AND ${spec.column} = $3::${spec.cast} [canonical='${diff.canonical}', key='${diff.key}', indexed='${diff.indexed}']`;
+  }
+  if (diff.entity === "circle_member") {
+    const spec = CIRCLE_MEMBER_FIELD_SQL[diff.field];
+    if (!spec) return undefined;
+    const separatorIndex = diff.key.indexOf(":");
+    const circleAddress = diff.key.slice(0, separatorIndex);
+    const memberAddress = diff.key.slice(separatorIndex + 1);
+    return `UPDATE circle_members SET ${spec.column} = $1::${spec.cast} WHERE circle_address = $2 AND member_address = $3 AND ${spec.column} = $4::${spec.cast} [canonical='${diff.canonical}', circle='${circleAddress}', member='${memberAddress}', indexed='${diff.indexed}']`;
+  }
+  if (diff.entity === "reputation" && diff.field === "score") {
+    return `UPDATE reputation SET score = $1::integer, updated_at = NOW() WHERE member_address = $2 AND score = $3::integer [canonical='${diff.canonical}', key='${diff.key}', indexed='${diff.indexed}']`;
+  }
+  return undefined;
+}
+
+/**
+ * Deterministic difference sorting for reproducible dry-run repair plans.
+ */
+export function compareDifferences(a: Difference, b: Difference): number {
+  if (a.entity !== b.entity) return a.entity.localeCompare(b.entity);
+  if (a.key !== b.key) return a.key.localeCompare(b.key);
+  return a.field.localeCompare(b.field);
+}
+
+/**
+ * Generate a deterministic, reproducible dry-run repair plan from a reconciliation report.
+ * Validates that each planned field is supported and bounds the output by maxRepairs
+ * so it is safe to attach to an incident report.
+ */
+export function createRepairPlan(
+  report: ReconciliationReport,
+  options: PlanOptions = {},
+): RepairPlan {
+  const maxRepairs = options.maxRepairs ?? DEFAULT_MAX_REPAIRS;
+  const sortedDiffs = [...report.differences].sort(compareDifferences);
+  const totalDifferences = sortedDiffs.length;
+  const capped = totalDifferences > maxRepairs;
+  const toPlan = sortedDiffs.slice(0, maxRepairs);
+
+  let unsupportedCount = 0;
+  const plannedRepairs: PlannedRepair[] = toPlan.map((d) => {
+    const supported = isFieldSupported(d.entity, d.field);
+    if (!supported) unsupportedCount++;
+    const sqlPreview = formatSqlPreview(d);
+    return {
+      entity: d.entity,
+      key: d.key,
+      field: d.field,
+      indexed: d.indexed,
+      canonical: d.canonical,
+      supported,
+      ...(sqlPreview ? { sqlPreview } : {}),
+    };
+  });
+
+  return {
+    generatedAt: report.generatedAt,
+    dryRun: true,
+    totalDifferences,
+    capped,
+    maxRepairs,
+    skippedGrace: report.circlesSkippedGrace,
+    unreadable: report.unreadable,
+    plannedRepairs,
+    summary: {
+      circlesScanned: report.circlesScanned,
+      circlesSkippedGrace: report.circlesSkippedGrace,
+      membersScanned: report.membersScanned,
+      reputationScanned: report.reputationScanned,
+      differencesFound: totalDifferences,
+      plannedRepairs: plannedRepairs.length,
+      unsupportedFields: unsupportedCount,
+      unreadableCount: report.unreadable.length,
+    },
+  };
+}
+
+/**
  * Conditional UPDATE guarded on the exact indexed value the difference was
  * computed from (`... AND <column> = <indexed>::cast`). If the row has since
  * changed — repaired by a previous run, or updated by a fresh event — the
@@ -478,10 +634,13 @@ const CIRCLE_MEMBER_FIELD_SQL: Record<string, { column: string; cast: string }> 
  * "skipped_stale" rather than overwriting newer data. This is what makes
  * repair safe to re-run.
  */
-async function repairCircleField(diff: Difference): Promise<boolean | null> {
+async function repairCircleField(
+  diff: Difference | PlannedRepair,
+  queryFn: QueryFn = query,
+): Promise<boolean | null> {
   const spec = CIRCLE_FIELD_SQL[diff.field];
   if (!spec) return null;
-  const rows = await query<{ address: string }>(
+  const rows = await queryFn<{ address: string }>(
     `UPDATE circles SET ${spec.column} = $1::${spec.cast}, updated_at = NOW()
      WHERE address = $2 AND ${spec.column} = $3::${spec.cast}
      RETURNING address`,
@@ -490,13 +649,16 @@ async function repairCircleField(diff: Difference): Promise<boolean | null> {
   return rows.length > 0;
 }
 
-async function repairCircleMemberField(diff: Difference): Promise<boolean | null> {
+async function repairCircleMemberField(
+  diff: Difference | PlannedRepair,
+  queryFn: QueryFn = query,
+): Promise<boolean | null> {
   const spec = CIRCLE_MEMBER_FIELD_SQL[diff.field];
   if (!spec) return null;
   const separatorIndex = diff.key.indexOf(":");
   const circleAddress = diff.key.slice(0, separatorIndex);
   const memberAddress = diff.key.slice(separatorIndex + 1);
-  const rows = await query<{ id: number }>(
+  const rows = await queryFn<{ id: number }>(
     `UPDATE circle_members SET ${spec.column} = $1::${spec.cast}
      WHERE circle_address = $2 AND member_address = $3 AND ${spec.column} = $4::${spec.cast}
      RETURNING id`,
@@ -505,15 +667,112 @@ async function repairCircleMemberField(diff: Difference): Promise<boolean | null
   return rows.length > 0;
 }
 
-async function repairReputationField(diff: Difference): Promise<boolean | null> {
+async function repairReputationField(
+  diff: Difference | PlannedRepair,
+  queryFn: QueryFn = query,
+): Promise<boolean | null> {
   if (diff.field !== "score") return null;
-  const rows = await query<{ member_address: string }>(
+  const rows = await queryFn<{ member_address: string }>(
     `UPDATE reputation SET score = $1::integer, updated_at = NOW()
      WHERE member_address = $2 AND score = $3::integer
      RETURNING member_address`,
     [diff.canonical, diff.key, diff.indexed],
   );
   return rows.length > 0;
+}
+
+/**
+ * Apply a pre-computed repair plan.
+ *
+ * Requires explicit confirmation (`confirm === true`).
+ * Rechecks conditions before mutation via conditional UPDATE statements guarded
+ * on the exact expected indexed value (`... AND <column> = <indexed>::cast`).
+ * If a row was concurrently updated between preview and apply, the update matches
+ * zero rows and is safely skipped as `skipped_stale`.
+ */
+export async function applyRepairPlan(
+  plan: RepairPlan,
+  options: ApplyPlanOptions = {},
+  queryFn?: QueryFn,
+): Promise<RepairOutcome[]> {
+  if (options.confirm !== true) {
+    throw new Error(
+      "Mutation rejected: applying a repair plan requires explicit confirmation ({ confirm: true } or --confirm / --apply).",
+    );
+  }
+
+  const queryExec = options.queryFn ?? queryFn ?? query;
+  const log = options.log ?? (() => {});
+  const outcomes: RepairOutcome[] = [];
+
+  for (const item of plan.plannedRepairs) {
+    if (!item.supported) {
+      outcomes.push({
+        entity: item.entity,
+        key: item.key,
+        field: item.field,
+        indexed: item.indexed,
+        canonical: item.canonical,
+        outcome: "unsupported_field",
+      });
+      log(`[reconcile] unsupported field: ${item.entity} ${item.key} ${item.field}`);
+      continue;
+    }
+
+    try {
+      const applied =
+        item.entity === "circle"
+          ? await repairCircleField(item, queryExec)
+          : item.entity === "circle_member"
+          ? await repairCircleMemberField(item, queryExec)
+          : await repairReputationField(item, queryExec);
+
+      if (applied === null) {
+        outcomes.push({
+          entity: item.entity,
+          key: item.key,
+          field: item.field,
+          indexed: item.indexed,
+          canonical: item.canonical,
+          outcome: "unsupported_field",
+        });
+      } else if (applied) {
+        outcomes.push({
+          entity: item.entity,
+          key: item.key,
+          field: item.field,
+          indexed: item.indexed,
+          canonical: item.canonical,
+          outcome: "applied",
+        });
+        log(`[reconcile] repaired: ${item.entity} ${item.key} ${item.field} → ${item.canonical}`);
+      } else {
+        outcomes.push({
+          entity: item.entity,
+          key: item.key,
+          field: item.field,
+          indexed: item.indexed,
+          canonical: item.canonical,
+          outcome: "skipped_stale",
+        });
+        log(
+          `[reconcile] skipped (stale): ${item.entity} ${item.key} ${item.field} (current value in DB differs from expected ${item.indexed})`,
+        );
+      }
+    } catch (err) {
+      outcomes.push({
+        entity: item.entity,
+        key: item.key,
+        field: item.field,
+        indexed: item.indexed,
+        canonical: item.canonical,
+        outcome: "error",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return outcomes;
 }
 
 /**
@@ -525,48 +784,19 @@ async function repairReputationField(diff: Difference): Promise<boolean | null> 
 export async function repairDifferences(
   differences: Difference[],
   options: RepairOptions = {},
+  queryFn: QueryFn = query,
 ): Promise<RepairOutcome[]> {
-  const maxRepairs = options.maxRepairs ?? DEFAULT_MAX_REPAIRS;
-  const log = options.log ?? (() => {});
-  const outcomes: RepairOutcome[] = [];
-
-  const toApply = differences.slice(0, maxRepairs);
-  if (differences.length > maxRepairs) {
-    log(
-      `[reconcile] ${differences.length} difference(s) found; maxRepairs=${maxRepairs} caps this run — ` +
-        `re-run repair to continue with the remainder.`,
-    );
-  }
-
-  for (const diff of toApply) {
-    try {
-      const applied =
-        diff.entity === "circle"
-          ? await repairCircleField(diff)
-          : diff.entity === "circle_member"
-          ? await repairCircleMemberField(diff)
-          : await repairReputationField(diff);
-
-      if (applied === null) {
-        outcomes.push({ ...diff, outcome: "unsupported_field" });
-        continue;
-      }
-
-      outcomes.push({ ...diff, outcome: applied ? "applied" : "skipped_stale" });
-      log(
-        `[reconcile] ${applied ? "repaired" : "skipped (stale)"}: ` +
-          `${diff.entity} ${diff.key} ${diff.field} → ${diff.canonical}`,
-      );
-    } catch (err) {
-      outcomes.push({
-        ...diff,
-        outcome: "error",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  return outcomes;
+  const dummyReport: ReconciliationReport = {
+    generatedAt: new Date().toISOString(),
+    circlesScanned: 0,
+    circlesSkippedGrace: 0,
+    membersScanned: 0,
+    reputationScanned: 0,
+    unreadable: [],
+    differences,
+  };
+  const plan = createRepairPlan(dummyReport, { maxRepairs: options.maxRepairs });
+  return applyRepairPlan(plan, { confirm: true, log: options.log }, queryFn);
 }
 
 // ── Pretty-printers ────────────────────────────────────────────────────────────
@@ -602,6 +832,49 @@ export function printReconciliationReport(report: ReconciliationReport): void {
   console.log("─".repeat(60));
 }
 
+export function printRepairPlan(plan: RepairPlan): void {
+  console.log("\n[reconcile] Dry-run repair plan (read-only preview)");
+  console.log("─".repeat(60));
+  console.log(`  generated at: ${plan.generatedAt}`);
+  console.log(`  differences found: ${plan.totalDifferences}`);
+  console.log(
+    `  planned repairs: ${plan.plannedRepairs.length}` +
+      (plan.capped ? ` (capped by maxRepairs=${plan.maxRepairs})` : ""),
+  );
+  console.log(`  skipped grace-window circles: ${plan.skippedGrace}`);
+  console.log(`  unreadable entities: ${plan.unreadable.length}`);
+
+  if (plan.plannedRepairs.length > 0) {
+    console.log("\n  Planned field repairs:");
+    for (const r of plan.plannedRepairs) {
+      const statusTag = r.supported ? "[planned]" : "[unsupported]";
+      console.log(
+        `    • ${statusTag} ${r.entity} ${r.key} ${r.field}: ` +
+          `current=${r.indexed} → canonical=${r.canonical}`,
+      );
+      if (r.sqlPreview) {
+        console.log(`      preview: ${r.sqlPreview}`);
+      }
+    }
+  } else {
+    console.log("  No repairs planned (database is synchronized).");
+  }
+
+  if (plan.unreadable.length > 0) {
+    console.log("\n  Unreadable state (excluded from repairs):");
+    for (const u of plan.unreadable) {
+      console.log(`    • [${u.entity}] ${u.key}: ${u.error}`);
+    }
+  }
+
+  console.log("─".repeat(60));
+  console.log(
+    "  Mode: DRY-RUN. No changes were made to the database.\n" +
+      "  To apply this plan, re-run with: --repair --confirm (or --apply)",
+  );
+  console.log("─".repeat(60));
+}
+
 export function printRepairOutcomes(outcomes: RepairOutcome[]): void {
   console.log("\n[reconcile] Repair outcomes");
   console.log("─".repeat(60));
@@ -625,46 +898,75 @@ export function printRepairOutcomes(outcomes: RepairOutcome[]): void {
 // ── CLI entry point ────────────────────────────────────────────────────────────
 //
 // Run directly:
-//   ts-node src/db/reconcile.ts [--repair] [--circle=<address>]
-//     [--page-size=<n>] [--grace-ms=<n>] [--max-repairs=<n>]
+//   ts-node src/db/reconcile.ts [--repair] [--confirm|--apply] [--dry-run] [--json]
+//     [--circle=<address>] [--page-size=<n>] [--grace-ms=<n>] [--max-repairs=<n>]
 //
 // Flags:
-//   --repair          Apply canonical values for the differences found
-//                      (default is report-only; never mutates data).
+//   --repair          Generate and apply repairs (requires --confirm or --apply to mutate;
+//                      otherwise previews the dry-run plan).
+//   --confirm         Confirm and execute repairs (alias: --apply).
+//   --apply           Confirm and execute repairs (alias: --confirm).
+//   --dry-run         Force dry-run plan output only.
+//   --json            Output report, plan, and outcomes as JSON (safe for incidents).
 //   --circle=<addr>   Restrict the scan to one circle.
 //   --page-size=<n>   Circles fetched per DB page (default 100).
 //   --grace-ms=<n>    Eventual-consistency tolerance window (default 30000).
-//   --max-repairs=<n> Cap on repairs applied in one run (default 500).
+//   --max-repairs=<n> Cap on repairs planned/applied in one run (default 500).
 
 if (require.main === module) {
   withPoolCleanup(async () => {
     const args = process.argv.slice(2);
     const repair = args.includes("--repair");
+    const confirm = args.includes("--confirm") || args.includes("--apply");
+    const jsonOutput = args.includes("--json");
     const circleArg = args.find((a) => a.startsWith("--circle="));
     const pageSizeArg = args.find((a) => a.startsWith("--page-size="));
     const graceMsArg = args.find((a) => a.startsWith("--grace-ms="));
     const maxRepairsArg = args.find((a) => a.startsWith("--max-repairs="));
 
     const options: ReconciliationOptions = {
-      log: (msg) => console.log(msg),
+      log: jsonOutput ? () => {} : (msg) => console.log(msg),
       ...(circleArg ? { circleAddress: circleArg.replace("--circle=", "") } : {}),
       ...(pageSizeArg ? { pageSize: Number(pageSizeArg.replace("--page-size=", "")) } : {}),
       ...(graceMsArg ? { graceMs: Number(graceMsArg.replace("--grace-ms=", "")) } : {}),
     };
 
+    const maxRepairs = maxRepairsArg
+      ? Number(maxRepairsArg.replace("--max-repairs=", ""))
+      : undefined;
+
     try {
       const report = await runReconciliationReport(options);
+      const plan = createRepairPlan(report, { maxRepairs });
+
+      if (jsonOutput) {
+        if (repair && confirm) {
+          const outcomes = await applyRepairPlan(plan, { confirm: true });
+          console.log(JSON.stringify({ report, plan, outcomes }, null, 2));
+        } else {
+          console.log(JSON.stringify({ report, plan }, null, 2));
+        }
+        return;
+      }
+
       printReconciliationReport(report);
+      printRepairPlan(plan);
 
       if (repair) {
-        const maxRepairs = maxRepairsArg
-          ? Number(maxRepairsArg.replace("--max-repairs=", ""))
-          : undefined;
-        const outcomes = await repairDifferences(report.differences, {
-          maxRepairs,
-          log: (msg) => console.log(msg),
-        });
-        printRepairOutcomes(outcomes);
+        if (!confirm) {
+          console.log(
+            "\n[reconcile] Notice: --repair was passed without --confirm or --apply.\n" +
+              "  The above repair plan was simulated as a read-only dry-run.\n" +
+              "  To execute the mutations, run: npm run reconcile:repair -- --confirm",
+          );
+        } else {
+          console.log("\n[reconcile] Confirmation detected. Applying repair plan...");
+          const outcomes = await applyRepairPlan(plan, {
+            confirm: true,
+            log: (msg) => console.log(msg),
+          });
+          printRepairOutcomes(outcomes);
+        }
       }
     } catch (err) {
       console.error("[reconcile] Error:", err);
