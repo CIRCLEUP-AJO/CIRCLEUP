@@ -14,6 +14,12 @@ Versions follow [Semantic Versioning](https://semver.org/).
 3. Deploy frontend application and SDK consumers.
 
 ### Added
+- **Issue 109**: **Read-only reconciliation preview before applying repairs** (#945): added
+  deterministic dry-run repair preview (`createRepairPlan`) for indexer reconciliation,
+  reporting entity, key, field, current indexed value, canonical on-chain value, SQL preview,
+  skipped grace-window records, and unreadable state bounded by `maxRepairs` for incident attachment.
+  Applying a repair plan requires explicit confirmation (`--confirm` / `--apply` / `{ confirm: true }`)
+  and safely skips concurrent modifications via expected-value guarded conditional updates.
 - **Reputation provenance and freshness** (#967): the reputation page now
   labels each section with its data source (on-chain score read vs. indexed
   history projection) and its freshness (last indexed ledger / timestamp).
